@@ -158,17 +158,6 @@ impl Store {
         Ok(())
     }
 
-    pub async fn announce_order(
-        &self,
-        order: &Order,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(bot) = &self.bot {
-            let message = format!("New order: {} {}", order.amount, order.item);
-            bot.send_chat_message(&message).await?;
-        }
-        Ok(())
-    }
-
     // Integration method to handle bot commands related to trading
     pub async fn handle_bot_command(
         &mut self,
@@ -211,7 +200,7 @@ impl Store {
     }
 
     // Helper methods (you'll need to implement these based on your User/Order structures)
-    fn get_user_balance(&self, username: &str) -> f64 {
+    pub fn get_user_balance(&self, username: &str) -> f64 {
         self.users
             .get(username)
             .map(|user| user.balance)

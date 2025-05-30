@@ -75,12 +75,12 @@ impl Bot {
         Ok(())
     }
 
-    pub async fn send_command(
+    pub async fn send_trade(
         &self,
-        command: &str,
+        target: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(client) = self.client.read().await.as_ref() {
-            client.chat(&format!("/{}", command));
+            client.chat(&format!("/trade {}", target));
         }
         Ok(())
     }

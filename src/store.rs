@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::order::Order;
 use crate::pair::Pair;
 use crate::storage::Storage;
+use crate::trade::Trade;
 use crate::user::User;
 
 pub struct Store {
@@ -13,7 +14,7 @@ pub struct Store {
     pub pairs: HashMap<String, Pair>,
     pub users: HashMap<String, User>,
     pub orders: VecDeque<Order>,
-    // might wanna add trades: Vec<Trade>
+    pub trades: Vec<Trade>,
     // might wanna add events: Vec<Event> for stuff like paying, deposits, adding stock etc (maybe even merge trades into this, have methods to get sertain event types idk)
     // might wanna add logs
     // might wanna have also a list of items and synonyms and shit
@@ -33,6 +34,7 @@ impl Store {
         let pairs = Pair::load_all()?; // Load pairs, propagating any errors
         let users = User::load_all()?; // Load users, propagating any errors
         let orders = Order::load_all()?; // Load orders
+        let trades = todo!(); // Load trades
         let storage = Storage::load(&config.position).unwrap(); // Load storage
 
         Ok(Store {
@@ -40,6 +42,7 @@ impl Store {
             pairs,
             users,
             orders,
+            trades,
             storage,
             bot: None,
         })

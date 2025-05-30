@@ -7,6 +7,7 @@ mod pair;
 mod position;
 mod storage;
 mod store;
+mod trade;
 mod user;
 
 use crate::store::Store;

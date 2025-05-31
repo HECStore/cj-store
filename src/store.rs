@@ -15,7 +15,7 @@ pub struct Store {
     pub users: HashMap<String, User>,
     pub orders: VecDeque<Order>,
     pub trades: Vec<Trade>,
-    // might wanna add events: Vec<Event> for stuff like paying, deposits, adding stock etc (maybe even merge trades into this, have methods to get sertain event types idk)
+    // might wanna add events: Vec<Event> for stuff like paying, deposits, adding stock etc (maybe even merge trades into this, have methods to get certain event types idk)
     // might wanna add logs
     // might wanna have also a list of items and synonyms and shit
     pub storage: Storage,
@@ -34,7 +34,7 @@ impl Store {
         let pairs = Pair::load_all()?; // Load pairs, propagating any errors
         let users = User::load_all()?; // Load users, propagating any errors
         let orders = Order::load_all()?; // Load orders
-        let trades = todo!(); // Load trades
+        let trades = Trade::load_all()?; // Load trades
         let storage = Storage::load(&config.position).unwrap(); // Load storage
 
         Ok(Store {

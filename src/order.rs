@@ -12,7 +12,6 @@ pub enum OrderType {
     Sell,
     Deposit,
     Withdraw,
-    // might wanna do AddItem, RemoveItem, AddCurrency, RemoveCurrency, AddItemC, RemoveItemC or something, maybe handle those admin actions differently idk
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Default)]

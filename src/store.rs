@@ -15,7 +15,7 @@ pub struct Store {
     pub users: HashMap<String, User>,
     pub orders: VecDeque<Order>,
     pub trades: Vec<Trade>,
-    // might wanna add events: Vec<Event> for stuff like paying, deposits, adding stock etc (maybe even merge trades into this, have methods to get certain event types idk)
+    // might wanna add events: Vec<Event> for stuff like paying, deposits, adding pairs etc
     // might wanna add logs
     // might wanna have also a list of items and synonyms and shit
     pub storage: Storage,

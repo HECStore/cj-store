@@ -18,8 +18,8 @@ async fn main() {
     let logger = init_logger();
 
     // Channels for communication
-    let (store_tx, store_rx) = mpsc::channel::<StoreMessage>(100);
-    let (bot_tx, bot_rx) = mpsc::channel::<StoreToBot>(100);
+    let (store_tx, store_rx) = mpsc::channel::<StoreMessage>(128);
+    let (bot_tx, bot_rx) = mpsc::channel::<StoreToBot>(128);
 
     // Spawn Store task
     let store = Store::new(logger.clone(), bot_tx.clone()).await;

@@ -1,5 +1,3 @@
-// src/logging.rs
-
 use std::fs::File;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};

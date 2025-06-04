@@ -1,5 +1,3 @@
-// src/cli.rs
-
 use crate::logging::LogMessage;
 use crate::messages::{CliToStore, StoreMessage};
 use crate::types::User;

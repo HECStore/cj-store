@@ -3,7 +3,6 @@ use std::io;
 
 use crate::bot::Bot;
 use crate::config::Config;
-use crate::logging::LogMessage;
 use crate::types::{Order, Pair, Storage, Trade, User};
 
 pub struct Store {

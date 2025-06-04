@@ -1,5 +1,3 @@
-// src/messages.rs
-
 use crate::types::{Chest, Trade, User};
 use tokio::sync::oneshot;
 

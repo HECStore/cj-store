@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use crate::chest::Chest;
-use crate::node::Node;
-use crate::position::Position;
+use crate::types::chest::Chest;
+use crate::types::node::Node;
+use crate::types::position::Position;
 
 #[derive(Debug, Default)]
 pub struct Storage {

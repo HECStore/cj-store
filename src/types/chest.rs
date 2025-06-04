@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::position::Position;
+use crate::types::position::Position;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Chest {

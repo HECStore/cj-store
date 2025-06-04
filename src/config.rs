@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::position::Position;
+use crate::types::Position;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {

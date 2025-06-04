@@ -3,11 +3,8 @@ use std::io;
 
 use crate::bot::Bot;
 use crate::config::Config;
-use crate::order::Order;
-use crate::pair::Pair;
-use crate::storage::Storage;
-use crate::trade::Trade;
-use crate::user::User;
+use crate::logging::LogMessage;
+use crate::types::{Order, Pair, Storage, Trade, User};
 
 pub struct Store {
     pub config: Config,
@@ -236,7 +233,7 @@ impl Store {
         Order::save_all(&self.orders)?;
 
         // Save storage
-        self.storage.save().unwrap();
+        Storage::save(&self.storage).unwrap();
 
         Ok(())
     }

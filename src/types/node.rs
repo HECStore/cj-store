@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::chest::Chest;
-use crate::position::Position;
+use crate::types::chest::Chest;
+use crate::types::position::Position;
 
 #[derive(Debug)]
 pub struct Node {

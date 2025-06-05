@@ -1,49 +1,63 @@
-use crate::types::{Chest, Trade, User};
+use crate::{
+    bot::ChestAction,
+    types::{Chest, Trade, User},
+};
 use tokio::sync::oneshot;
 
-/// Messages sent to the Store from Bot or CLI.
+/// Messages sent to the Store from other components.
 pub enum StoreMessage {
-    FromBot(BotToStore),
-    FromCli(CliToStore),
+    FromBot(BotMessage),
+    FromCli(CliMessage),
 }
 
-/// Messages from Bot to Store (e.g., player commands).
-pub enum BotToStore {
-    /// Player sent a message (e.g., "/msg HECStore buy cobblestone 256").
-    PlayerMessage { player: String, message: String },
-}
-
-/// CLI commands to Store (e.g., query balances, set prices).
-pub enum CliToStore {
-    /// Request user balances.
-    GetBalances {
-        response_channel: oneshot::Sender<Vec<User>>,
-    },
-    /// Set price for an item.
-    SetPrice {
-        item: String,
-        price: f64,
-        response_channel: oneshot::Sender<Result<(), String>>,
-    },
-    /// Reboot the Bot.
-    RebootBot {
-        response_channel: oneshot::Sender<Result<(), String>>,
+/// Messages from Bot to Store.
+pub enum BotMessage {
+    /// Player sent a command (e.g., "/msg HECStore buy cobblestone 256").
+    PlayerCommand {
+        player_name: String,
+        command: String,
     },
 }
 
-/// Instructions from Store to Bot (e.g., navigate to chest, execute trade).
-pub enum StoreToBot {
-    /// Instruct Bot to go to a chest and perform an action.
-    GoToChest {
-        chest: Chest,
+/// Messages from CLI to Store.
+pub enum CliMessage {
+    /// Request all user balances.
+    QueryBalances {
+        respond_to: oneshot::Sender<Vec<User>>,
+    },
+    /// Update price for an item.
+    UpdatePrice {
+        item_name: String,
+        new_price: f64,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    /// Request bot restart.
+    RestartBot {
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    /// Signal graceful shutdown.
+    Shutdown {
+        respond_to: oneshot::Sender<()>,
+    },
+}
+
+/// Instructions from Store to Bot.
+pub enum BotInstruction {
+    /// Navigate to chest and perform action.
+    InteractWithChest {
+        target_chest: Chest,
         action: ChestAction,
-        response_channel: oneshot::Sender<Result<(), String>>,
+        respond_to: oneshot::Sender<Result<(), String>>,
     },
-    /// Instruct Bot to execute a trade.
-    ExecuteTrade {
-        trade: Trade,
-        response_channel: oneshot::Sender<Result<(), String>>,
+    /// Execute a player trade.
+    ProcessTrade {
+        trade_details: Trade,
+        respond_to: oneshot::Sender<Result<(), String>>,
     },
-    /// Reboot the Bot.
-    Reboot,
+    /// Restart the bot.
+    Restart,
+    /// Shutdown the bot gracefully.
+    Shutdown {
+        respond_to: oneshot::Sender<()>,
+    },
 }

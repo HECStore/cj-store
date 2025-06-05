@@ -1,14 +1,12 @@
-use crate::logging::LogMessage;
-use crate::messages::{CliToStore, StoreMessage};
-use crate::types::User;
+use crate::messages::{CliMessage, StoreMessage};
 use dialoguer::{Input, Select};
 use tokio::sync::{mpsc, oneshot};
-use tracing::Level;
+use tracing::{error, info, warn};
 
 /// Runs the CLI task, providing an interactive menu to manage the store.
-pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>, logger: mpsc::Sender<LogMessage>) {
+pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
     loop {
-        let options = vec!["Get user balances", "Set item price", "Reboot Bot", "Exit"];
+        let options = vec!["Get user balances", "Set item price", "Restart Bot", "Exit"];
         let selection = Select::new()
             .with_prompt("Select an action")
             .items(&options)
@@ -17,11 +15,30 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>, logger: mpsc::Sender<LogMe
             .expect("Failed to read selection");
 
         match selection {
-            0 => get_balances(&store_tx, &logger),
-            1 => set_price(&store_tx, &logger),
-            2 => reboot_bot(&store_tx, &logger),
+            0 => get_balances(&store_tx),
+            1 => set_price(&store_tx),
+            2 => restart_bot(&store_tx),
             3 => {
-                log(&logger, Level::INFO, "Exiting CLI".to_string());
+                info!("Initiating graceful shutdown");
+                let (response_tx, response_rx) = oneshot::channel();
+                let msg = StoreMessage::FromCli(CliMessage::Shutdown {
+                    respond_to: response_tx,
+                });
+
+                if store_tx.blocking_send(msg).is_err() {
+                    error!("Failed to send shutdown request");
+                    return;
+                }
+
+                // Wait for shutdown confirmation
+                if response_rx.blocking_recv().is_err() {
+                    error!("Failed to receive shutdown confirmation");
+                    return;
+                }
+
+                info!("Shutdown complete");
+                // Drop the store_tx channel to signal store shutdown
+                drop(store_tx);
                 break;
             }
             _ => unreachable!(),
@@ -29,21 +46,17 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>, logger: mpsc::Sender<LogMe
     }
 }
 
-/// Sends a GetBalances request and displays the results.
-fn get_balances(store_tx: &mpsc::Sender<StoreMessage>, logger: &mpsc::Sender<LogMessage>) {
-    log(logger, Level::INFO, "Requesting user balances".to_string());
+/// Sends a QueryBalances request and displays the results.
+fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
+    info!("Requesting user balances");
 
     let (response_tx, response_rx) = oneshot::channel();
-    let msg = StoreMessage::FromCli(CliToStore::GetBalances {
-        response_channel: response_tx,
+    let msg = StoreMessage::FromCli(CliMessage::QueryBalances {
+        respond_to: response_tx,
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        log(
-            logger,
-            Level::ERROR,
-            "Failed to send GetBalances request".to_string(),
-        );
+        error!("Failed to send QueryBalances request");
         return;
     }
 
@@ -51,121 +64,103 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>, logger: &mpsc::Sender<Log
         Ok(balances) => {
             if balances.is_empty() {
                 println!("No users found.");
-                log(logger, Level::INFO, "No users found".to_string());
+                info!("No users found");
             } else {
+                println!("\n=== User Balances ===");
                 for user in balances {
-                    println!("User: {}, Balance: {}", user.username, user.balance);
-                    log(
-                        logger,
-                        Level::INFO,
-                        format!("User: {}, Balance: {}", user.username, user.balance),
+                    println!(
+                        "User: {}, Balance: {} diamonds",
+                        user.username, user.balance
+                    );
+                    info!(
+                        "User: {}, Balance: {} diamonds",
+                        user.username, user.balance
                     );
                 }
+                println!("====================\n");
             }
         }
         Err(_) => {
             println!("Failed to receive balances.");
-            log(
-                logger,
-                Level::ERROR,
-                "Failed to receive balances".to_string(),
-            );
+            error!("Failed to receive balances");
         }
     }
 }
 
-/// Prompts for item and price, then sends a SetPrice request.
-fn set_price(store_tx: &mpsc::Sender<StoreMessage>, logger: &mpsc::Sender<LogMessage>) {
-    let item: String = Input::new()
+/// Prompts for item and price, then sends an UpdatePrice request.
+fn set_price(store_tx: &mpsc::Sender<StoreMessage>) {
+    let item_name: String = Input::new()
         .with_prompt("Enter item name")
         .interact_text()
         .expect("Failed to read item name");
-    let price: f64 = Input::new()
-        .with_prompt("Enter price")
+
+    let new_price: f64 = Input::new()
+        .with_prompt("Enter new price")
         .interact_text()
         .expect("Failed to read price");
 
-    log(
-        logger,
-        Level::INFO,
-        format!("Setting price for {} to {}", item, price),
-    );
+    if new_price < 0.0 {
+        println!("Price cannot be negative.");
+        warn!("Attempted to set negative price");
+        return;
+    }
+
+    info!("Setting price for {} to {} diamonds", item_name, new_price);
 
     let (response_tx, response_rx) = oneshot::channel();
-    let msg = StoreMessage::FromCli(CliToStore::SetPrice {
-        item,
-        price,
-        response_channel: response_tx,
+    let msg = StoreMessage::FromCli(CliMessage::UpdatePrice {
+        item_name,
+        new_price,
+        respond_to: response_tx,
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        log(
-            logger,
-            Level::ERROR,
-            "Failed to send SetPrice request".to_string(),
-        );
+        error!("Failed to send UpdatePrice request");
         return;
     }
 
     match response_rx.blocking_recv() {
         Ok(Ok(())) => {
-            println!("Price set successfully.");
-            log(logger, Level::INFO, "Price set successfully".to_string());
+            println!("Price updated successfully.");
+            info!("Price updated successfully");
         }
         Ok(Err(e)) => {
-            println!("Failed to set price: {}", e);
-            log(logger, Level::ERROR, format!("Failed to set price: {}", e));
+            println!("Failed to update price: {}", e);
+            error!("Failed to update price: {}", e);
         }
         Err(_) => {
-            println!("Failed to receive price response.");
-            log(
-                logger,
-                Level::ERROR,
-                "Failed to receive price response".to_string(),
-            );
+            println!("Failed to receive price update response.");
+            error!("Failed to receive price update response");
         }
     }
 }
 
-/// Sends a RebootBot request.
-fn reboot_bot(store_tx: &mpsc::Sender<StoreMessage>, logger: &mpsc::Sender<LogMessage>) {
-    log(logger, Level::INFO, "Requesting Bot reboot".to_string());
+/// Sends a RestartBot request.
+fn restart_bot(store_tx: &mpsc::Sender<StoreMessage>) {
+    info!("Requesting Bot restart");
 
     let (response_tx, response_rx) = oneshot::channel();
-    let msg = StoreMessage::FromCli(CliToStore::RebootBot {
-        response_channel: response_tx,
+    let msg = StoreMessage::FromCli(CliMessage::RestartBot {
+        respond_to: response_tx,
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        log(
-            logger,
-            Level::ERROR,
-            "Failed to send RebootBot request".to_string(),
-        );
+        error!("Failed to send RestartBot request");
         return;
     }
 
     match response_rx.blocking_recv() {
         Ok(Ok(())) => {
-            println!("Bot reboot initiated.");
-            log(logger, Level::INFO, "Bot reboot initiated".to_string());
+            println!("Bot restart initiated successfully.");
+            info!("Bot restart initiated successfully");
         }
         Ok(Err(e)) => {
-            println!("Failed to reboot Bot: {}", e);
-            log(logger, Level::ERROR, format!("Failed to reboot Bot: {}", e));
+            println!("Failed to restart Bot: {}", e);
+            error!("Failed to restart Bot: {}", e);
         }
         Err(_) => {
-            println!("Failed to receive reboot response.");
-            log(
-                logger,
-                Level::ERROR,
-                "Failed to receive reboot response".to_string(),
-            );
+            println!("Failed to receive restart response.");
+            error!("Failed to receive restart response");
         }
     }
-}
-
-/// Helper to send a log message.
-fn log(logger: &mpsc::Sender<LogMessage>, level: Level, message: String) {
-    let _ = logger.blocking_send(LogMessage { level, message });
 }

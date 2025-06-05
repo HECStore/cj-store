@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
 pub struct User {
     pub uuid: String,
     pub username: String, // can change

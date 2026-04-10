@@ -64,16 +64,20 @@ pub struct ChestSyncReport {
 /// Actions that can be performed on a chest.
 #[derive(Debug, Clone)]
 pub enum ChestAction {
+    /// Place `amount` of `item` into the chest, optionally attributed to a player.
     Deposit {
         item: String,
         amount: i32,
+        /// Player the items originated from, or `None` for system-initiated deposits.
         from_player: Option<String>,
         /// Item's stack size (1, 16, or 64) for capacity calculation
         stack_size: i32,
     },
+    /// Take `amount` of `item` out of the chest, optionally delivered to a player.
     Withdraw {
         item: String,
         amount: i32,
+        /// Player to receive the items, or `None` if withdrawal is not player-bound.
         to_player: Option<String>,
         /// Item's stack size (1, 16, or 64) for capacity calculation
         stack_size: i32,
@@ -84,8 +88,13 @@ pub enum ChestAction {
 }
 
 /// Messages sent to the Store from other components.
+///
+/// The Store multiplexes its inbox over this enum so a single channel can
+/// serve both the in-game Bot and the operator CLI.
 pub enum StoreMessage {
+    /// Message originating from the in-game Bot task.
     FromBot(BotMessage),
+    /// Message originating from the operator CLI task.
     FromCli(CliMessage),
 }
 
@@ -93,7 +102,9 @@ pub enum StoreMessage {
 pub enum BotMessage {
     /// Player sent a command (e.g., "/msg HECStore buy cobblestone 256").
     PlayerCommand {
+        /// In-game name of the player who issued the command.
         player_name: String,
+        /// Raw command text as received, minus the whisper prefix.
         command: String,
     },
 }
@@ -193,6 +204,9 @@ pub enum CliMessage {
 }
 
 /// Instructions from Store to Bot.
+///
+/// Every variant that needs a result carries a `oneshot::Sender` so the Store
+/// can `await` the Bot's outcome while remaining fully async.
 pub enum BotInstruction {
     /// Whisper a message to a player.
     Whisper {
@@ -257,6 +271,10 @@ pub enum BotInstruction {
         respond_to: oneshot::Sender<Result<(), String>>,
     },
     /// Restart the bot.
+    ///
+    /// Fire-and-forget: no response channel because the bot task tears itself
+    /// down and is re-spawned by the supervisor, so the original sender would
+    /// no longer exist to receive an ack.
     Restart,
     /// Shutdown the bot gracefully.
     Shutdown {

@@ -54,6 +54,10 @@ pub struct Node {
 impl Node {
     /// Creates a new Node with the given ID and storage position.
     /// Automatically creates 4 chests positioned around the node.
+    ///
+    /// Note: `storage_position` is the storage *origin* (node 0's location),
+    /// not the node's own position. The node's world position is derived from
+    /// the origin via `calc_position`.
     pub fn new(node_id: i32, storage_position: &Position) -> Node {
         let node_position = Self::calc_position(node_id, storage_position);
 
@@ -84,6 +88,18 @@ impl Node {
         }
     }
 
+    /// Loads a node from `data/storage/{id}.json` and reconciles it with the
+    /// current storage origin.
+    ///
+    /// Positions in the file are treated as derivable state: we always
+    /// recompute the node position and chest positions from `storage_position`
+    /// so that moving the storage origin in config correctly relocates existing
+    /// nodes without requiring a data migration. Only the chest `item`
+    /// assignments are authoritative on disk.
+    ///
+    /// For node 0, the reserved chest invariants (chest 0 = diamond,
+    /// chest 1 = overflow) are re-enforced on load in case the file was edited
+    /// manually, and any correction is persisted back to disk.
     pub fn load(id: i32, storage_position: &Position) -> Result<Self, Box<dyn std::error::Error>> {
         let file_path = format!("data/storage/{}.json", id);
 
@@ -156,6 +172,10 @@ impl Node {
         Ok(node)
     }
 
+    /// Serializes this node to `data/storage/{id}.json`.
+    ///
+    /// Uses `write_atomic` (write-to-temp + rename) so a crash mid-write
+    /// cannot leave a partially-written node file on disk.
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let file_path = format!("data/storage/{}.json", self.id);
         tracing::debug!("[Node] Saving node {} to {:?}", self.id, file_path);
@@ -218,28 +238,41 @@ impl Node {
                 z: storage_position.z,
             }
         } else {
-            // Find which ring this node belongs to
-            // Ring n contains nodes: (n-1)*n*4+1 to n*(n+1)*4
-            // Solve: n*(n+1)*4 < id+1 <= (n+1)*(n+2)*4
+            // Find which ring this node belongs to.
+            // Ring n is a square "shell" of 8*n nodes surrounding ring n-1,
+            // so ring n contains IDs (n-1)*n*4+1 ..= n*(n+1)*4.
+            // We walk outward from ring 1 until the ring's last ID is >= our id.
+            // (Closed-form via sqrt would work but this loop is O(sqrt(id))
+            // and avoids any floating-point rounding concerns.)
             let mut ring = 1;
             while ring * (ring + 1) * 4 < id {
                 ring += 1;
             }
 
-            // Position within the ring (0-indexed)
+            // Offset of this id within its ring, starting at 0.
             let pos_in_ring = id - (ring - 1) * ring * 4;
-            let side = 2 * ring; // Nodes per side of the ring
+            // Each of the 4 sides of a ring holds `2*ring` nodes; together
+            // they cover the 8*ring nodes of the ring.
+            let side = 2 * ring;
 
-            // Determine which side of the ring (Right/Bottom/Left/Top)
-            // Adjusted for node 0 at origin (was -2, now 0)
+            // Walk the ring clockwise in (dx, dz) grid coordinates (pre-scaling).
+            // The ring is the square of radius `ring` centered on node 0, and
+            // we traverse: Right edge (top->bottom), Bottom edge (right->left),
+            // Left edge (bottom->top), Top edge (left->right). This produces
+            // the spiral shown in the module docs.
+            //
+            // Note: -z is "up" / north in Minecraft, so "top side" uses dz=-ring.
             let (dx, dz) = match pos_in_ring / side {
-                0 => (ring, -ring + pos_in_ring),               // Right side
-                1 => (ring - (pos_in_ring - side), ring),       // Bottom side
-                2 => (-ring, ring - (pos_in_ring - 2 * side)),  // Left side
-                _ => (-ring + (pos_in_ring - 3 * side), -ring), // Top side
+                0 => (ring, -ring + pos_in_ring),               // Right side (walking +z)
+                1 => (ring - (pos_in_ring - side), ring),       // Bottom side (walking -x)
+                2 => (-ring, ring - (pos_in_ring - 2 * side)),  // Left side (walking -z)
+                _ => (-ring + (pos_in_ring - 3 * side), -ring), // Top side (walking +x)
             };
 
-            // Apply spacing (3 blocks) and add to storage origin
+            // Scale grid coordinates by 3-block spacing. The 3-block gap
+            // leaves room for the 2-wide chest footprint plus a walking lane
+            // between adjacent nodes, preventing their 2x2 chest clusters
+            // from overlapping.
             Position {
                 x: storage_position.x + dx * 3,
                 y: storage_position.y,
@@ -269,7 +302,13 @@ impl Node {
     /// Calculate chest position from node ID, chest index, and node position.
     ///
     /// This is a static method that can calculate a chest's world position
-    /// without creating a full Chest object. Useful for node validation.
+    /// without creating a full Chest object. Useful for node validation
+    /// and for recomputing positions in `load()` when the storage origin
+    /// has shifted.
+    ///
+    /// The returned position is the block the bot interacts with (the
+    /// south-facing front block of the double chest), not the chest block
+    /// itself — that is why every branch uses `z - 1`.
     ///
     /// # Arguments
     /// * `_node_id` - Node ID (unused, for future use)

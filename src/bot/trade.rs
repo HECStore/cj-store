@@ -8,6 +8,16 @@ use crate::messages::TradeItem;
 use super::Bot;
 
 /// Trade slot helper functions
+///
+/// The trade GUI is a standard 9x6 double-chest container (54 slots indexed 0..53).
+/// Layout (rows top-to-bottom, cols left-to-right):
+///   Rows 0..2, cols 0..3  -> bot offer slots (12)
+///   Row  0..2, col  4     -> divider column (glass panes, unused)
+///   Rows 0..2, cols 5..8  -> player offer slots (12)
+///   Rows 4..5, cols 0..1  -> lime wool accept buttons (4, duplicated for easier clicking)
+///   Rows 4..5, cols 2..3  -> red  wool cancel buttons (4)
+///   Rows 4..5, cols 5..8  -> player status dyes (8) - gray=not ready, magenta/lime=ready
+/// Index math below uses `row * 9 + col` to map (row, col) into the flat slot index.
 pub fn trade_bot_offer_slots() -> Vec<usize> {
     // 9x6 menu:
     // - rows 0..2 are trade item slots
@@ -90,7 +100,9 @@ pub async fn wait_for_trade_menu_or_failure(
             let contents = inv.contents();
             let contents_len = contents.as_ref().map(|c| c.len()).unwrap_or(0);
             if contents_len == 54 {
-                // Stronger identification: validate wool buttons and dye indicators exist.
+                // A 54-slot container alone is not proof this is the trade GUI -
+                // any double chest is also 54. Stronger identification: validate
+                // wool buttons and dye indicators exist at their expected slots.
                 if let Some(c) = contents {
                     let accept_slots = trade_accept_slots();
                     let cancel_slots = trade_cancel_slots();
@@ -159,6 +171,8 @@ pub async fn place_items_from_inventory_into_trade(
 
     // CRITICAL: Clear cursor before any inventory operations
     // If cursor has items from a previous operation, clicking will SWAP instead of pick up
+    // which corrupts the trade state and can leak items into unintended slots or even drop
+    // them onto the floor when clicking outside. This must run before every placement pass.
     let cursor_before = super::inventory::carried_item(&client);
     if cursor_before.count() > 0 {
         warn!(
@@ -215,8 +229,11 @@ pub async fn place_items_from_inventory_into_trade(
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         let slots_all = inv.slots().ok_or_else(|| "Trade menu closed".to_string())?;
 
-        // Find the best-fit stack from bot inventory (includes both inventory AND hotbar)
-        // Trade menu slots: 0-53 (container), 54-80 (inventory slots 9-35), 81-89 (hotbar slots 0-8)
+        // Find the best-fit stack from bot inventory (includes both inventory AND hotbar).
+        // Trade menu slots: 0-53 (container), 54-80 (inventory slots 9-35), 81-89 (hotbar slots 0-8).
+        // Best-fit strategy: prefer the largest stack that still fits into `remaining` so we can
+        // place the WHOLE stack in one left-click (fast path). Only fall back to a too-large stack
+        // (and then partial right-click placement below) when no fitting stack exists.
         let mut best_slot: Option<(usize, i32)> = None;
         for i in contents_len..slots_all.len() {
             let stack = &slots_all[i];
@@ -316,6 +333,9 @@ pub async fn place_items_from_inventory_into_trade(
         let carried_count = carried.count();
 
         if carried_count <= remaining {
+            // Fast path: the whole picked-up stack fits into what we still need, so
+            // deposit it with a single left-click. This avoids N right-clicks (one per
+            // item) and is the common case thanks to the best-fit selection above.
             // Place whole stack into offer.
             debug!("Placing {}x into offer slot {}", carried_count, target_offer);
             inv.click(PickupClick::Left {
@@ -362,6 +382,9 @@ pub async fn place_items_from_inventory_into_trade(
                 placed_count += carried_count;
             }
         } else {
+            // Slow path: picked stack is larger than we need, so we can't dump the whole
+            // thing. Right-click places exactly one item per click, then the surplus on
+            // cursor is returned to the original inventory slot.
             // Place exactly `remaining` items via right-click (one per click).
             debug!("Placing {} items (partial) into offer slot {}", remaining, target_offer);
             let items_to_place = remaining;
@@ -451,7 +474,17 @@ pub async fn place_items_from_inventory_into_trade(
 }
 
 /// Validate player items in trade GUI
-/// 
+///
+/// Two orthogonal validation modes control how strict amount checks are:
+/// - `flexible_validation`: accept any amount >= 1 of each expected item type, ignoring
+///   the `amount` field entirely. Used for deposit flows where the user doesn't specify
+///   a quantity and we take whatever they drop in.
+/// - `require_exact_amount`: reject trades where the player offers MORE than expected.
+///   Used for sell orders where the price is fixed and surplus must not be accepted.
+/// Default behavior (both false): at least `amount` required, surplus is allowed and
+/// later credited to the player's balance. Under-supplying is ALWAYS an error - this
+/// is what prevents the "pay less than the price" exploit.
+///
 /// Returns Ok((found_items, validation_errors)) where:
 /// - found_items: HashMap of normalized item IDs to amounts found
 /// - validation_errors: Vec of validation error messages (empty if all OK)
@@ -632,6 +665,19 @@ pub async fn execute_trade_with_player(
 
     // Start checking immediately for player confirmation (no gray_dye = either magenta or lime_dye)
     // and validate items, then accept immediately when ready.
+    //
+    // RACE CONDITION NOTES on accept-button detection:
+    // 1) The status dye is the only visible signal that the player pressed accept, but
+    //    the player can press accept, let us validate, then swap items before the server
+    //    finalizes the trade. We defend against this by re-validating items on EVERY
+    //    tick of this loop (not just the first time the dye flips), so a late swap is
+    //    caught before we re-click accept.
+    // 2) After the bot clicks accept, the menu may close almost immediately. A closed
+    //    menu does NOT prove success - the server also closes it on rejection. The
+    //    post-close branches below therefore verify success by checking the bot's own
+    //    inventory: if the items we placed are still there, the trade was rejected.
+    // 3) `last_click_time` rate-limits accept clicks to once per 250ms to avoid spamming
+    //    the server and accidentally un-accepting (a second click on lime wool toggles off).
     let status_slots = trade_player_status_slots();
     let player_slots = trade_player_offer_slots();
     let _bot_slots = trade_bot_offer_slots();
@@ -817,8 +863,11 @@ pub async fn execute_trade_with_player(
 
         if no_gray_dye {
             // Player is ready (no gray_dye = magenta or lime_dye)
-            // CRITICAL FIX: Re-validate items EVERY time before clicking accept
-            // This prevents the race condition where player adds items after initial validation
+            // CRITICAL FIX: Re-validate items EVERY time before clicking accept.
+            // This prevents the race condition where the player first places the expected
+            // items (we validate, set ever_validated=true), then swaps them out for junk
+            // right before pressing accept. Without re-validation each tick we'd accept
+            // the swapped state. See the RACE CONDITION NOTES above the outer loop.
             let contents_vec: Vec<azalea::inventory::ItemStack> = contents.iter().cloned().collect();
             let (found_items, validation_errors) = validate_player_items(
                 &contents_vec,

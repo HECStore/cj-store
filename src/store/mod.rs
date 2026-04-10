@@ -75,6 +75,11 @@ impl Store {
         // Normalize all pair item IDs to ensure consistent lookup
         // This strips "minecraft:" prefix from item names for cleaner storage/display
         // Also filters out invalid pairs (empty item names)
+        //
+        // Normalization happens at load time (not lookup time) so that the in-memory
+        // HashMap key, the Pair.item field, and the on-disk filename all agree on the
+        // same canonical form. This avoids subtle bugs where e.g. "minecraft:diamond"
+        // and "diamond" would be treated as distinct pairs.
         let mut normalized_pairs = HashMap::new();
         let mut needs_save = false;
         for (old_key, mut pair) in pairs.drain() {
@@ -105,8 +110,15 @@ impl Store {
         
         let users = User::load_all()?;
         
-        // Orders are session-only - start fresh on each restart
-        // Clear any existing orders.json file to avoid confusion
+        // Orders are session-only - start fresh on each restart.
+        //
+        // Rationale: an Order represents an in-flight user request that is tied to
+        // the live bot session (player connectivity, chest state, queue position).
+        // Replaying a half-finished order across restarts would risk double-charging
+        // users or desyncing against actual chest contents. Trades (the settled
+        // audit log) and pair reserves ARE persisted - only the transient order
+        // log is dropped. The stale file on disk is removed so operators inspecting
+        // data/ don't mistake it for live state.
         let orders_file = std::path::Path::new("data/orders.json");
         if orders_file.exists() {
             if let Err(e) = std::fs::remove_file(orders_file) {
@@ -205,6 +217,10 @@ impl Store {
         let min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
         info!("Autosave interval: {} seconds", self.config.autosave_interval_secs);
 
+        // Main event loop. Each iteration either drains one order from the queue
+        // OR blocks on one incoming message - never both concurrently. Orders are
+        // given strict priority over messages (see PRIORITY 1/2 below) so that an
+        // in-flight trade cannot be starved or interrupted by chatty players.
         loop {
             // Periodic state logging for debugging stuck conditions
             if !self.order_queue.is_empty() || self.processing_order {
@@ -219,13 +235,24 @@ impl Store {
             // This ensures order processing runs to COMPLETION before handling new messages.
             // Previously, using tokio::select! would CANCEL order processing when messages
             // arrived, causing the oneshot channel receiver to be dropped mid-operation.
+            //
+            // The ordering here is deliberate: we poll the order queue on every loop
+            // iteration BEFORE calling store_rx.recv(). Any messages that arrive while
+            // an order is executing simply accumulate in the channel buffer and are
+            // picked up on a later iteration once the queue drains.
             if !self.processing_order && !self.order_queue.is_empty() {
                 debug!("[Store] Starting order processing (queue_len={})", self.order_queue.len());
                 self.process_next_order().await;
                 info!("[Store] Order processing cycle complete, queue size: {}", self.order_queue.len());
                 
                 // ALWAYS save after order completion for data integrity
-                // (trades, stock updates must not be lost due to crash)
+                // (trades, stock updates must not be lost due to crash).
+                //
+                // Unlike the debounced message-path autosave below, order completion
+                // bypasses min_save_interval entirely. Orders move real value (player
+                // balances, physical chest contents), so a crash between completion
+                // and the next debounce window would leave the on-disk state behind
+                // what actually happened in-game and could not be reconstructed.
                 if self.dirty {
                     info!("[Store] Saving after order completion for data integrity");
                     if let Err(e) = state::save(&self) {

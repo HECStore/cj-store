@@ -39,8 +39,12 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
     let current_pos = client.entity().position();
     let current_block = BlockPos::from(current_pos);
 
-    // If already at exact position, consider it done
-    // Zero tolerance - bot must be exactly at the node P position
+    // If already at exact position, consider it done.
+    // Zero tolerance (must match the target block exactly, not "close enough"):
+    // node P coordinates define the precise block where the bot must stand so the
+    // chest UI opens reliably and item interactions target the correct slot. Even
+    // a one-block offset can cause the bot to face a different chest or miss the
+    // interaction entirely, so we refuse to treat "nearby" as arrived.
     let dx = (current_block.x - target_block.x).abs();
     let dy = (current_block.y - target_block.y).abs();
     let dz = (current_block.z - target_block.z).abs();
@@ -71,7 +75,9 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
         let new_dx = (new_block.x - target_block.x).abs();
         let new_dy = (new_block.y - target_block.y).abs();
         let new_dz = (new_block.z - target_block.z).abs();
-        // Zero tolerance - must be at exact position
+        // Same zero-tolerance rule as above: Azalea's pathfinder may report
+        // "done" when standing on an adjacent block, but for node P we require
+        // the exact block before considering navigation successful.
         if new_dx == 0 && new_dy == 0 && new_dz == 0 {
             info!(
                 "Reached exact target ({}, {}, {}) - position: ({}, {}, {})",
@@ -110,6 +116,11 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
 pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), String> {
     for attempt in 0..NAVIGATION_MAX_RETRIES {
         if attempt > 0 {
+            // Exponential backoff between retries: transient pathfinding failures
+            // are often caused by chunk loading, server lag, or temporary mob
+            // obstruction, so waiting progressively longer gives the world state
+            // a chance to settle before we ask Azalea to recompute the path.
+            // Capped at RETRY_MAX_DELAY_MS to avoid unbounded stalls.
             let delay_ms = exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
             info!(
                 "Retry {}/{} for navigation to ({}, {}, {}) after {}ms delay",
@@ -137,7 +148,12 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
         }
     }
     
-    // After all retries, continue anyway with a warning
+    // Best-effort semantics: after exhausting retries we deliberately return
+    // Ok(()) rather than Err. Navigation is advisory for the store workflow -
+    // the caller (chest interaction logic) will perform its own position and
+    // inventory validation, and aborting the entire task here would strand the
+    // bot mid-operation. A loud warning is logged so failures remain visible,
+    // but the pipeline is allowed to continue and recover downstream.
     warn!(
         "Navigation to ({}, {}, {}) failed after {} attempts, continuing anyway",
         target.x, target.y, target.z,

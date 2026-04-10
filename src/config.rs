@@ -91,8 +91,11 @@ impl Config {
     /// * `Ok(())` if all values are valid
     /// * `Err(message)` describing what's invalid
     pub fn validate(&self) -> Result<(), String> {
+        // Accumulate all errors rather than failing fast, so the user sees
+        // every problem with their config in one run instead of fixing them
+        // one at a time across multiple startup attempts.
         let mut errors = Vec::new();
-        
+
         // Validate fee
         if self.fee < FEE_MIN || self.fee > FEE_MAX {
             errors.push(format!(
@@ -104,7 +107,11 @@ impl Config {
             errors.push("fee must be a finite number".to_string());
         }
         
-        // Validate account_email (warn if empty, don't fail)
+        // Validate account_email (warn if empty, don't fail).
+        // Empty email is tolerated here so operators can generate a default
+        // config on first run and fill in credentials afterward without the
+        // whole load failing. Authentication itself will surface the error
+        // later if they try to actually connect.
         if self.account_email.trim().is_empty() {
             // This is a warning, not an error - bot may fail to connect
             eprintln!("Warning: account_email is empty in config - bot will fail to authenticate");
@@ -120,7 +127,9 @@ impl Config {
             errors.push("server_address cannot be empty".to_string());
         }
         
-        // Validate position (Minecraft coordinate limits: -30,000,000 to 30,000,000 for X/Z)
+        // Validate position (Minecraft coordinate limits: -30,000,000 to 30,000,000 for X/Z).
+        // This is the vanilla world border maximum; values beyond it almost
+        // certainly indicate a config typo rather than a legitimate location.
         const COORD_LIMIT: i32 = 30_000_000;
         if self.position.x.abs() > COORD_LIMIT || self.position.z.abs() > COORD_LIMIT {
             errors.push(format!(
@@ -183,7 +192,10 @@ impl Config {
         let config_path = Path::new(path);
 
         let config = if config_path.exists() {
-            // File exists, proceed with loading
+            // File exists, proceed with loading.
+            // Note: missing fields for timeouts/limits are filled in by
+            // serde defaults (see `#[serde(default = ...)]`), so older
+            // configs from before those fields existed still load cleanly.
             let json_str = fs::read_to_string(config_path)?;
             let config: Config = serde_json::from_str(&json_str)?;
             config

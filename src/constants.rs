@@ -18,20 +18,27 @@ pub const SHULKER_BOX_SLOTS: usize = 27;
 /// Maximum stack size for most items
 pub const DEFAULT_STACK_SIZE: i32 = 64;
 
-/// Hotbar slot 0 in inventory slot numbering (36-44 are hotbar slots)
+/// Hotbar slot 0 in inventory slot numbering (36-44 are hotbar slots).
+/// Minecraft's container protocol numbers slots contiguously: 0-8 are crafting/armor,
+/// 9-35 are the main inventory, and 36-44 are the hotbar. Add the hotbar index (0-8)
+/// to this constant to address a specific hotbar slot.
 pub const HOTBAR_SLOT_0: usize = 36;
 
-/// First inventory slot (non-hotbar) in player inventory
+/// First inventory slot (non-hotbar) in player inventory.
+/// Slots 0-8 are reserved for crafting grid and armor, so the main inventory starts at 9.
 pub const INVENTORY_SLOT_START: usize = 9;
 
-/// Last inventory slot (non-hotbar) in player inventory
+/// Last inventory slot (non-hotbar) in player inventory.
+/// The main inventory ends at 35; slot 36 is where the hotbar begins.
 pub const INVENTORY_SLOT_END: usize = 35;
 
 // ============================================================================
 // TIMEOUT CONSTANTS (in milliseconds)
 // ============================================================================
 
-/// Timeout for opening a chest container (15 seconds = 300 ticks at 20 TPS)
+/// Timeout for opening a chest container (15 seconds = 300 ticks at 20 TPS).
+/// Measured in ticks because the chest-open handler runs inside the client's
+/// tick loop rather than on a wall-clock timer.
 pub const CHEST_OPEN_TIMEOUT_TICKS: u32 = 300;
 
 /// Timeout for trade operations (45 seconds)
@@ -86,7 +93,9 @@ pub const DELAY_SHULKER_PLACE_MS: u64 = 750;
 /// Delay for disconnect operations (2 seconds)
 pub const DELAY_DISCONNECT_MS: u64 = 2_000;
 
-/// Additional buffer after disconnect for TCP cleanup
+/// Additional buffer after disconnect for TCP cleanup.
+/// Without this extra pause, reconnect attempts can race the OS releasing
+/// the old socket and fail with "address in use" or half-closed state errors.
 pub const DELAY_DISCONNECT_BUFFER_MS: u64 = 1_000;
 
 // ============================================================================
@@ -131,6 +140,8 @@ pub const RETRY_MAX_DELAY_MS: u64 = 5_000;
 /// # Returns
 /// Delay in milliseconds with exponential backoff: `base * 2^attempt`, capped at `max_ms`
 pub fn exponential_backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
+    // Clamp the shift amount to 10 to avoid shifting past u64 range on pathological
+    // attempt counts; `max_ms` will dominate well before this limit matters in practice.
     let delay = base_ms.saturating_mul(1u64 << attempt.min(10));
     delay.min(max_ms)
 }
@@ -148,7 +159,10 @@ pub const FEE_MAX: f64 = 1.0;
 /// Maximum reasonable quantity for a single transaction
 pub const MAX_TRANSACTION_QUANTITY: i32 = 1_000_000;
 
-/// Minimum reserve before price calculation becomes unreliable
+/// Minimum reserve before price calculation becomes unreliable.
+/// Pricing formulas typically divide by reserve; values this small cause
+/// numerical blow-up and unrealistic prices, so the bot should refuse to
+/// quote trades when a reserve falls below this threshold.
 pub const MIN_RESERVE_FOR_PRICE: f64 = 0.001;
 
 // ============================================================================

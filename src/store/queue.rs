@@ -120,7 +120,10 @@ impl OrderQueue {
         }
     }
 
-    /// Load queue from disk, or create empty queue if file doesn't exist
+    /// Load queue from disk, or create empty queue if file doesn't exist.
+    ///
+    /// Called at startup to restore any orders that were pending when the bot
+    /// last shut down, so players don't lose their place in line across restarts.
     pub fn load() -> io::Result<Self> {
         let path = Path::new(QUEUE_FILE);
         
@@ -145,7 +148,10 @@ impl OrderQueue {
         })
     }
 
-    /// Save queue to disk
+    /// Save queue to disk atomically.
+    ///
+    /// Uses `write_atomic` (write-to-temp + rename) so a crash mid-write cannot
+    /// leave a truncated/corrupt queue file on disk.
     pub fn save(&self) -> io::Result<()> {
         let data = QueuePersist {
             orders: self.orders.iter().cloned().collect(),
@@ -159,6 +165,12 @@ impl OrderQueue {
     }
 
     /// Clear the queue (used on startup if queue should be session-only)
+    ///
+    /// Note: `next_id` is intentionally NOT reset. Reusing IDs across a clear
+    /// would be dangerous because log entries, user-visible order references
+    /// ("Order #5 cancelled"), and any in-flight messages would suddenly point
+    /// at a different order. Keeping the counter monotonic guarantees every
+    /// order ID ever issued by this process is unique.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.orders.clear();
@@ -190,7 +202,10 @@ impl OrderQueue {
                username, user_uuid, order_type, item, quantity);
         debug!("[Queue] Current queue state: len={} next_id={}", self.orders.len(), self.next_id);
         
-        // Check user's order count
+        // Enforce MAX_ORDERS_PER_USER to prevent a single player from flooding
+        // the queue and blocking other users behind a long tail of their orders.
+        // It also bounds worst-case wait time for everyone else and discourages
+        // accidental spam from macro/keybind misuse.
         let user_count = self.user_order_count(&user_uuid);
         debug!("[Queue] User {} has {} orders in queue (max {})", username, user_count, MAX_ORDERS_PER_USER);
         if user_count >= MAX_ORDERS_PER_USER {
@@ -210,7 +225,9 @@ impl OrderQueue {
 
         let position = self.orders.len(); // 1-indexed position
 
-        // Persist to disk
+        // Persist on every mutation so an unexpected shutdown (crash, host reboot,
+        // OOM kill) never loses an order the player has already been told is queued.
+        // The queue is small and writes are atomic, so the I/O cost is acceptable.
         debug!("[Queue] Persisting queue to disk...");
         if let Err(e) = self.save() {
             error!("[Queue] FAILED to persist queue after adding order {}: {}", id, e);
@@ -233,8 +250,9 @@ impl OrderQueue {
             Some(o) => {
                 info!("[Queue] Popped order #{}: {} for {} (queued at {}, remaining in queue: {})",
                       o.id, o.description(), o.username, o.queued_at, self.orders.len());
-                
-                // Persist to disk
+
+                // Persist after pop so a crash during order processing does not
+                // cause the same order to be replayed on next startup.
                 debug!("[Queue] Persisting queue after pop...");
                 if let Err(e) = self.save() {
                     error!("[Queue] FAILED to persist queue after popping order #{}: {}", o.id, e);
@@ -323,7 +341,8 @@ impl OrderQueue {
                     order_id, user_uuid, order.description(), pos + 1
                 );
 
-                // Persist to disk
+                // Persist so the cancellation survives a restart; otherwise
+                // a crash between cancel and next save would resurrect the order.
                 debug!("[Queue] Persisting queue after cancel...");
                 if let Err(e) = self.save() {
                     error!("[Queue] FAILED to persist queue after cancelling order {}: {}", order_id, e);
@@ -347,7 +366,9 @@ impl OrderQueue {
     }
 
     /// Estimate wait time based on position (rough estimate)
-    /// Assumes ~30 seconds per order (actual time varies by order type)
+    /// Assumes ~30 seconds per order (actual time varies by order type).
+    /// This is only used for player-facing "you'll be served in ~X" hints,
+    /// so a coarse constant is preferred over a real moving average.
     pub fn estimate_wait(&self, position: usize) -> String {
         let orders_ahead = position.saturating_sub(1);
         if orders_ahead == 0 {

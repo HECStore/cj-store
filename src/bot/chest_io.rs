@@ -124,7 +124,12 @@ pub async fn place_shulker_in_chest_slot_verified(
         debug!("  Slot is None/empty");
     }
 
-    // Log all shulker locations for debugging
+    // Log all shulker locations for debugging.
+    // Slot index mapping in the double-chest container view:
+    //   0..54  = chest slots (the 54 big-chest slots)
+    //   54..81 = player inventory (27 slots, corresponding to player inventory slots 9..36)
+    //   81..90 = player hotbar (9 slots, corresponding to player inventory slots 0..8)
+    // `idx < 54` divides "in the chest" from "in the player's side".
     debug!("place_shulker_in_chest_slot_verified: Current shulker locations:");
     for (idx, slot) in updated_slots.iter().enumerate() {
         if slot.count() > 0 && super::shulker::is_shulker_box(&slot.kind().to_string()) {
@@ -528,17 +533,25 @@ pub async fn transfer_items_with_shulker(
                     break;
                 };
 
-                // If we need the full stack or more, use shift-click for efficiency
+                // Shift-click vs manual click tradeoff:
+                //   * Shift-click (quick_move_from_container) moves the WHOLE stack in a
+                //     single click, with the server distributing items to destination slots.
+                //     Far faster but we can't pick an exact amount - it's "all or whatever fits".
+                //     Only safe when we actually want the whole stack (remaining >= stack_count).
+                //   * Manual click (else branch below) picks up the stack, right-clicks N times
+                //     to drop exactly N items, then puts the rest back. Slower (N network ops)
+                //     but lets us move a precise partial amount.
                 if remaining >= stack_count {
                     debug!(
-                        "transfer_items_with_shulker: Shift-clicking slot {} ({} items, need {})", 
+                        "transfer_items_with_shulker: Shift-clicking slot {} ({} items, need {})",
                         slot, stack_count, remaining
                     );
                     let moved =
                         super::inventory::quick_move_from_container(shulker_container, slot).await?;
                     if moved <= 0 {
-                        // Shift-click reported 0 moved - could be timing issue
-                        // Re-check the slot to see if items actually moved
+                        // Shift-click reported 0 moved - could be a timing issue where the
+                        // container contents haven't synced yet. Re-check the slot count to
+                        // distinguish "silent success" from a real failure before retrying.
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         let contents_after = shulker_container
                             .contents()
@@ -637,17 +650,20 @@ pub async fn transfer_items_with_shulker(
             }
         }
         "deposit" => {
-            // From bot inventory (slots 9-35 AND hotbar 36-44) to shulker
-            // Container view when shulker is open: shulker (0-26), inventory (27-53), hotbar (54-62)
-            // After trades, items can be in either inventory OR hotbar, so we search BOTH
+            // From bot inventory (slots 9-35 AND hotbar 36-44) to shulker.
+            // Slot mapping differs from the DOUBLE-chest view because a shulker is
+            // a SMALL 27-slot container. When a shulker is open:
+            //   0..27  = shulker's own 27 storage slots
+            //   27..54 = player inventory (27 slots -> player slots 9..36)
+            //   54..63 = player hotbar (9 slots -> player slots 0..8)
+            // (Compare with the double-chest case where 0..54 = chest, 54..81 = inv, 81..90 = hotbar.)
+            // After villager trades, picked-up items can land in either the inventory or
+            // the hotbar, so we search the entire 27..63 range to find depositable items.
             let shulker_contents = shulker_container
                 .contents()
                 .ok_or_else(|| "Shulker closed".to_string())?;
             let inv_start = shulker_contents.len(); // Bot inventory starts after shulker contents (27)
-            // Container slots 27-53 are inventory slots 9-35 (27 slots)
-            // Container slots 54-62 are hotbar slots 0-8 (9 slots)
-            // Search BOTH inventory AND hotbar (27-62) to find items for deposit
-            let inventory_end = inv_start + 36; // 27 inventory + 9 hotbar = 36 slots (27-62)
+            let inventory_end = inv_start + 36; // 27 inventory + 9 hotbar = 36 slots (27..63)
 
             debug!(
                 "transfer_items_with_shulker: Deposit - searching slots {}-{} for {}", 
@@ -1146,10 +1162,12 @@ pub async fn automated_chest_io(
     } else {
         vec![-1; 54]
     };
-    
-    // Track which slots we've CONFIRMED empty during THIS operation
-    // This is separate from slot_counts because known_counts might have 0s
-    // that mean "never checked" vs "verified empty"
+
+    // Track which slots we've CONFIRMED empty during THIS operation.
+    // This is deliberately separate from `slot_counts` / `known_counts`:
+    // a `known_counts[i] == 0` is ambiguous (it could mean "never checked" just
+    // as easily as "verified empty"), so we only skip slots we opened ourselves
+    // this run. This is the withdraw-side counterpart to `confirmed_full` below.
     let mut confirmed_empty: std::collections::HashSet<usize> = std::collections::HashSet::new();
     
     if amount <= 0 {
@@ -1172,8 +1190,12 @@ pub async fn automated_chest_io(
 
     match direction {
         "withdraw" => {
-            // Find shulkers that contain the target item
-            // Repeat process until we have enough items (remaining <= 0)
+            // Find shulkers that contain the target item.
+            // Outer loop: restart the scan from slot 0 whenever we still need more items.
+            // `checked_slots` tracks slots visited in the CURRENT pass so we don't revisit
+            // them mid-pass; at the end of each pass we retain only the confirmed-empty ones
+            // (below), so an already-drained shulker stays skipped across passes but a shulker
+            // we only partially drained gets another look if we still need more.
             let mut all_shulkers_checked = false;
             let mut checked_slots = std::collections::HashSet::new();
 
@@ -1215,8 +1237,18 @@ pub async fn automated_chest_io(
                     all_shulkers_checked = false; // Found a shulker, not done yet
                     checked_slots.insert(slot_idx);
 
-                    // CRITICAL: Ensure cursor is empty before picking up shulker
-                    // If cursor has an item, clicking will swap instead of pick up
+                    // Per-shulker sequence for one withdraw pass:
+                    //   1. clear cursor, take shulker out of the chest slot into cursor
+                    //   2. close the chest (can't open the player inventory while a chest is open)
+                    //   3. move the shulker into hotbar slot 0 so the bot can place it
+                    //   4. right-click the floor block at the station to place the shulker
+                    //   5. open the placed shulker as a container
+                    //   6. shift-click target items from the shulker into bot inventory
+                    //   7. close the shulker, clear hotbar, break+pick up the shulker block
+                    //   8. reopen the chest, find the shulker in the chest-view inventory,
+                    //      and put it back into the same chest slot
+                    // CRITICAL: Ensure cursor is empty before picking up shulker -
+                    // if the cursor already holds something the click becomes a swap, not a pickup.
                     info!("Clearing cursor before picking up shulker");
                     container.click(PickupClick::LeftOutside);
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1411,8 +1443,11 @@ pub async fn automated_chest_io(
                     }
                 }
 
-                // Reset checked slots for next iteration if we still need more items
-                // BUT preserve slots CONFIRMED empty during this operation - no need to recheck those
+                // End of one outer pass over the 54 chest slots.
+                // If we still need more items, reset `checked_slots` so the next pass can
+                // revisit shulkers. BUT keep the confirmed-empty ones in the set so they
+                // stay skipped across passes - there's no point in re-opening a shulker we
+                // already drained this operation.
                 if remaining > 0 {
                     checked_slots.retain(|&slot| confirmed_empty.contains(&slot));
                 }
@@ -1458,14 +1493,18 @@ pub async fn automated_chest_io(
                     debug!("Skipping slot {}: confirmed full this operation", slot_idx);
                     continue;
                 }
-                
-                // Skip slots KNOWN to be at max capacity from known_counts
-                // Use dynamic shulker_capacity based on item's stack size
+
+                // Skip slots KNOWN to be at max capacity from `known_counts`.
+                // Unlike the withdraw side (where we distrust a stored 0 because it's
+                // ambiguous with "never checked"), a stored count >= capacity is
+                // unambiguous: the shulker physically cannot hold more. Skipping here
+                // avoids the huge cost of taking the shulker out, placing, opening,
+                // discovering it's full, and putting it back.
                 if let Some(known) = known_counts {
                     if let Some(&count) = known.get(slot_idx) {
                         if count >= shulker_capacity {
                             debug!(
-                                "Skipping slot {}: known full with {} items (max {})", 
+                                "Skipping slot {}: known full with {} items (max {})",
                                 slot_idx, count, shulker_capacity
                             );
                             confirmed_full.insert(slot_idx);
@@ -1499,9 +1538,13 @@ pub async fn automated_chest_io(
 
                 info!("Processing shulker in slot {} for deposit", slot_idx);
 
-                // CRITICAL: Ensure cursor is empty before picking up shulker
-                // If cursor has an item, clicking will swap instead of pick up
-                // Clear cursor by clicking outside the chest GUI
+                // Per-shulker sequence for deposit (mirror of the withdraw sequence):
+                //   take shulker from chest -> close chest -> ensure shulker in hotbar 0 ->
+                //   place on station -> open shulker -> shift-click items from player inv/hotbar
+                //   into shulker -> close shulker -> clear hotbar -> break+pickup shulker ->
+                //   reopen chest -> place shulker back in the same chest slot (verified).
+                // CRITICAL: Ensure cursor is empty before picking up shulker -
+                // if cursor has an item, clicking becomes a swap instead of a pickup.
                 info!("Clearing cursor before picking up shulker");
                 container.click(PickupClick::LeftOutside);
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;

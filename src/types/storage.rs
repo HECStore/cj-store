@@ -169,6 +169,12 @@ impl Storage {
         })
     }
 
+    /// Creates a new node with the lowest unused id and appends it to `self.nodes`.
+    ///
+    /// The id is chosen as the smallest non-negative integer not already in use so
+    /// that gaps left by removed nodes are reused (keeping on-disk filenames dense).
+    /// `Node::new` computes the node's world position from `self.position` using
+    /// the spiral layout described at the top of this file.
     pub fn add_node(&mut self) -> &mut Node {
         // Find the next available node_id (handle gaps from removed nodes)
         let mut node_id = 0i32;
@@ -180,6 +186,10 @@ impl Storage {
         self.nodes.last_mut().unwrap()
     }
 
+    /// Sums the counts of `item` across every shulker slot in every chest.
+    ///
+    /// Only chests whose assigned `item` matches are considered; negative slot
+    /// values (reserved/missing semantics) are filtered out by the `> 0` check.
     pub fn total_item_amount(&self, item: &str) -> i32 {
         self.nodes
             .iter()
@@ -384,14 +394,18 @@ impl Storage {
         }
 
         // Phase 2: Use empty chests; create new nodes if none exist.
-        // This handles overflow when existing chests are full.
+        // This handles overflow when existing chests are full, or when no chest
+        // has yet been assigned to this item. The loop is needed (instead of a
+        // single call) because a freshly-claimed chest may not have enough
+        // capacity for the remaining `qty`, forcing us to claim another.
         while qty > 0 {
             let (node_idx, chest_idx) = match Self::find_empty_chest_index(&self.nodes, item) {
                 Some(ix) => ix, // Found an empty chest
                 None => {
-                    // No empty chests: create a new node (adds 4 new empty chests)
+                    // No empty chests anywhere: grow storage by one node (which
+                    // adds 4 fresh empty chests) and retry. The expect() is safe
+                    // because a newly-constructed node always has empty chests.
                     self.add_node();
-                    // After adding a node, there will be empty chests.
                     Self::find_empty_chest_index(&self.nodes, item).expect("new node must have chests")
                 }
             };
@@ -411,12 +425,27 @@ impl Storage {
         plan
     }
 
+    /// Defensive invariant enforcement: every chest must expose exactly
+    /// `SLOTS_PER_CHEST` slots so that slot indices map 1:1 to Minecraft chest
+    /// slots. Older on-disk data or partially-initialised chests may violate
+    /// this, so deposit/withdraw paths call this before indexing `amounts`.
     fn normalize_amounts_len(chest: &mut Chest) {
         if chest.amounts.len() != Self::SLOTS_PER_CHEST {
             chest.amounts.resize(Self::SLOTS_PER_CHEST, 0);
         }
     }
 
+    /// Deposits as much of `*qty` as fits into `chest`, decrementing `qty` in
+    /// place and returning the amount actually deposited.
+    ///
+    /// Iterates slots in order, topping up each shulker to `shulker_capacity`
+    /// before moving on. Because we walk slots left-to-right, any partially
+    /// filled shulker encountered first is finished before an empty slot is
+    /// touched - this minimises fragmentation across shulkers so the bot needs
+    /// fewer shulker swaps per transfer.
+    ///
+    /// Slots with a negative count are treated as reserved and skipped (the
+    /// encoding is kept for future "missing shulker" semantics).
     fn deposit_into_chest(chest: &mut Chest, qty: &mut i32, stack_size: i32) -> i32 {
         if *qty <= 0 {
             return 0;
@@ -452,6 +481,20 @@ impl Storage {
         deposited
     }
 
+    /// Locates an unassigned chest suitable for a new `item` assignment.
+    ///
+    /// Returns `(node_idx, chest_idx)` of the first empty chest found under the
+    /// reservation rules below, or `None` if every chest is either assigned or
+    /// reserved-but-unavailable for this item.
+    ///
+    /// Selection priority:
+    /// 1. If `item == "diamond"`: node 0 / chest 0 (the diamond-reserved slot).
+    /// 2. If `item == OVERFLOW_CHEST_ITEM`: node 0 / chest 1 (overflow slot).
+    /// 3. Node 0 chests 2..=3 (general-purpose chests closest to spawn).
+    /// 4. Any empty chest in subsequent nodes, in node/chest order.
+    ///
+    /// Preferring node 0 keeps frequently-used items physically close to the
+    /// bot's parking position, reducing navigation time.
     fn find_empty_chest_index(nodes: &[Node], item: &str) -> Option<(usize, usize)> {
         // Node 0 has reserved chests:
         // - Chest 0: dedicated for diamonds only

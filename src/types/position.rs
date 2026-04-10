@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 
 /// A 3D position in Minecraft world coordinates.
 ///
-/// Uses integer coordinates (block positions).
+/// Uses `i32` because these refer to discrete block positions, not entity
+/// positions (which would be floating-point). This matches the coordinate
+/// type used by Minecraft's block API and avoids rounding ambiguity when
+/// addressing chests or other fixed-grid structures.
 /// - `x`: East (+) / West (-) axis
 /// - `y`: Height (0-320 typical, -64 minimum in modern Minecraft)
 /// - `z`: South (+) / North (-) axis

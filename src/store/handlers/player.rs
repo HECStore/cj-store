@@ -118,11 +118,16 @@ pub async fn handle_player_command(
     player_name: &str,
     command: &str,
 ) -> Result<(), String> {
-    // Resolve user UUID for rate limiting (creates user if needed)
+    // Resolve user UUID for rate limiting (creates user if needed).
+    // UUID is the canonical identity key - rate limiting and ownership
+    // must not rely on usernames since players can change them.
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
-    // Rate limiting check
+    // Rate limiting check - runs before command parsing so spamming any
+    // command (including malformed ones) counts toward the per-user limit.
+    // Violations are silently absorbed with a "please wait" reply: no
+    // dispatch happens, so the queue and downstream state stay untouched.
     if let Err(wait_duration) = store.rate_limiter.check(&user_uuid) {
         let wait_secs = wait_duration.as_secs_f64();
         let msg = if wait_secs < 1.0 {
@@ -135,6 +140,13 @@ pub async fn handle_player_command(
 
     let parts: Vec<&str> = command.split_whitespace().collect();
 
+    // Command dispatch:
+    // - "Order commands" (buy/sell/deposit/withdraw) only validate input
+    //   here and push an entry onto store.order_queue. Actual chest I/O and
+    //   trade GUI interaction happen later on the queue processor task.
+    // - "Quick commands" (balance/price/help/items/pay/queue/cancel/status
+    //   and operator admin commands) run inline because they don't need
+    //   the bot to physically move or interact with chests/players.
     match parts.get(0) {
         Some(&"buy") | Some(&"b") => {
             if parts.len() >= 3 {
@@ -167,7 +179,10 @@ pub async fn handle_player_command(
                     player_name, quantity, item
                 );
 
-                // Add to order queue
+                // Enqueue for sequential processing. Orders run one at a
+                // time because the bot has a single body - it must walk to
+                // chests, open the trade GUI, etc. Player receives the
+                // assigned order id and position so they can track/cancel.
                 match store.order_queue.add(
                     user_uuid.clone(),
                     player_name.to_string(),
@@ -1080,8 +1095,14 @@ pub async fn handle_deposit_balance_queued(
 ) -> Result<(), String> {
     info!("[Deposit] === STARTING DEPOSIT ORDER === player={} amount={:?}", player_name, amount);
     state::assert_invariants(store, "pre-deposit-balance", false)?;
-    
-    // Maximum diamonds the trade GUI can hold (12 stacks of 64)
+
+    // Maximum diamonds the trade GUI can hold (12 stacks of 64 = 768).
+    // Rationale: Minecraft's vanilla trade/offer UI exposes 12 offer slots
+    // (4x3 grid on each side). Each slot holds at most one 64-stack of
+    // diamonds, so a single trade round-trip can move at most 768 diamonds.
+    // Requests larger than this cannot fit into one trade window and must
+    // be split - we reject them at the handler rather than silently
+    // truncating so the player isn't surprised by a partial transaction.
     const MAX_TRADE_DIAMONDS: i32 = 12 * 64; // 768
     
     // Determine if this is a fixed-amount or flexible deposit
@@ -1311,8 +1332,11 @@ pub async fn handle_withdraw_balance_queued(
 ) -> Result<(), String> {
     info!("[Withdraw] === STARTING WITHDRAW ORDER === player={} amount={:?}", player_name, amount);
     state::assert_invariants(store, "pre-withdraw-balance", false)?;
-    
-    // Maximum diamonds the trade GUI can hold (12 stacks of 64)
+
+    // Maximum diamonds the trade GUI can hold per transaction: 12 slots
+    // times a 64-stack each = 768 diamonds. See handle_deposit_balance_queued
+    // for the full rationale - the cap comes from the vanilla trade window
+    // layout, not from any arbitrary policy.
     const MAX_TRADE_DIAMONDS: i32 = 12 * 64; // 768
 
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
@@ -1490,8 +1514,20 @@ pub async fn handle_withdraw_balance_queued(
         info!("[Withdraw] All {} diamond withdrawal operations completed", withdraw_plan.len());
     }
 
-    // NOTE: Do NOT deduct balance yet - wait until trade succeeds
-    // This prevents the bug where balance is deducted even if trade is rejected
+    // NOTE: Do NOT deduct balance yet - wait until trade succeeds.
+    // This prevents the bug where balance is deducted even if trade is rejected.
+    //
+    // Ordering of withdraw steps (important for rollback correctness):
+    //   1. Pull diamonds out of the storage chests into bot inventory (done above).
+    //   2. Attempt the trade handoff to the player.
+    //   3. ONLY on successful trade, subtract from the user's balance.
+    //
+    // If step 2 fails for ANY reason (send error, channel drop, timeout,
+    // trade rejected by player), the rollback path below redeposits the
+    // physical diamonds back into storage and returns early - and because
+    // the balance was never touched, no balance restoration is needed.
+    // This keeps physical diamonds (chests) and ledger balance in lockstep
+    // so a user cannot lose diamonds to a failed/cancelled trade.
 
     // Perform trade: bot offers whole diamonds, player offers nothing
     info!("[Withdraw] Initiating trade: bot offers {} diamonds to {}", whole_diamonds, player_name);

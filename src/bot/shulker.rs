@@ -145,6 +145,9 @@ pub async fn place_shulker_on_station(bot: &Bot, station_pos: &Position) -> Resu
     // Place it on the station (shulker should be in cursor from chest click)
     // In Minecraft, to place a block, you right-click on the face of an adjacent block
     // The station is at the same Y as the node, so we click on the block below to place on top
+    // Sequencing: look_at -> short settle delay -> block_interact -> longer settle delay.
+    // The delays give the server time to process the rotation packet before the place packet,
+    // and then let the resulting block-place finalize before the caller proceeds.
     let place_on_block = BlockPos::new(station_pos.x, station_pos.y - 1, station_pos.z);
     // Look at the top face of the floor block (where we want to place the shulker)
     let place_vec3 = Vec3::new(
@@ -232,7 +235,8 @@ pub async fn pickup_shulker_from_station(
 
     // Wait for block to actually be broken (check block state in a loop)
     // Shulker boxes break quickly but we need to verify the block is actually gone
-    // before moving to pick it up
+    // before moving to pick it up. Walking away before the break completes can cancel
+    // mining server-side and leave the shulker intact.
     const MAX_BREAK_WAIT_MS: u64 = 7000; // Maximum 7 seconds to wait for block to break
     const CHECK_INTERVAL_MS: u64 = 150; // Check every 150ms
     let mut waited_ms: u64 = 0;
@@ -293,7 +297,10 @@ pub async fn pickup_shulker_from_station(
             break;
         }
 
-        // Continue mining in case it stopped
+        // Re-mine safety net: azalea's mining can silently stop if the look direction
+        // drifts or the initial start_mining packet was dropped. Every 500ms we re-aim
+        // at the block center and re-issue start_mining so a transient glitch doesn't
+        // stall the whole pickup until the 7s timeout.
         if waited_ms % 500 == 0 {
             debug!(
                 "pickup_shulker_from_station: Re-issuing mining command at {}ms",
@@ -304,12 +311,17 @@ pub async fn pickup_shulker_from_station(
         }
     }
 
-    // Additional delay for the item to drop and settle
+    // Additional delay for the item to drop and settle.
+    // After the block is destroyed the server spawns the dropped item entity on a
+    // short delay, and it needs a moment to settle onto the floor before the bot's
+    // pickup radius can reliably vacuum it up.
     info!("pickup_shulker_from_station: Waiting 1s for dropped item to settle");
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    // Walk to X position (x-3 from node position) to pick up the dropped shulker
-    // X is one block west of S (which is at x-2), and coincides with the P position of the node to the west
+    // Walk to X position (x-3 from node position) to pick up the dropped shulker.
+    // X is one block west of S (which is at x-2), and coincides with the P position of the node to the west.
+    // Standing at the node itself is too far for the item pickup radius to reach the drop,
+    // so we deliberately step one block past S and then walk back.
     let pickup_pos = Position {
         x: node_position.x - 3, // One block left of S (which is at x-2)
         y: node_position.y,
@@ -320,6 +332,8 @@ pub async fn pickup_shulker_from_station(
         pickup_pos.x, pickup_pos.y, pickup_pos.z
     );
     super::navigation::navigate_to_position(bot, &pickup_pos).await?;
+    // Small pause after arriving so the server has time to deliver any pickup packets
+    // triggered by walking over the item before we move again.
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
     // Walk back to node position to ensure we're in the right place for next operations
@@ -330,7 +344,10 @@ pub async fn pickup_shulker_from_station(
     super::navigation::navigate_to_position(bot, node_position).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
-    // Verify we picked up the shulker - this is CRITICAL, return error if not found
+    // Verify we picked up the shulker - this is CRITICAL, return error if not found.
+    // A missing shulker here usually means either the break never completed, the item
+    // despawned, or the bot failed to path into pickup range - all conditions the
+    // caller must handle rather than silently continuing with an empty hand.
     let inv_handle = client.open_inventory();
     if let Some(handle) = inv_handle {
         let slots = handle.slots();

@@ -21,16 +21,32 @@ use crate::fsutil::write_atomic;
 #[allow(dead_code)]
 pub const DEFAULT_MAX_ORDERS: usize = 10_000;
 
+/// The kind of transaction recorded in the audit log.
+///
+/// Variants are split between user-initiated trades (`Buy`/`Sell`),
+/// operator inventory adjustments (`AddItem`/`RemoveItem`), user balance
+/// movements (`DepositBalance`/`WithdrawBalance`), and operator balance
+/// adjustments (`AddCurrency`/`RemoveCurrency`). Serialized variant names
+/// are part of the on-disk format in `data/orders.json`, so renaming them
+/// is a breaking change.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Default, Clone)]
 pub enum OrderType {
+    /// User purchased an item from the store.
     #[default]
     Buy,
+    /// User sold an item to the store.
     Sell,
-    AddItem,         // Operator: add items to storage
-    RemoveItem,      // Operator: remove items from storage
-    DepositBalance,  // User: deposit diamonds to balance
-    WithdrawBalance, // User: withdraw diamonds from balance
+    /// Operator added items to storage (no currency movement).
+    AddItem,
+    /// Operator removed items from storage (no currency movement).
+    RemoveItem,
+    /// User deposited diamonds into their store balance.
+    DepositBalance,
+    /// User withdrew diamonds from their store balance.
+    WithdrawBalance,
+    /// Operator credited currency to a user's balance directly.
     AddCurrency,
+    /// Operator debited currency from a user's balance directly.
     RemoveCurrency,
 }
 
@@ -119,6 +135,10 @@ impl Order {
     }
     
     /// Prune the order queue to a custom limit, removing the oldest orders.
+    ///
+    /// Orders are appended to the back of the `VecDeque`, so the front holds
+    /// the oldest entries. Popping from the front preserves chronological
+    /// order while discarding the least recent history first.
     #[allow(dead_code)]
     pub fn prune_to_limit(orders: &mut VecDeque<Self>, max_orders: usize) {
         while orders.len() > max_orders {
@@ -146,7 +166,10 @@ impl Order {
             }
         }
 
-        // Create a pruned copy if needed (don't mutate the original)
+        // Create a pruned copy if needed (don't mutate the original).
+        // Skipping `len - max_orders` from the front keeps the most recent
+        // `max_orders` entries, matching the pop_front pruning semantics
+        // used elsewhere but without requiring a mutable borrow of the caller's queue.
         let orders_to_save: VecDeque<Self> = if orders.len() > max_orders {
             tracing::info!("Pruning {} orders to {} before saving", orders.len(), max_orders);
             orders.iter().skip(orders.len() - max_orders).cloned().collect()

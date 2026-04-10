@@ -34,13 +34,19 @@ pub fn with_minecraft_prefix(item: &str) -> String {
 }
 
 /// Resolve username to UUID via Mojang API (async)
-/// 
+///
 /// Uses the async Mojang API client for better performance without blocking the runtime.
+/// `_store` is currently unused but retained in the signature to allow future
+/// caching of lookups without requiring call-site changes.
 pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String, String> {
     User::get_uuid_async(username).await
 }
 
-/// Ensure user exists in store, creating if missing
+/// Ensure user exists in store, creating if missing.
+///
+/// UUIDs are the canonical identity key (usernames can change), so we look up
+/// by UUID and only update the stored username when it has drifted. Marks the
+/// store dirty on any mutation so the change is persisted on the next flush.
 pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
     if !store.users.contains_key(uuid) {
         store.users.insert(
@@ -66,7 +72,11 @@ pub fn is_operator(store: &Store, user_uuid: &str) -> bool {
     store.users.get(user_uuid).is_some_and(|u| u.operator)
 }
 
-/// Get node position for a given chest_id
+/// Get node position for a given chest_id.
+///
+/// Each node holds 4 chests, so the node id is `chest_id / 4`. If the node
+/// isn't materialized in `storage.nodes` yet, we deterministically recompute
+/// its position from the storage origin so callers always get a valid location.
 pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position {
     let node_id = chest_id / 4;
     store.storage.nodes.iter()
@@ -78,7 +88,11 @@ pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position
         })
 }
 
-/// Send a message to a player via bot whisper
+/// Send a message to a player via bot whisper.
+///
+/// Uses a oneshot channel so we can await the bot's acknowledgement and
+/// surface send failures (bot disconnected, channel closed) back to the caller
+/// instead of silently dropping the message.
 pub async fn send_message_to_player(store: &Store, player_name: &str, message: &str) -> Result<(), String> {
     debug!("Sending message to {}: {}", player_name, message);
     let (tx, rx) = oneshot::channel();
@@ -94,7 +108,12 @@ pub async fn send_message_to_player(store: &Store, player_name: &str, message: &
     rx.await.map_err(|e| format!("Bot response dropped: {}", e))?
 }
 
-/// Helper to format transfer summaries (excludes coordinates for security)
+/// Helper to format transfer summaries (excludes coordinates for security).
+///
+/// Player-facing output must NEVER leak chest coordinates: exposing them would
+/// let customers (or griefers) locate and bypass the storage system directly.
+/// Only item + amount pairs are included; long lists are truncated with a
+/// "(+N more)" suffix to keep whispers within Minecraft's chat limits.
 pub fn summarize_transfers(transfers: &[crate::types::storage::ChestTransfer], max: usize) -> String {
     if transfers.is_empty() {
         return "none".to_string();
@@ -117,7 +136,11 @@ pub fn summarize_transfers(transfers: &[crate::types::storage::ChestTransfer], m
     parts.join("; ")
 }
 
-/// Helper to format issue lists
+/// Helper to format issue lists.
+///
+/// Produces a compact "prefix: a; b; c (+N more)" string for operator reports
+/// and whispers. The `max` cap prevents one pathological operation from
+/// flooding chat when many issues accumulate.
 pub fn fmt_issues(prefix: &str, issues: &[String], max: usize) -> String {
     if issues.is_empty() {
         return prefix.to_string();

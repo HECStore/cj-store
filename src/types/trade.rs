@@ -29,16 +29,29 @@ pub const DEFAULT_MAX_TRADES_IN_MEMORY: usize = 50_000;
 #[allow(dead_code)]
 pub const TRADE_RETENTION_DAYS: i64 = 365;
 
+/// The category of a recorded trade.
+///
+/// Customer-facing transactions (`Buy`, `Sell`) are distinguished from
+/// administrative adjustments so that reports can exclude bookkeeping
+/// entries from sales figures.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Default, Clone)]
 pub enum TradeType {
+    /// Customer bought an item from the store (store -> customer).
     #[default]
     Buy,
+    /// Customer sold an item to the store (customer -> store).
     Sell,
+    /// Admin adjustment: stock added without a customer transaction.
     AddStock,
+    /// Admin adjustment: stock removed without a customer transaction.
     RemoveStock,
+    /// User deposited currency into their store balance.
     DepositBalance,
+    /// User withdrew currency from their store balance.
     WithdrawBalance,
+    /// Admin adjustment: currency added to the store's treasury.
     AddCurrency,
+    /// Admin adjustment: currency removed from the store's treasury.
     RemoveCurrency,
 }
 
@@ -84,9 +97,13 @@ impl Trade {
         }
     }
 
-    // Helper function to get the file path for a single trade
+    // Helper function to get the file path for a single trade.
+    // The timestamp doubles as the filename, so two trades created in the
+    // same nanosecond would collide — in practice this is fine since
+    // `Utc::now()` is monotonic per process and trades are created serially.
     fn get_trade_file_path(timestamp: &DateTime<Utc>) -> PathBuf {
-        // Format timestamp as RFC3339 string and replace colons with dashes for filesystem compatibility
+        // Colons are reserved on Windows (NTFS) filesystems, so RFC3339
+        // timestamps must have them replaced before use as a filename.
         let timestamp_str = timestamp.to_rfc3339().replace(':', "-");
         PathBuf::from(Self::TRADES_DIR).join(format!("{}.json", timestamp_str))
     }
@@ -188,7 +205,9 @@ impl Trade {
         // Sort trades by timestamp (oldest first)
         trades.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         
-        // Limit to max_trades (keep most recent)
+        // Limit to max_trades (keep most recent).
+        // Since trades are sorted oldest-first, skipping the first N entries
+        // discards the oldest and retains the most recent `max_trades`.
         if trades.len() > max_trades {
             let original_count = trades.len();
             trades = trades.into_iter()
@@ -262,6 +281,9 @@ impl Trade {
     /// Saves a Vec of `Trade`s, where each `Trade` is saved to its own file
     /// in the `data/trades/` directory using the `trade.save()` method.
     /// This method overwrites existing files and then removes any orphaned files.
+    ///
+    /// The orphan cleanup ensures the on-disk set matches `trades` exactly,
+    /// so callers can use this to synchronize after in-memory deletions.
     pub fn save_all(trades: &Vec<Self>) -> io::Result<()> {
         let dir_path = Path::new(Self::TRADES_DIR);
 

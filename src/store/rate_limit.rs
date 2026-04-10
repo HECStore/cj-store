@@ -36,6 +36,9 @@ struct UserRateLimit {
 }
 
 impl UserRateLimit {
+    /// Create a fresh tracking entry. Note that `last_message_time` is seeded
+    /// to "now" here, but callers (see `RateLimiter::check`) typically override
+    /// it so that a first-time user isn't instantly rate limited.
     fn new() -> Self {
         Self {
             last_message_time: Instant::now(),
@@ -57,10 +60,18 @@ impl Default for RateLimiter {
     }
 }
 
-/// Calculate the required cooldown based on violation count
+/// Calculate the required cooldown based on violation count.
+///
+/// Uses exponential backoff so that repeat spammers face rapidly growing
+/// wait times, while occasional offenders barely notice. The doubling
+/// pattern (2s, 4s, 8s, 16s, ...) is a classic anti-abuse strategy: it
+/// punishes sustained spam without over-penalizing honest mistakes, and
+/// the `MAX_COOLDOWN` cap ensures a persistent spammer can't be locked
+/// out indefinitely (which would also make the UX unrecoverable).
 fn calculate_cooldown(violations: u32) -> Duration {
     // Exponential backoff: base * 2^violations
-    // Cap the exponent to prevent overflow (2^10 = 1024, which is plenty)
+    // Cap the exponent at 10 to prevent shift overflow on u64; 2^10 = 1024
+    // already vastly exceeds MAX_COOLDOWN, so higher values are pointless.
     let multiplier = 1u64 << violations.min(10);
     let cooldown_ms = RATE_LIMIT_BASE_COOLDOWN_MS.saturating_mul(multiplier);
     Duration::from_millis(cooldown_ms.min(RATE_LIMIT_MAX_COOLDOWN_MS))
@@ -87,7 +98,11 @@ impl RateLimiter {
 
         // Get or create user's rate limit entry
         let user_limit = self.limits.entry(user_uuid.to_string()).or_insert_with(|| {
-            // New user - set last_message_time in the past so first message always succeeds
+            // For a brand new user, we backdate `last_message_time` by 60s
+            // (longer than MAX_COOLDOWN) so that the `elapsed >= required_cooldown`
+            // check below will always pass on the very first message. Without
+            // this hack, a new user would be treated as having "just messaged"
+            // at entry creation time and get rejected on their first request.
             let mut limit = UserRateLimit::new();
             limit.last_message_time = now - Duration::from_secs(60);
             limit
@@ -106,10 +121,16 @@ impl RateLimiter {
         if elapsed >= required_cooldown {
             // User waited long enough - allow the message
             user_limit.last_message_time = now;
-            // Don't reset violations here - they only reset after 30s idle
+            // Intentionally do NOT reset violations here. If we did, a spammer
+            // could simply wait out each escalating cooldown once and then
+            // resume spamming at the base rate forever. Violations only clear
+            // after a full RATE_LIMIT_RESET_AFTER_MS of genuine idleness.
             Ok(())
         } else {
-            // User is sending too fast - increment violations and reject
+            // User is sending too fast - count this as another violation so
+            // the next allowed message has to wait even longer. `saturating_add`
+            // guards against wrap-around from a pathological spammer; the
+            // cooldown is capped separately in `calculate_cooldown`.
             user_limit.consecutive_violations = user_limit.consecutive_violations.saturating_add(1);
             let remaining = required_cooldown - elapsed;
             Err(remaining)

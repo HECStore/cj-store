@@ -15,7 +15,9 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
     for node in &mut store.storage.nodes {
         for chest in &mut node.chests {
             if chest.id == report.chest_id {
-                // Node 0 has reserved chests (forced, cannot change item type)
+                // Node 0 has reserved chests whose item type is fixed by protocol.
+                // We warn (rather than erroring) so a misbehaving bot report is
+                // logged but cannot corrupt the reserved-chest assignment.
                 if chest.id == crate::constants::DIAMOND_CHEST_ID {
                     // Chest 0: dedicated for diamonds
                     if chest.item != "diamond" {
@@ -32,8 +34,12 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                     chest.item = report.item;
                 }
                 
-                // Merge counts: only update slots where report has count >= 0
-                // Slots with -1 mean "not checked" and should keep their existing value
+                // Slot merge semantics:
+                //   count >=  0 -> authoritative new value, overwrite in place
+                //   count == -1 -> sentinel for "bot did not inspect this slot",
+                //                  preserve the existing stored value
+                // The bounds check guards against a report whose slot array is
+                // longer than our configured chest layout.
                 for (i, &new_count) in report.amounts.iter().enumerate() {
                     if new_count >= 0 && i < chest.amounts.len() {
                         chest.amounts[i] = new_count;
@@ -77,11 +83,19 @@ pub fn save(store: &Store) -> Result<(), Box<dyn std::error::Error + Send + Sync
     Ok(())
 }
 
-/// Audit store state and optionally repair issues
+/// Audit store state and optionally repair issues.
+///
+/// Walks users, storage chests and pairs looking for broken invariants and
+/// returns a human-readable list of problems. When `repair` is true, issues
+/// that have a safe automatic fix (currently: Pair.item_stock drifting from
+/// the physical chest total) are corrected in place, and the returned vec is
+/// prefixed with a "Repair applied" marker line so callers can tell repairs
+/// ran even when no other issues remain.
 pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
     let mut issues = Vec::new();
 
-    // Users
+    // Users: NaN/Inf would poison any later arithmetic, and negative balances
+    // would let users spend money they never had -- both must be flagged.
     for user in store.users.values() {
         if !user.balance.is_finite() {
             issues.push(format!("User {} has non-finite balance", user.username));
@@ -113,6 +127,8 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
             };
             
             for (i, a) in chest.amounts.iter().enumerate() {
+                // -1 is the legal "unknown/unchecked" sentinel (see
+                // apply_chest_sync); anything more negative is corruption.
                 if *a < -1 {
                     issues.push(format!("Chest {} slot {} has invalid amount {}", chest.id, i, a));
                 }
@@ -130,7 +146,11 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
         }
     }
 
-    // Pairs vs storage + numeric sanity
+    // Pairs vs storage + numeric sanity.
+    // The cached Pair.item_stock must agree with the sum of physical chest
+    // slots for that item; drift here typically indicates a missed sync or a
+    // crash between a trade and a save. When repair is enabled we trust the
+    // physical storage as the source of truth and rewrite the cached value.
     for pair in store.pairs.values_mut() {
         if pair.item_stock < 0 {
             issues.push(format!(
@@ -163,11 +183,18 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
     issues
 }
 
-/// Assert store invariants, optionally repairing issues
+/// Assert store invariants, optionally repairing issues.
+///
+/// Wraps [`audit_state`] and turns any remaining (unfixable) issues into an
+/// `Err`. Intended for use at well-defined checkpoints (e.g. after loading,
+/// before saving) where silently continuing on a broken state would be worse
+/// than aborting the operation.
 pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Result<(), String> {
     use crate::store::utils;
     let issues = audit_state(store, repair);
-    // If repair is on, audit_state always includes the first "Repair applied..." line.
+    // When repair is on, audit_state always prepends a "Repair applied..."
+    // marker line; skip it so we only surface problems that repair couldn't
+    // handle.
     let relevant = if repair {
         issues.into_iter().skip(1).collect::<Vec<_>>()
     } else {

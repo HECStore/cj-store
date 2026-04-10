@@ -176,8 +176,11 @@ pub async fn bot_task(
     }
 
     let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    // Exponential backoff for reconnect attempts: starts at 2s, doubles on each failure,
+    // capped at 60s. Reset to 2s on successful reconnect.
     let mut backoff = tokio::time::Duration::from_secs(2);
     let max_backoff = tokio::time::Duration::from_secs(60);
+    // Initialize last_attempt in the past so the first reconnect check can fire immediately.
     let mut last_attempt = tokio::time::Instant::now() - backoff;
 
     // Main event loop (+ periodic reconnect checks)
@@ -197,9 +200,12 @@ pub async fn bot_task(
                     let server_address = bot.server_address.clone();
                     if let Err(e) = connection::connect(&bot, account, server_address).await {
                         warn!("Reconnect attempt failed: {}", e);
+                        // Double backoff on failure (bounded by max_backoff) to avoid hammering the server.
                         backoff = (backoff * 2).min(max_backoff);
                     } else {
-                        // Give the client a short window to initialize.
+                        // Poll up to 20s for Event::Init to populate bot.client. connect() returns
+                        // as soon as the task is spawned, but the client handle is only set once
+                        // the server completes the login/configuration handshake.
                         let mut ok = false;
                         let start = tokio::time::Instant::now();
                         while start.elapsed() < tokio::time::Duration::from_secs(20) {
@@ -210,6 +216,7 @@ pub async fn bot_task(
                             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                         }
                         if ok {
+                            // Successful reconnect: reset backoff to the initial floor.
                             backoff = tokio::time::Duration::from_secs(2);
                             info!("Bot reconnected");
                             
@@ -278,10 +285,13 @@ pub async fn bot_task(
                                     error!("[Bot] Deposit from player is not supported in sync mode");
                                     Err("Deposit from player is not supported in sync mode".to_string())
                                 } else {
-                                    // Pass existing slot counts so we can skip known-full shulkers
-                                    // Only pass if at least one slot has been checked (has non-zero value)
-                                    // Otherwise all 0s could mean "never checked" vs "all empty"
-                                    let known_counts = if target_chest.amounts.len() == 54 
+                                    // Pass existing slot counts so chest_io can skip shulkers known to be full
+                                    // (fast-path optimization to avoid opening every shulker on deposit).
+                                    // Guard: only forward counts if the array is fully sized (54) AND at
+                                    // least one slot is non-zero. An all-zero array is ambiguous - it could
+                                    // mean "never scanned yet" rather than "confirmed empty", and treating
+                                    // an unscanned chest as empty would skip valid destinations.
+                                    let known_counts = if target_chest.amounts.len() == 54
                                         && target_chest.amounts.iter().any(|&x| x > 0) {
                                         Some(&target_chest.amounts)
                                     } else {
@@ -322,10 +332,12 @@ pub async fn bot_task(
                                     error!("[Bot] Withdraw to player is not supported in sync mode");
                                     Err("Withdraw to player is not supported in sync mode".to_string())
                                 } else {
-                                    // Pass existing slot counts so we can skip known-empty shulkers
-                                    // Only pass if at least one slot has been checked (has non-zero value)
-                                    // Otherwise all 0s could mean "never checked" vs "all empty"
-                                    let known_counts = if target_chest.amounts.len() == 54 
+                                    // Pass existing slot counts so chest_io can skip shulkers known to be empty
+                                    // (fast-path optimization to avoid opening empty shulkers on withdraw).
+                                    // Same all-zero ambiguity guard as the deposit path: an unscanned chest
+                                    // has a zero-filled amounts array which we must NOT treat as "all empty",
+                                    // otherwise we'd refuse to pull from chests that actually have stock.
+                                    let known_counts = if target_chest.amounts.len() == 54
                                         && target_chest.amounts.iter().any(|&x| x > 0) {
                                         Some(&target_chest.amounts)
                                     } else {
@@ -585,11 +597,14 @@ async fn validate_node_physically(
                 node_id, node_position.x, node_position.y, node_position.z, e)
     })?;
     
-    // Step 2: Check each of the 4 chests
+    // Step 2: Check each of the 4 chests.
+    // Errors are accumulated (not early-return) so the report lists every broken chest
+    // in a single validation pass, instead of forcing the operator to re-run after each fix.
     let mut validation_errors = Vec::new();
-    
+
     for chest_index in 0..4 {
-        // Add delay between chest operations (except before first chest)
+        // Space chest opens apart so the server finishes processing the previous close
+        // packet before we issue another open (prevents "container already open" races).
         if chest_index > 0 {
             info!("Waiting {}ms before opening next chest...", 
                   crate::constants::DELAY_VALIDATION_BETWEEN_CHESTS_MS);
@@ -611,13 +626,17 @@ async fn validate_node_physically(
                 // Verify contents are all shulker boxes
                 match container.contents() {
                     Some(contents) => {
+                        // A valid storage chest is a double chest with exactly 54 slots.
+                        // Single chests (27) or any other size indicate the block at this
+                        // position isn't the expected double chest.
                         if contents.len() != 54 {
                             validation_errors.push(format!(
                                 "Chest {} has {} slots (expected 54)",
                                 chest_index, contents.len()
                             ));
                         } else {
-                            // Check each slot contains a shulker box
+                            // Every slot must hold a shulker box - empty slots and non-shulker
+                            // items both break the storage invariant this node relies on.
                             let mut non_shulker_slots = Vec::new();
                             for (slot_idx, stack) in contents.iter().enumerate() {
                                 if stack.count() <= 0 {
@@ -629,8 +648,10 @@ async fn validate_node_physically(
                                     }
                                 }
                             }
-                            
+
                             if !non_shulker_slots.is_empty() {
+                                // Cap the per-chest error detail at 5 slots to keep error
+                                // messages readable when a whole chest is misconfigured.
                                 let issues = if non_shulker_slots.len() > 5 {
                                     format!("{} slots missing shulkers (first 5: {})", 
                                             non_shulker_slots.len(),

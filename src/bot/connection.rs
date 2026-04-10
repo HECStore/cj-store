@@ -44,6 +44,9 @@ pub async fn connect(
 
     // In azalea 0.15+, ClientBuilder::start runs on a LocalSet (not Send).
     // Spawn it locally so we can continue processing BotInstruction messages.
+    // NOTE: This requires the caller to be running inside a tokio LocalSet
+    // (see main.rs). Using tokio::spawn instead would fail to compile because
+    // the future returned by start() is !Send.
     let handle = tokio::task::spawn_local(async move {
         // Check shutdown flag before starting
         if shutdown.load(Ordering::SeqCst) {
@@ -57,7 +60,10 @@ pub async fn connect(
         //   ClientBuilder::new_without_plugins()
         //       .add_plugins(DefaultPlugins.build().disable::<LogPlugin>())
         //       .add_plugins(DefaultBotPlugins)
-        // But that adds significant dependencies, so we accept the harmless error instead
+        // But that adds significant dependencies, so we accept the harmless error instead.
+        // The `let _ =` intentionally discards the Result: the only failure path here is
+        // bevy's LogPlugin double-initialization error described above, which is benign
+        // and must not abort the connect task.
         let _ = azalea::ClientBuilder::new()
             .set_handler(handle_event_fn)
             .set_state(initial_state)
@@ -132,7 +138,11 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
         }
     };
     
-    // Give the disconnect packet time to be sent and processed
+    // Give the disconnect packet time to be sent and processed.
+    // This is the FIRST of two ~2s waits. It happens BEFORE aborting the task so
+    // that Azalea's event loop is still alive to actually flush the disconnect
+    // packet out of its send buffer; aborting too early would drop the packet
+    // and the server would only notice us via a keep-alive timeout.
     // IMPORTANT: We need to wait long enough for:
     // 1. The disconnect packet to be sent over the network
     // 2. The server to receive and process it
@@ -184,7 +194,12 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
             info!("[Connection] Task.abort() called (took {:?})", abort_duration);
             debug!("[Connection] Task abort signal sent (task may still be cleaning up)");
             
-            // Wait for the abort to take effect and the TCP connection to fully close at OS level
+            // Wait for the abort to take effect and the TCP connection to fully close at OS level.
+            // This is the SECOND ~2s wait: distinct from the pre-abort wait above because
+            // task.abort() is asynchronous - the task may still be mid-await when the signal
+            // arrives, and its Drop chain (which closes the socket) runs after that. Without
+            // this second delay, a fast reconnect could race the old socket's teardown and
+            // see the server still holding the previous session.
             // The OS may keep the connection in TIME_WAIT state for a few seconds
             info!("[Connection] Waiting 2000ms (2 seconds) for task abort and OS-level TCP connection closure");
             let abort_wait_start = Instant::now();

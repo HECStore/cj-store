@@ -18,8 +18,12 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
             "Bot not connected".to_string()
         })?;
 
-    // CRITICAL: First check and clear the cursor if it has items
-    // Items in cursor from previous operations can cause subsequent operations to fail
+    // CRITICAL: First check and clear the cursor if it has items.
+    // Items in cursor from previous operations can cause subsequent operations to fail:
+    // a held cursor stack makes left-clicks behave as "place" instead of "pick up",
+    // which silently corrupts any shift-click / pickup sequence that follows. Leftover
+    // cursor state is also invisible to the server until the next click, so we proactively
+    // stash it in an empty inventory slot (or drop it outside) before doing anything else.
     let cursor = carried_item(&client);
     if cursor.count() > 0 {
         warn!(
@@ -152,6 +156,10 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
 /// Move items from hotbar (slots 36-44) to inventory (slots 9-35).
 /// This ensures hotbar slot 0 (36) is always available for shulker boxes.
 /// Called after trade completes to organize inventory.
+///
+/// Slot numbering note: the player inventory container uses a flat slot space where
+/// 0-8 are crafting/armor, 9-35 are the main inventory rows, and 36-44 are the hotbar.
+/// The in-game "hotbar slot N" (0-8) corresponds to container slot `36 + N`.
 pub async fn move_hotbar_to_inventory(bot: &Bot) -> Result<(), String> {
     info!("move_hotbar_to_inventory: Starting hotbar cleanup");
     
@@ -319,9 +327,15 @@ pub fn verify_holding_shulker(client: &azalea::Client) -> bool {
 }
 
 /// Check if the entity's Inventory component is available (entity fully initialized).
-/// 
+///
 /// Use this to verify the bot is ready for inventory operations after connection.
 /// Returns true if the Inventory component is available, false otherwise.
+///
+/// Background: immediately after login, Azalea's ECS may not yet have attached the
+/// `Inventory` component to the player entity. Any inventory read (including cursor
+/// state) performed during that window will silently report empty, which can cause
+/// subsequent click logic to make decisions on stale data. Callers should wait for
+/// this check to return true before touching inventory state.
 pub fn is_entity_ready(client: &azalea::Client) -> bool {
     client.ecs.read().get::<azalea::entity::inventory::Inventory>(client.entity).is_some()
 }
@@ -363,6 +377,29 @@ pub fn carried_item(client: &azalea::Client) -> azalea::inventory::ItemStack {
 /// If shulker is in cursor, places it in hotbar slot 0.
 /// If shulker is in another slot, moves it to hotbar slot 0.
 /// Returns Ok(()) if shulker is now in hotbar slot 0, Err if it couldn't be moved.
+///
+/// Flow overview (this function is the trickiest piece of state-wrangling in the bot):
+///   1. Fast path: shulker already sits in container slot 36 (hotbar slot 0) -> done.
+///   2. Cursor path: shulker is currently held on the cursor.
+///        a. If slot 36 is empty, just left-click slot 36 to deposit.
+///        b. If slot 36 is occupied, we CANNOT use a pick-up/put-down dance because
+///           the cursor already holds the shulker - left-clicking would swap the
+///           shulker for whatever was in slot 36, then we'd be holding junk. Instead
+///           we shift-click slot 36 to evacuate its contents into the main inventory
+///           (slots 9-35) without touching the cursor, verify the shulker is still
+///           on the cursor (rarely, the shift-click can race and displace it), and
+///           then left-click slot 36 to place the shulker.
+///        c. If any verification fails, hand off to `recover_shulker_to_slot_0`,
+///           which retries from a clean state.
+///   3. Slot path: shulker lives in some other inventory/hotbar slot.
+///        a. Evacuate slot 36 into an empty inventory slot if needed (pick-up/put-down).
+///        b. Pick up the shulker, place it into slot 36, then verify with a short
+///           retry loop because server inventory updates lag behind click packets.
+///
+/// Why slot 0 specifically: the "place shulker" path later uses the hotbar-select
+/// packet to hold the shulker for a block_interact, and the rest of the bot assumes
+/// hotbar slot 0 as the canonical carry slot. Keeping this invariant centralized here
+/// keeps every caller simple.
 pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
     use azalea::inventory::operations::PickupClick;
 
@@ -392,7 +429,9 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
             "Inventory closed".to_string()
         })?;
 
-    const HOTBAR_SLOT_0: usize = 36; // Hotbar slot 0 is inventory slot 36
+    // Hotbar slot 0 is container index 36 in the player inventory slot space
+    // (0-8 = crafting/armor, 9-35 = main inventory, 36-44 = hotbar).
+    const HOTBAR_SLOT_0: usize = 36;
 
     // Log current state for debugging
     let cursor_item = carried_item(&client);
@@ -446,7 +485,10 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
             carried.kind()
         );
         
-        // CRITICAL: Clear hotbar slot 0 first if needed, but be careful not to lose the shulker in cursor
+        // CRITICAL: Clear hotbar slot 0 first if needed, but be careful not to lose the shulker in cursor.
+        // A naive left-click on slot 36 while holding the shulker would SWAP the two stacks,
+        // leaving us with the wrong item on the cursor. We must use shift-click (quick move) to
+        // evacuate slot 36 into the main inventory without disturbing cursor state.
         if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0) {
             if slot_item.count() > 0 {
                 info!(
@@ -486,6 +528,10 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
                         error!("ensure_shulker_in_hotbar_slot_0: Failed to clear hotbar slot 0 - item still present after shift-click");
                         return Err("Failed to clear hotbar slot 0 - item still present".to_string());
                     }
+                    // Rare race: the shift-click can shuffle stacks in a way that leaves the
+                    // shulker elsewhere (e.g. it stacked onto a matching shulker in the main
+                    // inventory). If the cursor no longer holds a shulker we fall through to
+                    // a full inventory search and move.
                         if verify_carried.count() == 0 || !shulker::is_shulker_box(&verify_carried.kind().to_string()) {
                         // Shulker lost from cursor, search for it in inventory
                         warn!(
@@ -696,7 +742,9 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
         });
         tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
         
-        // Verify it's now in hotbar slot 0 (with retry for timing issues)
+        // Verify it's now in hotbar slot 0. We poll a few times because the server's
+        // inventory-update packet can arrive after our click ACK, so the local slot view
+        // may still show the pre-click state on the first read.
         let mut verified = false;
         for verify_attempt in 0..5 {
             let updated_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;

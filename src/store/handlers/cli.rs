@@ -11,6 +11,8 @@ use super::super::{Store, state, utils};
 pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Result<(), String> {
     match message {
         CliMessage::QueryBalances { respond_to } => {
+            // Read-only snapshot: clones the user map so the CLI receives an
+            // owned Vec without holding a reference into the live store.
             debug!("Querying user balances");
             let users: Vec<User> = store.users.values().cloned().collect();
             let _ = respond_to.send(users);
@@ -32,6 +34,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             is_operator,
             respond_to,
         } => {
+            // Heuristic: hyphen presence is used to distinguish a raw UUID
+            // (e.g. "xxxxxxxx-xxxx-...") from a Minecraft username, which
+            // cannot contain hyphens. Usernames require an async Mojang
+            // lookup; UUIDs are used as-is.
             let uuid = if username_or_uuid.contains('-') {
                 // Assume it's a UUID
                 username_or_uuid.clone()
@@ -39,12 +45,17 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 // Assume it's a username, resolve UUID
                 utils::resolve_user_uuid(store, &username_or_uuid).await?
             };
+            // Auto-create the user record if missing so operators can be
+            // granted to players who have never interacted with the store.
             utils::ensure_user_exists(store, &username_or_uuid, &uuid);
             if let Some(user) = store.users.get_mut(&uuid) {
                 user.operator = is_operator;
+                // Mark dirty so the periodic save picks up the flag change.
                 store.dirty = true;
                 let _ = respond_to.send(Ok(()));
             } else {
+                // Shouldn't normally happen after ensure_user_exists, but
+                // guard against a failed insert rather than panicking.
                 let _ = respond_to.send(Err("User not found".to_string()));
             }
             Ok(())
@@ -80,11 +91,15 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 }
             }
             
-            // Save the node to persist it (including reserved assignments for node 0)
+            // Save the node to persist it (including reserved assignments for node 0).
+            // Node persistence is per-file so we save immediately rather than
+            // waiting for the periodic store-level save.
             if let Err(e) = node.save() {
                 warn!("Failed to save node {}: {}", node_id, e);
             }
-            
+
+            // Dirty flag still set so the aggregate Storage state (which
+            // tracks the node list) is persisted on the next save cycle.
             store.dirty = true;
             let _ = respond_to.send(Ok(node_id));
             Ok(())
@@ -97,7 +112,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             // Only adds the node if all checks pass.
             info!("[CLI] Adding new node with physical validation");
             
-            // Calculate the would-be node ID and position
+            // Calculate the would-be node ID and position.
+            // We compute this BEFORE calling add_node so the bot can be sent
+            // to the exact position it will occupy, and we can reject the
+            // node (without rollback) if validation fails.
             let mut next_node_id = 0i32;
             while store.storage.nodes.iter().any(|n| n.id == next_node_id) {
                 next_node_id += 1;
@@ -124,6 +142,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 validation_rx
             ).await;
             
+            // Nested result layering:
+            //   outer Result = timeout (Err = elapsed)
+            //   middle Result = oneshot recv (Err = bot dropped sender)
+            //   inner Result = actual validation outcome from the bot
             match validation_result {
                 Ok(Ok(Ok(()))) => {
                     // Validation passed - add the node
@@ -191,12 +213,14 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             let idx = store.storage.nodes.iter().position(|n| n.id == node_id);
             if let Some(idx) = idx {
                 store.storage.nodes.remove(idx);
-                // Remove the file data/storage/{node_id}.json
+                // Remove the file data/storage/{node_id}.json so a stale
+                // entry doesn't get reloaded on next startup.
                 let file_path = format!("data/storage/{}.json", node_id);
                 if let Err(e) = std::fs::remove_file(&file_path) {
                     warn!("Failed to remove node file {}: {}", file_path, e);
                     // Continue anyway - the node is removed from memory
                 }
+                // Persist the updated Storage (node list) on the next save.
                 store.dirty = true;
                 let _ = respond_to.send(Ok(()));
             } else {
@@ -210,11 +234,15 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 let _ = respond_to.send(Err("Item name cannot be empty".to_string()));
                 return Ok(());
             }
-            // Validate stack size
+            // Stack size must be a valid Minecraft stack size: 1 (unstackable
+            // items like tools), 16 (ender pearls, signs, snowballs), or
+            // 64 (most items). Any other value indicates a typo.
             if stack_size != 1 && stack_size != 16 && stack_size != 64 {
                 let _ = respond_to.send(Err(format!("Invalid stack size: {}. Must be 1, 16, or 64", stack_size)));
                 return Ok(());
             }
+            // Normalize to the canonical item id (lowercase, strip namespace,
+            // etc.) so the pair key is consistent with how trades reference it.
             let normalized_item = utils::normalize_item_id(&item_name);
             // Check if normalization resulted in empty string (invalid item name)
             if normalized_item.is_empty() {
@@ -245,8 +273,9 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 return Ok(());
             }
             let normalized_item = utils::normalize_item_id(&item_name);
-            
-            // Cannot remove the diamond pair (used as currency)
+
+            // Diamond is the store's base currency; removing it would break
+            // every existing pair's pricing and user balance accounting.
             if normalized_item == "diamond" {
                 let _ = respond_to.send(Err("Cannot remove diamond pair (used as currency)".to_string()));
                 return Ok(());
@@ -284,7 +313,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
         }
         CliMessage::QueryTrades { limit, respond_to } => {
             debug!("Querying recent trades (limit: {})", limit);
-            // Get the most recent trades (trades are stored oldest-first)
+            // Trades are appended chronologically, so rev() + take(limit)
+            // yields the N most recent trades in newest-first order. Using
+            // .take() on the reversed iterator avoids allocating the full
+            // history when only a small window is requested.
             let recent_trades: Vec<crate::types::Trade> = store.trades
                 .iter()
                 .rev() // Most recent first
@@ -296,7 +328,9 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
         }
         CliMessage::RestartBot { respond_to } => {
             info!("Initiating bot restart");
-            // Send restart instruction to bot
+            // A failed bot_tx send means the bot channel is closed, which is
+            // fatal for this handler: we propagate the error upward (not just
+            // via respond_to) so Store::run can surface it.
             if let Err(e) = store.bot_tx.send(BotInstruction::Restart).await {
                 let error_msg = format!("Failed to send restart instruction: {}", e);
                 error!("{}", error_msg);
@@ -308,6 +342,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
         }
         CliMessage::AuditState { repair, respond_to } => {
             let report = state::audit_state(store, repair);
+            // audit_state returns a header line plus one line per fix. A
+            // report length > 1 in repair mode means at least one mutation
+            // happened, so we must persist. (A length-1 report is just the
+            // "nothing to fix" header.)
             if repair && report.len() > 1 {
                 store.dirty = true;
             }
@@ -321,8 +359,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             info!("[CLI] Starting storage discovery");
             
             let mut discovered_count = 0usize;
-            
-            // Find the starting node ID (skip already existing nodes)
+
+            // Snapshot existing IDs up-front so the skip check inside the
+            // loop is O(1) and isn't affected as add_node() mutates the
+            // nodes vec during discovery.
             let existing_ids: std::collections::HashSet<i32> = store.storage.nodes.iter()
                 .map(|n| n.id)
                 .collect();
@@ -383,8 +423,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                         next_node_id += 1;
                     }
                     Ok(Ok(Err(validation_error))) => {
-                        // Node not found or invalid - stop discovery
-                        info!("[CLI] Node {} not found or invalid: {} - stopping discovery", 
+                        // A missing/invalid position is the termination
+                        // signal: discovery assumes nodes are laid out
+                        // contiguously, so the first gap ends the scan.
+                        info!("[CLI] Node {} not found or invalid: {} - stopping discovery",
                               next_node_id, validation_error);
                         break;
                     }
@@ -406,8 +448,11 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             Ok(())
         }
         CliMessage::ClearStuckOrder { respond_to } => {
-            // Clear stuck order processing state.
-            // This allows the queue to continue if an order got stuck.
+            // Manual escape hatch: if an order never reaches a terminal
+            // state (bot crashed mid-trade, chest stuck, etc.) the queue
+            // refuses to advance because processing_order stays true.
+            // This command forcibly clears that flag so the next order can
+            // be picked up on the following tick.
             info!("[CLI] Clearing stuck order processing state");
             
             let stuck_order_desc = if store.processing_order {
@@ -428,8 +473,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             store.processing_order = false;
             store.current_order = None;
             store.dirty = true;
-            
-            // Save the queue state to ensure it's persisted
+
+            // Persist the queue immediately (in addition to the dirty flag)
+            // so a crash between now and the next periodic save doesn't
+            // re-strand the queue on the same phantom order.
             if let Err(e) = store.order_queue.save() {
                 warn!("[CLI] Failed to save queue after clearing stuck order: {}", e);
             }

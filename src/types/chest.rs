@@ -36,7 +36,7 @@ use crate::types::position::Position;
 ///   - Non-stackable items (tools, etc.): 27 × 1 = 27 max
 /// - If `item.is_empty()`, all `amounts` should be 0 (empty chest)
 ///
-/// **ID Calculation**: `id = node_id * 4 + index`
+/// **ID Calculation**: `id = node_id * 4 + index` (4 chests per node, indices 0-3)
 ///
 /// **Position**: Calculated from node position + index offset (see `Chest::new()`)
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -96,6 +96,9 @@ impl Chest {
                 z: self.position.z + 1,  // Chest at z-1, so P at z
             }),
             _ => {
+                // Unlike Chest::new() which panics on invalid index, this getter
+                // logs and returns None because it may be called on deserialized
+                // data where a corrupted JSON file should not crash the bot.
                 tracing::error!("Invalid chest index: {} (expected 0-3)", self.index);
                 None
             }
@@ -172,8 +175,8 @@ impl Chest {
             node_id,
             index,
             position,
-            item: String::new(),  // empty string
-            amounts: vec![0; 54], // vector of 54 zeros
+            item: String::new(),  // empty = unassigned chest
+            amounts: vec![0; 54], // one entry per slot in a double chest
         }
     }
 

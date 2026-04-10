@@ -133,6 +133,8 @@ impl User {
 
         // Mojang API returns UUID without hyphens; format it with hyphens
         // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        // The length check is a guard against malformed responses before slicing,
+        // which would otherwise panic on non-32-char strings.
         let id = &mojang_response.id;
         if id.len() != 32 {
             return Err(format!("Invalid UUID length from Mojang API: {}", id));
@@ -168,6 +170,8 @@ impl User {
             username
         );
 
+        // NOTE: blocking::get creates a fresh client per call (no pooling).
+        // The async variant above reuses HTTP_CLIENT and should be preferred.
         let response = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
 
         // Mojang API returns 204 No Content when player doesn't exist
@@ -221,6 +225,9 @@ impl User {
 
     /// Saves this single `User` instance to `data/users/{self.uuid}.json`.
     /// Creates the 'data/users' directory if it doesn't exist.
+    ///
+    /// Uses `write_atomic` (temp file + rename) so a crash mid-write cannot
+    /// leave a partially written user file that would fail to deserialize.
     pub fn save(&self) -> io::Result<()> {
         let path = Self::get_user_file_path(&self.uuid);
 
@@ -282,6 +289,10 @@ impl User {
     /// Saves a HashMap of `User`s, where each `User` is saved to its own file
     /// in the `data/users/` directory using the `user.save()` method.
     /// This method overwrites existing files and then removes any orphaned files.
+    ///
+    /// The orphan cleanup pass makes the on-disk directory a faithful mirror
+    /// of the in-memory map: users removed from the map are also deleted from
+    /// disk, preventing stale state from being resurrected by `load_all`.
     pub fn save_all(users: &HashMap<String, Self>) -> io::Result<()> {
         let dir_path = Path::new(Self::USERS_DIR);
 
@@ -293,7 +304,10 @@ impl User {
         // Keep track of files that should exist after saving
         let mut expected_files = HashSet::new();
 
-        // Save each user individually using the individual user.save() method
+        // Save each user individually using the individual user.save() method.
+        // Note: filenames are keyed on user.uuid (not the HashMap key) so that
+        // on-disk files always match the canonical identity stored inside the
+        // User struct, even if the two were ever to diverge.
         for user in users.values() {
             user.save()?;
             let filename = format!("{}.json", user.uuid);

@@ -1,3 +1,11 @@
+//! Interactive CLI menu for store operators.
+//!
+//! This module runs on a dedicated blocking thread (not a Tokio task) because
+//! `dialoguer` performs synchronous terminal I/O. It communicates with the
+//! async `Store` actor by sending `CliMessage`s over an `mpsc` channel and
+//! awaiting replies via `oneshot` channels using `blocking_send` /
+//! `blocking_recv`.
+
 use crate::messages::{CliMessage, StoreMessage};
 use crate::types::TradeType;
 use dialoguer::{Input, Select};
@@ -5,8 +13,15 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 /// Runs the CLI task, providing an interactive menu to manage the store.
+///
+/// This function blocks the calling thread in a loop until the operator
+/// selects "Exit". On exit it performs a coordinated shutdown: it sends a
+/// `Shutdown` message, waits for the `Store` to confirm, then drops
+/// `store_tx` so the `Store`'s receiver closes and its task can terminate.
 pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
     loop {
+        // NOTE: The numeric indices in the match below are tied to the order
+        // of this vector. Keep them in sync when adding/removing entries.
         let options = vec![
             "Get user balances",
             "Get pairs",
@@ -44,6 +59,8 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
             8 => remove_pair(&store_tx),
             9 => view_storage(&store_tx),
             10 => view_trades(&store_tx),
+            // Audit in read-only vs. repair mode — the bool flag is the only
+            // difference, so both menu entries route through `audit_state`.
             11 => audit_state(&store_tx, false),
             12 => audit_state(&store_tx, true),
             13 => restart_bot(&store_tx),
@@ -70,7 +87,9 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
                 info!("[CLI] Received shutdown confirmation from Store");
 
                 info!("[CLI] Dropping store_tx channel to signal Store shutdown");
-                // Drop the store_tx channel to signal store shutdown
+                // Explicitly drop our sender so the Store's receiver observes
+                // a closed channel and can break out of its own recv loop.
+                // This is the last remaining sender in the CLI thread.
                 drop(store_tx);
                 info!("[CLI] store_tx dropped, CLI task exiting");
                 break;
@@ -121,11 +140,15 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 }
 
-/// Sends a QueryPairs request and displays the results.
+/// Sends a QueryPairs request and displays the results, including
+/// AMM-style buy/sell prices derived from each pair's current reserves.
 fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
     info!("Requesting pairs");
 
-    // First, get the fee rate from config
+    // Fetch the configured fee rate first so buy/sell prices reflect the
+    // actual spread the store charges. We fall back to 12.5% (the default
+    // configured fee) if the query fails for any reason, so the operator
+    // still sees a sensible price estimate rather than an error.
     let (fee_tx, fee_rx) = oneshot::channel();
     let fee_msg = StoreMessage::FromCli(CliMessage::QueryFee {
         respond_to: fee_tx,
@@ -155,15 +178,19 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
             } else {
                 println!("\n=== Pairs ===");
                 for pair in pairs {
+                    // Base price is the constant-product mid-price
+                    // (currency / item). We only show prices when both
+                    // reserves are positive — otherwise the pair is not
+                    // tradeable and the quote would be undefined / infinite.
                     let price_buy = if pair.item_stock > 0 && pair.currency_stock > 0.0 {
                         let base = pair.currency_stock / (pair.item_stock as f64);
-                        Some(base * (1.0 + fee)) // Use actual fee from config
+                        Some(base * (1.0 + fee)) // Buy price: mid + fee spread
                     } else {
                         None
                     };
                     let price_sell = if pair.item_stock > 0 && pair.currency_stock > 0.0 {
                         let base = pair.currency_stock / (pair.item_stock as f64);
-                        Some(base * (1.0 - fee)) // Use actual fee from config
+                        Some(base * (1.0 - fee)) // Sell price: mid - fee spread
                     } else {
                         None
                     };
@@ -195,6 +222,8 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
         .interact_text()
         .expect("Failed to read username/UUID");
 
+    // Default to "false" (index 0) so accidentally pressing Enter never
+    // grants operator privileges by mistake.
     let is_operator: bool = Select::new()
         .with_prompt("Set operator status")
         .items(&["false", "true"])
@@ -379,19 +408,22 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
         .interact_text()
         .expect("Failed to read item name");
 
-    // Prompt for stack size with common options
+    // Stack size must match Minecraft's hard-coded per-item limit, otherwise
+    // the bot's storage math (shulker box layouts, chest capacity) will be
+    // off. We expose the three valid values rather than a free-form number
+    // so operators can't enter an illegal stack size like 32.
     let stack_size_selection = Select::new()
         .with_prompt("Select stack size")
         .items(&["64 (most items)", "16 (ender pearls, eggs, signs, buckets)", "1 (tools, weapons, armor)"])
         .default(0)
         .interact()
         .expect("Failed to read stack size selection");
-    
+
     let stack_size = match stack_size_selection {
         0 => 64,
         1 => 16,
         2 => 1,
-        _ => 64,
+        _ => 64, // Unreachable: Select only returns valid indices above.
     };
 
     info!("Requesting to add pair for {} with stack size {}", item_name, stack_size);

@@ -81,7 +81,10 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     tracing::debug!("[File] write_atomic: Destination file exists: {}", dest_exists);
     if dest_exists {
         tracing::debug!("[File] write_atomic: Attempting to remove existing destination file");
-        // Try to remove the existing file, with retries for Windows file locking issues
+        // Try to remove the existing file, with retries for Windows file locking issues.
+        // 5 attempts with exponential backoff gives ~150ms total wait (10+20+40+80),
+        // which is enough for transient AV scans / indexer handles to release the file
+        // without making the UI feel unresponsive.
         for attempt in 0..5 {
             match fs::remove_file(path) {
                 Ok(_) => {
@@ -91,7 +94,9 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
                 Err(e) => {
                     tracing::debug!("[File] write_atomic: Failed to remove existing file (attempt {}): {}", attempt + 1, e);
                     if attempt == 4 {
-                        // Last attempt failed, try rename anyway (might work if file was just closed)
+                        // Last attempt failed, try rename anyway (might work if file was just closed).
+                        // We don't return an error here because the rename/copy fallback below
+                        // may still succeed, and if not, it produces a more informative error.
                         tracing::debug!("[File] write_atomic: All remove attempts failed, will try rename anyway");
                         break;
                     }
@@ -112,8 +117,10 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
         },
         Err(e) => {
             tracing::warn!("[File] write_atomic: Rename failed: {} (path: {:?}, tmp_path: {:?})", e, path, tmp_path);
-            // If rename failed, try fallback: copy + remove
+            // If rename failed, try fallback: copy + remove.
             // This handles cases where rename fails due to Windows path issues
+            // (e.g., cross-volume moves, or quirks with UNC / long paths).
+            // Copy loses the atomicity guarantee, but it's preferable to losing the write entirely.
             tracing::debug!("[File] write_atomic: Trying copy fallback");
             match fs::copy(&tmp_path, path) {
                 Ok(_) => {

@@ -108,8 +108,9 @@ pub async fn handle_buy_order(
 
     // Check if player has enough balance OR will offer enough diamonds in trade
     let user_balance = store.users.get(&user_uuid).map(|u| u.balance).unwrap_or(0.0);
-    // Player can pay with balance + diamonds they offer in trade
-    // Calculate how many diamonds player needs to offer (round up to nearest integer)
+    // Hybrid payment model: diamonds are whole-unit items in the trade GUI, but cost is a float.
+    // Strategy: use the player's float balance first, then ceil the remainder into whole diamonds.
+    // Any fractional overpayment (e.g. need 1.3 diamonds, player pays 2) is credited back to balance below.
     let balance_shortfall = total_cost - user_balance;
     let diamonds_to_offer = if balance_shortfall > 0.0 {
         let ceil_value = balance_shortfall.ceil();
@@ -140,7 +141,10 @@ pub async fn handle_buy_order(
         .await;
     }
 
-    // **Transaction Planning Phase**: Simulate withdrawal without mutating real storage.
+    // **Transaction Planning Phase**: Clone storage and run withdraw_plan against the clone.
+    // This produces a concrete list of chest operations (which chest, how much) without touching
+    // real state. If planning fails we can bail cleanly. The actual storage is mutated later by
+    // apply_chest_sync once the bot confirms each physical operation (plan-then-commit pattern).
     let mut sim_storage = store.storage.clone();
     let preview_withdraw_plan = sim_storage.withdraw_plan(item, qty_i32);
     let preview_withdrawn: i32 = preview_withdraw_plan.iter().map(|t| t.amount).sum();
@@ -311,7 +315,10 @@ pub async fn handle_buy_order(
     let actual_received = match trade_result {
         Err(err) => {
             error!("[Buy] Trade FAILED: {} - rolling back withdrawals", err);
-            // Rollback: deposit items back into storage chests from bot inventory.
+            // Rollback: items are currently in the bot's inventory (we already withdrew them).
+            // Walk the original withdraw plan in order and deposit each chunk back into the same
+            // chest it came from. We track success/failure per-step but continue on failure —
+            // items stuck in bot inventory after a rollback failure require operator intervention.
             info!("[Buy] Rolling back {} withdrawal operations to return {} items...", preview_withdraw_plan.len(), qty_i32);
             
             let mut rollback_success = 0;
@@ -403,12 +410,15 @@ pub async fn handle_buy_order(
     
     // Re-read current balance (may have changed since we calculated diamonds_to_offer)
     let current_balance = store.users.get(&user_uuid).map(|u| u.balance).unwrap_or(0.0);
-    
-    // Validate: diamonds_received + current_balance must cover total_cost
+
+    // Final payment validation: balance + actual diamonds received from the trade must cover cost.
+    // Because the buy trade uses require_exact_amount=false, the player could theoretically offer
+    // fewer diamonds than requested. We recheck here and rollback if they shortchanged us.
     let total_available = (diamonds_received as f64) + current_balance;
     if total_available < total_cost {
         // Insufficient payment - need to rollback
-        // This is a serious error since trade already completed
+        // This is a serious error since trade already completed: items left the bot's inventory
+        // to the player's, and we also have some diamonds. Both need to be unwound.
         error!(
             "Insufficient payment after trade: received {} diamonds + {:.2} balance = {:.2}, need {:.2}",
             diamonds_received, current_balance, total_available, total_cost
@@ -686,7 +696,8 @@ pub async fn handle_sell_order(
 
     // Plan deposit - this also validates that storage has physical space
     // The deposit_plan function allocates items to existing chests, empty chests,
-    // or creates new nodes if needed. We simulate this to ensure it will succeed.
+    // or creates new nodes if needed. We simulate on a clone (plan-then-commit) so we can
+    // reject the order cleanly if planning fails without leaving the real storage in a bad state.
     let stack_size = pair.stack_size;
     let mut sim_storage = store.storage.clone();
     let preview_deposit_plan = sim_storage.deposit_plan(item, qty_i32, stack_size);
@@ -722,7 +733,10 @@ pub async fn handle_sell_order(
         );
     }
 
-    // Calculate diamond payout: whole diamonds go in trade, fractional part to balance
+    // Split the float payout into two channels: whole diamonds are handed over in the trade GUI
+    // (since Minecraft items are integer units), and the leftover fraction (< 1 diamond) is
+    // credited to the player's store balance during the commit phase below. This lets AMM pricing
+    // produce non-integer payouts without losing precision.
     let floor_value = total_payout.floor();
     // Validate that the result fits in i32
     if floor_value > i32::MAX as f64 {
@@ -910,7 +924,10 @@ pub async fn handle_sell_order(
     let actual_received = match trade_result {
         Err(err) => {
             error!("[Sell] Trade failed for {}: {}", player_name, err);
-            // Rollback: deposit diamonds back into storage
+            // Rollback: we already withdrew whole_diamonds into bot inventory for the payout.
+            // Since the trade never completed, we still hold those diamonds and must return them
+            // to storage. Build a fresh deposit plan (not the symmetric of the withdraw plan,
+            // since intermediate layout may have shifted) and replay it best-effort.
             if whole_diamonds > 0 {
                 info!("[Sell] Rolling back {} diamonds to storage", whole_diamonds);
                 let mut sim_diamond_storage = store.storage.clone();
@@ -996,8 +1013,11 @@ pub async fn handle_sell_order(
         }
     };
     
-    // CRITICAL: Validate that player actually put in the expected items
-    // This prevents the exploit where player puts in fewer items than promised
+    // CRITICAL: Validate that player actually put in the expected items.
+    // The trade GUI enforces require_exact_amount=true above, but we defensively re-verify the
+    // actual received items here to prevent exploits where slot-swapping or client-side tricks
+    // could desync the bot's view of what was offered. Item IDs are normalized before comparison
+    // to handle namespace/casing variants (e.g. "minecraft:cobblestone" vs "cobblestone").
     info!("[Sell] Validating items received from trade...");
     let target_item_id = crate::bot::Bot::normalize_item_id(item);
     info!("[Sell] Target item ID (normalized): '{}' (original: '{}')", target_item_id, item);
@@ -1185,9 +1205,14 @@ pub async fn handle_sell_order(
 
         match bot_result {
             Err(err) => {
-                error!("[Sell] Bot reported error on chest {} deposit after {:.2}s: {}", 
+                error!("[Sell] Bot reported error on chest {} deposit after {:.2}s: {}",
                        t.chest_id, await_elapsed.as_secs_f64(), err);
-                // Rollback: do NOT credit player. Best-effort: park items by returning them via trade.
+                // Partial-deposit failure: some earlier chests in the plan may have already
+                // accepted items, but this one failed. We cannot cleanly unwind the earlier
+                // deposits (items are already committed to storage and player's items are mixed
+                // in), so we do NOT credit the player and attempt a best-effort return via trade
+                // of the ORIGINAL qty. The apply_chest_sync calls above have kept storage state
+                // consistent with what actually happened physically.
                 let (rb_tx, rb_rx) = oneshot::channel();
                 let _ = store
                     .bot_tx
@@ -1231,7 +1256,9 @@ pub async fn handle_sell_order(
     info!("[Sell] Committing ledger updates for {} sell of {}x {}", player_name, qty_i32, item);
     let pair = store.pairs.get_mut(item).unwrap();
 
-    // Apply transfer: player receives whole diamonds from trade + fractional to balance
+    // Credit the leftover sub-diamond fraction to the player's balance. The whole_diamonds
+    // portion was already handed over physically during the trade GUI step, so it is not
+    // touched here — only the fractional remainder needs to be recorded in the ledger.
     store.users.get_mut(&user_uuid).unwrap().balance += fractional_diamonds;
     store.users.get_mut(&user_uuid).unwrap().username = player_name.to_owned();
     store.dirty = true;

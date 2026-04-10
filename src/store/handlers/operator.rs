@@ -58,7 +58,10 @@ pub async fn handle_additem_order(
                 item: item.to_string(),
                 amount: qty_i32,
             }],
-            // Additem: require EXACT amount for inventory accounting
+            // Exact-amount enforcement is critical here: the deposit plan was sized for
+            // `qty_i32` and our stock accounting assumes that's what entered bot inventory.
+            // Accepting a different amount would desync the plan from reality and could
+            // leave orphaned items in the bot or under-fill chests.
             require_exact_amount: true,
             flexible_validation: false,
             respond_to: trade_tx,
@@ -85,8 +88,11 @@ pub async fn handle_additem_order(
     // Trade succeeded - for operator additem we trust the exact amount was given
     info!("[Additem] Trade succeeded, depositing items into storage...");
 
-    // Deposit items into storage
-    // Track how many items we've successfully deposited for potential rollback
+    // Deposit items into storage.
+    // At this point the trade has already succeeded, so the items physically live in the
+    // bot's inventory. If any subsequent chest step fails we must account for exactly how
+    // much made it into storage vs. how much is still held by the bot, so we can hand the
+    // remainder back to the operator rather than silently losing it.
     let mut items_deposited = 0i32;
     let mut deposit_failed = false;
     let mut failed_reason = String::new();
@@ -152,8 +158,10 @@ pub async fn handle_additem_order(
         }
     }
     
-    // If deposit failed after trade succeeded, items may be in bot inventory
-    // Try to return them to the operator via trade
+    // Failsafe: the operator already parted with their items in the trade above, so any
+    // undeposited remainder is sitting in the bot's inventory. Return it via a reverse
+    // trade so the operator is made whole. If that reverse trade also fails, the items
+    // are genuinely stuck and need manual admin recovery - we log a CRITICAL message.
     if deposit_failed {
         let items_in_bot_inventory = qty_i32 - items_deposited;
         if items_in_bot_inventory > 0 {
@@ -171,6 +179,8 @@ pub async fn handle_additem_order(
                         amount: items_in_bot_inventory,
                     }],
                     player_offers: vec![],
+                    // This is a return-to-sender trade; the operator offers nothing, so
+                    // exact-amount enforcement would be meaningless here.
                     require_exact_amount: false,
                     flexible_validation: false,
                     respond_to: rb_tx,
@@ -379,7 +389,9 @@ pub async fn handle_removeitem_order(
     
     if let Err(e) = trade_send_result {
         error!("[Removeitem] FAILED to send trade instruction: {}", e);
-        // Rollback: deposit items back into storage
+        // Rollback path: withdrawal already moved items from chests into the bot, but the
+        // trade never left this process. Re-deposit each planned chunk back into its
+        // originating chest so physical storage and our in-memory accounting stay aligned.
         info!("[Removeitem] Rolling back {} items to storage (trade send failed)", qty_i32);
         for t in &preview_withdraw_plan {
             let node_position = store.get_node_position(t.chest_id);
@@ -420,7 +432,9 @@ pub async fn handle_removeitem_order(
     
     if let Err(err) = &trade_result {
         error!("[Removeitem] Trade FAILED: {} - rolling back items to storage", err);
-        // Rollback: deposit items back into storage
+        // Rollback path: the trade was delivered to the bot but rejected/cancelled, so the
+        // withdrawn items are still in the bot's inventory. Deposit them back using the
+        // same plan we withdrew with; chest_sync keeps our stock numbers consistent.
         for t in &preview_withdraw_plan {
             let node_position = store.get_node_position(t.chest_id);
             let chest = crate::types::Chest {

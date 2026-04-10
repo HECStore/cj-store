@@ -70,6 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Communication channels between tasks:
             // - Store <-> Bot: BotInstruction (Store -> Bot), BotMessage (Bot -> Store)
             // - Store <-> CLI: CliMessage (CLI -> Store), responses via oneshot channels
+            //
+            // Buffer size of 128 chosen as a pragmatic middle ground: large enough to
+            // absorb bursts (e.g. many whispers during a raid/event) without blocking
+            // senders, but small enough to apply backpressure if the Store falls behind.
             let (store_tx, store_rx) = mpsc::channel::<StoreMessage>(128);
             let (bot_tx, bot_rx) = mpsc::channel::<BotInstruction>(128);
 
@@ -133,7 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Give a moment for any final logging to complete
+    // Give a moment for any final logging to complete.
+    // The tracing file appender buffers writes on a background worker; without this
+    // brief yield, shutdown-time log lines can be lost when the process exits before
+    // the appender flushes. 100ms is empirically sufficient for a local file writer.
     info!("[Main] Waiting 100ms for final logging to complete");
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     info!("[Main] Final wait complete, main() returning");

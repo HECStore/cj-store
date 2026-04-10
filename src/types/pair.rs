@@ -60,10 +60,12 @@ pub struct Pair {
 }
 
 impl Pair {
-    // Directory where all individual pair files will be stored
+    // Directory where all individual pair files will be stored.
+    // One file per pair keeps diffs small and avoids rewriting the whole catalog on every update.
     const PAIRS_DIR: &str = "data/pairs";
-    
-    /// Number of slots in a shulker box (27 = 3 rows × 9 columns)
+
+    /// Number of slots in a shulker box (27 = 3 rows × 9 columns).
+    /// Used as the unit of storage capacity since the store organizes stock in shulker boxes.
     pub const SHULKER_BOX_SLOTS: i32 = 27;
     
     /// Calculate the maximum item capacity of a shulker box for this item.
@@ -98,7 +100,9 @@ impl Pair {
         sanitized
     }
 
-    // Helper function to get the file path for a single pair
+    /// Builds the on-disk path for a pair file, applying filename sanitization
+    /// so the same item name always maps to the same path regardless of whether
+    /// the caller passes "minecraft:gunpowder" or "gunpowder".
     fn get_pair_file_path(item_name: &str) -> PathBuf {
         let sanitized_name = Self::sanitize_item_name_for_filename(item_name);
         PathBuf::from(Self::PAIRS_DIR).join(format!("{}.json", sanitized_name))
@@ -126,7 +130,9 @@ impl Pair {
     /// Creates the 'data/pairs' directory if it doesn't exist.
     /// Returns an error if the item name is empty or invalid (e.g., "minecraft:").
     pub fn save(&self) -> io::Result<()> {
-        // Validate item name is not empty or invalid
+        // Guard against writing a pair with an unusable identifier: an empty name
+        // would produce ".json", and a bare "minecraft:" prefix would sanitize to
+        // an empty name, both of which would silently collide or corrupt storage.
         if self.item.trim().is_empty() || self.item == "minecraft:" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -202,7 +208,9 @@ impl Pair {
             fs::create_dir_all(dir_path)?;
         }
 
-        // Keep track of files that should exist after saving
+        // Track which filenames are still "live" so we can garbage-collect
+        // any orphaned files below (pairs that existed on disk but were
+        // removed from the in-memory map).
         let mut expected_files = HashSet::new();
 
         // Save each pair individually using the individual pair.save() method

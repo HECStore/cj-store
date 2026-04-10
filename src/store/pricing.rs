@@ -32,6 +32,10 @@ pub fn validate_fee(fee: f64) -> bool {
 
 /// Check if reserves are sufficient for reliable price calculation.
 /// Very small reserves can lead to precision issues or extreme prices.
+///
+/// Rationale: with tiny `y`, the AMM price approaches zero; with tiny `x`,
+/// a single trade can consume most of the pool and cause huge slippage or
+/// floating-point precision loss near the `(x - dx)` denominator.
 /// 
 /// # Arguments
 /// * `item_stock` - Number of items in reserve
@@ -52,21 +56,31 @@ pub fn reserves_sufficient(item_stock: i32, currency_stock: f64) -> bool {
 /// This implements the x * y = k invariant:
 /// - Before: item_stock * currency_stock = k
 /// - After: (item_stock - amount) * (currency_stock + cost) = k
-/// 
+///
+/// Slippage emerges naturally: as `amount` approaches `item_stock`, the
+/// denominator `(x - amount)` shrinks toward zero and cost grows without
+/// bound. This is the self-balancing property of an AMM - it becomes
+/// progressively more expensive to drain the pool, which protects against
+/// total stock-out and manipulates incentives toward equilibrium.
+///
+/// The fee is applied on top of the base AMM cost (not added to the
+/// reserves formula), so `k` grows slightly each trade - this is how fee
+/// revenue accrues in the pool.
+///
 /// # Arguments
 /// * `store` - The store state
 /// * `item` - Item identifier
 /// * `amount` - Number of items to buy
-/// 
+///
 /// # Returns
 /// * `Some(cost)` - Total cost in currency to buy the specified amount
 /// * `None` - If reserves insufficient, amount exceeds stock, fee invalid, or calculation fails
-/// 
+///
 /// # Example
 /// With 1000 currency stock, 100 item stock, and 12.5% fee, buying 10 items:
 /// - Base cost: 1000 * 10 / (100 - 10) = 1000 * 10 / 90 = 111.11
 /// - With fee: 111.11 * 1.125 = 125.0
-/// 
+///
 /// Note: Buying all 100 items would cost infinity (you can't drain the pool).
 pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64> {
     let pair = store.pairs.get(item)?;
@@ -87,7 +101,9 @@ pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64>
         return None;
     }
     
-    // Cannot buy more than or equal to entire stock (would divide by zero or negative)
+    // Cannot buy more than or equal to entire stock (would divide by zero or negative).
+    // At amount == item_stock the denominator (x - dx) is 0 => infinite cost;
+    // beyond that it flips sign and would produce a nonsensical "negative" cost.
     if amount >= pair.item_stock {
         return None;
     }
@@ -95,12 +111,14 @@ pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64>
     let x = pair.item_stock as f64;
     let y = pair.currency_stock;
     let dx = amount as f64;
-    
+
     // cost = y * dx / (x - dx)
+    // Derived from keeping k constant: x*y = (x-dx)*(y+cost) => cost = y*dx/(x-dx)
     let base_cost = y * dx / (x - dx);
     let cost = base_cost * (1.0 + store.config.fee);
-    
-    // Validate final cost
+
+    // Guard against NaN/Infinity sneaking out (e.g. from extreme reserve values
+    // or a denominator that underflowed despite the earlier amount < stock check).
     if cost.is_finite() && cost > 0.0 {
         Some(cost)
     } else {
@@ -116,7 +134,14 @@ pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64>
 /// This implements the x * y = k invariant:
 /// - Before: item_stock * currency_stock = k
 /// - After: (item_stock + amount) * (currency_stock - payout) = k
-/// 
+///
+/// Note that unlike `calculate_buy_cost`, there is no hard cap on `amount`:
+/// the seller can dump arbitrarily many items into the pool. The `(x + dx)`
+/// denominator only grows, so payout is bounded above by `y` and naturally
+/// exhibits diminishing returns (slippage against the seller). The fee is
+/// subtracted from the payout, meaning the pool keeps a little extra `y`
+/// and `k` grows.
+///
 /// # Arguments
 /// * `store` - The store state
 /// * `item` - Item identifier
@@ -152,12 +177,17 @@ pub fn calculate_sell_payout(store: &Store, item: &str, amount: i32) -> Option<f
     let x = pair.item_stock as f64;
     let y = pair.currency_stock;
     let dx = amount as f64;
-    
+
     // payout = y * dx / (x + dx)
+    // Derived from keeping k constant: x*y = (x+dx)*(y-payout) => payout = y*dx/(x+dx)
+    // As dx -> infinity, payout asymptotically approaches y but never reaches it,
+    // so the pool's currency reserve can never be fully drained by selling.
     let base_payout = y * dx / (x + dx);
     let payout = base_payout * (1.0 - store.config.fee);
-    
-    // Validate final payout
+
+    // A zero payout can occur for tiny `dx` against a large `x` due to
+    // floating-point rounding; treat that as a failed trade rather than
+    // silently accepting a free item transfer.
     if payout.is_finite() && payout > 0.0 {
         Some(payout)
     } else {

@@ -84,8 +84,11 @@ git clone <repo-url>
 cd cj-store
 cargo build --release
 
-# Edit configuration (created on first run if missing)
-# You MUST set account_email and server_address
+# First run creates data/config.json with defaults, then fails on auth —
+# this is expected. Stop the bot (Ctrl+C), edit the config, then run again.
+cargo run --release
+
+# Edit configuration — you MUST set account_email and server_address
 code data/config.json  # or your preferred editor
 ```
 
@@ -96,7 +99,8 @@ Before the bot can operate, you need to build physical storage nodes in Minecraf
 1. Choose a **storage origin position** (set in `config.json` as `position`)
 2. Build **Node 0** at that position (see [Storage Layout](#storage-graph-datastorageltnode_idgtjson) for the exact layout)
 3. Fill all 4 double chests with **shulker boxes** (one per slot = 54 shulkers per chest)
-4. The bot's **hotbar slot 0** must be empty for shulker handling
+
+The bot auto-manages its own inventory (keeping hotbar slot 0 free for shulker handling), so no manual bot-side setup is needed beyond the physical build.
 
 ### 4. Run the Bot
 
@@ -134,7 +138,7 @@ cj-store/
   src/
     main.rs                     # starts Store + Bot + CLI tasks
     store/                       # Store module (authoritative state + message handlers + autosave)
-      mod.rs                    # Store struct, run loop (with tokio::select!), message routing
+      mod.rs                    # Store struct, run loop (priority-based: orders before messages), message routing
       handlers/                 # Command handlers
         mod.rs                  # Handler module exports
         player.rs              # Player command handlers (buy, sell, balance, pay, queue, cancel)
@@ -205,17 +209,17 @@ All cross-component communication is explicit:
 - **Consistent state**: Invariants are maintained between operations
 - **Predictable behavior**: Concurrent buy/sell orders are queued and processed sequentially
 
-**Non-blocking message handling**: The Store uses `tokio::select!` to handle both incoming messages AND order processing concurrently:
-- **Quick commands** (balance, price, help, items, queue, cancel, status) execute immediately
+**Priority-based event loop**: Each iteration of the Store loop either drains one order from the queue OR blocks on one incoming message — never both concurrently. Orders are given strict priority so an in-flight trade cannot be interrupted:
+- **Quick commands** (balance, price, help, items, queue, cancel, status) are validated and executed inline when picked up by the loop
 - **Order commands** (buy, sell, deposit, withdraw) are validated and added to a queue, then processed one at a time
-- This means players can check prices, balances, queue status, or bot status even while another order is being processed
+- While an order is executing, any incoming messages simply buffer in the channel and are handled as soon as the order completes (orders are typically short, so the delay is usually imperceptible)
 
 **Message channels**: All inter-task communication uses Tokio channels:
 - `mpsc::channel` for Store ↔ Bot communication (buffered, 128 messages)
 - `oneshot::channel` for request/response patterns (CLI queries, trade confirmations)
 
 **Important behavior**:
-- **Autosave**: debounced (saved at most a few times per second or rarer) to reduce disk churn; final save happens on shutdown.
+- **Autosave**: debounced by `autosave_interval_secs` in config (default 2s); saves only when state is dirty. A final save always happens on shutdown, and a non-debounced save runs immediately after every completed order to guarantee trade/balance/stock updates are never lost to a crash.
 - **Order processing**: Multiple players can send commands simultaneously, but order commands are queued and processed one at a time by the Store task, ensuring no conflicts.
 
 ### Order Queue System
@@ -253,7 +257,7 @@ The bot uses a **FIFO order queue** to handle multiple buy/sell/deposit/withdraw
 │  ─┬─ Trade accepted + completed ──→ SUCCESS                         │
 │   │   "Bought 64 cobblestone for 10.50 diamonds. Trade complete."    │
 │   │                                                                  │
-│   ├─ Trade timeout (10s accept, 45s complete) ──→ CANCELLED         │
+│   ├─ Trade timeout (30s accept, 45s complete) ──→ CANCELLED         │
 │   │   "Trade timed out. Order cancelled."                            │
 │   │                                                                  │
 │   ├─ Player cancelled trade ──→ CANCELLED                           │
@@ -271,7 +275,7 @@ The bot uses a **FIFO order queue** to handle multiple buy/sell/deposit/withdraw
 |----------|-------|---------|
 | **Max orders per player** | 8 | Prevents queue monopolization |
 | **Queue persistence** | Yes | Saved to `data/queue.json`, survives restarts |
-| **Trade accept timeout** | 10 seconds | Order cancelled if player doesn't accept |
+| **Trade accept timeout** | 30 seconds | Order cancelled if player doesn't accept the trade request |
 | **Trade completion timeout** | 45 seconds | Order cancelled if trade doesn't complete |
 | **Retry on timeout** | No | Timed-out orders are cancelled, not retried |
 
@@ -284,7 +288,7 @@ The bot uses a **FIFO order queue** to handle multiple buy/sell/deposit/withdraw
 | Pre-trade info | `Buy 64 cobblestone: Total 10.50 diamonds. Please offer 11 diamonds in the trade.` |
 | Trade complete | `Bought 64 cobblestone for 10.50 diamonds (fee 1.17). Trade complete.` |
 | Trade timeout | `Trade timed out. Order cancelled.` |
-| Queue full | `Queue full. You have 8 pending orders. Wait for some to complete.` |
+| Queue full | `Queue full. You have 8 pending orders (max 8). Wait for some to complete.` |
 
 #### Queue Commands
 
@@ -300,13 +304,13 @@ The bot implements rate limiting to prevent players from spamming commands:
 
 **Base behavior**:
 - **Minimum 2 seconds between commands**: Players must wait at least 2 seconds between messages
-- **Exponential backoff**: If a player keeps spamming, the wait time doubles each violation:
-  - 1st violation: wait 2s
-  - 2nd violation: wait 4s
-  - 3rd violation: wait 8s
-  - 4th violation: wait 16s
-  - ... caps at 60 seconds maximum
-- **Reset after 30s idle**: If a player stops messaging for 30 seconds, their violation count resets
+- **Exponential backoff**: Each time a player messages faster than the required cooldown, the violation counter increments and the *next* required cooldown doubles:
+  - 0 violations: 2s cooldown (base)
+  - 1 violation: 4s cooldown
+  - 2 violations: 8s cooldown
+  - 3 violations: 16s cooldown
+  - ... capped at 60 seconds maximum
+- **Reset after 30s idle**: If a player stops messaging for 30 seconds, their violation count resets to 0
 
 **Example**:
 ```
@@ -379,11 +383,11 @@ The configuration file `data/config.json` is loaded on startup. If missing, it's
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `trade_timeout_ms` | `u64` | `45000` | Trade operation timeout (45 seconds) |
-| `pathfinding_timeout_ms` | `u64` | `60000` | Pathfinding timeout (60 seconds) |
-| `max_orders` | `usize` | `10000` | Max orders in memory per session (cleared on restart) |
-| `max_trades_in_memory` | `usize` | `50000` | Max trades loaded into memory on startup |
-| `autosave_interval_secs` | `u64` | `2` | Minimum interval between autosaves |
+| `max_orders` | `usize` | `10000` | Prune target for the in-memory order log (session-only; `orders.json` is cleared on each restart) |
+| `max_trades_in_memory` | `usize` | `50000` | Max trades loaded into memory on startup (older trades remain on disk) |
+| `autosave_interval_secs` | `u64` | `2` | Minimum interval between debounced autosaves |
+| `trade_timeout_ms` | `u64` | `45000` | **Reserved** — parsed and validated but currently not wired through; trade completion uses a hardcoded 45s timeout |
+| `pathfinding_timeout_ms` | `u64` | `60000` | **Reserved** — parsed and validated but currently not wired through; pathfinding uses hardcoded constants in `src/constants.rs` |
 
 
 Example (full `data/config.json`):
@@ -403,7 +407,7 @@ Example (full `data/config.json`):
 }
 ```
 
-**Note**: The config file is auto-created with default values if it doesn't exist on first run. You must edit `data/config.json` to set your account email and server address before the bot can connect. All timeout and limit settings are optional and will use defaults if not specified.
+All timeout and limit settings are optional and fall back to the defaults above if omitted.
 
 ---
 
@@ -424,7 +428,7 @@ Note: CLI offers an option to make anyone an operator just by typing their usern
 
 Notes:
 - `User::get_uuid(username)` calls Mojang's public API (`api.mojang.com`). Both blocking (`get_uuid`) and async (`get_uuid_async`) versions are available, with the async version using connection pooling for better performance.
-- Store's `pay(...)` uses UUIDs as the canonical key; it updates usernames on each payment.
+- `pay_async(...)` in `src/store/handlers/player.rs` uses UUIDs as the canonical key and updates the stored username on each payment.
 
 ### Pairs (`data/pairs/<item>.json`)
 
@@ -478,7 +482,7 @@ Notes:
 - **Per-user limit**: Maximum 8 orders per user in the queue at any time
 - **FIFO processing**: Orders are processed in first-in-first-out order
 - **Auto-save**: Queue is saved to disk after each add/pop/cancel operation
-- **Trade timeouts**: If a player doesn't accept a trade request within 10 seconds (or complete within 45 seconds), the order is cancelled and removed from the queue
+- **Trade timeouts**: If a player doesn't accept a trade request within 30 seconds (or complete within 45 seconds), the order is cancelled and removed from the queue
 - This is separate from `orders.json` (audit log) - the queue holds **pending** orders, while orders.json records **completed** orders
 
 ### Trades (`data/trades/<timestamp>.json`)
@@ -508,7 +512,7 @@ The storage system models a physical layout of chests in Minecraft, organized in
 | Field | Description |
 |-------|-------------|
 | `position` | Storage origin (x, y, z) from config — defines where Node 0 is located |
-| `nodes` | HashMap of nodes, loaded from individual JSON files under `data/storage/` |
+| `nodes` | `Vec<Node>`, loaded from individual `data/storage/<id>.json` files on startup |
 
 > [!NOTE]
 > If no nodes exist on startup, storage is initialized empty. Use the CLI to add nodes.
@@ -632,9 +636,8 @@ Each chest has 54 slots, and **every slot is assumed to contain exactly 1 shulke
 
 - **Single item type per chest**: Each chest stores only one item type (or is unassigned)
 - **Shulker colors don't matter**: The system treats all shulker box colors identically
-- **Auto-unassign on empty**: When all 54 slots have `amounts[i] == 0`, the chest becomes unassigned (`item = ""`)
-- **Auto-assign on overflow**: When a chest is full (all shulkers at max capacity), the system assigns another empty chest
-- **Preference for same node**: When allocating new chests, the system prefers empty chests in the same node first
+- **Chest assignment is sticky**: Once a chest is assigned to an item, it keeps that assignment even when drained to zero. Use "Repair state" in the CLI if you need to reclaim empty chests.
+- **Auto-assign on overflow**: When existing chests for an item are full, the deposit planner grabs the next empty chest (preferring the same node), and creates a new node if none are available
 
 > [!IMPORTANT]
 > The system **assumes** every chest slot contains a shulker box. If a slot is empty or contains a different item, operations will fail.
@@ -864,11 +867,11 @@ This section documents **how `/trade` works on this server** and how the bot use
 │              ↓                                                           │
 │  2. Bot sends: /trade <username>                                         │
 │              ↓                                                           │
-│  3. ─┬─ Player accepts (within 10s) ──→ GUI opens                        │
+│  3. ─┬─ Player accepts (within 30s) ──→ GUI opens                        │
 │      │                                       ↓                           │
 │      ├─ Player declines ──────────────→ Trade aborted                   │
 │      │                                                                   │
-│      └─ Timeout (10s) ────────────────→ Trade aborted                   │
+│      └─ Timeout (30s) ────────────────→ Trade aborted                   │
 │                                                                          │
 │  4. Player adds items to their offer slots                               │
 │              ↓                                                           │
@@ -891,7 +894,7 @@ This section documents **how `/trade` works on this server** and how the bot use
 
 | Phase | Timeout | What Happens on Timeout |
 |-------|---------|-------------------------|
-| Trade request acceptance | **10 seconds** | Order cancelled, player notified |
+| Trade request acceptance | **30 seconds** | Order cancelled, player notified |
 | Trade completion | **45 seconds** | Trade cancelled, rollback attempted |
 
 ### Trade GUI Layout
@@ -1102,7 +1105,7 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### ✅ Implemented Features
 
-1. **Storage-backed fulfillment**: `buy/sell` move items via **trade** and do chest container interactions. The bot **syncs the real chest contents** after each withdraw/deposit and returns a 54-slot `amounts` vector. The Store then overwrites `Chest.amounts` with that truth before committing state.
+1. **Storage-backed fulfillment**: `buy/sell` move items via **trade** and do chest container interactions. The bot **syncs the real chest contents** after each withdraw/deposit and returns a 54-slot `amounts` vector. The Store then merges the reported counts into `Chest.amounts` (slots with `-1` mean "not checked" and keep their existing value) before committing state.
 
 2. **In-game trade / inventory automation**: The bot uses `/trade <username>` and automates the trade GUI, including failure detection and basic rollback.
 
@@ -1162,7 +1165,7 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Trade Issues
 
-- **"Trade timeout"**: Player may not have accepted the trade request within 10 seconds. The bot waits up to 10 seconds for the trade GUI to open. If it doesn't open, the trade is aborted. Try again.
+- **"Trade timeout"**: Player may not have accepted the trade request within 30 seconds. The bot waits up to 30 seconds for the trade GUI to open. If it doesn't open, the trade is aborted. Try again.
 - **"Trade closed before items could be validated"**: The trade menu closed before the bot could validate the items (e.g., player cancelled immediately). The trade is safely aborted with no items or currency exchanged.
 - **"Trade cancelled by player before completion"**: The player cancelled the trade after the bot validated items but before the trade completed. No items or currency are exchanged.
 - **"Trade validation failed"**: Items in trade GUI don't match expected items. The bot validates:
@@ -1201,7 +1204,7 @@ The system is designed for **transactional integrity** — either a trade comple
 - **"Order #X not found in queue"**: The order may have already been processed or cancelled. Use `queue` to see your current pending orders.
 - **"You can only cancel your own orders"**: You tried to cancel someone else's order. Use `queue` to see only your orders and their IDs.
 - **Order still pending after long time**: Check the queue position with `queue`. Orders are processed one at a time, so if there are many orders ahead, yours will take longer.
-- **"Trade failed" / Order cancelled**: If you don't accept the trade request within 10 seconds, or don't complete the trade within 45 seconds, the order is automatically cancelled. You'll need to queue a new order.
+- **"Trade failed" / Order cancelled**: If you don't accept the trade request within 30 seconds, or don't complete the trade within 45 seconds, the order is automatically cancelled. You'll need to queue a new order.
 - **Orders after bot restart**: The queue persists across restarts. If the bot was restarted, your pending orders will resume processing automatically.
 
 ### Performance
@@ -1275,20 +1278,16 @@ The following limitations are documented for awareness:
 
 7. **Memory Usage**: All users, pairs, and trades (up to `max_trades_in_memory`) are loaded into memory on startup. Orders start fresh each session (not loaded from disk). Adjust limits in config for large stores.
 
-### Future Enhancements
-
-See "🔄 Future enhancements" section above for planned features like advanced pricing models and statistics tracking.
-
 ---
 
 ## Important Implementation Details
 
 ### Item Storage Model
 
-- **One item type per chest**: Each chest can only store one type of item (or be empty). This simplifies management but means items are segregated by chest.
+- **One item type per chest**: Each chest can only store one type of item (or be unassigned). This simplifies management but means items are segregated by chest.
 - **Shulker box assumption**: The system assumes every chest slot contains exactly 1 shulker box. If a slot is empty or contains a different item, the system may malfunction.
 - **Item count tracking**: `Chest.amounts[i]` tracks items **inside** the shulker in slot `i`, not the shulker box itself. The shulker box is assumed to always be present.
-- **Empty chest detection**: A chest is considered empty when all 54 slots have `amounts[i] == 0`. The chest is then marked as unassigned (`item = ""`).
+- **Sticky assignment**: A chest's `item` field is set when items are first deposited and stays even if all 54 slots drain to zero. This avoids churn if the chest is about to be refilled; run "Repair state" in the CLI if you want to reclaim drained chests.
 
 ### Price Calculation Details (Constant Product AMM)
 

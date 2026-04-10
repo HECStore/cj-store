@@ -19,7 +19,7 @@
 //! - Users: `data/users/{uuid}.json`
 //! - Pairs: `data/pairs/{item}.json`
 //! - Nodes: `data/storage/{node_id}.json`
-//! - Orders: `data/orders.json` (single file, pruned to 10K)
+//! - Orders: `data/orders.json` (single file, session-only, pruned to 10K)
 //! - Trades: `data/trades/{timestamp}.json` (one file per trade)
 
 pub mod chest;

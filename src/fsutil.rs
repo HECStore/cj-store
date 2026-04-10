@@ -20,7 +20,7 @@ use std::path::Path;
 /// but prevents torn writes in normal operation. For true atomicity, consider
 /// using platform-specific APIs (e.g., `CreateFile` with `FILE_FLAG_WRITE_THROUGH` on Windows).
 ///
-/// **Used By**: All JSON persistence operations (users, pairs, orders, trades, chests).
+/// **Used By**: All JSON persistence operations (users, pairs, orders, trades, nodes, queue, config).
 /// This ensures state files are never left in a corrupted state.
 pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     let path = path.as_ref();

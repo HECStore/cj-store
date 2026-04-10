@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(normalize_item_id("minecraft:diamond"), "diamond");
         assert_eq!(normalize_item_id("minecraft:cobblestone"), "cobblestone");
         
-        // Should handle custom namespaces (strip prefix)
+        // Should preserve custom namespaces (only strips "minecraft:" prefix)
         assert_eq!(normalize_item_id("modid:custom_item"), "modid:custom_item");
         
         // Empty string returns empty string (invalid, caller should validate)

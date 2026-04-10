@@ -6,7 +6,7 @@
 //! ## Key Features
 //! - UUID-based identity (canonical key, survives username changes)
 //! - Diamond balance tracking (f64 for fractional diamonds)
-//! - Operator flag for privileged commands (deposit, withdraw, add/remove currency)
+//! - Operator flag for privileged commands (additem, removeitem, addcurrency, removecurrency)
 //!
 //! ## Mojang API Integration
 //! - `get_uuid()` and `get_uuid_async()` call Mojang's public API to resolve usernames to UUIDs
@@ -63,7 +63,7 @@ pub struct User {
     pub username: String,
     /// Diamond balance (f64 for fractional support)
     pub balance: f64,
-    /// Operator flag: enables privileged commands (deposit, withdraw, add/remove currency)
+    /// Operator flag: enables privileged commands (additem, removeitem, addcurrency, removecurrency)
     #[serde(default)]
     pub operator: bool,
 }

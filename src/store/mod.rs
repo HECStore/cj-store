@@ -394,7 +394,7 @@ impl Store {
         }
     }
 
-    /// Apply chest sync report from bot (overwrites storage with bot-reported truth)
+    /// Apply chest sync report from bot (merges bot-reported slot counts into storage)
     pub(crate) fn apply_chest_sync(&mut self, report: ChestSyncReport) -> Result<(), String> {
         state::apply_chest_sync(self, report)
     }

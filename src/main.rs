@@ -41,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Idempotent initialization: ignore "already set" errors from dependencies
     // Default log levels:
-    // - cj_store (this crate): info level for detailed diagnostics
-    // - Other crates: info level to reduce noise
+    // - cj_store (this crate): info level
+    // - Other crates: info level
     // Override with RUST_LOG env var: e.g., RUST_LOG=debug or RUST_LOG=cj_store=trace
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info").add_directive("cj_store=info".parse().unwrap()));

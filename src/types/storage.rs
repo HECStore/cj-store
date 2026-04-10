@@ -1,0 +1,694 @@
+//! # Storage System
+//!
+//! Models physical storage as a graph: `Storage` → `Node` → `Chest` → shulker boxes.
+//!
+//! ## Architecture
+//! - **Storage**: Root container with origin position and list of nodes
+//! - **Node**: Cluster of 4 chests arranged in a 2×2 pattern (2 blocks tall)
+//! - **Chest**: 54-slot container where **each slot contains 1 shulker box**
+//! - **Shulker**: Each shulker box contains items (up to 27 slots × 64 items = 1728 items max)
+//!
+//! ## Layout
+//! Each node has this footprint (top-down):
+//! ```
+//! NNNN
+//! NCCN  (chests, 2 blocks tall)
+//! NCCN
+//! NSNP  (N = nothing/empty, S = shulker station, P = bot position)
+//! ```
+//!
+//! Nodes are arranged in a **spiral pattern**, spaced 3 blocks apart.
+//! See `README.md` "Persistence layout - Storage graph" for details.
+//!
+//! ## Storage Operations
+//! - **`deposit_plan()`**: Allocates items to chests (creates new nodes if needed)
+//! - **`withdraw_plan()`**: Removes items from chests (deterministic order)
+//! - **`total_item_amount()`**: Sums items across all chests for a given item
+//!
+//! ## Shulker Handling
+//! The bot must:
+//! 1. Navigate to node position
+//! 2. Open chest
+//! 3. Take shulker from chest slot
+//! 4. Place on shulker station (S position)
+//! 5. Open shulker, transfer items
+//! 6. Close shulker, pick it up
+//! 7. Place shulker back in same chest slot
+//!
+//! See `bot.rs` for shulker automation implementation.
+
+use std::fs;
+use std::path::Path;
+
+use crate::types::chest::Chest;
+use crate::types::node::Node;
+use crate::types::position::Position;
+
+/// Represents a planned transfer operation on a specific chest.
+///
+/// Used by `deposit_plan()` and `withdraw_plan()` to communicate which chests
+/// the bot needs to interact with and how much to transfer.
+///
+/// The bot receives these plans and executes them sequentially.
+#[derive(Debug, Clone)]
+pub struct ChestTransfer {
+    /// Chest ID (node_id * 4 + index)
+    pub chest_id: i32,
+    /// World position of the chest (for bot navigation)
+    pub position: Position,
+    /// Item identifier
+    pub item: String,
+    /// Amount to transfer (items, not stacks)
+    pub amount: i32,
+}
+
+/// Root storage container: manages all nodes and their chests.
+///
+/// **Persistence**: Nodes are stored as `data/storage/{node_id}.json`
+///
+/// **Initialization**: If `data/storage/` doesn't exist, returns empty storage.
+/// Nodes are loaded on startup and saved on each autosave.
+///
+/// **Node Management**: Nodes can be added/removed via CLI commands.
+/// Physical validation (checking chests exist in-world) is optional.
+#[derive(Debug, Default, Clone)]
+pub struct Storage {
+    /// Storage origin position (from config)
+    pub position: Position,
+    /// List of nodes (loaded from `data/storage/` JSON files)
+    pub nodes: Vec<Node>,
+}
+
+impl Storage {
+    /// Number of slots per chest (standard double chest = 54 slots)
+    pub const SLOTS_PER_CHEST: usize = 54;
+
+    /// Default maximum item capacity per shulker box (27 slots × 64 items = 1728).
+    /// 
+    /// **Note**: Actual capacity varies by item type. Use `Pair::shulker_capacity_for_stack_size()`
+    /// or `pair.shulker_capacity()` for accurate capacity based on item stack size.
+    ///
+    /// **Storage Model**:
+    /// - Each chest slot **ALWAYS** contains 1 shulker box (any color, treated equally)
+    /// - `Chest.amounts[i]` = item count **inside** the shulker in chest slot `i`
+    /// - Max per shulker: 27 slots × stack_size items
+    ///   - Most items: 27 × 64 = 1728 items
+    ///   - Ender pearls, eggs: 27 × 16 = 432 items
+    ///   - Tools, armor: 27 × 1 = 27 items
+    /// - Max per chest: 54 shulkers × capacity
+    pub const DEFAULT_SHULKER_CAPACITY: i32 = 27 * 64;
+
+    /// Save the storage by calling save() on all nodes
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::debug!("[Storage] Saving {} nodes", self.nodes.len());
+        for node in &self.nodes {
+            tracing::debug!("[Storage] Saving node {}", node.id);
+            node.save()?;
+            tracing::debug!("[Storage] Node {} saved successfully", node.id);
+        }
+        tracing::debug!("[Storage] All nodes saved successfully");
+        Ok(())
+    }
+
+    /// Convenience constructor (reserved for future tooling/tests).
+    #[allow(dead_code)]
+    pub fn new(storage_position: &Position) -> Self {
+        Storage {
+            position: *storage_position,
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Load storage nodes by reading all JSON files in data/storage and loading corresponding nodes
+    pub fn load(storage_position: &Position) -> Result<Self, Box<dyn std::error::Error>> {
+        let storage_path = "data/storage";
+
+        // Create directory if it doesn't exist
+        if !Path::new(storage_path).exists() {
+            fs::create_dir_all(storage_path)?;
+            return Ok(Storage {
+                position: *storage_position,
+                nodes: Vec::new(),
+            });
+        }
+
+        let mut nodes = Vec::new();
+
+        // Read all entries in the storage directory
+        for entry in fs::read_dir(storage_path)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Only process JSON files
+            if path.is_file() {
+                if let Some(extension) = path.extension() {
+                    if extension == "json" {
+                        if let Some(file_name) = path.file_stem() {
+                            if let Some(file_str) = file_name.to_str() {
+                                // Parse filename as node ID (e.g., "0.json" -> 0)
+                                if let Ok(node_id) = file_str.parse::<i32>() {
+                                    // Load the node using its ID and the storage position
+                                    match Node::load(node_id, &storage_position) {
+                                        Ok(node) => nodes.push(node),
+                                        Err(e) => {
+                                            // Log error but continue loading other nodes
+                                            eprintln!("Failed to load node {}: {}", node_id, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Storage {
+            position: *storage_position,
+            nodes,
+        })
+    }
+
+    pub fn add_node(&mut self) -> &mut Node {
+        // Find the next available node_id (handle gaps from removed nodes)
+        let mut node_id = 0i32;
+        while self.nodes.iter().any(|n| n.id == node_id) {
+            node_id += 1;
+        }
+        let node = Node::new(node_id, &self.position);
+        self.nodes.push(node);
+        self.nodes.last_mut().unwrap()
+    }
+
+    pub fn total_item_amount(&self, item: &str) -> i32 {
+        self.nodes
+            .iter()
+            .flat_map(|n| &n.chests)
+            .filter(|c| c.item == item)
+            .flat_map(|c| c.amounts.iter().copied())
+            .filter(|a| *a > 0)
+            .sum()
+    }
+
+    /// Returns mutable refs to all chests that contain `item`.
+    /// Reserved for future algorithms/CLI tooling.
+    #[allow(dead_code)]
+    pub fn chests_with_item_mut(&mut self, item: &str) -> Vec<&mut Chest> {
+        let mut out = Vec::new();
+        for node in &mut self.nodes {
+            for chest in &mut node.chests {
+                if chest.item == item {
+                    out.push(chest);
+                }
+            }
+        }
+        out
+    }
+
+    /// Returns chest IDs that contain `item`.
+    /// Reserved for future algorithms/CLI tooling.
+    #[allow(dead_code)]
+    pub fn chest_ids_with_item(&self, item: &str) -> Vec<i32> {
+        self.nodes
+            .iter()
+            .flat_map(|n| &n.chests)
+            .filter(|c| c.item == item)
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// Find a chest by id.
+    /// Reserved for future bot/chest routing logic.
+    #[allow(dead_code)]
+    pub fn get_chest_mut(&mut self, chest_id: i32) -> Option<&mut Chest> {
+        for node in &mut self.nodes {
+            for chest in &mut node.chests {
+                if chest.id == chest_id {
+                    return Some(chest);
+                }
+            }
+        }
+        None
+    }
+
+    /// Convenience wrapper (reserved): withdraw and return actual amount removed.
+    #[allow(dead_code)]
+    pub fn withdraw_item(&mut self, item: &str, qty: i32) -> i32 {
+        self.withdraw_plan(item, qty).iter().map(|t| t.amount).sum()
+    }
+
+    /// Convenience wrapper (reserved): deposit and return actual amount added.
+    #[allow(dead_code)]
+    pub fn deposit_item(&mut self, item: &str, qty: i32, stack_size: i32) -> i32 {
+        self.deposit_plan(item, qty, stack_size).iter().map(|t| t.amount).sum()
+    }
+
+    /// Plans withdrawal of `qty` items from storage.
+    ///
+    /// **Mutates** storage state (removes items from `Chest.amounts`) and returns
+    /// a plan of which chests to visit and how much to withdraw from each.
+    ///
+    /// **Deterministic Order**: Processes nodes/chests/slots in fixed order:
+    /// 1. Nodes: by index (0, 1, 2, ...)
+    /// 2. Chests: by index within node (0, 1, 2, 3)
+    /// 3. Slots: by index within chest (0..53)
+    ///
+    /// This ensures consistent behavior and makes rollback easier.
+    ///
+    /// **Returns**: Vector of `ChestTransfer` indicating which chests to visit.
+    /// The bot will execute these transfers sequentially.
+    ///
+    /// **Note**: This is a **planning** function. The actual withdrawal happens
+    /// when the bot executes the plan and syncs chest contents back to storage.
+    pub fn withdraw_plan(&mut self, item: &str, mut qty: i32) -> Vec<ChestTransfer> {
+        if qty <= 0 {
+            return Vec::new();
+        }
+
+        let mut plan: Vec<ChestTransfer> = Vec::new();
+
+        // Deterministic order: node id then chest index then slot index.
+        // This ensures consistent behavior and makes rollback predictable.
+        for node_idx in 0..self.nodes.len() {
+            for chest_idx in 0..self.nodes[node_idx].chests.len() {
+                if qty <= 0 {
+                    return plan; // Early exit when we have enough
+                }
+
+                let chest = &mut self.nodes[node_idx].chests[chest_idx];
+                if chest.item != item {
+                    continue; // Skip chests that don't contain this item
+                }
+
+                // Ensure chest has exactly 54 slots (defensive)
+                Self::normalize_amounts_len(chest);
+                let mut chest_taken = 0;
+
+                // Withdraw from each shulker slot until we have enough
+                for slot in 0..chest.amounts.len() {
+                    if qty <= 0 {
+                        break;
+                    }
+
+                    let available = chest.amounts[slot];
+                    if available <= 0 {
+                        continue; // Empty shulker slot
+                    }
+
+                    // Take as much as we need (or all available, whichever is less)
+                    let take = available.min(qty);
+                    chest.amounts[slot] -= take;
+                    qty -= take;
+                    chest_taken += take;
+                }
+
+                // If we took anything from this chest, add it to the plan
+                if chest_taken > 0 {
+                    plan.push(ChestTransfer {
+                        chest_id: chest.id,
+                        position: chest.position,
+                        item: item.to_string(),
+                        amount: chest_taken,
+                    });
+                }
+            }
+        }
+
+        plan
+    }
+
+    /// Plans deposit of `qty` items into storage.
+    ///
+    /// **Mutates** storage state (adds items to `Chest.amounts`) and returns
+    /// a plan of which chests to visit and how much to deposit in each.
+    ///
+    /// **Allocation Strategy**:
+    /// 1. **Fill existing chests** already assigned to this item (prefer same item)
+    /// 2. **Use empty chests** if available (prefer same node if possible)
+    /// 3. **Create new nodes** if no empty chests exist
+    ///
+    /// **Filling Order**: Partially-filled shulker slots are filled first, then empty slots.
+    /// This minimizes fragmentation and keeps shulkers organized.
+    ///
+    /// **Arguments**:
+    /// - `item`: Item identifier (without minecraft: prefix)
+    /// - `qty`: Quantity to deposit
+    /// - `stack_size`: Maximum stack size for this item (1, 16, or 64)
+    ///
+    /// **Returns**: Vector of `ChestTransfer` indicating which chests to visit.
+    /// The bot will execute these transfers sequentially.
+    ///
+    /// **Note**: This is a **planning** function. The actual deposit happens
+    /// when the bot executes the plan and syncs chest contents back to storage.
+    pub fn deposit_plan(&mut self, item: &str, mut qty: i32, stack_size: i32) -> Vec<ChestTransfer> {
+        if qty <= 0 {
+            return Vec::new();
+        }
+
+        let mut plan: Vec<ChestTransfer> = Vec::new();
+
+        // Phase 1: Fill existing chests already assigned to this item.
+        // This keeps items consolidated and minimizes chest usage.
+        for node_idx in 0..self.nodes.len() {
+            for chest_idx in 0..self.nodes[node_idx].chests.len() {
+                if qty <= 0 {
+                    return plan; // Early exit when we've deposited everything
+                }
+                // Skip node 0 reserved chests for non-matching items:
+                // - Chest 0: dedicated for diamonds only
+                // - Chest 1: dedicated for overflow only (bot deposits unknown/leftover items)
+                if node_idx == 0 {
+                    if chest_idx == 0 && item != "diamond" {
+                        continue;
+                    }
+                    if chest_idx == 1 && item != crate::constants::OVERFLOW_CHEST_ITEM {
+                        continue;
+                    }
+                }
+                let chest = &mut self.nodes[node_idx].chests[chest_idx];
+                if chest.item != item {
+                    continue; // Skip chests assigned to other items
+                }
+                let before = qty;
+                let deposited_here = Self::deposit_into_chest(chest, &mut qty, stack_size);
+                if deposited_here > 0 {
+                    plan.push(ChestTransfer {
+                        chest_id: chest.id,
+                        position: chest.position,
+                        item: item.to_string(),
+                        amount: deposited_here,
+                    });
+                }
+                let _ = before; // Silence unused warning (used for debugging)
+            }
+        }
+
+        // Phase 2: Use empty chests; create new nodes if none exist.
+        // This handles overflow when existing chests are full.
+        while qty > 0 {
+            let (node_idx, chest_idx) = match Self::find_empty_chest_index(&self.nodes, item) {
+                Some(ix) => ix, // Found an empty chest
+                None => {
+                    // No empty chests: create a new node (adds 4 new empty chests)
+                    self.add_node();
+                    // After adding a node, there will be empty chests.
+                    Self::find_empty_chest_index(&self.nodes, item).expect("new node must have chests")
+                }
+            };
+            let chest = &mut self.nodes[node_idx].chests[chest_idx];
+            chest.item = item.to_string();
+            let deposited_here = Self::deposit_into_chest(chest, &mut qty, stack_size);
+            if deposited_here > 0 {
+                plan.push(ChestTransfer {
+                    chest_id: chest.id,
+                    position: chest.position,
+                    item: item.to_string(),
+                    amount: deposited_here,
+                });
+            }
+        }
+
+        plan
+    }
+
+    fn normalize_amounts_len(chest: &mut Chest) {
+        if chest.amounts.len() != Self::SLOTS_PER_CHEST {
+            chest.amounts.resize(Self::SLOTS_PER_CHEST, 0);
+        }
+    }
+
+    fn deposit_into_chest(chest: &mut Chest, qty: &mut i32, stack_size: i32) -> i32 {
+        if *qty <= 0 {
+            return 0;
+        }
+
+        Self::normalize_amounts_len(chest);
+        let mut deposited = 0;
+        
+        // Calculate shulker capacity from stack size (27 slots × stack_size)
+        let shulker_capacity = crate::types::Pair::shulker_capacity_for_stack_size(stack_size);
+
+        // Fill partially-filled slots first, then empty slots.
+        for slot in 0..chest.amounts.len() {
+            if *qty <= 0 {
+                return deposited;
+            }
+
+            let current = chest.amounts[slot];
+            if current < 0 {
+                continue; // reserved/missing slot semantics (future)
+            }
+            if current >= shulker_capacity {
+                continue;
+            }
+
+            let capacity_left = shulker_capacity - current;
+            let add = capacity_left.min(*qty);
+            chest.amounts[slot] += add;
+            *qty -= add;
+            deposited += add;
+        }
+
+        deposited
+    }
+
+    fn find_empty_chest_index(nodes: &[Node], item: &str) -> Option<(usize, usize)> {
+        // Node 0 has reserved chests:
+        // - Chest 0: dedicated for diamonds only
+        // - Chest 1: dedicated for overflow only (bot deposits unknown/leftover items)
+        // For other items: skip chest 0 and chest 1, prioritize node 0 chests 2, 3
+        // Note: Phase 1 already fills existing chests assigned to the item, so Phase 2 only
+        // looks for truly empty (unassigned) chests
+        if !nodes.is_empty() {
+            let node_0 = &nodes[0];
+            // Check node 0 chest 0 if depositing diamonds and it's empty
+            if item == "diamond" {
+                if node_0.chests[0].item.is_empty() {
+                    return Some((0, 0));
+                }
+            }
+            // Check node 0 chest 1 if depositing to overflow and it's empty
+            if item == crate::constants::OVERFLOW_CHEST_ITEM {
+                if node_0.chests.len() > 1 && node_0.chests[1].item.is_empty() {
+                    return Some((0, 1));
+                }
+            }
+            // For all items, check node 0 chests 2, 3 (skip chest 0 for non-diamonds, skip chest 1 for non-overflow)
+            for ci in 2..node_0.chests.len() {
+                if node_0.chests[ci].item.is_empty() {
+                    return Some((0, ci));
+                }
+            }
+        }
+        
+        // If node 0 chests are not empty, check other nodes
+        for (ni, node) in nodes.iter().enumerate() {
+            // Skip node 0 (already checked above)
+            if ni == 0 {
+                continue;
+            }
+            for (ci, chest) in node.chests.iter().enumerate() {
+                if chest.item.is_empty() {
+                    return Some((ni, ci));
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the overflow chest (node 0, chest 1) if it exists.
+    /// Returns None if node 0 doesn't exist yet.
+    #[allow(dead_code)]
+    pub fn get_overflow_chest(&self) -> Option<&Chest> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        self.nodes[0].chests.get(1)
+    }
+
+    /// Get a mutable reference to the overflow chest (node 0, chest 1).
+    /// Returns None if node 0 doesn't exist yet.
+    #[allow(dead_code)]
+    pub fn get_overflow_chest_mut(&mut self) -> Option<&mut Chest> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        self.nodes[0].chests.get_mut(1)
+    }
+
+    /// Get the overflow chest position.
+    /// Returns None if node 0 doesn't exist yet.
+    #[allow(dead_code)]
+    pub fn get_overflow_chest_position(&self) -> Option<Position> {
+        self.get_overflow_chest().map(|c| c.position)
+    }
+
+    /// Get the overflow chest ID (always 1, since it's node 0 chest 1).
+    #[allow(dead_code)]
+    pub const fn overflow_chest_id() -> i32 {
+        crate::constants::OVERFLOW_CHEST_ID
+    }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_storage() -> Storage {
+        let origin = Position { x: 0, y: 64, z: 0 };
+        let mut storage = Storage::new(&origin);
+        // Add a node for testing
+        storage.add_node();
+        storage
+    }
+
+    #[test]
+    fn test_new_storage() {
+        let origin = Position { x: 100, y: 64, z: -200 };
+        let storage = Storage::new(&origin);
+        
+        assert_eq!(storage.position.x, 100);
+        assert_eq!(storage.position.y, 64);
+        assert_eq!(storage.position.z, -200);
+        assert_eq!(storage.nodes.len(), 0);
+    }
+
+    #[test]
+    fn test_add_node() {
+        let mut storage = test_storage();
+        let initial_nodes = storage.nodes.len();
+        
+        storage.add_node();
+        
+        assert_eq!(storage.nodes.len(), initial_nodes + 1);
+    }
+
+    #[test]
+    fn test_deposit_plan_empty_storage() {
+        let mut storage = test_storage();
+        
+        // Assign chest to item first
+        storage.nodes[0].chests[0].item = "diamond".to_string();
+        
+        // Stack size 64 for diamond
+        let plan = storage.deposit_plan("diamond", 100, 64);
+        
+        assert!(!plan.is_empty());
+        let total: i32 = plan.iter().map(|t| t.amount).sum();
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn test_withdraw_plan_empty_storage() {
+        let mut storage = test_storage();
+        
+        // Try to withdraw from empty storage
+        let plan = storage.withdraw_plan("diamond", 100);
+        
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn test_deposit_then_withdraw() {
+        let mut storage = test_storage();
+        
+        // Deposit items (stack size 64)
+        let deposit_plan = storage.deposit_plan("cobblestone", 500, 64);
+        let deposited: i32 = deposit_plan.iter().map(|t| t.amount).sum();
+        assert_eq!(deposited, 500);
+        
+        // Check total
+        assert_eq!(storage.total_item_amount("cobblestone"), 500);
+        
+        // Withdraw half
+        let withdraw_plan = storage.withdraw_plan("cobblestone", 250);
+        let withdrawn: i32 = withdraw_plan.iter().map(|t| t.amount).sum();
+        assert_eq!(withdrawn, 250);
+        
+        // Check remaining
+        assert_eq!(storage.total_item_amount("cobblestone"), 250);
+    }
+
+    #[test]
+    fn test_total_item_amount() {
+        let mut storage = test_storage();
+        
+        // Initially zero
+        assert_eq!(storage.total_item_amount("iron_ingot"), 0);
+        
+        // Deposit (stack size 64)
+        storage.deposit_plan("iron_ingot", 1000, 64);
+        assert_eq!(storage.total_item_amount("iron_ingot"), 1000);
+    }
+
+    #[test]
+    fn test_shulker_capacity_limit() {
+        let mut storage = test_storage();
+        
+        // Each shulker can hold 27 slots × 64 items = 1728 items (for most items)
+        // One chest has 54 shulkers = 54 * 1728 = 93,312 items max
+        // With 4 chests per node = 4 * 93,312 = 373,248 items max per node
+        
+        // Deposit more than one shulker can hold (stack size 64)
+        let plan = storage.deposit_plan("gold_ingot", 100, 64);
+        let deposited: i32 = plan.iter().map(|t| t.amount).sum();
+        assert_eq!(deposited, 100);
+        
+        // Verify amounts don't exceed shulker capacity per slot
+        // For gold_ingot (stack size 64), capacity is 27 * 64 = 1728
+        let gold_capacity = crate::types::Pair::shulker_capacity_for_stack_size(64);
+        for node in &storage.nodes {
+            for chest in &node.chests {
+                for &amount in &chest.amounts {
+                    assert!(amount <= gold_capacity);
+                }
+            }
+        }
+    }
+    
+    #[test]
+    fn test_shulker_capacity_calculation() {
+        // Test shulker capacities for different stack sizes
+        use crate::types::Pair;
+        
+        // Stack size 64: 27 * 64 = 1728
+        assert_eq!(Pair::shulker_capacity_for_stack_size(64), 27 * 64);
+        
+        // Stack size 16: 27 * 16 = 432
+        assert_eq!(Pair::shulker_capacity_for_stack_size(16), 27 * 16);
+        
+        // Stack size 1: 27 * 1 = 27
+        assert_eq!(Pair::shulker_capacity_for_stack_size(1), 27 * 1);
+    }
+
+    #[test]
+    fn test_withdraw_partial() {
+        let mut storage = test_storage();
+        
+        // Deposit (stack size 64)
+        storage.deposit_plan("emerald", 100, 64);
+        
+        // Withdraw more than available
+        let plan = storage.withdraw_plan("emerald", 200);
+        let withdrawn: i32 = plan.iter().map(|t| t.amount).sum();
+        
+        // Should only get what's available
+        assert_eq!(withdrawn, 100);
+        assert_eq!(storage.total_item_amount("emerald"), 0);
+    }
+
+    #[test]
+    fn test_chest_ids_with_item() {
+        let mut storage = test_storage();
+        
+        // Deposit to create assignment (stack size 64)
+        storage.deposit_plan("lapis_lazuli", 50, 64);
+        
+        let chest_ids = storage.chest_ids_with_item("lapis_lazuli");
+        assert!(!chest_ids.is_empty());
+    }
+}

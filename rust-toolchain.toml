@@ -1,0 +1,6 @@
+[toolchain]
+# This project uses Azalea, which may require nightly depending on its
+# transitive dependencies (SIMD crates / feature gates). We pin to nightly
+# to keep builds consistent.
+channel = "nightly"
+profile = "default"

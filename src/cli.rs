@@ -627,6 +627,8 @@ fn clear_stuck_order(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 }
 
+/// Sends an AuditState request and displays any invariant violations found.
+/// If `repair` is true, also applies safe automatic repairs (e.g. recomputing pair stock).
 fn audit_state(store_tx: &mpsc::Sender<StoreMessage>, repair: bool) {
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::AuditState { repair, respond_to: response_tx });

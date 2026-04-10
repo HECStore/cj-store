@@ -172,7 +172,9 @@ pub async fn place_shulker_on_station(bot: &Bot, station_pos: &Position) -> Resu
 }
 
 /// Pick up a shulker box from the shulker station.
-/// Breaks the shulker first, waits for it to be fully broken, then walks to the N space one block left of S (x-2 from node position) to pick it up, then returns to node position.
+/// Breaks the shulker first, waits for it to be fully broken, then walks to the X position
+/// (x-3 from node position, one block west of S) to pick up the dropped item, then returns
+/// to the node position.
 pub async fn pickup_shulker_from_station(
     bot: &Bot,
     station_pos: &Position,

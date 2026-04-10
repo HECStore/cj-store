@@ -309,7 +309,7 @@ impl Store {
 
     /// Process the next order from the queue
     ///
-    /// This method is called by the select! loop when there are orders waiting
+    /// This method is called by the main store loop when there are orders waiting
     /// and no order is currently being processed. It sets `processing_order = true`
     /// at the start and `false` at the end to prevent concurrent order execution.
     ///

@@ -121,7 +121,7 @@ pub const RETRY_BASE_DELAY_MS: u64 = 500;
 /// Maximum delay for exponential backoff (milliseconds)
 pub const RETRY_MAX_DELAY_MS: u64 = 5_000;
 
-/// Calculate exponential backoff delay with jitter.
+/// Calculate exponential backoff delay.
 /// 
 /// # Arguments
 /// * `attempt` - Current attempt number (0-indexed)

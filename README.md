@@ -148,6 +148,7 @@ cj-store/
       pricing.rs                # Constant product AMM pricing (calculate_buy_cost, calculate_sell_payout)
       queue.rs                  # Order queue system (QueuedOrder, OrderQueue, persistence)
       rate_limit.rs             # Anti-spam rate limiting with exponential backoff
+      rollback.rs               # Shared rollback helper (items/diamonds back to storage on failure)
       state.rs                  # State management (save, audit_state, assert_invariants)
       utils.rs                  # Helper functions (normalize_item_id, resolve_user_uuid, etc.)
     bot/                        # Bot module (Azalea bot client + whisper parsing → StoreMessage)
@@ -155,7 +156,7 @@ cj-store/
       connection.rs             # Connection management (connect, disconnect)
       navigation.rs             # Pathfinding (navigate_to_position, go_to_node, go_to_chest)
       shulker.rs               # Shulker operations (place, pickup, open, station position)
-      chest_io.rs               # Chest operations (automated_chest_io, read_chest_amounts, etc.)
+      chest_io.rs               # Chest operations (automated_chest_io, transfer_items_with_shulker, etc.)
       trade.rs                  # Trade automation (execute_trade_with_player, trade GUI handling)
       inventory.rs              # Inventory management (ensure_inventory_empty, move_hotbar_to_inventory, etc.)
     cli.rs                      # dialoguer menu → StoreMessage
@@ -386,8 +387,8 @@ The configuration file `data/config.json` is loaded on startup. If missing, it's
 | `max_orders` | `usize` | `10000` | Prune target for the in-memory order log (session-only; `orders.json` is cleared on each restart) |
 | `max_trades_in_memory` | `usize` | `50000` | Max trades loaded into memory on startup (older trades remain on disk) |
 | `autosave_interval_secs` | `u64` | `2` | Minimum interval between debounced autosaves |
-| `trade_timeout_ms` | `u64` | `45000` | **Reserved** — parsed and validated but currently not wired through; trade completion uses a hardcoded 45s timeout |
-| `pathfinding_timeout_ms` | `u64` | `60000` | **Reserved** — parsed and validated but currently not wired through; pathfinding uses hardcoded constants in `src/constants.rs` |
+| `trade_timeout_ms` | `u64` | `45000` | Maximum time to wait for a trade GUI interaction to complete before aborting and rolling back |
+| `pathfinding_timeout_ms` | `u64` | `60000` | Maximum time to wait for the bot to reach a destination before aborting the current navigation |
 
 
 Example (full `data/config.json`):
@@ -895,7 +896,8 @@ This section documents **how `/trade` works on this server** and how the bot use
 | Phase | Timeout | What Happens on Timeout |
 |-------|---------|-------------------------|
 | Trade request acceptance | **30 seconds** | Order cancelled, player notified |
-| Trade completion | **45 seconds** | Trade cancelled, rollback attempted |
+| Trade completion | `trade_timeout_ms` (default **45 s**) | Trade cancelled, rollback attempted |
+| Pathfinding | `pathfinding_timeout_ms` (default **60 s**) | Navigation aborted, current action fails |
 
 ### Trade GUI Layout
 
@@ -1240,7 +1242,7 @@ The system is designed for **transactional integrity** — either a trade comple
   - `"minecraft:diamond"` → `"diamond"`
   - `"diamond"` → `"diamond"` (unchanged)
 - **Storage**: Items are stored in pairs/chests WITHOUT the `minecraft:` prefix
-- **Minecraft interaction**: When interacting with the game, `utils::with_minecraft_prefix()` adds the prefix back
+- **Minecraft interaction**: Bot-side code re-adds the `minecraft:` prefix inline where needed (e.g., when matching Azalea item IDs)
 - **Player input**: Players can use either format (`diamond` or `minecraft:diamond`) - both work
 
 ### Testing

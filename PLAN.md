@@ -2,13 +2,19 @@
 
 ## Context
 
-The codebase is currently at ~72/100. It has solid architecture (single-owner state, typed channels, no race conditions), correct AMM pricing, thorough rollback logic, and atomic persistence. The main weaknesses are: massive duplication in rollback/order handlers, hardcoded timeouts ignoring existing config fields, excessive verbose logging, clone-heavy planning, no tests for the riskiest code paths, 600-800 line functions, dead code, and stringly-typed errors everywhere.
+The codebase started at ~72/100 and is currently at ~80/100 after the first batch of improvements. Solid architecture (single-owner state, typed channels, no race conditions), correct AMM pricing, thorough rollback logic, and atomic persistence remain the strong foundation. Remaining weaknesses: 600–800 line order/chest-io functions, clone-heavy planning, no tests for the riskiest code paths, and stringly-typed errors everywhere.
 
-This plan documents every change needed to reach 100/100, organized into tiers by impact-to-effort ratio.
+### Already shipped
+- **1.1 Shared rollback helper** — extracted into `src/store/rollback.rs`, replacing ~400 lines of copy-pasted rollback blocks across `orders.rs`, `player.rs`, and `operator.rs`.
+- **1.2 Config wiring** — `trade_timeout_ms` and `pathfinding_timeout_ms` now drive runtime behavior instead of hardcoded durations.
+- **2.1 Logging pruned ~60%** — redundant entry/exit traces, step-by-step banners, and per-slot debug noise removed across `src/bot/` and `src/store/`.
+- **2.4 Dead code cleanup** — removed genuinely-unused items (`place_shulker_on_station`, `dump_inventory_to_overflow`, `read_chest_amounts`, `BotInstruction::Chat`, `ChestAction::Check`, queue `clear`/`peek`, `with_minecraft_prefix`). Test-only helpers gated with `#[cfg(test)]`. Intentional API surface kept with targeted `#[allow(dead_code)]` + justification comments. `cargo check` is warning-free.
+
+This plan documents the remaining changes needed to reach 100/100, organized into tiers by impact-to-effort ratio.
 
 ---
 
-## Tier 1: 72 → 82 (High impact, moderate effort)
+## Tier 1: 80 → 82 (remaining items)
 
 ### 1.3 Split mega-functions
 
@@ -24,7 +30,7 @@ handle_buy_order → split into:
   - execute_buy_withdrawal(store, plan) → Result
   - execute_buy_trade(store, plan, player) → TradeResult
   - commit_buy(store, plan, trade_result) → Result
-  - (rollback uses the new shared helper from 1.1)
+  - (rollback uses the shared helper in src/store/rollback.rs)
 
 handle_sell_order → same pattern:
   - validate_sell_order → SellPlan
@@ -78,7 +84,7 @@ Migrate progressively — start with store handlers, then bot, then types.
 
 ---
 
-## Tier 2: 82 → 88 (Structural improvements)
+## Tier 2: 82 → 88 (remaining items)
 
 ### 2.2 Add integration tests for order handlers
 
@@ -323,12 +329,16 @@ Each transition is a function that consumes the old state and produces the new o
 
 ## Summary
 
-| Tier | Score    | Key Changes                                                   | Effort   |
-| ---- | -------- | ------------------------------------------------------------- | -------- |
-| 1    | 72 → 82  | Extract rollback, wire config, split functions, error enum    | 2-3 days |
-| 2    | 82 → 88  | Cut logging, add tests, lightweight planner, remove dead code | 2-3 days |
-| 3    | 88 → 93  | Crash journal, type-safe IDs, property tests, SQLite          | 4-5 days |
-| 4    | 93 → 95+ | State machine, metrics, partial fills, UUID cache             | 3-4 days |
-| 5    | 95 → 100 | E2E tests, formal verification, hot-reload, audit chain       | 5+ days  |
+| Tier        | Score        | Key Changes                                                                |
+| ----------- | ------------ | -------------------------------------------------------------------------- |
+| 1 (done)    | 72 → ~78     | ✅ Shared rollback helper, config wiring                                    |
+| 1 (remain)  | ~78 → 82     | Split mega-functions, error enum                                           |
+| 2 (done)    | included     | ✅ Cut logging ~60%, dead-code cleanup                                      |
+| 2 (remain)  | 82 → 88      | Integration tests for order handlers, lightweight planner (no clone)       |
+| 3           | 88 → 93      | Crash journal, type-safe IDs, property tests, SQLite                       |
+| 4           | 93 → 95+     | State machine, metrics, partial fills, UUID cache                          |
+| 5           | 95 → 100     | E2E tests, formal verification, hot-reload, audit chain                    |
+
+**Current score:** ~80/100 (Tier 1.1, 1.2, 2.1, 2.4 shipped).
 
 **Recommended stopping point for a single-server Minecraft bot:** End of Tier 2 (~88/100). Everything past that is over-engineering unless this becomes a multi-server product.

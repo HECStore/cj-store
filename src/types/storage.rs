@@ -79,6 +79,7 @@ pub struct Storage {
     pub nodes: Vec<Node>,
 }
 
+#[allow(dead_code)] // storage lookup/mutation API kept as cohesive surface
 impl Storage {
     /// Number of slots per chest (standard double chest = 54 slots)
     pub const SLOTS_PER_CHEST: usize = 54;
@@ -111,7 +112,6 @@ impl Storage {
     }
 
     /// Convenience constructor (reserved for future tooling/tests).
-    #[allow(dead_code)]
     pub fn new(storage_position: &Position) -> Self {
         Storage {
             position: *storage_position,
@@ -202,7 +202,6 @@ impl Storage {
 
     /// Returns mutable refs to all chests that contain `item`.
     /// Reserved for future algorithms/CLI tooling.
-    #[allow(dead_code)]
     pub fn chests_with_item_mut(&mut self, item: &str) -> Vec<&mut Chest> {
         let mut out = Vec::new();
         for node in &mut self.nodes {
@@ -217,7 +216,6 @@ impl Storage {
 
     /// Returns chest IDs that contain `item`.
     /// Reserved for future algorithms/CLI tooling.
-    #[allow(dead_code)]
     pub fn chest_ids_with_item(&self, item: &str) -> Vec<i32> {
         self.nodes
             .iter()
@@ -229,7 +227,6 @@ impl Storage {
 
     /// Find a chest by id.
     /// Reserved for future bot/chest routing logic.
-    #[allow(dead_code)]
     pub fn get_chest_mut(&mut self, chest_id: i32) -> Option<&mut Chest> {
         for node in &mut self.nodes {
             for chest in &mut node.chests {
@@ -242,13 +239,11 @@ impl Storage {
     }
 
     /// Convenience wrapper (reserved): withdraw and return actual amount removed.
-    #[allow(dead_code)]
     pub fn withdraw_item(&mut self, item: &str, qty: i32) -> i32 {
         self.withdraw_plan(item, qty).iter().map(|t| t.amount).sum()
     }
 
     /// Convenience wrapper (reserved): deposit and return actual amount added.
-    #[allow(dead_code)]
     pub fn deposit_item(&mut self, item: &str, qty: i32, stack_size: i32) -> i32 {
         self.deposit_plan(item, qty, stack_size).iter().map(|t| t.amount).sum()
     }
@@ -541,7 +536,6 @@ impl Storage {
 
     /// Get the overflow chest (node 0, chest 1) if it exists.
     /// Returns None if node 0 doesn't exist yet.
-    #[allow(dead_code)]
     pub fn get_overflow_chest(&self) -> Option<&Chest> {
         if self.nodes.is_empty() {
             return None;
@@ -551,7 +545,6 @@ impl Storage {
 
     /// Get a mutable reference to the overflow chest (node 0, chest 1).
     /// Returns None if node 0 doesn't exist yet.
-    #[allow(dead_code)]
     pub fn get_overflow_chest_mut(&mut self) -> Option<&mut Chest> {
         if self.nodes.is_empty() {
             return None;
@@ -561,13 +554,11 @@ impl Storage {
 
     /// Get the overflow chest position.
     /// Returns None if node 0 doesn't exist yet.
-    #[allow(dead_code)]
     pub fn get_overflow_chest_position(&self) -> Option<Position> {
         self.get_overflow_chest().map(|c| c.position)
     }
 
     /// Get the overflow chest ID (always 1, since it's node 0 chest 1).
-    #[allow(dead_code)]
     pub const fn overflow_chest_id() -> i32 {
         crate::constants::OVERFLOW_CHEST_ID
     }

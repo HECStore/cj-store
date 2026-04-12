@@ -138,7 +138,7 @@ impl RateLimiter {
     }
 
     /// Get the current violation count for a user (for debugging/logging)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // operator-tooling API, kept for future admin commands
     pub fn get_violations(&self, user_uuid: &str) -> u32 {
         self.limits
             .get(user_uuid)
@@ -148,7 +148,7 @@ impl RateLimiter {
 
     /// Clean up stale entries (users who haven't sent messages in a while)
     /// Call periodically to prevent memory growth
-    #[allow(dead_code)]
+    #[allow(dead_code)] // hook for a future periodic-cleanup task
     pub fn cleanup_stale(&mut self, max_age: Duration) {
         let now = Instant::now();
         self.limits.retain(|_, limit| {

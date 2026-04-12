@@ -59,6 +59,7 @@ pub struct Pair {
     pub currency_stock: f64,
 }
 
+#[allow(dead_code)] // persistence + capacity helpers kept as cohesive type API
 impl Pair {
     // Directory where all individual pair files will be stored.
     // One file per pair keeps diffs small and avoids rewriting the whole catalog on every update.
@@ -72,7 +73,6 @@ impl Pair {
     /// 
     /// A shulker box has 27 slots, each holding up to `stack_size` items.
     /// Returns: 27 × stack_size
-    #[allow(dead_code)]
     pub fn shulker_capacity(&self) -> i32 {
         Self::SHULKER_BOX_SLOTS * self.stack_size
     }
@@ -110,7 +110,6 @@ impl Pair {
 
     /// Loads a single `Pair` from `data/pairs/{item_name}.json`.
     /// Returns an `io::Error` with `ErrorKind::NotFound` if the file does not exist.
-    #[allow(dead_code)]
     pub fn load(item_name: &str) -> io::Result<Self> {
         let path = Self::get_pair_file_path(item_name);
 

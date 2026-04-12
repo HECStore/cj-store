@@ -73,7 +73,7 @@ pub async fn handle_additem_order(
         return Err(format!("Failed to send trade instruction to bot: {}", e));
     }
 
-    let trade_result = tokio::time::timeout(tokio::time::Duration::from_secs(45), trade_rx)
+    let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
         .map_err(|_| "Bot timed out waiting for trade completion".to_string())?
         .map_err(|e| format!("Bot response dropped: {}", e))?;
@@ -187,7 +187,7 @@ pub async fn handle_additem_order(
                 })
                 .await;
             
-            match tokio::time::timeout(tokio::time::Duration::from_secs(45), rb_rx).await {
+            match tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), rb_rx).await {
                 Ok(Ok(Ok(_))) => {
                     info!("[Additem] Successfully returned {} items to operator", items_in_bot_inventory);
                     return utils::send_message_to_player(
@@ -389,82 +389,39 @@ pub async fn handle_removeitem_order(
     
     if let Err(e) = trade_send_result {
         error!("[Removeitem] FAILED to send trade instruction: {}", e);
-        // Rollback path: withdrawal already moved items from chests into the bot, but the
-        // trade never left this process. Re-deposit each planned chunk back into its
-        // originating chest so physical storage and our in-memory accounting stay aligned.
-        info!("[Removeitem] Rolling back {} items to storage (trade send failed)", qty_i32);
-        for t in &preview_withdraw_plan {
-            let node_position = store.get_node_position(t.chest_id);
-            let chest = crate::types::Chest {
-                id: t.chest_id,
-                node_id: t.chest_id / 4,
-                index: t.chest_id % 4,
-                position: t.position,
-                item: t.item.clone(),
-                amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-            };
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = store.bot_tx
-                .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                    target_chest: chest,
-                    node_position,
-                    action: crate::messages::ChestAction::Deposit {
-                        item: item.to_string(),
-                        amount: t.amount,
-                        from_player: None,
-                        stack_size: store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64),
-                    },
-                    respond_to: tx,
-                })
-                .await;
-            if let Ok(Ok(Ok(report))) = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await {
-                let _ = store.apply_chest_sync(report);
-            }
-        }
+        // Rollback: withdrawal already moved items from chests into the bot.
+        // Re-deposit each planned chunk back into its source chest via the shared helper.
+        let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
+        let _ = super::super::rollback::deposit_transfers(
+            store,
+            &preview_withdraw_plan,
+            item,
+            stack_size,
+            "[Removeitem] trade-send-failed",
+        )
+        .await;
         return Err(format!("Failed to send trade instruction to bot: {}", e));
     }
 
-    let trade_result = tokio::time::timeout(tokio::time::Duration::from_secs(45), trade_rx)
+    let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
         .map_err(|_| "Bot timed out waiting for trade completion".to_string())?
         .map_err(|e| format!("Bot response dropped: {}", e))?;
     
     if let Err(err) = &trade_result {
         error!("[Removeitem] Trade FAILED: {} - rolling back items to storage", err);
-        // Rollback path: the trade was delivered to the bot but rejected/cancelled, so the
-        // withdrawn items are still in the bot's inventory. Deposit them back using the
-        // same plan we withdrew with; chest_sync keeps our stock numbers consistent.
-        for t in &preview_withdraw_plan {
-            let node_position = store.get_node_position(t.chest_id);
-            let chest = crate::types::Chest {
-                id: t.chest_id,
-                node_id: t.chest_id / 4,
-                index: t.chest_id % 4,
-                position: t.position,
-                item: t.item.clone(),
-                amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-            };
+        // Rollback: items are still in the bot's inventory. Deposit them back using
+        // the same plan we withdrew with via the shared helper.
+        let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
+        let _ = super::super::rollback::deposit_transfers(
+            store,
+            &preview_withdraw_plan,
+            item,
+            stack_size,
+            "[Removeitem] trade-failed",
+        )
+        .await;
 
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = store.bot_tx
-                .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                    target_chest: chest,
-                    node_position,
-                    action: crate::messages::ChestAction::Deposit {
-                        item: item.to_string(),
-                        amount: t.amount,
-                        from_player: None,
-                        stack_size: store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64),
-                    },
-                    respond_to: tx,
-                })
-                .await;
-            if let Ok(Ok(Ok(report))) = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await {
-                let _ = store.apply_chest_sync(report);
-            }
-        }
-        
         return utils::send_message_to_player(
             store,
             player_name,

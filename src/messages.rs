@@ -82,9 +82,6 @@ pub enum ChestAction {
         /// Item's stack size (1, 16, or 64) for capacity calculation
         stack_size: i32,
     },
-    /// Reserved for future GUI automation / inspection.
-    #[allow(dead_code)]
-    Check,
 }
 
 /// Messages sent to the Store from other components.
@@ -216,16 +213,6 @@ pub enum BotInstruction {
     },
     /// Send a public chat message.
     /// 
-    /// **Status**: Reserved for future use.
-    /// Potential use cases:
-    /// - Broadcasting store status to nearby players
-    /// - Announcing price changes
-    /// - Responding to public mentions
-    #[allow(dead_code)]
-    Chat {
-        message: String,
-        respond_to: oneshot::Sender<Result<(), String>>,
-    },
     /// Navigate to chest, perform action, then read chest contents and return a sync report.
     InteractWithChestAndSync {
         target_chest: Chest,

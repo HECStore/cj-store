@@ -215,7 +215,7 @@ pub async fn place_items_from_inventory_into_trade(
                 total_count += stack.count();
             }
         }
-        info!(
+        debug!(
             "Trade placement: need {}x {}, found {} total in {} stacks: {:?}",
             amount, item, total_count, found_items.len(), found_items
         );
@@ -469,7 +469,7 @@ pub async fn place_items_from_inventory_into_trade(
         }
     }
 
-    info!("Trade placement complete: placed {} items", placed_count);
+    debug!("Trade placement complete: placed {} items", placed_count);
     Ok(())
 }
 
@@ -597,7 +597,7 @@ pub async fn execute_trade_with_player(
     if !super::inventory::is_entity_ready(&client) {
         warn!("Entity not ready, waiting for initialization...");
         super::inventory::wait_for_entity_ready(&client).await?;
-        info!("Entity now ready for trade operations");
+        debug!("Entity now ready for trade operations");
     }
 
     // Inventory hygiene: clear inventory into buffer chest if configured.
@@ -622,8 +622,12 @@ pub async fn execute_trade_with_player(
 
     // Wait for GUI open (player acceptance).
     let chat_rx = bot.chat_subscribe();
-    let inv = wait_for_trade_menu_or_failure(bot, tokio::time::Duration::from_secs(30), chat_rx)
-        .await?;
+    let inv = wait_for_trade_menu_or_failure(
+        bot,
+        tokio::time::Duration::from_millis(bot.trade_timeout_ms),
+        chat_rx,
+    )
+    .await?;
 
     // Fill bot offers into left 12 slots.
     for ti in bot_offers {
@@ -659,7 +663,7 @@ pub async fn execute_trade_with_player(
                 inv.close();
                 return Err(error_msg);
             }
-            info!("Bot offer verified: {}x {} in trade GUI", actual, ti.item);
+            debug!("Bot offer verified: {}x {} in trade GUI", actual, ti.item);
         }
     }
 
@@ -764,7 +768,7 @@ pub async fn execute_trade_with_player(
                 }
                 
                 // Items not found in bot inventory = trade completed successfully
-                info!("Trade completed successfully (menu closed after bot accepted, items exchanged)");
+                info!("Trade completed (menu closed after accept)");
                 // Move items from hotbar to inventory before returning
                 if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
                     warn!("Failed to move hotbar items to inventory after trade: {}", e);
@@ -831,7 +835,7 @@ pub async fn execute_trade_with_player(
                             drop(inv_check);
                         }
                         
-                        info!("Trade completed successfully (menu closed during content check)");
+                        info!("Trade completed (verified during content check)");
                         // Move items from hotbar to inventory before returning
                         if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
                             warn!("Failed to move hotbar items to inventory after trade: {}", e);
@@ -958,7 +962,7 @@ pub async fn execute_trade_with_player(
                     }
                     
                     // Trade completed successfully
-                    info!("Trade completed successfully after accept click");
+                    info!("Trade completed (after accept click)");
                     // Move items from hotbar to inventory before returning
                     if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
                         warn!("Failed to move hotbar items to inventory after trade: {}", e);
@@ -1025,7 +1029,7 @@ pub async fn execute_trade_with_player(
             }
             
             // Trade completed - move items from hotbar to inventory
-            info!("Trade completed at timeout check, organizing inventory (moving hotbar items to inventory)");
+            info!("Trade completed (verified at timeout)");
             if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
                 warn!("Failed to move hotbar items to inventory after trade: {}", e);
             }

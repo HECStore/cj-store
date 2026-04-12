@@ -1093,7 +1093,7 @@ pub async fn handle_deposit_balance_queued(
     player_name: &str,
     amount: Option<f64>,
 ) -> Result<(), String> {
-    info!("[Deposit] === STARTING DEPOSIT ORDER === player={} amount={:?}", player_name, amount);
+    info!("[Deposit] Starting: player={} amount={:?}", player_name, amount);
     state::assert_invariants(store, "pre-deposit-balance", false)?;
 
     // Maximum diamonds the trade GUI can hold (12 stacks of 64 = 768).
@@ -1141,8 +1141,10 @@ pub async fn handle_deposit_balance_queued(
     utils::send_message_to_player(store, player_name, &msg).await?;
 
     // Perform trade: player offers diamonds, bot offers nothing
-    info!("[Deposit] Initiating trade: player {} should offer {} diamonds (flexible={})", 
-          player_name, diamonds_to_trade, is_flexible);
+    info!(
+        "[Deposit] Initiating trade: {} offers up to {} diamonds (flexible={})",
+        player_name, diamonds_to_trade, is_flexible
+    );
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
     let send_result = store.bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
@@ -1164,37 +1166,30 @@ pub async fn handle_deposit_balance_queued(
         .await;
     
     if let Err(e) = send_result {
-        tracing::error!("[Deposit] FAILED to send trade instruction: {}", e);
+        tracing::error!("[Deposit] Failed to send trade instruction: {}", e);
         return Err(format!("Failed to send trade instruction to bot: {}", e));
     }
-    info!("[Deposit] Trade instruction sent, awaiting result (timeout 45s)...");
 
-    let trade_start = std::time::Instant::now();
-    let trade_timeout_result = tokio::time::timeout(tokio::time::Duration::from_secs(45), trade_rx).await;
-    let trade_elapsed = trade_start.elapsed();
-    
-    let trade_result = match trade_timeout_result {
-        Ok(channel_result) => {
-            match channel_result {
-                Ok(result) => {
-                    info!("[Deposit] Trade result received after {:.2}s", trade_elapsed.as_secs_f64());
-                    result
-                }
-                Err(e) => {
-                    tracing::error!("[Deposit] Trade channel DROPPED after {:.2}s: {}", trade_elapsed.as_secs_f64(), e);
-                    return Err(format!("Bot response dropped: {}", e));
-                }
-            }
+    let trade_result = match tokio::time::timeout(
+        tokio::time::Duration::from_millis(store.config.trade_timeout_ms),
+        trade_rx,
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            tracing::error!("[Deposit] Trade channel dropped: {}", e);
+            return Err(format!("Bot response dropped: {}", e));
         }
         Err(_) => {
-            tracing::error!("[Deposit] Trade TIMEOUT after {:.2}s!", trade_elapsed.as_secs_f64());
+            tracing::error!("[Deposit] Trade timeout");
             return Err("Bot timed out waiting for trade completion".to_string());
         }
     };
-    
+
     let actual_received = match trade_result {
         Err(err) => {
-            tracing::error!("[Deposit] Trade FAILED: {}", err);
+            warn!("[Deposit] Trade failed: {}", err);
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -1202,10 +1197,7 @@ pub async fn handle_deposit_balance_queued(
             )
             .await;
         }
-        Ok(received) => {
-            info!("[Deposit] Trade succeeded, received {} item types", received.len());
-            received
-        }
+        Ok(received) => received,
     };
     
     // Calculate actual diamonds received
@@ -1225,56 +1217,24 @@ pub async fn handle_deposit_balance_queued(
         .await;
     }
 
-    // Deposit the received diamonds into storage (diamond chest)
-    // Use the actual amount received, not the originally requested amount
-    let stack_size = 64; // Diamond stack size
-    let mut sim_storage = store.storage.clone();
-    let deposit_plan = sim_storage.deposit_plan("diamond", diamonds_actually_received, stack_size);
-    
-    for t in &deposit_plan {
-        let node_position = store.get_node_position(t.chest_id);
-        let chest = crate::types::Chest {
-            id: t.chest_id,
-            node_id: t.chest_id / 4,
-            index: t.chest_id % 4,
-            position: t.position,
-            item: t.item.clone(),
-            amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-        };
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        store.bot_tx
-            .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                target_chest: chest,
-                node_position,
-                action: crate::messages::ChestAction::Deposit {
-                    item: "diamond".to_string(),
-                    amount: t.amount,
-                    from_player: None,
-                    stack_size: 64, // Diamonds stack to 64
-                },
-                respond_to: tx,
-            })
-            .await
-            .map_err(|e| format!("Failed to send chest instruction to bot: {}", e))?;
-
-        let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
-            .await
-            .map_err(|_| "Bot timed out depositing diamonds to storage".to_string())?
-            .map_err(|e| format!("Bot response dropped: {}", e))?;
-
-        match bot_result {
-            Err(err) => {
-                // Deposit failed - diamonds are in bot inventory but couldn't be stored
-                // Credit the user anyway since trade completed, but warn
-                tracing::warn!("Failed to deposit diamonds into storage: {} - diamonds remain in bot inventory", err);
-            }
-            Ok(report) => {
-                if let Err(e) = store.apply_chest_sync(report) {
-                    tracing::warn!("Chest sync failed after diamond deposit: {}", e);
-                }
-            }
-        }
+    // Deposit the received diamonds into storage (diamond chest).
+    // Uses the actual amount received, not the originally requested amount.
+    // Per-step errors are tolerated here: the user is still credited because
+    // the trade completed, and any stuck diamonds will be logged and need
+    // operator attention via the overflow chest.
+    let rb = super::super::rollback::rollback_amount_to_storage(
+        store,
+        "diamond",
+        diamonds_actually_received,
+        64,
+        "[Deposit]",
+    )
+    .await;
+    if rb.has_failures() {
+        tracing::warn!(
+            "[Deposit] Failed to deposit {} diamond step(s) into storage - some diamonds may remain in bot inventory",
+            rb.operations_failed
+        );
     }
 
     // Add to balance - credit the ACTUAL diamonds received, not the requested amount
@@ -1304,7 +1264,7 @@ pub async fn handle_deposit_balance_queued(
         user_uuid.clone(),
     ));
 
-    tracing::info!("Executed deposit balance: user={} amount={}", player_name, actual_amount);
+    info!("[Deposit] Completed: user={} amount={}", player_name, actual_amount);
 
     if let Err(e) = state::assert_invariants(store, "post-deposit-balance", true) {
         tracing::error!("Invariant violation after deposit balance: {}", e);
@@ -1330,7 +1290,7 @@ pub async fn handle_withdraw_balance_queued(
     player_name: &str,
     amount: Option<f64>,
 ) -> Result<(), String> {
-    info!("[Withdraw] === STARTING WITHDRAW ORDER === player={} amount={:?}", player_name, amount);
+    info!("[Withdraw] Starting: player={} amount={:?}", player_name, amount);
     state::assert_invariants(store, "pre-withdraw-balance", false)?;
 
     // Maximum diamonds the trade GUI can hold per transaction: 12 slots
@@ -1412,16 +1372,15 @@ pub async fn handle_withdraw_balance_queued(
 
     // Withdraw diamonds from storage (diamond chest) before trading
     if whole_diamonds > 0 {
-        info!("[Withdraw] Withdrawing {} diamonds from storage for {}", whole_diamonds, player_name);
         let mut sim_storage = store.storage.clone();
         let withdraw_plan = sim_storage.withdraw_plan("diamond", whole_diamonds);
         let preview_withdrawn: i32 = withdraw_plan.iter().map(|t| t.amount).sum();
-        debug!("[Withdraw] Diamond withdrawal plan: {} operations, {} total diamonds", 
-               withdraw_plan.len(), preview_withdrawn);
-        
+
         if preview_withdrawn < whole_diamonds {
-            tracing::error!("[Withdraw] Insufficient physical diamonds: need {}, storage has {}", 
-                   whole_diamonds, preview_withdrawn);
+            tracing::error!(
+                "[Withdraw] Insufficient physical diamonds: need {}, storage has {}",
+                whole_diamonds, preview_withdrawn
+            );
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -1433,13 +1392,7 @@ pub async fn handle_withdraw_balance_queued(
             .await;
         }
 
-        let mut withdraw_step = 0;
         for t in &withdraw_plan {
-            withdraw_step += 1;
-            info!("[Withdraw] Diamond withdrawal step {}/{}: chest {} at ({},{},{}), {} diamonds",
-                  withdraw_step, withdraw_plan.len(),
-                  t.chest_id, t.position.x, t.position.y, t.position.z, t.amount);
-            
             let node_position = store.get_node_position(t.chest_id);
             let chest = crate::types::Chest {
                 id: t.chest_id,
@@ -1451,7 +1404,6 @@ pub async fn handle_withdraw_balance_queued(
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            debug!("[Withdraw] Sending diamond withdrawal instruction to bot...");
             let send_result = store.bot_tx
                 .send(crate::messages::BotInstruction::InteractWithChestAndSync {
                     target_chest: chest,
@@ -1467,28 +1419,23 @@ pub async fn handle_withdraw_balance_queued(
                 .await;
             
             if let Err(e) = send_result {
-                tracing::error!("[Withdraw] FAILED to send chest instruction: {}", e);
+                tracing::error!("[Withdraw] Failed to send chest instruction: {}", e);
                 return Err(format!("Failed to send chest instruction to bot: {}", e));
             }
 
-            debug!("[Withdraw] Awaiting diamond withdrawal response (timeout {}s)...", CHEST_OP_TIMEOUT_SECS);
-            let await_start = std::time::Instant::now();
-            let timeout_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await;
-            let await_elapsed = await_start.elapsed();
-            
-            let bot_result = match timeout_result {
-                Ok(channel_result) => {
-                    debug!("[Withdraw] Response received after {:.2}s", await_elapsed.as_secs_f64());
-                    match channel_result {
-                        Ok(result) => result,
-                        Err(e) => {
-                            tracing::error!("[Withdraw] Channel DROPPED after {:.2}s: {}", await_elapsed.as_secs_f64(), e);
-                            return Err(format!("Bot response dropped: {}", e));
-                        }
-                    }
+            let bot_result = match tokio::time::timeout(
+                tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS),
+                rx,
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    tracing::error!("[Withdraw] Channel dropped: {}", e);
+                    return Err(format!("Bot response dropped: {}", e));
                 }
                 Err(_) => {
-                    tracing::error!("[Withdraw] TIMEOUT after {:.2}s!", await_elapsed.as_secs_f64());
+                    tracing::error!("[Withdraw] Timeout waiting for bot");
                     return Err("Bot timed out withdrawing diamonds from storage".to_string());
                 }
             };
@@ -1504,14 +1451,12 @@ pub async fn handle_withdraw_balance_queued(
                     .await;
                 }
                 Ok(report) => {
-                    info!("[Withdraw] Diamond withdrawal from chest {} succeeded", report.chest_id);
                     if let Err(e) = store.apply_chest_sync(report) {
                         tracing::warn!("[Withdraw] Chest sync failed after diamond withdrawal: {}", e);
                     }
                 }
             }
         }
-        info!("[Withdraw] All {} diamond withdrawal operations completed", withdraw_plan.len());
     }
 
     // NOTE: Do NOT deduct balance yet - wait until trade succeeds.
@@ -1530,7 +1475,7 @@ pub async fn handle_withdraw_balance_queued(
     // so a user cannot lose diamonds to a failed/cancelled trade.
 
     // Perform trade: bot offers whole diamonds, player offers nothing
-    info!("[Withdraw] Initiating trade: bot offers {} diamonds to {}", whole_diamonds, player_name);
+    info!("[Withdraw] Initiating trade: {} diamonds to {}", whole_diamonds, player_name);
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
     let trade_send_result = store.bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
@@ -1552,193 +1497,75 @@ pub async fn handle_withdraw_balance_queued(
         .await;
     
     if let Err(e) = trade_send_result {
-        tracing::error!("[Withdraw] FAILED to send trade instruction: {}", e);
+        tracing::error!("[Withdraw] Failed to send trade instruction: {}", e);
         // Rollback: deposit diamonds back into storage (balance was NOT deducted)
-        if whole_diamonds > 0 {
-            info!("[Withdraw] Rolling back {} diamonds to storage (trade send failed)", whole_diamonds);
-            let stack_size = 64;
-            let mut sim_storage = store.storage.clone();
-            let deposit_plan = sim_storage.deposit_plan("diamond", whole_diamonds, stack_size);
-            
-            for t in &deposit_plan {
-                let node_position = store.get_node_position(t.chest_id);
-                let chest = crate::types::Chest {
-                    id: t.chest_id,
-                    node_id: t.chest_id / 4,
-                    index: t.chest_id % 4,
-                    position: t.position,
-                    item: t.item.clone(),
-                    amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-                };
-
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let _ = store.bot_tx
-                    .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                        target_chest: chest,
-                        node_position,
-                        action: crate::messages::ChestAction::Deposit {
-                            item: "diamond".to_string(),
-                            amount: t.amount,
-                            from_player: None,
-                            stack_size: 64, // Diamonds stack to 64
-                        },
-                        respond_to: tx,
-                    })
-                    .await;
-                if let Ok(Ok(Ok(report))) = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await {
-                    let _ = store.apply_chest_sync(report);
-                }
-            }
-        }
+        let _ = super::super::rollback::rollback_amount_to_storage(
+            store,
+            "diamond",
+            whole_diamonds,
+            64,
+            "[Withdraw] trade-send-failed",
+        )
+        .await;
         return Err(format!("Failed to send trade instruction to bot: {}", e));
     }
-    info!("[Withdraw] Trade instruction sent, awaiting result (timeout 45s)...");
 
-    let trade_start = std::time::Instant::now();
-    let trade_timeout_result = tokio::time::timeout(tokio::time::Duration::from_secs(45), trade_rx).await;
-    let trade_elapsed = trade_start.elapsed();
-    
-    let trade_result = match trade_timeout_result {
-        Ok(channel_result) => {
-            info!("[Withdraw] Trade response received after {:.2}s", trade_elapsed.as_secs_f64());
-            match channel_result {
-                Ok(result) => result, // Extract inner Result<Vec<TradeItem>, String> directly
-                Err(e) => {
-                    tracing::error!("[Withdraw] Trade channel DROPPED after {:.2}s: {}", trade_elapsed.as_secs_f64(), e);
-                    // Rollback: deposit diamonds back into storage before returning
-                    if whole_diamonds > 0 {
-                        info!("[Withdraw] Rolling back {} diamonds to storage (channel dropped)", whole_diamonds);
-                        let stack_size = 64;
-                        let mut sim_storage = store.storage.clone();
-                        let deposit_plan = sim_storage.deposit_plan("diamond", whole_diamonds, stack_size);
-                        
-                        for t in &deposit_plan {
-                            let node_position = store.get_node_position(t.chest_id);
-                            let chest = crate::types::Chest {
-                                id: t.chest_id,
-                                node_id: t.chest_id / 4,
-                                index: t.chest_id % 4,
-                                position: t.position,
-                                item: t.item.clone(),
-                                amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-                            };
-
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let _ = store.bot_tx
-                                .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                                    target_chest: chest,
-                                    node_position,
-                                    action: crate::messages::ChestAction::Deposit {
-                                        item: "diamond".to_string(),
-                                        amount: t.amount,
-                                        from_player: None,
-                                        stack_size: 64,
-                                    },
-                                    respond_to: tx,
-                                })
-                                .await;
-                            if let Ok(Ok(Ok(report))) = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await {
-                                let _ = store.apply_chest_sync(report);
-                            }
-                        }
-                    }
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        &format!("Withdraw aborted: bot response dropped: {}", e),
-                    ).await;
-                }
-            }
+    let trade_result = match tokio::time::timeout(
+        tokio::time::Duration::from_millis(store.config.trade_timeout_ms),
+        trade_rx,
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            tracing::error!("[Withdraw] Trade channel dropped: {}", e);
+            let _ = super::super::rollback::rollback_amount_to_storage(
+                store,
+                "diamond",
+                whole_diamonds,
+                64,
+                "[Withdraw] channel-dropped",
+            )
+            .await;
+            return utils::send_message_to_player(
+                store,
+                player_name,
+                &format!("Withdraw aborted: bot response dropped: {}", e),
+            )
+            .await;
         }
         Err(_) => {
-            tracing::error!("[Withdraw] Trade TIMEOUT after {:.2}s!", trade_elapsed.as_secs_f64());
-            // Rollback: deposit diamonds back into storage before returning
-            if whole_diamonds > 0 {
-                info!("[Withdraw] Rolling back {} diamonds to storage (timeout)", whole_diamonds);
-                let stack_size = 64;
-                let mut sim_storage = store.storage.clone();
-                let deposit_plan = sim_storage.deposit_plan("diamond", whole_diamonds, stack_size);
-                
-                for t in &deposit_plan {
-                    let node_position = store.get_node_position(t.chest_id);
-                    let chest = crate::types::Chest {
-                        id: t.chest_id,
-                        node_id: t.chest_id / 4,
-                        index: t.chest_id % 4,
-                        position: t.position,
-                        item: t.item.clone(),
-                        amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-                    };
-
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = store.bot_tx
-                        .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                            target_chest: chest,
-                            node_position,
-                            action: crate::messages::ChestAction::Deposit {
-                                item: "diamond".to_string(),
-                                amount: t.amount,
-                                from_player: None,
-                                stack_size: 64,
-                            },
-                            respond_to: tx,
-                        })
-                        .await;
-                    if let Ok(Ok(Ok(report))) = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await {
-                        let _ = store.apply_chest_sync(report);
-                    }
-                }
-            }
+            tracing::error!("[Withdraw] Trade timeout");
+            let _ = super::super::rollback::rollback_amount_to_storage(
+                store,
+                "diamond",
+                whole_diamonds,
+                64,
+                "[Withdraw] timeout",
+            )
+            .await;
             return utils::send_message_to_player(
                 store,
                 player_name,
                 "Withdraw aborted: bot timed out waiting for trade completion. Diamonds returned to storage.",
-            ).await;
+            )
+            .await;
         }
     };
-    
-    if let Err(ref err) = trade_result {
-        tracing::error!("[Withdraw] Trade FAILED: {}", err);
-        // NOTE: Balance was NOT deducted yet, so no need to restore it
-        
-        // Rollback: deposit diamonds back into storage
-        if whole_diamonds > 0 {
-            info!("[Withdraw] Rolling back {} diamonds to storage", whole_diamonds);
-            let stack_size = 64;
-            let mut sim_storage = store.storage.clone();
-            let deposit_plan = sim_storage.deposit_plan("diamond", whole_diamonds, stack_size);
-            
-            for t in &deposit_plan {
-                let node_position = store.get_node_position(t.chest_id);
-                let chest = crate::types::Chest {
-                    id: t.chest_id,
-                    node_id: t.chest_id / 4,
-                    index: t.chest_id % 4,
-                    position: t.position,
-                    item: t.item.clone(),
-                    amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-                };
 
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let _ = store.bot_tx
-                    .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                        target_chest: chest,
-                        node_position,
-                        action: crate::messages::ChestAction::Deposit {
-                            item: "diamond".to_string(),
-                            amount: t.amount,
-                            from_player: None,
-                            stack_size: 64, // Diamonds stack to 64
-                        },
-                        respond_to: tx,
-                    })
-                    .await;
-                if let Ok(Ok(Ok(report))) = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx).await {
-                    let _ = store.apply_chest_sync(report);
-                }
-            }
-        }
-        
+    if let Err(ref err) = trade_result {
+        warn!("[Withdraw] Trade failed: {}", err);
+        // Balance was NOT deducted yet, so no need to restore it; only need to put
+        // the physical diamonds back.
+        let _ = super::super::rollback::rollback_amount_to_storage(
+            store,
+            "diamond",
+            whole_diamonds,
+            64,
+            "[Withdraw] trade-failed",
+        )
+        .await;
+
         return utils::send_message_to_player(
             store,
             player_name,
@@ -1772,7 +1599,7 @@ pub async fn handle_withdraw_balance_queued(
         user_uuid.clone(),
     ));
 
-    tracing::info!("Executed withdraw balance: user={} amount={}", player_name, amount);
+    info!("[Withdraw] Completed: user={} amount={}", player_name, amount);
 
     if let Err(e) = state::assert_invariants(store, "post-withdraw-balance", true) {
         tracing::error!("Invariant violation after withdraw balance: {}", e);

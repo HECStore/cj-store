@@ -19,20 +19,6 @@ pub fn normalize_item_id(item: &str) -> String {
     item.strip_prefix("minecraft:").unwrap_or(item).to_string()
 }
 
-/// Add "minecraft:" prefix to an item ID for use with Minecraft server.
-/// Use this when sending item IDs to the game (e.g., for trade validation).
-#[allow(dead_code)]
-pub fn with_minecraft_prefix(item: &str) -> String {
-    if item.is_empty() {
-        return String::new();
-    }
-    if item.contains(':') {
-        item.to_string()
-    } else {
-        format!("minecraft:{}", item)
-    }
-}
-
 /// Resolve username to UUID via Mojang API (async)
 ///
 /// Uses the async Mojang API client for better performance without blocking the runtime.
@@ -184,22 +170,6 @@ mod tests {
         
         // Empty string returns empty string (invalid, caller should validate)
         assert_eq!(normalize_item_id(""), "");
-    }
-    
-    #[test]
-    fn test_with_minecraft_prefix() {
-        // Should add minecraft: prefix
-        assert_eq!(with_minecraft_prefix("diamond"), "minecraft:diamond");
-        assert_eq!(with_minecraft_prefix("cobblestone"), "minecraft:cobblestone");
-        
-        // Should preserve existing prefix
-        assert_eq!(with_minecraft_prefix("minecraft:diamond"), "minecraft:diamond");
-        
-        // Should preserve custom namespaces
-        assert_eq!(with_minecraft_prefix("modid:custom_item"), "modid:custom_item");
-        
-        // Empty string returns empty string
-        assert_eq!(with_minecraft_prefix(""), "");
     }
     
     #[test]

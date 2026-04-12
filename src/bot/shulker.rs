@@ -78,16 +78,8 @@ pub fn is_shulker_box(item_id: &str) -> bool {
     SHULKER_BOX_IDS.contains(&normalized.as_str())
 }
 
-/// Validate that a chest slot contains a shulker box.
-///
-/// # Arguments
-/// * `item_id` - The item ID found in the chest slot
-/// * `slot_index` - The slot index (for error messages)
-///
-/// # Returns
-/// * `Ok(())` if the slot contains a valid shulker box
-/// * `Err(message)` if the slot is empty or contains a non-shulker item
-#[allow(dead_code)]
+/// Validate that a chest slot contains a shulker box (test-only helper).
+#[cfg(test)]
 pub fn validate_chest_slot_is_shulker(item_id: &str, slot_index: usize) -> Result<(), String> {
     if item_id.is_empty() {
         return Err(format!(
@@ -108,72 +100,6 @@ pub fn validate_chest_slot_is_shulker(item_id: &str, slot_index: usize) -> Resul
     Ok(())
 }
 
-/// Place a shulker box from inventory onto the shulker station position.
-/// The shulker should already be in hand (picked up from chest).
-#[allow(dead_code)]
-pub async fn place_shulker_on_station(bot: &Bot, station_pos: &Position) -> Result<(), String> {
-    info!(
-        "place_shulker_on_station: Placing shulker at station ({}, {}, {})",
-        station_pos.x, station_pos.y, station_pos.z
-    );
-
-    let client = bot.client.read().await.clone().ok_or_else(|| {
-        error!("place_shulker_on_station: Bot not connected");
-        "Bot not connected".to_string()
-    })?;
-
-    // Verify we're holding a shulker before placing
-    let carried = super::inventory::carried_item(&client);
-    if carried.count() == 0 || !is_shulker_box(&carried.kind().to_string()) {
-        error!(
-            "place_shulker_on_station: Not holding a shulker! Cursor has: {} x{}",
-            carried.kind(),
-            carried.count()
-        );
-        return Err(format!(
-            "Not holding a shulker before placing. Cursor has: {} x{}",
-            carried.kind(),
-            carried.count()
-        ));
-    }
-    debug!(
-        "place_shulker_on_station: Verified holding shulker: {} x{}",
-        carried.kind(),
-        carried.count()
-    );
-
-    // Place it on the station (shulker should be in cursor from chest click)
-    // In Minecraft, to place a block, you right-click on the face of an adjacent block
-    // The station is at the same Y as the node, so we click on the block below to place on top
-    // Sequencing: look_at -> short settle delay -> block_interact -> longer settle delay.
-    // The delays give the server time to process the rotation packet before the place packet,
-    // and then let the resulting block-place finalize before the caller proceeds.
-    let place_on_block = BlockPos::new(station_pos.x, station_pos.y - 1, station_pos.z);
-    // Look at the top face of the floor block (where we want to place the shulker)
-    let place_vec3 = Vec3::new(
-        station_pos.x as f64 + 0.5,
-        station_pos.y as f64 - 0.4, // Look slightly below station Y to target floor block's top face
-        station_pos.z as f64 + 0.5,
-    );
-    debug!(
-        "place_shulker_on_station: Looking at placement target ({:.1}, {:.1}, {:.1})",
-        place_vec3.x, place_vec3.y, place_vec3.z
-    );
-    client.look_at(place_vec3);
-    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-
-    // Right-click on the block below to place the shulker on top
-    debug!(
-        "place_shulker_on_station: Interacting with block at ({}, {}, {})",
-        place_on_block.x, place_on_block.y, place_on_block.z
-    );
-    client.block_interact(place_on_block);
-    tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
-
-    info!("place_shulker_on_station: Shulker placement interaction complete");
-    Ok(())
-}
-
 /// Pick up a shulker box from the shulker station.
 /// Breaks the shulker first, waits for it to be fully broken, then walks to the X position
 /// (x-3 from node position, one block west of S) to pick up the dropped item, then returns
@@ -183,8 +109,8 @@ pub async fn pickup_shulker_from_station(
     station_pos: &Position,
     node_position: &Position,
 ) -> Result<(), String> {
-    info!(
-        "pickup_shulker_from_station: Starting shulker pickup at station ({}, {}, {})",
+    debug!(
+        "pickup_shulker_from_station: Picking up shulker at ({}, {}, {})",
         station_pos.x, station_pos.y, station_pos.z
     );
 
@@ -217,10 +143,6 @@ pub async fn pickup_shulker_from_station(
     }
 
     // Break the shulker first (bot should already be positioned to see it)
-    info!(
-        "pickup_shulker_from_station: Breaking shulker at ({}, {}, {})",
-        station_pos.x, station_pos.y, station_pos.z
-    );
     // Look at center of shulker block for accurate mining
     let station_vec3 = Vec3::new(
         station_pos.x as f64 + 0.5,
@@ -255,8 +177,8 @@ pub async fn pickup_shulker_from_station(
             // Block is broken if it's air or any non-solid block
             // Use case-insensitive check since debug format produces "ShulkerBox" not "shulker"
             if block_name_lower.contains("air") || !block_name_lower.contains("shulker") {
-                info!(
-                    "pickup_shulker_from_station: Shulker block BROKEN after {}ms (block is now: {})",
+                debug!(
+                    "pickup_shulker_from_station: Block broken after {}ms (now: {})",
                     waited_ms, block_name
                 );
                 break;
@@ -270,8 +192,8 @@ pub async fn pickup_shulker_from_station(
             }
         } else {
             // Block state is None, treat as broken
-            info!(
-                "pickup_shulker_from_station: Shulker block BROKEN after {}ms (block state is None)",
+            debug!(
+                "pickup_shulker_from_station: Block broken after {}ms (state=None)",
                 waited_ms
             );
             break;
@@ -315,7 +237,7 @@ pub async fn pickup_shulker_from_station(
     // After the block is destroyed the server spawns the dropped item entity on a
     // short delay, and it needs a moment to settle onto the floor before the bot's
     // pickup radius can reliably vacuum it up.
-    info!("pickup_shulker_from_station: Waiting 1s for dropped item to settle");
+    // Wait for the dropped item entity to settle
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     // Walk to X position (x-3 from node position) to pick up the dropped shulker.
@@ -327,8 +249,8 @@ pub async fn pickup_shulker_from_station(
         y: node_position.y,
         z: node_position.z,
     };
-    info!(
-        "pickup_shulker_from_station: Walking to pickup position ({}, {}, {}) to collect dropped shulker",
+    debug!(
+        "pickup_shulker_from_station: Walking to pickup position ({}, {}, {})",
         pickup_pos.x, pickup_pos.y, pickup_pos.z
     );
     super::navigation::navigate_to_position(bot, &pickup_pos).await?;
@@ -336,11 +258,7 @@ pub async fn pickup_shulker_from_station(
     // triggered by walking over the item before we move again.
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
-    // Walk back to node position to ensure we're in the right place for next operations
-    info!(
-        "pickup_shulker_from_station: Returning to node position ({}, {}, {})",
-        node_position.x, node_position.y, node_position.z
-    );
+    // Walk back to node position
     super::navigation::navigate_to_position(bot, node_position).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
@@ -355,12 +273,7 @@ pub async fn pickup_shulker_from_station(
         if let Some(slots) = slots {
             for (i, slot) in slots.iter().enumerate() {
                 if slot.count() > 0 && is_shulker_box(&slot.kind().to_string()) {
-                    info!(
-                        "pickup_shulker_from_station: SUCCESS - Found shulker in inventory slot {} ({})",
-                        i,
-                        slot.kind()
-                    );
-                    info!("pickup_shulker_from_station: Pickup operation complete");
+                    debug!("pickup_shulker_from_station: Found shulker in slot {}", i);
                     return Ok(());
                 }
             }
@@ -442,16 +355,11 @@ async fn open_shulker_at_station_once(
 
     match result {
         Some(container) => {
-            // Log container info
             if let Some(contents) = container.contents() {
-                info!(
-                    "open_shulker_at_station_once: SUCCESS - Shulker opened, {} slots, {} items",
+                debug!(
+                    "open_shulker_at_station_once: Opened, {} slots, {} items",
                     contents.len(),
                     contents.iter().map(|s| s.count() as i32).sum::<i32>()
-                );
-            } else {
-                info!(
-                    "open_shulker_at_station_once: SUCCESS - Shulker opened (contents not available yet)"
                 );
             }
             Ok(container)
@@ -476,9 +384,9 @@ pub async fn open_shulker_at_station(
     bot: &Bot,
     station_pos: &Position,
 ) -> Result<azalea::container::ContainerHandle, String> {
-    info!(
-        "open_shulker_at_station: Opening shulker at ({}, {}, {}) with up to {} retries",
-        station_pos.x, station_pos.y, station_pos.z, SHULKER_OP_MAX_RETRIES
+    debug!(
+        "open_shulker_at_station: Opening at ({}, {}, {})",
+        station_pos.x, station_pos.y, station_pos.z
     );
 
     let mut last_error = String::new();
@@ -487,14 +395,9 @@ pub async fn open_shulker_at_station(
         if attempt > 0 {
             let delay_ms =
                 exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
-            info!(
-                "open_shulker_at_station: Retry {}/{} at ({}, {}, {}) after {}ms delay",
-                attempt + 1,
-                SHULKER_OP_MAX_RETRIES,
-                station_pos.x,
-                station_pos.y,
-                station_pos.z,
-                delay_ms
+            debug!(
+                "open_shulker_at_station: Retry {}/{} after {}ms",
+                attempt + 1, SHULKER_OP_MAX_RETRIES, delay_ms
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         } else {

@@ -73,12 +73,12 @@ struct MojangResponse {
     id: String,
 }
 
+#[allow(dead_code)] // persistence + lookup API kept as cohesive surface
 impl User {
     // Directory where all individual user files will be stored
     const USERS_DIR: &str = "data/users";
 
     /// Convenience constructor (reserved for future tooling).
-    #[allow(dead_code)]
     pub fn new(username: String) -> Self {
         User {
             uuid: Self::get_uuid(&username).unwrap_or_default(),
@@ -207,7 +207,6 @@ impl User {
 
     /// Loads a single `User` from `data/users/{uuid}.json`.
     /// Reserved for future tooling/debugging.
-    #[allow(dead_code)]
     pub fn load(uuid: &str) -> io::Result<Self> {
         let path = Self::get_user_file_path(uuid);
 

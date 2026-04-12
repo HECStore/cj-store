@@ -101,10 +101,6 @@ pub async fn place_shulker_in_chest_slot_verified(
     }
 
     // Place back in chest slot
-    info!(
-        "place_shulker_in_chest_slot_verified: Left-clicking chest slot {} to place shulker", 
-        chest_slot
-    );
     container.click(PickupClick::Left {
         slot: Some(chest_slot as u16),
     });
@@ -149,10 +145,6 @@ pub async fn place_shulker_in_chest_slot_verified(
             if chest_item.count() > 0
                 && super::shulker::is_shulker_box(&chest_item.kind().to_string())
             {
-                info!(
-                    "place_shulker_in_chest_slot_verified: SUCCESS - Shulker verified in chest slot {} on attempt {}",
-                    chest_slot, attempt + 1
-                );
                 verified = true;
                 break;
             }
@@ -177,7 +169,6 @@ pub async fn place_shulker_in_chest_slot_verified(
         );
 
         // Try clicking on chest slot again in case shulker is in cursor
-        info!("place_shulker_in_chest_slot_verified: Recovery - clicking chest slot {} again", chest_slot);
         container.click(PickupClick::Left {
             slot: Some(chest_slot as u16),
         });
@@ -197,10 +188,6 @@ pub async fn place_shulker_in_chest_slot_verified(
             if chest_item.count() > 0
                 && super::shulker::is_shulker_box(&chest_item.kind().to_string())
             {
-                info!(
-                    "place_shulker_in_chest_slot_verified: Recovery SUCCESS - Shulker placed in chest slot {}",
-                    chest_slot
-                );
                 return Ok(());
             }
         }
@@ -289,42 +276,17 @@ async fn open_chest_container_once(
     let timeout_ticks: usize = 300;
     let timeout_secs = timeout_ticks / 20;
 
-    debug!(
-        "open_chest_container_once: Opening container with {}s timeout",
-        timeout_secs
-    );
     let container = client
         .open_container_at_with_timeout_ticks(chest_pos, Some(timeout_ticks))
         .await;
 
     match container {
-        Some(c) => {
-            // Log container info
-            if let Some(contents) = c.contents() {
-                info!(
-                    "open_chest_container_once: SUCCESS - Chest opened at ({}, {}, {}), {} slots, {} items",
-                    chest_pos.x, chest_pos.y, chest_pos.z,
-                    contents.len(),
-                    contents.iter().map(|s| s.count() as i32).sum::<i32>()
-                );
-            } else {
-                info!(
-                    "open_chest_container_once: SUCCESS - Chest opened at ({}, {}, {}) (contents not available yet)",
-                    chest_pos.x, chest_pos.y, chest_pos.z
-                );
-            }
-            Ok(c)
-        }
+        Some(c) => Ok(c),
         None => {
-            error!(
-                "open_chest_container_once: FAILED to open chest at ({}, {}, {}) after {}s timeout",
+            Err(format!(
+                "Failed to open chest at ({}, {}, {}) after {}s timeout",
                 chest_pos.x, chest_pos.y, chest_pos.z, timeout_secs
-            );
-            let error_msg = format!(
-                "Failed to open chest at ({}, {}, {}) after {}s timeout - chest may not exist or is obstructed",
-                chest_pos.x, chest_pos.y, chest_pos.z, timeout_secs
-            );
-            Err(error_msg)
+            ))
         }
     }
 }
@@ -376,13 +338,7 @@ pub async fn open_chest_container_for_validation(
         .await;
 
     match container {
-        Some(c) => {
-            info!(
-                "Successfully opened chest at ({}, {}, {}) for validation",
-                chest_pos.x, chest_pos.y, chest_pos.z
-            );
-            Ok(c)
-        }
+        Some(c) => Ok(c),
         None => {
             // No retries for validation - fail fast
             Err(format!(
@@ -409,41 +365,22 @@ pub async fn open_chest_container(
     bot: &Bot,
     chest_pos: BlockPos,
 ) -> Result<azalea::container::ContainerHandle, String> {
-    info!(
-        "open_chest_container: Opening chest at ({}, {}, {}) with up to {} retries",
-        chest_pos.x, chest_pos.y, chest_pos.z, CHEST_OP_MAX_RETRIES
-    );
-    
     let mut last_error = String::new();
 
     for attempt in 0..CHEST_OP_MAX_RETRIES {
         if attempt > 0 {
             let delay_ms =
                 exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
-            info!(
-                "open_chest_container: Retry {}/{} at ({}, {}, {}) after {}ms delay",
-                attempt + 1,
-                CHEST_OP_MAX_RETRIES,
-                chest_pos.x,
-                chest_pos.y,
-                chest_pos.z,
-                delay_ms
+            debug!(
+                "Retrying chest open at ({}, {}, {}) attempt {}/{} after {}ms",
+                chest_pos.x, chest_pos.y, chest_pos.z,
+                attempt + 1, CHEST_OP_MAX_RETRIES, delay_ms
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        } else {
-            debug!("open_chest_container: Attempt 1/{}", CHEST_OP_MAX_RETRIES);
         }
 
         match open_chest_container_once(bot, chest_pos).await {
-            Ok(container) => {
-                if attempt > 0 {
-                    info!(
-                        "open_chest_container: SUCCESS on attempt {}/{}", 
-                        attempt + 1, CHEST_OP_MAX_RETRIES
-                    );
-                }
-                return Ok(container);
-            }
+            Ok(container) => return Ok(container),
             Err(e) => {
                 last_error = e.clone();
                 warn!(
@@ -484,9 +421,9 @@ pub async fn transfer_items_with_shulker(
     let mut remaining = amount;
     let mut total_moved = 0;
 
-    info!(
-        "transfer_items_with_shulker: Starting {} of {} x{} (target_id: {})", 
-        direction, item, amount, target_id
+    debug!(
+        "transfer_items_with_shulker: {} {} x{}",
+        direction, item, amount
     );
 
     match direction {
@@ -526,10 +463,6 @@ pub async fn transfer_items_with_shulker(
                 }
 
                 let Some((slot, stack_count)) = found else {
-                    info!(
-                        "transfer_items_with_shulker: No more {} found in shulker, stopping withdraw", 
-                        target_id
-                    );
                     break;
                 };
 
@@ -560,11 +493,10 @@ pub async fn transfer_items_with_shulker(
                         
                         if current_count < stack_count {
                             // Items DID move, we just didn't detect it
-                            // Count the actual moved amount
                             let actual_moved = stack_count - current_count;
-                            info!(
-                                "transfer_items_with_shulker: Shift-click reported 0 but {} items actually moved (slot {} now has {})", 
-                                actual_moved, slot, current_count
+                            debug!(
+                                "Shift-click reported 0 but {} items actually moved",
+                                actual_moved
                             );
                             total_moved += actual_moved;
                             remaining -= actual_moved;
@@ -592,17 +524,12 @@ pub async fn transfer_items_with_shulker(
                     );
                 } else {
                     // Need only a partial stack - use manual click transfer
-                    info!(
-                        "transfer_items_with_shulker: Partial transfer needed ({} from stack of {})", 
-                        remaining, stack_count
-                    );
                     // Pick up the stack from shulker
-                    debug!("transfer_items_with_shulker: Picking up stack from slot {}", slot);
                     shulker_container.click(PickupClick::Left {
                         slot: Some(slot as u16),
                     });
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    
+
                     // Find an empty slot in inventory portion (slots 27-53 in shulker container view)
                     let all_slots = shulker_container
                         .slots()
@@ -708,10 +635,6 @@ pub async fn transfer_items_with_shulker(
                 }
 
                 let Some((slot, stack_count)) = found else {
-                    info!(
-                        "transfer_items_with_shulker: No more {} found in inventory/hotbar, stopping deposit", 
-                        target_id
-                    );
                     break;
                 };
 
@@ -735,10 +658,7 @@ pub async fn transfer_items_with_shulker(
                         if current_count < stack_count {
                             // Items DID move, we just didn't detect it
                             let actual_moved = stack_count - current_count;
-                            info!(
-                                "transfer_items_with_shulker: Shift-click reported 0 but {} items actually moved (slot {} now has {})", 
-                                actual_moved, slot, current_count
-                            );
+                            debug!("Shift-click reported 0 but {} items actually moved", actual_moved);
                             total_moved += actual_moved;
                             remaining -= actual_moved;
                             consecutive_failures = 0;
@@ -746,11 +666,11 @@ pub async fn transfer_items_with_shulker(
                             // Items really didn't move - retry
                             consecutive_failures += 1;
                             warn!(
-                                "transfer_items_with_shulker: Shift-click moved 0 items (failure {}/3)", 
+                                "Shift-click moved 0 items (failure {}/3)",
                                 consecutive_failures
                             );
                             if consecutive_failures >= 3 {
-                                error!("transfer_items_with_shulker: Shift-click failed 3 times in a row, stopping deposit");
+                                error!("Shift-click failed 3 times in a row, stopping deposit");
                                 break;
                             }
                         }
@@ -759,18 +679,9 @@ pub async fn transfer_items_with_shulker(
                     consecutive_failures = 0; // Reset on success
                     total_moved += moved;
                     remaining -= moved;
-                    debug!(
-                        "transfer_items_with_shulker: Shift-click moved {}, total: {}, remaining: {}", 
-                        moved, total_moved, remaining
-                    );
                 } else {
                     // Need only a partial stack - use manual click transfer
-                    info!(
-                        "transfer_items_with_shulker: Partial transfer needed ({} from stack of {})", 
-                        remaining, stack_count
-                    );
                     // Pick up the stack from inventory
-                    debug!("transfer_items_with_shulker: Picking up stack from slot {}", slot);
                     shulker_container.click(PickupClick::Left {
                         slot: Some(slot as u16),
                     });
@@ -844,10 +755,6 @@ pub async fn transfer_items_with_shulker(
                     
                     // If we couldn't place everything, shulker is now full - break to let caller try next shulker
                     if remaining > 0 {
-                        info!(
-                            "transfer_items_with_shulker: Shulker filled during partial transfer, {} items remaining for next shulker",
-                            remaining
-                        );
                         break;
                     }
                 }
@@ -859,196 +766,14 @@ pub async fn transfer_items_with_shulker(
         }
     }
 
-    info!(
-        "transfer_items_with_shulker: {} complete - moved {} of {} requested", 
-        direction, total_moved, amount
-    );
     if total_moved < amount {
         warn!(
-            "transfer_items_with_shulker: Incomplete transfer - only moved {}/{}", 
-            total_moved, amount
+            "Incomplete transfer: moved {}/{} ({})",
+            total_moved, amount, direction
         );
     }
 
     Ok(total_moved)
-}
-
-/// Read chest amounts by opening each shulker in the chest and reading its contents.
-/// Returns a Vec<i32> of length 54, where each entry is the item count in that shulker slot.
-pub async fn read_chest_amounts(
-    bot: &Bot,
-    chest_pos: BlockPos,
-    item: &str,
-    node_position: &Position,
-) -> Result<Vec<i32>, String> {
-    // CRITICAL: Move any items from hotbar to inventory BEFORE starting shulker operations
-    // This ensures hotbar slot 0 is free for shulker placement
-    info!("Clearing hotbar before read_chest_amounts to ensure slot 0 is available");
-    if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-        warn!("Failed to clear hotbar before chest read: {} - proceeding anyway", e);
-    }
-    
-    let mut container = open_chest_container(bot, chest_pos).await?;
-    let target_id = Bot::normalize_item_id(item);
-
-    let contents = container
-        .contents()
-        .ok_or_else(|| "Chest closed while reading contents".to_string())?;
-    if contents.len() != 54 {
-        return Err(format!(
-            "Unexpected chest contents size: {}",
-            contents.len()
-        ));
-    }
-
-    let mut amounts = vec![0i32; 54];
-    let station_pos = super::shulker::shulker_station_position(node_position);
-
-    // For each slot in the chest
-    for slot_idx in 0..54 {
-        // Refresh contents to get current state
-        let contents = container
-            .contents()
-            .ok_or_else(|| "Chest closed".to_string())?;
-        if slot_idx >= contents.len() {
-            continue;
-        }
-
-        let stack = &contents[slot_idx];
-        if stack.count() <= 0 {
-            continue; // Empty slot
-        }
-
-        let id = stack.kind().to_string();
-        if !super::shulker::is_shulker_box(&id) {
-            warn!("Chest slot {} contains non-shulker item: {}", slot_idx, id);
-            continue;
-        }
-
-        // CRITICAL: Ensure cursor is empty before picking up shulker
-        // If cursor has an item, clicking will swap instead of pick up
-        container.click(PickupClick::LeftOutside);
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        // Take shulker from chest slot (pickup into hand)
-        container.click(PickupClick::Left {
-            slot: Some(slot_idx as u16),
-        });
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-        // Place shulker on station - click on floor block below to place on top
-        // In Minecraft, to place a block you right-click on an adjacent solid block
-        let floor_block = BlockPos::new(station_pos.x, station_pos.y - 1, station_pos.z);
-        let client = bot
-            .client
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| "Bot not connected".to_string())?;
-        // Look at the top face of the floor block (where we want to place the shulker)
-        let place_vec3 = Vec3::new(
-            station_pos.x as f64 + 0.5,
-            station_pos.y as f64 - 0.4, // Look slightly below station Y to target floor's top face
-            station_pos.z as f64 + 0.5,
-        );
-        client.look_at(place_vec3);
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-        client.block_interact(floor_block);
-        tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
-
-        // Open shulker
-        let shulker_container = super::shulker::open_shulker_at_station(bot, &station_pos).await?;
-        let shulker_contents = shulker_container
-            .contents()
-            .ok_or_else(|| "Shulker closed".to_string())?;
-
-        // Read item count from shulker (all 27 slots, but we only care about the target item)
-        let mut item_count = 0i32;
-        for shulker_slot in shulker_contents.iter() {
-            if shulker_slot.count() > 0
-                && Bot::normalize_item_id(&shulker_slot.kind().to_string()) == target_id
-            {
-                item_count += shulker_slot.count();
-            }
-        }
-
-        amounts[slot_idx] = item_count;
-
-        // Close shulker
-        shulker_container.close();
-        tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
-
-        // CRITICAL: Clear hotbar BEFORE picking up shulker from station
-        // This ensures the shulker ends up in slot 0 when auto-picked up
-        if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-            warn!("Failed to clear hotbar before shulker pickup (read_chest_amounts): {} - proceeding anyway", e);
-        }
-
-        // Pick up shulker from station (break block)
-        super::shulker::pickup_shulker_from_station(bot, &station_pos, node_position).await?;
-
-        // Re-open chest if it was closed (it might have closed when we broke the shulker)
-        let chest_still_open = container.contents().is_some();
-        if !chest_still_open {
-            // Re-open chest
-            drop(container);
-            container = open_chest_container(bot, chest_pos).await?;
-        }
-
-        // Place shulker back in the same chest slot
-        // Find shulker in inventory through the chest container's slots
-        // When a chest is open, we CANNOT call open_inventory() separately
-        // Double chest layout: slots 0-53 = chest, slots 54-80 = player inventory, slots 81-89 = hotbar
-        let all_slots = container
-            .slots()
-            .ok_or_else(|| "Chest closed while looking for shulker".to_string())?;
-        let chest_size = container
-            .contents()
-            .ok_or_else(|| "Chest closed".to_string())?
-            .len();
-
-        // Search for shulker in player inventory portion of chest view (slots after chest contents)
-        let mut shulker_in_container_view: Option<usize> = None;
-        for i in chest_size..all_slots.len() {
-            let slot_item = &all_slots[i];
-            if slot_item.count() > 0
-                && super::shulker::is_shulker_box(&slot_item.kind().to_string())
-            {
-                shulker_in_container_view = Some(i);
-                break;
-            }
-        }
-
-        if let Some(container_slot) = shulker_in_container_view {
-            // Pick up shulker from the container view's inventory portion
-            container.click(PickupClick::Left {
-                slot: Some(container_slot as u16),
-            });
-            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-
-            // Place back in chest slot
-            container.click(PickupClick::Left {
-                slot: Some(slot_idx as u16),
-            });
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            
-            // Only close/reopen if there might be more slots to process
-            if slot_idx < 53 {
-                // Close and reopen chest to ensure clean state for next iteration
-                // close() takes ownership, so we must reopen immediately
-                container.close();
-                tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
-                container = open_chest_container(bot, chest_pos).await?;
-            }
-        } else {
-            warn!(
-                "Could not find shulker in inventory (via chest container view) to place back in slot {}",
-                slot_idx
-            );
-        }
-    }
-
-    Ok(amounts)
 }
 
 /// Automated chest I/O with full shulker handling.
@@ -1109,7 +834,6 @@ pub async fn automated_chest_io(
     if !super::inventory::is_entity_ready(&client) {
         warn!("Entity not ready, waiting for initialization...");
         super::inventory::wait_for_entity_ready(&client).await?;
-        info!("Entity now ready for chest operations");
     }
     
     // CRITICAL: Verify bot is at the EXACT node position before chest operations
@@ -1139,10 +863,6 @@ pub async fn automated_chest_io(
             ));
         }
         
-        info!(
-            "Position verified: bot at exact node position ({}, {}, {})",
-            current_block.x, current_block.y, current_block.z
-        );
     }
     
     drop(client); // Release the reference
@@ -1151,7 +871,6 @@ pub async fn automated_chest_io(
     // This ensures hotbar slot 0 is free for shulker placement
     // Without this, if items (like diamonds from a failed trade) are in hotbar slot 0,
     // the shulker operations get messy and can fail
-    info!("Clearing hotbar before chest operations to ensure slot 0 is available");
     if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
         warn!("Failed to clear hotbar before chest operations: {} - proceeding anyway", e);
     }
@@ -1176,15 +895,11 @@ pub async fn automated_chest_io(
 
     let target_id = Bot::normalize_item_id(item);
     info!(
-        "Starting {} operation: {} items of {} at chest {:?}",
+        "[ChestIO] {} {}x {} at chest {:?}",
         direction, amount, item, chest_pos
     );
     let mut container = open_chest_container(bot, chest_pos).await?;
     let station_pos = super::shulker::shulker_station_position(node_position);
-    info!(
-        "Chest opened successfully, shulker station at {:?}",
-        station_pos
-    );
 
     let mut remaining = amount;
 
@@ -1249,7 +964,6 @@ pub async fn automated_chest_io(
                     //      and put it back into the same chest slot
                     // CRITICAL: Ensure cursor is empty before picking up shulker -
                     // if the cursor already holds something the click becomes a swap, not a pickup.
-                    info!("Clearing cursor before picking up shulker");
                     container.click(PickupClick::LeftOutside);
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
@@ -1261,7 +975,6 @@ pub async fn automated_chest_io(
 
                     // IMPORTANT: Close chest FIRST before inventory operations
                     // Can't open inventory while a container is open
-                    info!("Closing chest to allow inventory operations");
                     drop(container);
                     // CRITICAL: Wait longer for server to sync inventory state after chest closes
                     // The shulker that was in cursor needs time to appear in the inventory
@@ -1276,7 +989,6 @@ pub async fn automated_chest_io(
                         .ok_or_else(|| "Bot not connected".to_string())?;
 
                     // CRITICAL: Ensure shulker is in hotbar slot 0 before placing
-                    info!("Ensuring shulker is in hotbar slot 0 before placing on station");
                     if let Err(e) = super::inventory::ensure_shulker_in_hotbar_slot_0(bot).await {
                         return Err(format!("Failed to ensure shulker in hotbar slot 0: {}", e));
                     }
@@ -1335,10 +1047,6 @@ pub async fn automated_chest_io(
                     if shulker_item_count > 0 {
                         // Transfer items from shulker to bot inventory (up to remaining amount)
                         let to_withdraw = remaining.min(shulker_item_count);
-                        info!(
-                            "Shulker contains {} items, withdrawing {} (need {})",
-                            shulker_item_count, to_withdraw, remaining
-                        );
                         let moved = transfer_items_with_shulker(
                             bot,
                             &shulker_container,
@@ -1347,7 +1055,7 @@ pub async fn automated_chest_io(
                             "withdraw",
                         )
                         .await?;
-                        info!("Withdrew {} items from shulker", moved);
+                        debug!("Withdrew {} items from shulker", moved);
                         
                         // Record the count after withdrawal
                         let remaining_in_slot = shulker_item_count - moved;
@@ -1367,10 +1075,6 @@ pub async fn automated_chest_io(
                         // Shulker doesn't contain target item - record 0 and mark confirmed empty
                         slot_counts[slot_idx] = 0;
                         confirmed_empty.insert(slot_idx);
-                        info!(
-                            "Shulker does not contain target item {}, skipping",
-                            target_id
-                        );
                     }
 
                     // Close shulker
@@ -1536,7 +1240,7 @@ pub async fn automated_chest_io(
                     continue;
                 }
 
-                info!("Processing shulker in slot {} for deposit", slot_idx);
+                debug!("Processing shulker in slot {} for deposit", slot_idx);
 
                 // Per-shulker sequence for deposit (mirror of the withdraw sequence):
                 //   take shulker from chest -> close chest -> ensure shulker in hotbar 0 ->
@@ -1545,12 +1249,10 @@ pub async fn automated_chest_io(
                 //   reopen chest -> place shulker back in the same chest slot (verified).
                 // CRITICAL: Ensure cursor is empty before picking up shulker -
                 // if cursor has an item, clicking becomes a swap instead of a pickup.
-                info!("Clearing cursor before picking up shulker");
                 container.click(PickupClick::LeftOutside);
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
                 // Take shulker from chest into cursor
-                info!("Taking shulker from chest slot {}", slot_idx);
                 container.click(PickupClick::Left {
                     slot: Some(slot_idx as u16),
                 });
@@ -1558,7 +1260,6 @@ pub async fn automated_chest_io(
 
                 // IMPORTANT: Close chest FIRST to ensure shulker stays in cursor
                 // If we open inventory while chest is open, the cursor might be lost
-                info!("Closing chest to preserve shulker in cursor");
                 drop(container);
                 // CRITICAL: Wait longer for server to sync inventory state after chest closes
                 // The shulker that was in cursor needs time to appear in the inventory
@@ -1573,7 +1274,6 @@ pub async fn automated_chest_io(
                     .ok_or_else(|| "Bot not connected".to_string())?;
 
                 // CRITICAL: Use ensure_shulker_in_hotbar_slot_0() to handle all cases
-                info!("Ensuring shulker is in hotbar slot 0 before placing on station");
                 if let Err(e) = super::inventory::ensure_shulker_in_hotbar_slot_0(bot).await {
                     return Err(format!("Failed to ensure shulker in hotbar slot 0: {}", e));
                 }
@@ -1616,15 +1316,12 @@ pub async fn automated_chest_io(
 
                 // Right-click on the floor block to place the shulker on top
                 // block_interact performs a right-click interaction with the item in hand/cursor
-                info!("Placing shulker on station by clicking floor block at {:?}", floor_block);
                 client.block_interact(floor_block);
                 tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
 
                 // Open shulker (don't reopen chest yet - we'll do that after closing shulker if needed)
-                info!("Opening shulker at station");
                 let shulker_container =
                     super::shulker::open_shulker_at_station(bot, &station_pos).await?;
-                info!("Shulker opened successfully");
 
                 // Check if shulker has space (can hold target item) and count existing items
                 // Use the correct stack size for calculating available space
@@ -1642,7 +1339,7 @@ pub async fn automated_chest_io(
                     }
                 }
 
-                info!(
+                debug!(
                     "Shulker has {} space for {} (need {}), currently contains {}",
                     total_space, target_id, remaining, initial_item_count
                 );
@@ -1663,18 +1360,14 @@ pub async fn automated_chest_io(
                         bot_item_count += stack.count();
                     }
                 }
-                info!(
-                    "Bot has {} items of {} in inventory+hotbar (slots 27-62)",
+                debug!(
+                    "Bot has {} items of {} in inventory+hotbar",
                     bot_item_count, target_id
                 );
 
                 if total_space > 0 && remaining > 0 && bot_item_count > 0 {
                     // Transfer items from bot inventory to shulker
                     let to_deposit = remaining.min(total_space).min(bot_item_count);
-                    info!(
-                        "Transferring {} items from bot inventory to shulker",
-                        to_deposit
-                    );
                     let moved = transfer_items_with_shulker(
                         bot,
                         &shulker_container,
@@ -1683,7 +1376,7 @@ pub async fn automated_chest_io(
                         "deposit",
                     )
                     .await?;
-                    info!("Transferred {} items into shulker", moved);
+                    debug!("Deposited {} items into shulker", moved);
                     
                     // Record the count after deposit
                     slot_counts[slot_idx] = initial_item_count + moved;
@@ -1716,8 +1409,8 @@ pub async fn automated_chest_io(
                         slot_counts[slot_idx] = initial_item_count;
                         // Mark as confirmed full so we skip it if we somehow revisit
                         confirmed_full.insert(slot_idx);
-                        info!(
-                            "Shulker has no space for {} (full or contains different items), putting back and trying next shulker",
+                        debug!(
+                            "Shulker full or wrong item for {}, trying next",
                             target_id
                         );
                         // Close shulker first
@@ -1785,13 +1478,10 @@ pub async fn automated_chest_io(
 
                         // Continue to next shulker
                         continue;
-                    } else {
-                        info!("No remaining items to deposit (remaining: {})", remaining);
                     }
                 }
 
                 // Close shulker
-                info!("Closing shulker");
                 shulker_container.close();
                 // Longer delay after close to let server process the close event
                 // and avoid race conditions with container content events
@@ -1804,13 +1494,10 @@ pub async fn automated_chest_io(
                 }
 
                 // Pick up shulker
-                info!("Picking up shulker from station");
                 super::shulker::pickup_shulker_from_station(bot, &station_pos, node_position)
                     .await?;
-                info!("Shulker picked up successfully");
 
                 // Re-open chest (it was closed when we placed shulker)
-                info!("Reopening chest to place shulker back");
                 container = open_chest_container(bot, chest_pos).await?;
 
                 // Find shulker in inventory through the chest container's slots
@@ -1837,7 +1524,6 @@ pub async fn automated_chest_io(
                 }
 
                 if let Some(container_slot) = shulker_in_container_view {
-                    info!("Trying to place shulker into chest slot {}", slot_idx);
                     place_shulker_in_chest_slot_verified(&container, container_slot, slot_idx)
                         .await?;
                     
@@ -1846,7 +1532,6 @@ pub async fn automated_chest_io(
                     if remaining > 0 && slot_idx < 53 {
                         // Close and reopen chest to ensure clean state for next iteration
                         // close() takes ownership, so we must reopen immediately
-                        info!("Closing chest after placing shulker back to ensure clean state");
                         container.close();
                         tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
                         container = open_chest_container(bot, chest_pos).await?;

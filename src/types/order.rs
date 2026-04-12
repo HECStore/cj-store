@@ -18,7 +18,7 @@ use crate::fsutil::write_atomic;
 /// Default maximum number of orders to retain in memory and on disk.
 /// This value is used when loading config or when config is not available.
 /// Can be overridden in config.json via the `max_orders` field.
-#[allow(dead_code)]
+#[allow(dead_code)] // fallback constant for config loading
 pub const DEFAULT_MAX_ORDERS: usize = 10_000;
 
 /// The kind of transaction recorded in the audit log.
@@ -66,20 +66,19 @@ pub struct Order {
     pub user_uuid: String,
 }
 
+#[allow(dead_code)] // persistence API — load/save/prune used by state management (keep as cohesive surface)
 impl Order {
     const ORDERS_FILE: &'static str = "data/orders.json";
 
     /// Loads all orders from a single JSON file into a VecDeque.
     /// If the file has more than DEFAULT_MAX_ORDERS, only the most recent are kept.
     /// Use `load_all_with_limit` if you need a custom limit.
-    #[allow(dead_code)]
     pub fn load_all() -> io::Result<VecDeque<Self>> {
         Self::load_all_with_limit(DEFAULT_MAX_ORDERS)
     }
     
     /// Loads all orders from a single JSON file into a VecDeque.
     /// If the file has more than `max_orders`, only the most recent are kept.
-    #[allow(dead_code)]
     pub fn load_all_with_limit(max_orders: usize) -> io::Result<VecDeque<Self>> {
         let file_path = Path::new(Self::ORDERS_FILE);
 
@@ -129,7 +128,6 @@ impl Order {
 
     /// Prune the order queue to DEFAULT_MAX_ORDERS, removing the oldest orders.
     /// This should be called periodically to prevent unbounded growth.
-    #[allow(dead_code)]
     pub fn prune(orders: &mut VecDeque<Self>) {
         Self::prune_to_limit(orders, DEFAULT_MAX_ORDERS);
     }
@@ -139,7 +137,6 @@ impl Order {
     /// Orders are appended to the back of the `VecDeque`, so the front holds
     /// the oldest entries. Popping from the front preserves chronological
     /// order while discarding the least recent history first.
-    #[allow(dead_code)]
     pub fn prune_to_limit(orders: &mut VecDeque<Self>, max_orders: usize) {
         while orders.len() > max_orders {
             orders.pop_front(); // Remove oldest
@@ -149,7 +146,6 @@ impl Order {
     /// Saves a VecDeque of Orders to a single JSON file.
     /// Automatically prunes to DEFAULT_MAX_ORDERS before saving.
     /// Use `save_all_with_limit` for a custom limit.
-    #[allow(dead_code)]
     pub fn save_all(orders: &VecDeque<Self>) -> io::Result<()> {
         Self::save_all_with_limit(orders, DEFAULT_MAX_ORDERS)
     }
@@ -185,7 +181,6 @@ impl Order {
     }
     
     /// Get the number of orders currently stored.
-    #[allow(dead_code)]
     pub fn count(orders: &VecDeque<Self>) -> usize {
         orders.len()
     }

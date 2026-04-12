@@ -81,50 +81,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // See `Store::new()` for initialization details.
             let store = Store::new(bot_tx.clone()).await?;
 
-            // Spawn Store task: handles all state mutations and persistence
-            // This is the authoritative source of truth for all store data.
-            info!("[Main] Spawning Store task");
+            // Spawn Store task (authoritative source of truth for all store data)
             let store_handle = tokio::spawn(store.run(store_rx, bot_tx.clone()));
-            info!("[Main] Store task spawned");
 
-            // Load config for bot creation (account email, server address, storage position)
-            info!("[Main] Loading config for bot");
+            // Load config for bot creation
             let config = crate::config::Config::load()?;
-            info!("[Main] Config loaded");
 
-            // Spawn Bot task (must be local due to Azalea's !Send requirements)
-            // Handles Minecraft client connection, whisper parsing, trade automation, chest I/O
-            info!("[Main] Spawning Bot task (local)");
+            // Spawn Bot task (local due to Azalea's !Send requirements)
             let bot_handle = tokio::task::spawn_local(crate::bot::bot_task(
                 store_tx.clone(),
                 bot_rx,
                 config.account_email,
                 config.server_address,
                 config.buffer_chest_position,
+                config.trade_timeout_ms,
+                config.pathfinding_timeout_ms,
             ));
-            info!("[Main] Bot task spawned");
 
             // Spawn CLI task (blocking I/O for interactive menu)
-            // Provides operator interface for managing store state
-            info!("[Main] Spawning CLI task (blocking)");
             let cli_handle = tokio::task::spawn_blocking(move || cli_task(store_tx));
-            info!("[Main] CLI task spawned");
 
-            // Wait for tasks to complete
-            info!("[Main] All tasks spawned, waiting for completion");
+            info!("[Main] All tasks spawned");
             let join_result = tokio::try_join!(store_handle, bot_handle, cli_handle);
-            info!("[Main] All tasks completed, join result received");
             Ok::<_, Box<dyn std::error::Error>>(join_result)
         })
         .await;
 
-    info!("[Main] Processing task join results");
     match result {
-        Ok(Ok((store_result, bot_result, cli_result))) => {
-            info!("[Main] All tasks completed successfully");
-            info!("[Main] Store task result: {:?}", store_result);
-            info!("[Main] Bot task result: {:?}", bot_result);
-            info!("[Main] CLI task result: {:?}", cli_result);
+        Ok(Ok(_)) => {
+            info!("[Main] All tasks completed");
             println!("✅ Application shutdown complete");
         }
         Ok(Err(e)) => {
@@ -137,13 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Give a moment for any final logging to complete.
-    // The tracing file appender buffers writes on a background worker; without this
-    // brief yield, shutdown-time log lines can be lost when the process exits before
-    // the appender flushes. 100ms is empirically sufficient for a local file writer.
-    info!("[Main] Waiting 100ms for final logging to complete");
+    // Brief yield so the tracing file appender can flush final log lines
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    info!("[Main] Final wait complete, main() returning");
 
     Ok(())
 }

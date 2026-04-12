@@ -290,7 +290,7 @@ impl Node {
     /// ```
     /// Shulker station is 2 blocks west of P, at the same Y and Z level.
     /// Reserved for future use (currently calculated inline in bot.rs).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reserved; bot currently computes inline
     pub fn shulker_station_position(&self) -> Position {
         Position {
             x: self.position.x - 2,

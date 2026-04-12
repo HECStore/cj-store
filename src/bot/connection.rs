@@ -1,7 +1,7 @@
 //! Connection management for the bot
 
 use azalea::account::Account;
-use tracing::{info, warn, debug};
+use tracing::{debug, info};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use super::{Bot, BotState, handle_event_fn};
@@ -100,40 +100,21 @@ pub async fn connect(
 /// See README.md "Graceful Shutdown" section for the complete shutdown sequence.
 pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let disconnect_start = Instant::now();
-    info!("[Connection] ===== DISCONNECT START (shutdown={}) =====", shutdown);
-    
+    info!("[Connection] Disconnect starting (shutdown={})", shutdown);
+
     if shutdown {
-        // Set shutdown flag to prevent reconnection
-        info!("[Connection] Step 1/6: Setting shutdown flag to prevent reconnection");
         bot.shutdown.store(true, Ordering::SeqCst);
-        debug!("[Connection] Shutdown flag set to true");
     }
-    
-    // Clear connecting flag
-    info!("[Connection] Step 2/6: Clearing connecting flag");
+
     bot.connecting.store(false, Ordering::SeqCst);
-    debug!("[Connection] Connecting flag cleared");
-    
-    // Check current connection state
-    let client_exists_before = bot.client.read().await.is_some();
-    let task_exists_before = bot.client_task.lock().await.is_some();
-    info!("[Connection] Step 3/6: Pre-disconnect state check - client exists: {}, task exists: {}", 
-          client_exists_before, task_exists_before);
     
     // Disconnect the client first to send disconnect packet gracefully
-    info!("[Connection] Step 4/6: Disconnecting client to send disconnect packet");
     let had_client = {
         let client_guard = bot.client.write().await;
         if let Some(client) = client_guard.as_ref() {
-            info!("[Connection] Client found, calling disconnect() method");
-            let before_disconnect = Instant::now();
             client.disconnect();
-            let disconnect_call_duration = before_disconnect.elapsed();
-            info!("[Connection] Client.disconnect() called (took {:?})", disconnect_call_duration);
-            debug!("[Connection] Disconnect method returned (non-blocking)");
             true
         } else {
-            warn!("[Connection] No client found (already disconnected or never connected)");
             false
         }
     };
@@ -148,79 +129,42 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
     // 2. The server to receive and process it
     // 3. The TCP connection to be closed by both sides
     // 4. The OS to release the socket
+    // Wait for the disconnect packet to be sent before aborting the task.
+    // Azalea's event loop must still be alive to flush the packet; aborting too
+    // early would drop it and the server would only notice via keep-alive timeout.
     if had_client {
-        info!("[Connection] Step 5/6: Waiting for disconnect packet to be sent and TCP connection to close");
-        info!("[Connection] Waiting 2000ms (2 seconds) for network I/O, server processing, and TCP closure");
-        let wait_start = Instant::now();
-        
-        // Poll the client state periodically to see if it's been cleared (indicating disconnect event processed)
         let mut elapsed = tokio::time::Duration::from_millis(0);
         let check_interval = tokio::time::Duration::from_millis(100);
         let max_wait = tokio::time::Duration::from_millis(2000);
-        
+
         while elapsed < max_wait {
             tokio::time::sleep(check_interval).await;
             elapsed += check_interval;
-            
-            let client_still_exists = bot.client.read().await.is_some();
-            if !client_still_exists {
-                info!("[Connection] Client cleared after {:?} (Disconnect event likely processed)", elapsed);
+            if bot.client.read().await.is_none() {
+                debug!("[Connection] Client cleared after {:?}", elapsed);
                 break;
             }
         }
-        
-        let wait_duration = wait_start.elapsed();
-        let client_still_exists = bot.client.read().await.is_some();
-        info!("[Connection] Disconnect wait complete (actual wait: {:?}, client still exists: {})", 
-              wait_duration, client_still_exists);
-        
-        if client_still_exists {
-            warn!("[Connection] Client still exists after wait - Disconnect event may not have fired yet");
-        }
-    } else {
-        info!("[Connection] Step 5/6: Skipping wait (no client to disconnect)");
     }
     
-    // Now abort the Azalea client task (this will drop BotState which contains store_tx clone)
-    // IMPORTANT: Even after aborting, the TCP connection may take time to close at the OS level
-    info!("[Connection] Step 6/6: Aborting Azalea client task");
+    // Abort the Azalea client task, then wait for OS-level TCP teardown.
+    // task.abort() is async — the Drop chain (which closes the socket) runs after
+    // the task's current await point, so a fast reconnect could race the old socket.
     let task_aborted = {
         let mut task_guard = bot.client_task.lock().await;
         if let Some(task) = task_guard.take() {
-            info!("[Connection] Azalea client task found, aborting now");
-            let abort_start = Instant::now();
             task.abort();
-            let abort_duration = abort_start.elapsed();
-            info!("[Connection] Task.abort() called (took {:?})", abort_duration);
-            debug!("[Connection] Task abort signal sent (task may still be cleaning up)");
-            
-            // Wait for the abort to take effect and the TCP connection to fully close at OS level.
-            // This is the SECOND ~2s wait: distinct from the pre-abort wait above because
-            // task.abort() is asynchronous - the task may still be mid-await when the signal
-            // arrives, and its Drop chain (which closes the socket) runs after that. Without
-            // this second delay, a fast reconnect could race the old socket's teardown and
-            // see the server still holding the previous session.
-            // The OS may keep the connection in TIME_WAIT state for a few seconds
-            info!("[Connection] Waiting 2000ms (2 seconds) for task abort and OS-level TCP connection closure");
-            let abort_wait_start = Instant::now();
             tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-            let abort_wait_duration = abort_wait_start.elapsed();
-            info!("[Connection] Task abort wait complete (actual wait: {:?})", abort_wait_duration);
-            warn!("[Connection] NOTE: OS may keep TCP connection in TIME_WAIT for up to 60 seconds, but server should see disconnect immediately");
             true
         } else {
-            warn!("[Connection] No Azalea client task found (already aborted or never spawned)");
             false
         }
     };
-    
+
     // Clear the client reference
-    info!("[Connection] Clearing client reference from bot state");
-    let client_cleared = bot.client.write().await.take().is_some();
-    info!("[Connection] Client reference cleared (had client: {})", client_cleared);
-    
-    let total_duration = disconnect_start.elapsed();
-    info!("[Connection] ===== DISCONNECT COMPLETE (total time: {:?}, had_client: {}, task_aborted: {}) =====", 
-          total_duration, had_client, task_aborted);
+    bot.client.write().await.take();
+
+    info!("[Connection] Disconnect complete in {:?} (had_client={}, task_aborted={})",
+          disconnect_start.elapsed(), had_client, task_aborted);
     Ok(())
 }

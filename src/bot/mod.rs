@@ -67,6 +67,18 @@ pub struct Bot {
     pub connecting: Arc<AtomicBool>,
     pub shutdown: Arc<AtomicBool>,
     pub client_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Trade GUI timeout in milliseconds (from config).
+    ///
+    /// Sourced from `Config::trade_timeout_ms` so operators can tune how long
+    /// the bot waits for a player to accept/complete a trade without touching
+    /// source. Used by `bot::trade` when waiting for the trade menu to open.
+    pub trade_timeout_ms: u64,
+    /// Pathfinding budget in milliseconds (from config).
+    ///
+    /// Sourced from `Config::pathfinding_timeout_ms`; an upper bound on how
+    /// long navigation may run before giving up. Used by `bot::navigation`
+    /// across retry attempts.
+    pub pathfinding_timeout_ms: u64,
 }
 
 impl Bot {
@@ -76,6 +88,8 @@ impl Bot {
         store_tx: mpsc::Sender<StoreMessage>,
         chat_tx: Arc<broadcast::Sender<String>>,
         buffer_chest_position: Option<Position>,
+        trade_timeout_ms: u64,
+        pathfinding_timeout_ms: u64,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let account = Account::microsoft(&account_email).await?;
 
@@ -89,6 +103,8 @@ impl Bot {
             connecting: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             client_task: Arc::new(Mutex::new(None)),
+            trade_timeout_ms,
+            pathfinding_timeout_ms,
         })
     }
 
@@ -125,17 +141,6 @@ impl Bot {
         crate::store::utils::normalize_item_id(item)
     }
     
-    /// Add "minecraft:" prefix to an item ID for use with Minecraft server.
-    /// Use this when sending item IDs to the game (e.g., for trade validation).
-    /// 
-    /// # Examples
-    /// - "diamond" -> "minecraft:diamond"
-    /// - "minecraft:diamond" -> "minecraft:diamond"
-    #[allow(dead_code)]
-    pub fn with_minecraft_prefix(item: &str) -> String {
-        crate::store::utils::with_minecraft_prefix(item)
-    }
-
     pub fn chat_subscribe(&self) -> broadcast::Receiver<String> {
         self.chat_tx.subscribe()
     }
@@ -148,6 +153,8 @@ pub async fn bot_task(
     account_email: String,
     server_address: String,
     buffer_chest_position: Option<Position>,
+    trade_timeout_ms: u64,
+    pathfinding_timeout_ms: u64,
 ) {
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
 
@@ -158,6 +165,8 @@ pub async fn bot_task(
         store_tx.clone(),
         Arc::new(chat_tx),
         buffer_chest_position,
+        trade_timeout_ms,
+        pathfinding_timeout_ms,
     )
     .await
     {
@@ -219,14 +228,12 @@ pub async fn bot_task(
                             // Successful reconnect: reset backoff to the initial floor.
                             backoff = tokio::time::Duration::from_secs(2);
                             info!("Bot reconnected");
-                            
+
                             // CRITICAL: Wait for Azalea to fully initialize all entity components
                             // The Inventory component may not be immediately available after Event::Init
                             // Without this delay, accessing inventory operations can cause a panic:
                             // "Our client is missing a required component: &azalea_entity::inventory::Inventory"
-                            info!("Waiting 2s for entity components to fully initialize...");
                             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            info!("Entity initialization wait complete, bot ready for operations");
                         } else {
                             backoff = (backoff * 2).min(max_backoff);
                             warn!("Reconnect attempt did not initialize in time");
@@ -245,31 +252,22 @@ pub async fn bot_task(
                 let result = bot.send_whisper(&target, &message).await;
                 let _ = respond_to.send(result);
             }
-            BotInstruction::Chat { message, respond_to } => {
-                let result = bot.send_chat_message(&message).await;
-                let _ = respond_to.send(result);
-            }
             BotInstruction::InteractWithChestAndSync {
                 target_chest,
                 node_position,
                 action,
                 respond_to,
             } => {
-                info!("[Bot] === CHEST INTERACTION START === chest={} action={:?}", target_chest.id, action);
-                info!("[Bot] Chest {} at ({},{},{}), node position ({},{},{})",
-                      target_chest.id,
-                      target_chest.position.x, target_chest.position.y, target_chest.position.z,
-                      node_position.x, node_position.y, node_position.z);
-                
+                debug!("[Bot] Chest interaction: chest={} action={:?}", target_chest.id, action);
+
                 let op_start = std::time::Instant::now();
 
                 let result: Result<ChestSyncReport, String> = match navigation::go_to_chest(&bot, &target_chest, &node_position).await {
                     Err(e) => {
-                        error!("[Bot] Navigation to chest {} FAILED: {}", target_chest.id, e);
+                        error!("[Bot] Navigation to chest {} failed: {}", target_chest.id, e);
                         Err(e)
                     }
                     Ok(()) => {
-                        info!("[Bot] Navigation to chest {} complete, starting IO operation", target_chest.id);
                         // Perform requested IO (only supports bot inventory direction; no direct player IO here).
                         // automated_chest_io now returns counts for processed slots (-1 for unprocessed)
                         let chest_block_pos = azalea::BlockPos::new(
@@ -280,7 +278,6 @@ pub async fn bot_task(
                         
                         match action.clone() {
                             ChestAction::Deposit { item, amount, from_player, stack_size } => {
-                                info!("[Bot] Deposit operation: {}x {} (from_player={:?}, stack_size={})", amount, item, from_player, stack_size);
                                 if from_player.is_some() {
                                     error!("[Bot] Deposit from player is not supported in sync mode");
                                     Err("Deposit from player is not supported in sync mode".to_string())
@@ -312,7 +309,6 @@ pub async fn bot_task(
                                     
                                     match io_result {
                                         Ok(amounts) => {
-                                            info!("[Bot] Deposit IO completed successfully in {:.2}s", io_elapsed.as_secs_f64());
                                             Ok(ChestSyncReport {
                                                 chest_id: target_chest.id,
                                                 item,
@@ -327,7 +323,6 @@ pub async fn bot_task(
                                 }
                             }
                             ChestAction::Withdraw { item, amount, to_player, stack_size } => {
-                                info!("[Bot] Withdraw operation: {}x {} (to_player={:?}, stack_size={})", amount, item, to_player, stack_size);
                                 if to_player.is_some() {
                                     error!("[Bot] Withdraw to player is not supported in sync mode");
                                     Err("Withdraw to player is not supported in sync mode".to_string())
@@ -343,7 +338,6 @@ pub async fn bot_task(
                                     } else {
                                         None
                                     };
-                                    let io_start = std::time::Instant::now();
                                     let io_result = chest_io::automated_chest_io(
                                         &bot,
                                         chest_block_pos,
@@ -354,11 +348,9 @@ pub async fn bot_task(
                                         known_counts,
                                         stack_size,
                                     ).await;
-                                    let io_elapsed = io_start.elapsed();
-                                    
+
                                     match io_result {
                                         Ok(amounts) => {
-                                            info!("[Bot] Withdraw IO completed successfully in {:.2}s", io_elapsed.as_secs_f64());
                                             Ok(ChestSyncReport {
                                                 chest_id: target_chest.id,
                                                 item,
@@ -366,37 +358,9 @@ pub async fn bot_task(
                                             })
                                         }
                                         Err(e) => {
-                                            error!("[Bot] Withdraw IO FAILED after {:.2}s: {}", io_elapsed.as_secs_f64(), e);
+                                            error!("[Bot] Withdraw IO failed: {}", e);
                                             Err(e)
                                         }
-                                    }
-                                }
-                            }
-                            ChestAction::Check => {
-                                info!("[Bot] Check operation for item: {}", target_chest.item);
-                                // For Check, we still need to read all shulkers
-                                let item = target_chest.item.clone();
-                                let io_start = std::time::Instant::now();
-                                let io_result = chest_io::read_chest_amounts(
-                                    &bot,
-                                    chest_block_pos,
-                                    &item,
-                                    &node_position,
-                                ).await;
-                                let io_elapsed = io_start.elapsed();
-                                
-                                match io_result {
-                                    Ok(amounts) => {
-                                        info!("[Bot] Check IO completed successfully in {:.2}s", io_elapsed.as_secs_f64());
-                                        Ok(ChestSyncReport {
-                                            chest_id: target_chest.id,
-                                            item,
-                                            amounts,
-                                        })
-                                    }
-                                    Err(e) => {
-                                        error!("[Bot] Check IO FAILED after {:.2}s: {}", io_elapsed.as_secs_f64(), e);
-                                        Err(e)
                                     }
                                 }
                             }
@@ -405,22 +369,12 @@ pub async fn bot_task(
                 };
 
                 let op_elapsed = op_start.elapsed();
-                match &result {
-                    Ok(report) => {
-                        info!("[Bot] === CHEST INTERACTION COMPLETE === chest={} SUCCESS in {:.2}s", 
-                              report.chest_id, op_elapsed.as_secs_f64());
-                    }
-                    Err(e) => {
-                        error!("[Bot] === CHEST INTERACTION FAILED === chest={} ERROR after {:.2}s: {}", 
-                               target_chest.id, op_elapsed.as_secs_f64(), e);
-                    }
+                if let Err(e) = &result {
+                    error!("[Bot] Chest {} failed after {:.2}s: {}", target_chest.id, op_elapsed.as_secs_f64(), e);
                 }
-                
-                info!("[Bot] Sending result to respond_to channel...");
-                let send_result = respond_to.send(result);
-                match send_result {
-                    Ok(()) => info!("[Bot] Response sent successfully to channel"),
-                    Err(_) => error!("[Bot] FAILED to send response - channel receiver was dropped!"),
+
+                if respond_to.send(result).is_err() {
+                    error!("[Bot] Response channel dropped for chest {}", target_chest.id);
                 }
             }
             BotInstruction::TradeWithPlayer {
@@ -431,40 +385,31 @@ pub async fn bot_task(
                 flexible_validation,
                 respond_to,
             } => {
-                info!("[Bot] === TRADE WITH PLAYER START === target={}", target_username);
-                info!("[Bot] Bot offers: {:?}", bot_offers);
-                info!("[Bot] Player offers: {:?}", player_offers);
-                info!("[Bot] Validation mode: require_exact={}, flexible={}", require_exact_amount, flexible_validation);
-                
+                info!("[Bot] Trade with {}: bot_offers={:?} player_offers={:?}", target_username, bot_offers, player_offers);
+
                 let trade_start = std::time::Instant::now();
                 let result = trade::execute_trade_with_player(
-                    &bot, 
-                    &target_username, 
-                    &bot_offers, 
+                    &bot,
+                    &target_username,
+                    &bot_offers,
                     &player_offers,
                     require_exact_amount,
                     flexible_validation,
-                ).await;
+                )
+                .await;
                 let trade_elapsed = trade_start.elapsed();
-                
+
                 match &result {
                     Ok(received) => {
-                        info!("[Bot] === TRADE COMPLETE === SUCCESS in {:.2}s, received {} item types", 
-                              trade_elapsed.as_secs_f64(), received.len());
-                        for item in received {
-                            info!("[Bot]   Received: {}x {}", item.amount, item.item);
-                        }
+                        info!("[Bot] Trade completed in {:.2}s, received {:?}", trade_elapsed.as_secs_f64(), received);
                     }
                     Err(e) => {
-                        error!("[Bot] === TRADE FAILED === after {:.2}s: {}", trade_elapsed.as_secs_f64(), e);
+                        error!("[Bot] Trade failed after {:.2}s: {}", trade_elapsed.as_secs_f64(), e);
                     }
                 }
                 
-                info!("[Bot] Sending trade result to respond_to channel...");
-                let send_result = respond_to.send(result);
-                match send_result {
-                    Ok(()) => info!("[Bot] Trade response sent successfully"),
-                    Err(_) => error!("[Bot] FAILED to send trade response - channel receiver was dropped!"),
+                if respond_to.send(result).is_err() {
+                    error!("[Bot] Trade response channel dropped");
                 }
             }
             BotInstruction::ValidateNode {
@@ -498,32 +443,17 @@ pub async fn bot_task(
             }
             BotInstruction::Shutdown { respond_to } => {
                 info!("[Bot] Shutdown instruction received");
-                info!("[Bot] Shutdown: Step 1/3 - Disconnecting from server");
-                
+
                 // Disconnect from server (with shutdown flag)
-                let disconnect_start = std::time::Instant::now();
-                info!("[Bot] Shutdown: Calling disconnect() - this will handle all cleanup");
                 if let Err(e) = connection::disconnect(&bot, true).await {
-                    error!("[Bot] Shutdown: Error during bot disconnect: {}", e);
-                } else {
-                    let disconnect_duration = disconnect_start.elapsed();
-                    info!("[Bot] Shutdown: Bot disconnect() completed (took {:?})", disconnect_duration);
+                    error!("[Bot] Shutdown: Error during disconnect: {}", e);
                 }
 
-                // Disconnect already waits internally (2000ms + 2000ms = 4 seconds), but give additional buffer
-                info!("[Bot] Shutdown: Step 2/3 - Waiting additional 1000ms for OS-level TCP connection closure");
-                let additional_wait_start = std::time::Instant::now();
+                // Additional buffer for OS-level TCP connection closure
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                let additional_wait_duration = additional_wait_start.elapsed();
-                info!("[Bot] Shutdown: Additional disconnect wait complete (took {:?})", additional_wait_duration);
 
                 // Signal shutdown complete
-                info!("[Bot] Shutdown: Step 3/3 - Sending shutdown confirmation to Store");
                 let _ = respond_to.send(());
-                info!("[Bot] Shutdown: Shutdown confirmation sent");
-                
-                // Break from the outer loop to end the task
-                info!("[Bot] Shutdown: Breaking from main loop, bot task exiting");
                 // Don't drop store_tx here - it will be dropped in final cleanup
                 // Dropping it here would cause a move error since it's used again below
                 break 'outer;
@@ -534,36 +464,15 @@ pub async fn bot_task(
     }
 
     // Channel closed, perform final cleanup
-    info!("[Bot] Channel closed (bot_rx returned None), performing final cleanup");
-    info!("[Bot] Final cleanup: Ensuring bot is disconnected");
-    
-    // Ensure bot is disconnected and client task is aborted (with shutdown flag)
-    let final_disconnect_start = std::time::Instant::now();
-    info!("[Bot] Final cleanup: Calling disconnect() to ensure clean shutdown");
+    info!("[Bot] Channel closed, performing final cleanup");
+
     if let Err(e) = connection::disconnect(&bot, true).await {
-        error!("[Bot] Final cleanup: Error during bot disconnect: {}", e);
-    } else {
-        let final_disconnect_duration = final_disconnect_start.elapsed();
-        info!("[Bot] Final cleanup: Bot disconnect() completed (took {:?})", final_disconnect_duration);
+        error!("[Bot] Error during final disconnect: {}", e);
     }
-    
-    // Disconnect already waits internally (2000ms + 2000ms = 4 seconds), but give additional buffer
-    info!("[Bot] Final cleanup: Waiting additional 1000ms for OS-level TCP connection closure");
-    let final_wait_start = std::time::Instant::now();
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-    let final_wait_duration = final_wait_start.elapsed();
-    info!("[Bot] Final cleanup: Additional disconnect wait complete (took {:?})", final_wait_duration);
 
-    // Explicitly drop bot to ensure bot.store_tx is dropped
-    info!("[Bot] Final cleanup: Dropping bot struct (this will drop bot.store_tx)");
     drop(bot);
-    info!("[Bot] Final cleanup: Bot struct dropped");
-    
-    // Explicitly drop store_tx parameter to close the channel for Store task
-    info!("[Bot] Final cleanup: Dropping store_tx parameter to close channel");
     drop(store_tx);
-    info!("[Bot] Final cleanup: store_tx parameter dropped");
-
     info!("[Bot] Bot task shutdown complete");
 }
 
@@ -588,7 +497,7 @@ async fn validate_node_physically(
 ) -> Result<(), String> {
     use crate::types::Node;
     
-    info!("Starting physical validation for node {} at ({}, {}, {})",
+    info!("Validating node {} at ({}, {}, {})",
           node_id, node_position.x, node_position.y, node_position.z);
     
     // Step 1: Navigate to node position
@@ -606,8 +515,6 @@ async fn validate_node_physically(
         // Space chest opens apart so the server finishes processing the previous close
         // packet before we issue another open (prevents "container already open" races).
         if chest_index > 0 {
-            info!("Waiting {}ms before opening next chest...", 
-                  crate::constants::DELAY_VALIDATION_BETWEEN_CHESTS_MS);
             tokio::time::sleep(tokio::time::Duration::from_millis(
                 crate::constants::DELAY_VALIDATION_BETWEEN_CHESTS_MS
             )).await;
@@ -616,8 +523,8 @@ async fn validate_node_physically(
         let chest_pos = Node::calc_chest_position(node_id, chest_index, node_position);
         let block_pos = azalea::BlockPos::new(chest_pos.x, chest_pos.y, chest_pos.z);
         
-        info!("Validating chest {} at ({}, {}, {})", 
-              chest_index, chest_pos.x, chest_pos.y, chest_pos.z);
+        debug!("Validating chest {} at ({}, {}, {})",
+               chest_index, chest_pos.x, chest_pos.y, chest_pos.z);
         
         // Try to open the chest using fast validation (no retries, short timeout)
         // If there's no chest at this position, we fail fast instead of waiting 45+ seconds
@@ -660,8 +567,6 @@ async fn validate_node_physically(
                                     non_shulker_slots.join(", ")
                                 };
                                 validation_errors.push(format!("Chest {}: {}", chest_index, issues));
-                            } else {
-                                info!("Chest {} validated: all 54 slots contain shulker boxes", chest_index);
                             }
                         }
                     }

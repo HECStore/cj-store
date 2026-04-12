@@ -66,32 +66,25 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
             13 => restart_bot(&store_tx),
             14 => clear_stuck_order(&store_tx),
             15 => {
-                info!("[CLI] User selected Exit - initiating graceful shutdown");
+                info!("[CLI] Initiating graceful shutdown");
                 let (response_tx, response_rx) = oneshot::channel();
                 let msg = StoreMessage::FromCli(CliMessage::Shutdown {
                     respond_to: response_tx,
                 });
 
-                info!("[CLI] Sending shutdown message to Store");
                 if store_tx.blocking_send(msg).is_err() {
-                    error!("[CLI] Failed to send shutdown request to Store");
+                    error!("[CLI] Failed to send shutdown request");
                     return;
                 }
-                info!("[CLI] Shutdown message sent to Store, waiting for confirmation");
 
-                // Wait for shutdown confirmation
                 if response_rx.blocking_recv().is_err() {
-                    error!("[CLI] Failed to receive shutdown confirmation from Store");
+                    error!("[CLI] Failed to receive shutdown confirmation");
                     return;
                 }
-                info!("[CLI] Received shutdown confirmation from Store");
 
-                info!("[CLI] Dropping store_tx channel to signal Store shutdown");
-                // Explicitly drop our sender so the Store's receiver observes
-                // a closed channel and can break out of its own recv loop.
-                // This is the last remaining sender in the CLI thread.
+                // Drop sender so the Store's receiver closes and its task can terminate.
                 drop(store_tx);
-                info!("[CLI] store_tx dropped, CLI task exiting");
+                info!("[CLI] Shutdown complete");
                 break;
             }
             _ => unreachable!(),
@@ -101,8 +94,6 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
 
 /// Sends a QueryBalances request and displays the results.
 fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting user balances");
-
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::QueryBalances {
         respond_to: response_tx,
@@ -117,15 +108,10 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(balances) => {
             if balances.is_empty() {
                 println!("No users found.");
-                info!("No users found");
             } else {
                 println!("\n=== User Balances ===");
                 for user in balances {
                     println!(
-                        "User: {}, Balance: {} diamonds",
-                        user.username, user.balance
-                    );
-                    info!(
                         "User: {}, Balance: {} diamonds",
                         user.username, user.balance
                     );
@@ -143,8 +129,6 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
 /// Sends a QueryPairs request and displays the results, including
 /// AMM-style buy/sell prices derived from each pair's current reserves.
 fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting pairs");
-
     // Fetch the configured fee rate first so buy/sell prices reflect the
     // actual spread the store charges. We fall back to 12.5% (the default
     // configured fee) if the query fails for any reason, so the operator
@@ -174,7 +158,6 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(pairs) => {
             if pairs.is_empty() {
                 println!("No pairs found.");
-                info!("No pairs found");
             } else {
                 println!("\n=== Pairs ===");
                 for pair in pairs {
@@ -247,24 +230,17 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(())) => {
-            println!("Operator status updated successfully.");
-            info!("Operator status updated successfully");
-        }
+        Ok(Ok(())) => println!("Operator status updated successfully."),
         Ok(Err(e)) => {
             println!("Failed to update operator status: {}", e);
             error!("Failed to update operator status: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive operator status update response.");
-            error!("Failed to receive operator status update response");
-        }
+        Err(_) => error!("Failed to receive operator status update response"),
     }
 }
 
 /// Sends an AddNode request (without physical validation).
 fn add_node(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting to add node (no validation)");
     println!("Note: This adds the node WITHOUT verifying it exists in-world.");
     println!("Use 'Add node (with bot validation)' for physical verification.");
 
@@ -279,24 +255,17 @@ fn add_node(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(node_id)) => {
-            println!("Node {} added successfully.", node_id);
-            info!("Node {} added successfully", node_id);
-        }
+        Ok(Ok(node_id)) => println!("Node {} added successfully.", node_id),
         Ok(Err(e)) => {
             println!("Failed to add node: {}", e);
             error!("Failed to add node: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive add node response.");
-            error!("Failed to receive add node response");
-        }
+        Err(_) => error!("Failed to receive add node response"),
     }
 }
 
 /// Sends an AddNodeWithValidation request (with bot-based physical validation).
 fn add_node_with_validation(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting to add node with validation");
     println!("Bot will navigate to the calculated position and verify:");
     println!("  1. All 4 chests exist and can be opened");
     println!("  2. Each chest slot contains a shulker box");
@@ -313,24 +282,17 @@ fn add_node_with_validation(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(node_id)) => {
-            println!("Node {} validated and added successfully!", node_id);
-            info!("Node {} validated and added successfully", node_id);
-        }
+        Ok(Ok(node_id)) => println!("Node {} validated and added successfully!", node_id),
         Ok(Err(e)) => {
             println!("Failed to add node: {}", e);
             error!("Failed to add node: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive add node response.");
-            error!("Failed to receive add node response");
-        }
+        Err(_) => error!("Failed to receive add node response"),
     }
 }
 
 /// Discovers existing storage nodes by having the bot physically scan positions.
 fn discover_storage(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting storage discovery");
     println!("Bot will scan for existing storage nodes starting from position 0.");
     println!("For each position, the bot will:");
     println!("  1. Navigate to the calculated node position");
@@ -350,18 +312,12 @@ fn discover_storage(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(count)) => {
-            println!("Storage discovery complete! {} nodes discovered.", count);
-            info!("Storage discovery complete: {} nodes discovered", count);
-        }
+        Ok(Ok(count)) => println!("Storage discovery complete! {} nodes discovered.", count),
         Ok(Err(e)) => {
             println!("Storage discovery failed: {}", e);
             error!("Storage discovery failed: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive discovery response.");
-            error!("Failed to receive discovery response");
-        }
+        Err(_) => error!("Failed to receive discovery response"),
     }
 }
 
@@ -386,18 +342,12 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(())) => {
-            println!("Node {} removed successfully.", node_id);
-            info!("Node {} removed successfully", node_id);
-        }
+        Ok(Ok(())) => println!("Node {} removed successfully.", node_id),
         Ok(Err(e)) => {
             println!("Failed to remove node: {}", e);
             error!("Failed to remove node: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive remove node response.");
-            error!("Failed to receive remove node response");
-        }
+        Err(_) => error!("Failed to receive remove node response"),
     }
 }
 
@@ -441,18 +391,12 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(())) => {
-            println!("Pair '{}' added successfully (stack size: {}, stocks set to zero).", item_name, stack_size);
-            info!("Pair '{}' added successfully with stack size {}", item_name, stack_size);
-        }
+        Ok(Ok(())) => println!("Pair '{}' added successfully (stack size: {}, stocks set to zero).", item_name, stack_size),
         Ok(Err(e)) => {
             println!("Failed to add pair: {}", e);
             error!("Failed to add pair: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive add pair response.");
-            error!("Failed to receive add pair response");
-        }
+        Err(_) => error!("Failed to receive add pair response"),
     }
 }
 
@@ -477,25 +421,17 @@ fn remove_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(())) => {
-            println!("Pair '{}' removed successfully.", item_name);
-            info!("Pair '{}' removed successfully", item_name);
-        }
+        Ok(Ok(())) => println!("Pair '{}' removed successfully.", item_name),
         Ok(Err(e)) => {
             println!("Failed to remove pair: {}", e);
             error!("Failed to remove pair: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive remove pair response.");
-            error!("Failed to receive remove pair response");
-        }
+        Err(_) => error!("Failed to receive remove pair response"),
     }
 }
 
 /// Sends a QueryStorage request and displays the storage state.
 fn view_storage(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting storage state");
-
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::QueryStorage {
         respond_to: response_tx,
@@ -530,10 +466,7 @@ fn view_storage(store_tx: &mpsc::Sender<StoreMessage>) {
             }
             println!("====================\n");
         }
-        Err(_) => {
-            println!("Failed to receive storage state.");
-            error!("Failed to receive storage state");
-        }
+        Err(_) => error!("Failed to receive storage state"),
     }
 }
 
@@ -544,8 +477,6 @@ fn view_trades(store_tx: &mpsc::Sender<StoreMessage>) {
         .default(20)
         .interact_text()
         .expect("Failed to read limit");
-
-    info!("Requesting recent trades (limit: {})", limit);
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::QueryTrades {
@@ -562,7 +493,6 @@ fn view_trades(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(trades) => {
             if trades.is_empty() {
                 println!("No trades found.");
-                info!("No trades found");
             } else {
                 println!("\n=== Recent Trades ({} shown) ===", trades.len());
                 for trade in trades {
@@ -589,17 +519,12 @@ fn view_trades(store_tx: &mpsc::Sender<StoreMessage>) {
                 println!("====================\n");
             }
         }
-        Err(_) => {
-            println!("Failed to receive trades.");
-            error!("Failed to receive trades");
-        }
+        Err(_) => error!("Failed to receive trades"),
     }
 }
 
 /// Sends a RestartBot request.
 fn restart_bot(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting Bot restart");
-
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::RestartBot {
         respond_to: response_tx,
@@ -611,24 +536,17 @@ fn restart_bot(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(())) => {
-            println!("Bot restart initiated successfully.");
-            info!("Bot restart initiated successfully");
-        }
+        Ok(Ok(())) => println!("Bot restart initiated successfully."),
         Ok(Err(e)) => {
             println!("Failed to restart Bot: {}", e);
             error!("Failed to restart Bot: {}", e);
         }
-        Err(_) => {
-            println!("Failed to receive restart response.");
-            error!("Failed to receive restart response");
-        }
+        Err(_) => error!("Failed to receive restart response"),
     }
 }
 
 /// Clears stuck order processing state, allowing the queue to continue.
 fn clear_stuck_order(store_tx: &mpsc::Sender<StoreMessage>) {
-    info!("Requesting to clear stuck order");
     println!("This will clear any stuck order processing state.");
     println!("Use this if an order got stuck and the queue isn't advancing.");
 
@@ -646,16 +564,9 @@ fn clear_stuck_order(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Some(stuck_order)) => {
             println!("Cleared stuck order: {}", stuck_order);
             println!("Queue will now continue processing remaining orders.");
-            info!("Cleared stuck order: {}", stuck_order);
         }
-        Ok(None) => {
-            println!("No stuck order was detected (processing was not blocked).");
-            info!("No stuck order detected");
-        }
-        Err(_) => {
-            println!("Failed to receive clear stuck order response.");
-            error!("Failed to receive clear stuck order response");
-        }
+        Ok(None) => println!("No stuck order was detected (processing was not blocked)."),
+        Err(_) => error!("Failed to receive clear stuck order response"),
     }
 }
 

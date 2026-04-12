@@ -21,12 +21,12 @@ use crate::fsutil::write_atomic;
 /// Trades older than this limit may be archived or removed.
 /// This prevents unbounded memory growth on startup.
 /// Can be overridden in config.json via the `max_trades_in_memory` field.
-#[allow(dead_code)]
+#[allow(dead_code)] // fallback constant for config loading
 pub const DEFAULT_MAX_TRADES_IN_MEMORY: usize = 50_000;
 
 /// Number of days to retain trade files on disk.
 /// Trades older than this are candidates for archival/deletion.
-#[allow(dead_code)]
+#[allow(dead_code)] // retention window used by archive_old_trades
 pub const TRADE_RETENTION_DAYS: i64 = 365;
 
 /// The category of a recorded trade.
@@ -75,6 +75,7 @@ pub struct Trade {
     pub timestamp: DateTime<Utc>,
 }
 
+#[allow(dead_code)] // persistence/archival API kept as cohesive surface
 impl Trade {
     // Directory where all individual trade files will be stored
     const TRADES_DIR: &str = "data/trades";
@@ -127,7 +128,6 @@ impl Trade {
 
     /// Loads a single `Trade` from `data/trades/{timestamp}.json`.
     /// Reserved for future tooling/debugging.
-    #[allow(dead_code)]
     pub fn load(timestamp: &DateTime<Utc>) -> io::Result<Self> {
         let path = Self::get_trade_file_path(timestamp);
 
@@ -151,7 +151,6 @@ impl Trade {
     /// **Memory limit**: Only loads the most recent DEFAULT_MAX_TRADES_IN_MEMORY trades.
     /// Older trades remain on disk but aren't loaded into memory.
     /// Use `load_all_with_limit` for a custom limit.
-    #[allow(dead_code)]
     pub fn load_all() -> io::Result<Vec<Self>> {
         Self::load_all_with_limit(DEFAULT_MAX_TRADES_IN_MEMORY)
     }
@@ -227,7 +226,6 @@ impl Trade {
     }
     
     /// Get count of trades currently in memory.
-    #[allow(dead_code)]
     pub fn count(trades: &[Self]) -> usize {
         trades.len()
     }
@@ -237,7 +235,6 @@ impl Trade {
     /// 
     /// **Note**: This is a utility function for manual maintenance.
     /// It's not called automatically during normal operation.
-    #[allow(dead_code)]
     pub fn archive_old_trades(trades: &mut Vec<Self>, days_to_keep: i64) -> io::Result<usize> {
         let cutoff = Utc::now() - chrono::Duration::days(days_to_keep);
         let dir_path = Path::new(Self::TRADES_DIR);

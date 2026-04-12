@@ -164,20 +164,6 @@ impl OrderQueue {
         write_atomic(QUEUE_FILE, &json)
     }
 
-    /// Clear the queue (used on startup if queue should be session-only)
-    ///
-    /// Note: `next_id` is intentionally NOT reset. Reusing IDs across a clear
-    /// would be dangerous because log entries, user-visible order references
-    /// ("Order #5 cancelled"), and any in-flight messages would suddenly point
-    /// at a different order. Keeping the counter monotonic guarantees every
-    /// order ID ever issued by this process is unique.
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.orders.clear();
-        // Keep next_id incrementing to avoid ID reuse
-        info!("Queue cleared (next_id remains at {})", self.next_id);
-    }
-
     /// Add a new order to the queue
     ///
     /// # Arguments
@@ -198,16 +184,9 @@ impl OrderQueue {
         item: String,
         quantity: u32,
     ) -> Result<(u64, usize), String> {
-        debug!("[Queue] add() called: user={} ({}) order_type={:?} item={} qty={}", 
-               username, user_uuid, order_type, item, quantity);
-        debug!("[Queue] Current queue state: len={} next_id={}", self.orders.len(), self.next_id);
-        
         // Enforce MAX_ORDERS_PER_USER to prevent a single player from flooding
         // the queue and blocking other users behind a long tail of their orders.
-        // It also bounds worst-case wait time for everyone else and discourages
-        // accidental spam from macro/keybind misuse.
         let user_count = self.user_order_count(&user_uuid);
-        debug!("[Queue] User {} has {} orders in queue (max {})", username, user_count, MAX_ORDERS_PER_USER);
         if user_count >= MAX_ORDERS_PER_USER {
             warn!("[Queue] User {} rejected: already has {} orders (max {})", username, user_count, MAX_ORDERS_PER_USER);
             return Err(format!(
@@ -218,21 +197,15 @@ impl OrderQueue {
 
         let id = self.next_id;
         self.next_id += 1;
-        debug!("[Queue] Assigned order ID {} (next_id now {})", id, self.next_id);
 
         let order = QueuedOrder::new(id, user_uuid.clone(), username.clone(), order_type, item.clone(), quantity);
         self.orders.push_back(order);
 
         let position = self.orders.len(); // 1-indexed position
 
-        // Persist on every mutation so an unexpected shutdown (crash, host reboot,
-        // OOM kill) never loses an order the player has already been told is queued.
-        // The queue is small and writes are atomic, so the I/O cost is acceptable.
-        debug!("[Queue] Persisting queue to disk...");
+        // Persist on every mutation so an unexpected shutdown never loses a queued order.
         if let Err(e) = self.save() {
-            error!("[Queue] FAILED to persist queue after adding order {}: {}", id, e);
-        } else {
-            debug!("[Queue] Queue persisted successfully");
+            error!("[Queue] Failed to persist after adding order {}: {}", id, e);
         }
 
         info!("[Queue] Order {} added to queue at position {} (user={} item={} qty={})", 
@@ -242,36 +215,17 @@ impl OrderQueue {
 
     /// Pop the next order from the front of the queue
     pub fn pop(&mut self) -> Option<QueuedOrder> {
-        debug!("[Queue] pop() called, current len={}", self.orders.len());
-        
         let order = self.orders.pop_front();
-        
-        match &order {
-            Some(o) => {
-                info!("[Queue] Popped order #{}: {} for {} (queued at {}, remaining in queue: {})",
-                      o.id, o.description(), o.username, o.queued_at, self.orders.len());
 
-                // Persist after pop so a crash during order processing does not
-                // cause the same order to be replayed on next startup.
-                debug!("[Queue] Persisting queue after pop...");
-                if let Err(e) = self.save() {
-                    error!("[Queue] FAILED to persist queue after popping order #{}: {}", o.id, e);
-                } else {
-                    debug!("[Queue] Queue persisted successfully after pop");
-                }
-            }
-            None => {
-                debug!("[Queue] pop() called but queue was empty");
+        if let Some(ref o) = order {
+            debug!("[Queue] Popped order #{}: {} for {} (remaining: {})",
+                   o.id, o.description(), o.username, self.orders.len());
+            if let Err(e) = self.save() {
+                error!("[Queue] Failed to persist after popping order #{}: {}", o.id, e);
             }
         }
 
         order
-    }
-
-    /// Peek at the next order without removing it
-    #[allow(dead_code)]
-    pub fn peek(&self) -> Option<&QueuedOrder> {
-        self.orders.front()
     }
 
     /// Check if the queue is empty
@@ -284,24 +238,22 @@ impl OrderQueue {
         self.orders.len()
     }
 
-    /// Get 1-indexed position of an order by ID
-    /// Returns None if order not found
-    #[allow(dead_code)]
+    /// Get 1-indexed position of an order by ID (test-only helper).
+    #[cfg(test)]
     pub fn get_position(&self, order_id: u64) -> Option<usize> {
         self.orders
             .iter()
             .position(|o| o.id == order_id)
-            .map(|p| p + 1) // Convert to 1-indexed
+            .map(|p| p + 1)
     }
 
-    /// Get 1-indexed position of a user's first order
-    /// Returns None if user has no orders
-    #[allow(dead_code)]
+    /// Get 1-indexed position of a user's first order (test-only helper).
+    #[cfg(test)]
     pub fn get_user_position(&self, user_uuid: &str) -> Option<usize> {
         self.orders
             .iter()
             .position(|o| o.user_uuid == user_uuid)
-            .map(|p| p + 1) // Convert to 1-indexed
+            .map(|p| p + 1)
     }
 
     /// Count how many orders a user has in the queue
@@ -326,9 +278,6 @@ impl OrderQueue {
     /// * `Ok(())` - Order was cancelled
     /// * `Err(message)` - Order not found or doesn't belong to user
     pub fn cancel(&mut self, user_uuid: &str, order_id: u64) -> Result<(), String> {
-        debug!("[Queue] cancel() called: user={} order_id={}", user_uuid, order_id);
-        debug!("[Queue] Current queue state: len={}", self.orders.len());
-        
         let position = self.orders
             .iter()
             .position(|o| o.id == order_id && o.user_uuid == user_uuid);
@@ -341,13 +290,8 @@ impl OrderQueue {
                     order_id, user_uuid, order.description(), pos + 1
                 );
 
-                // Persist so the cancellation survives a restart; otherwise
-                // a crash between cancel and next save would resurrect the order.
-                debug!("[Queue] Persisting queue after cancel...");
                 if let Err(e) = self.save() {
-                    error!("[Queue] FAILED to persist queue after cancelling order {}: {}", order_id, e);
-                } else {
-                    debug!("[Queue] Queue persisted successfully after cancel");
+                    error!("[Queue] Failed to persist after cancelling order {}: {}", order_id, e);
                 }
 
                 Ok(())

@@ -12,8 +12,6 @@ use crate::constants::{NAVIGATION_MAX_RETRIES, RETRY_BASE_DELAY_MS, RETRY_MAX_DE
 use crate::types::{Chest, Position};
 use super::Bot;
 
-/// Maximum wait time for pathfinding in milliseconds (10 seconds)
-const PATHFINDING_WAIT_MS: u64 = 10_000;
 /// Interval between position checks in milliseconds
 const PATHFINDING_CHECK_INTERVAL_MS: u64 = 100;
 
@@ -64,9 +62,10 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
     // Azalea's pathfinding should NOT break blocks - it only walks around obstacles
     // If blocks are being broken, it's likely from a different source (e.g., block_interact misuse)
     client.goto(BlockPosGoal(target_block)).await;
-    
-    // Wait for pathfinding to complete
-    let max_checks = (PATHFINDING_WAIT_MS / PATHFINDING_CHECK_INTERVAL_MS) as usize;
+
+    // Wait for pathfinding to complete (timeout from config)
+    let pathfinding_wait_ms = bot.pathfinding_timeout_ms;
+    let max_checks = (pathfinding_wait_ms / PATHFINDING_CHECK_INTERVAL_MS) as usize;
     let mut checks = 0;
     while checks < max_checks {
         tokio::time::sleep(tokio::time::Duration::from_millis(PATHFINDING_CHECK_INTERVAL_MS)).await;
@@ -93,7 +92,7 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
     let final_block = BlockPos::from(final_pos);
     warn!(
         "Pathfinding timeout after {}ms - target: ({}, {}, {}), current: ({}, {}, {})",
-        PATHFINDING_WAIT_MS,
+        pathfinding_wait_ms,
         target_block.x, target_block.y, target_block.z,
         final_block.x, final_block.y, final_block.z
     );

@@ -72,7 +72,7 @@ impl Chest {
     /// 23  <- y (bottom row)
     /// ```
     /// All chests at z-1 (south face), x-2 (left) or x-1 (right).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reverse-lookup API for future tooling
     pub fn node_position(&self) -> Option<Position> {
         match self.index {
             0 => Some(Position {

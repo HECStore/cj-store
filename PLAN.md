@@ -10,50 +10,6 @@ This plan documents every change needed to reach 100/100, organized into tiers b
 
 ## Tier 1: 72 → 82 (High impact, moderate effort)
 
-### 1.1 Extract rollback into a shared helper
-
-**Problem:** Rollback blocks (withdraw items back to storage after failed trade) are copy-pasted 10+ times across `orders.rs`, `player.rs`, and `operator.rs` with minor variations. ~400 lines of near-identical code.
-
-**Files:** `src/store/orders.rs`, `src/store/handlers/player.rs`, `src/store/handlers/operator.rs`
-
-**Change:** Create a new function in `src/store/utils.rs` (or a new `src/store/rollback.rs`):
-
-```rust
-pub async fn rollback_transfers_to_storage(
-    store: &mut Store,
-    transfers: &[ChestTransfer],
-    item: &str,
-    stack_size: i32,
-    context: &str, // for logging, e.g. "buy", "sell", "removeitem"
-) -> RollbackResult {
-    // Unified rollback: iterate transfers, send InteractWithChestAndSync deposits,
-    // apply_chest_sync, track success/failure counts
-}
-
-pub struct RollbackResult {
-    pub items_returned: i32,
-    pub operations_succeeded: usize,
-    pub operations_failed: usize,
-}
-```
-
-Replace all inline rollback blocks with calls to this helper.
-
-Similarly extract `rollback_diamonds_to_storage()` for sell/withdraw diamond rollbacks.
-
-### 1.2 Wire up dead config fields
-
-**Problem:** `trade_timeout_ms` and `pathfinding_timeout_ms` exist in `Config` but are never read. All timeouts are hardcoded as `Duration::from_secs(45)`, `Duration::from_secs(30)`, etc.
-
-**Files:** `src/store/orders.rs`, `src/store/handlers/player.rs`, `src/store/handlers/operator.rs`, `src/bot/trade.rs`, `src/bot/navigation.rs`, `src/config.rs`
-
-**Change:**
-
-- Pass `store.config.trade_timeout_ms` through `BotInstruction::TradeWithPlayer` (add a `timeout_ms: u64` field) or access it where needed
-- Replace all hardcoded `Duration::from_secs(45)` trade timeouts with `Duration::from_millis(store.config.trade_timeout_ms)`
-- Replace hardcoded pathfinding timeouts with config value
-- Update README to remove "Reserved" labels from these fields
-
 ### 1.3 Split mega-functions
 
 **Problem:** `handle_buy_order` (~600 lines), `handle_sell_order` (~700 lines), and `automated_chest_io` (~800 lines) are too long to reason about.
@@ -124,19 +80,6 @@ Migrate progressively — start with store handlers, then bot, then types.
 
 ## Tier 2: 82 → 88 (Structural improvements)
 
-### 2.1 Cut logging by ~60%
-
-**Problem:** ~30% of lines are tracing calls. Many are redundant ("Step 1/6... Step 2/6...") or log both entry AND exit of every trivial operation.
-
-**Files:** All files in `src/store/` and `src/bot/`
-
-**Change:**
-
-- Add `#[tracing::instrument]` to key functions instead of manual entry/exit logs
-- Keep: order start/complete/fail, trade success/failure, errors, warnings
-- Remove: "Sending message...", "Message sent", "Step X/Y", "Starting...", "Complete", per-slot debug logging
-- Rule of thumb: one info-level log per state transition, debug for internals
-
 ### 2.2 Add integration tests for order handlers
 
 **Problem:** The riskiest code (buy/sell/deposit/withdraw handlers) has zero tests. Only types and pricing have unit tests.
@@ -181,18 +124,6 @@ impl<'a> WithdrawPlanner<'a> {
 ```
 
 The `deposit_plan` / `withdraw_plan` methods currently mutate `self` — refactor them to return a plan + adjustment set without mutating.
-
-### 2.4 Remove all `#[allow(dead_code)]`
-
-**Problem:** ~15 functions/constants marked `#[allow(dead_code)]`. These are either genuinely unused (delete them) or used only in tests (move the allow to `#[cfg(test)]`).
-
-**Files:** `src/constants.rs`, `src/types/*.rs`, `src/store/*.rs`, `src/bot/shulker.rs`
-
-**Change:** For each `#[allow(dead_code)]` item:
-
-- If truly unused and no plans to use: **delete it**
-- If used only in tests: move to `#[cfg(test)]` module
-- If planned for future use: add a brief `// TODO: wire up for <feature>` and keep
 
 ---
 

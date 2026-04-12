@@ -18,7 +18,7 @@ This plan documents the remaining changes needed to reach 100/100, organized int
 
 ### 1.3 Split mega-functions
 
-**Problem:** `handle_buy_order` (~600 lines), `handle_sell_order` (~700 lines), and `automated_chest_io` (~800 lines) are too long to reason about.
+**Problem:** `handle_buy_order` (~470 lines), `handle_sell_order` (~500 lines), and `automated_chest_io` (~740 lines) are too long to reason about. The Tier 2.1 logging cleanup trimmed them, but the underlying monolithic structure remains.
 
 **Files:** `src/store/orders.rs`, `src/bot/chest_io.rs`
 

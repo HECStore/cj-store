@@ -277,7 +277,7 @@ The bot uses a **FIFO order queue** to handle multiple buy/sell/deposit/withdraw
 | **Max orders per player** | 8 | Prevents queue monopolization |
 | **Queue persistence** | Yes | Saved to `data/queue.json`, survives restarts |
 | **Trade accept timeout** | 30 seconds | Order cancelled if player doesn't accept the trade request |
-| **Trade completion timeout** | 45 seconds | Order cancelled if trade doesn't complete |
+| **Trade completion timeout** | `trade_timeout_ms` (default 45 s) | Order cancelled if trade doesn't complete |
 | **Retry on timeout** | No | Timed-out orders are cancelled, not retried |
 
 #### Player Feedback Messages
@@ -483,7 +483,7 @@ Notes:
 - **Per-user limit**: Maximum 8 orders per user in the queue at any time
 - **FIFO processing**: Orders are processed in first-in-first-out order
 - **Auto-save**: Queue is saved to disk after each add/pop/cancel operation
-- **Trade timeouts**: If a player doesn't accept a trade request within 30 seconds (or complete within 45 seconds), the order is cancelled and removed from the queue
+- **Trade timeouts**: If a player doesn't accept a trade request within 30 seconds (or complete within the configured `trade_timeout_ms`, default 45 s), the order is cancelled and removed from the queue
 - This is separate from `orders.json` (audit log) - the queue holds **pending** orders, while orders.json records **completed** orders
 
 ### Trades (`data/trades/<timestamp>.json`)

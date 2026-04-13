@@ -144,8 +144,9 @@ cj-store/
         player.rs              # Player command handlers (buy, sell, balance, pay, queue, cancel)
         operator.rs            # Operator handlers (additem, removeitem, add/remove currency)
         cli.rs                 # CLI message handlers
+      journal.rs                # Operation journal for crash recovery (tracks in-flight shulker ops)
       orders.rs                 # Order execution (handle_buy_order, handle_sell_order, execute_queued_order)
-      pricing.rs                # Constant product AMM pricing (calculate_buy_cost, calculate_sell_payout)
+      pricing.rs                # Constant product AMM pricing + property-based tests (proptest)
       queue.rs                  # Order queue system (QueuedOrder, OrderQueue, persistence)
       rate_limit.rs             # Anti-spam rate limiting with exponential backoff
       rollback.rs               # Shared rollback helper (items/diamonds back to storage on failure)
@@ -156,14 +157,16 @@ cj-store/
       connection.rs             # Connection management (connect, disconnect)
       navigation.rs             # Pathfinding (navigate_to_position, go_to_node, go_to_chest)
       shulker.rs               # Shulker operations (place, pickup, open, station position)
-      chest_io.rs               # Chest operations (automated_chest_io, transfer_items_with_shulker, etc.)
+      chest_io.rs               # Chest operations — automated_chest_io dispatches to withdraw_shulkers / deposit_shulkers
       trade.rs                  # Trade automation (execute_trade_with_player, trade GUI handling)
       inventory.rs              # Inventory management (ensure_inventory_empty, move_hotbar_to_inventory, etc.)
     cli.rs                      # dialoguer menu → StoreMessage
     config.rs                   # data/config.json loader/creator
     messages.rs                 # StoreMessage / BotMessage / CliMessage / BotInstruction
     types.rs                    # re-exports model types
+    error.rs                    # StoreError enum (typed errors for hot-path operations)
     types/
+      item_id.rs                # ItemId newtype — normalized, non-empty item identifier
       user.rs                   # per-user persistence + Mojang UUID lookup
       pair.rs                   # per-item "pair" persistence (data/pairs/*.json)
       order.rs                  # global queue persistence (data/orders.json)
@@ -175,6 +178,7 @@ cj-store/
   data/
     config.json
     logs/store.log
+    journal.json                # In-flight shulker operation (crash recovery, normally empty)
     orders.json                 # Order audit log (session-only, cleared on restart)
     queue.json                  # Pending order queue (persistent, resumes on restart)
     pairs/*.json
@@ -485,6 +489,22 @@ Notes:
 - **Auto-save**: Queue is saved to disk after each add/pop/cancel operation
 - **Trade timeouts**: If a player doesn't accept a trade request within 30 seconds (or complete within the configured `trade_timeout_ms`, default 45 s), the order is cancelled and removed from the queue
 - This is separate from `orders.json` (audit log) - the queue holds **pending** orders, while orders.json records **completed** orders
+
+### Operation Journal (`data/journal.json`)
+
+Type: `Vec<JournalEntry>` (`src/store/journal.rs`)
+
+Fields (JournalEntry):
+- **operation_id**: `u64` monotonic counter (per-run, not globally unique)
+- **operation_type**: `WithdrawFromChest | DepositToChest`
+- **chest_id**: `i32` target chest
+- **slot_index**: `usize` slot within the chest
+- **state**: `ShulkerTaken | ShulkerOnStation | ItemsTransferred | ShulkerPickedUp | ShulkerReplaced`
+
+Notes:
+- **Normally empty**: The file contains `[]` when no operation is in flight. A non-empty file after startup means the previous run crashed mid-shulker-operation.
+- **Detection only**: On startup, the bot logs any leftover entry at error level and clears the file. It does NOT attempt automatic recovery — the operator should check in-world state.
+- **Single entry**: Only one shulker operation runs at a time (chest I/O is serialized), so the array holds at most one element.
 
 ### Trades (`data/trades/<timestamp>.json`)
 
@@ -1024,6 +1044,7 @@ If any validation fails, the trade is aborted and the player is notified.
 | Component | Location | Function |
 |-----------|----------|----------|
 | Buy/sell orchestration | `src/store/orders.rs` | `handle_buy_order`, `handle_sell_order` |
+| Trade state machine | `src/store/trade_state.rs` | `TradeState` enum, phase transitions |
 | Trade instructions | `src/messages.rs` | `BotInstruction::TradeWithPlayer`, `TradeItem` |
 | Trade GUI automation | `src/bot/trade.rs` | `execute_trade_with_player` |
 
@@ -1230,6 +1251,7 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Error Handling Patterns
 
+- **`StoreError` enum**: `src/error.rs` defines a typed error enum (via `thiserror`) with a `From<StoreError> for String` shim so existing `Result<T, String>` call sites can migrate progressively. The hot-path helpers `execute_chest_transfers` and `perform_trade` already return typed variants (`BotDisconnected`, `TradeTimeout`, `ChestOp`, `TradeRejected`).
 - **Store operations**: Return `Result<(), String>` - errors are logged and sent to player via whisper
 - **Bot operations**: Return `Result<T, String>` - errors are logged and propagated to Store
 - **Persistence**: Return `Result<(), Box<dyn Error>>` - errors are logged, state remains dirty for retry
@@ -1238,15 +1260,16 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Item ID Handling
 
-- **Normalization**: Item names are normalized using `utils::normalize_item_id()` (in `src/store/utils.rs`) which strips the `minecraft:` prefix:
-  - `"minecraft:diamond"` → `"diamond"`
-  - `"diamond"` → `"diamond"` (unchanged)
+- **`ItemId` newtype** ([src/types/item_id.rs](src/types/item_id.rs)): All item-referencing fields (`Pair::item`, `Chest::item`, `Order::item`, `Trade::item`, `ChestTransfer::item`) use a dedicated `ItemId` wrapper instead of raw `String`. `ItemId::new()` strips the `minecraft:` prefix and rejects empty strings at construction time, making normalization bugs compile errors. Serialized with `#[serde(transparent)]` so on-disk JSON stays a bare string — fully backwards compatible.
+- **Normalization**: `ItemId::new("minecraft:diamond")` → `ItemId("diamond")`; `ItemId::new("diamond")` → `ItemId("diamond")` (unchanged). Also available as `utils::normalize_item_id()` for raw strings.
 - **Storage**: Items are stored in pairs/chests WITHOUT the `minecraft:` prefix
-- **Minecraft interaction**: Bot-side code re-adds the `minecraft:` prefix inline where needed (e.g., when matching Azalea item IDs)
+- **Minecraft interaction**: Bot-side code re-adds the `minecraft:` prefix via `item_id.with_minecraft_prefix()` where needed (e.g., when matching Azalea item IDs)
 - **Player input**: Players can use either format (`diamond` or `minecraft:diamond`) - both work
 
 ### Testing
 
+- **Unit and integration tests**: `cargo test` runs 74 tests covering pricing invariants (including 7 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), and the order-handler integration suite. The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
+- **Property-based AMM tests**: `proptest` exercises the pricing functions across thousands of random reserve/quantity combinations, asserting that `k` never decreases, buy cost always exceeds sell payout (positive spread), per-item price increases with trade size (slippage), and sell payout is bounded by the currency reserve.
 - Test with small quantities first before large trades
 - Verify physical nodes exist before adding them via CLI
 - Use "Audit state" regularly to catch inconsistencies early

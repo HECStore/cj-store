@@ -190,7 +190,7 @@ pub enum CliMessage {
     },
     /// Clear stuck order processing state.
     /// 
-    /// This resets `processing_order` to false and clears `current_order`,
+    /// This resets `processing_order` to false and clears `current_trade`,
     /// allowing the queue to continue processing. Use when an order gets
     /// stuck due to timeout or other issues.
     /// 

@@ -4,7 +4,7 @@ use tracing::{error, info, warn};
 
 use crate::constants::CHEST_OP_TIMEOUT_SECS;
 use crate::messages::TradeItem;
-use crate::types::{Order, Trade, TradeType};
+use crate::types::{ItemId, Order, Trade, TradeType};
 use super::super::{Store, state, utils};
 
 /// Handle additem orders (operator-only)
@@ -36,10 +36,11 @@ pub async fn handle_additem_order(
             .await;
     }
 
-    // Plan deposit
+    // Plan deposit against a read-only view of storage so we don't pay the
+    // cost of cloning the entire structure just to preview placement.
     let stack_size = store.pairs.get(item).unwrap().stack_size;
-    let mut sim_storage = store.storage.clone();
-    let preview_deposit_plan = sim_storage.deposit_plan(item, qty_i32, stack_size);
+    let (preview_deposit_plan, _) =
+        store.storage.simulate_deposit_plan(item, qty_i32, stack_size);
 
     // Notify operator before trade
     utils::send_message_to_player(
@@ -227,7 +228,7 @@ pub async fn handle_additem_order(
 
     store.trades.push(Trade::new(
         TradeType::AddStock,
-        item.to_string(),
+        ItemId::from_normalized(item.to_string()),
         qty_i32,
         0.0,
         user_uuid.clone(),
@@ -235,7 +236,7 @@ pub async fn handle_additem_order(
 
     store.orders.push_back(Order {
         order_type: crate::types::order::OrderType::AddItem,
-        item: item.to_string(),
+        item: ItemId::from_normalized(item.to_string()),
         amount: qty_i32,
         user_uuid: user_uuid.clone(),
     });
@@ -297,10 +298,9 @@ pub async fn handle_removeitem_order(
         .await;
     }
 
-    // Plan withdrawal
-    let mut sim_storage = store.storage.clone();
-    let preview_withdraw_plan = sim_storage.withdraw_plan(item, qty_i32);
-    let preview_withdrawn: i32 = preview_withdraw_plan.iter().map(|t| t.amount).sum();
+    // Plan withdrawal without cloning storage.
+    let (preview_withdraw_plan, preview_withdrawn) =
+        store.storage.simulate_withdraw_plan(item, qty_i32);
     if preview_withdrawn != qty_i32 {
         return utils::send_message_to_player(
             store,
@@ -438,7 +438,7 @@ pub async fn handle_removeitem_order(
 
     store.trades.push(Trade::new(
         TradeType::RemoveStock,
-        item.to_string(),
+        ItemId::from_normalized(item.to_string()),
         qty_i32,
         0.0,
         user_uuid.clone(),
@@ -446,7 +446,7 @@ pub async fn handle_removeitem_order(
 
     store.orders.push_back(Order {
         order_type: crate::types::order::OrderType::RemoveItem,
-        item: item.to_string(),
+        item: ItemId::from_normalized(item.to_string()),
         amount: qty_i32,
         user_uuid: user_uuid.clone(),
     });
@@ -498,7 +498,7 @@ pub async fn handle_add_currency(
 
     store.trades.push(Trade::new(
         TradeType::AddCurrency,
-        item.to_string(),
+        ItemId::from_normalized(item.to_string()),
         0,
         amount,
         user_uuid.clone(),
@@ -506,7 +506,7 @@ pub async fn handle_add_currency(
 
     store.orders.push_back(Order {
         order_type: crate::types::order::OrderType::AddCurrency,
-        item: item.to_string(),
+        item: ItemId::from_normalized(item.to_string()),
         amount: 0,
         user_uuid: user_uuid.clone(),
     });
@@ -571,7 +571,7 @@ pub async fn handle_remove_currency(
 
     store.trades.push(Trade::new(
         TradeType::RemoveCurrency,
-        item.to_string(),
+        ItemId::from_normalized(item.to_string()),
         0,
         amount,
         user_uuid.clone(),
@@ -579,7 +579,7 @@ pub async fn handle_remove_currency(
 
     store.orders.push_back(Order {
         order_type: crate::types::order::OrderType::RemoveCurrency,
-        item: item.to_string(),
+        item: ItemId::from_normalized(item.to_string()),
         amount: 0,
         user_uuid: user_uuid.clone(),
     });

@@ -79,6 +79,12 @@ pub struct Bot {
     /// long navigation may run before giving up. Used by `bot::navigation`
     /// across retry attempts.
     pub pathfinding_timeout_ms: u64,
+    /// Persistent journal of in-flight shulker operations (crash recovery).
+    ///
+    /// `chest_io` writes state transitions here so a subsequent process can
+    /// detect — and an operator can reconcile — any operation that was
+    /// mid-flight at the moment of a crash.
+    pub journal: crate::store::journal::SharedJournal,
 }
 
 impl Bot {
@@ -90,6 +96,7 @@ impl Bot {
         buffer_chest_position: Option<Position>,
         trade_timeout_ms: u64,
         pathfinding_timeout_ms: u64,
+        journal: crate::store::journal::SharedJournal,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let account = Account::microsoft(&account_email).await?;
 
@@ -105,6 +112,7 @@ impl Bot {
             client_task: Arc::new(Mutex::new(None)),
             trade_timeout_ms,
             pathfinding_timeout_ms,
+            journal,
         })
     }
 
@@ -158,6 +166,37 @@ pub async fn bot_task(
 ) {
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
 
+    // Load the operation journal and surface any leftover in-flight entry.
+    //
+    // A leftover entry means the previous run crashed between shulker lifecycle
+    // steps. We don't attempt automatic resume (that would require verifying
+    // live world state, which is easy to get wrong and leaks items); instead we
+    // log prominently so an operator can reconcile, then zero the file so the
+    // bot can proceed with fresh operations.
+    let journal = match crate::store::journal::Journal::load() {
+        Ok((journal, leftover)) => {
+            if let Some(entry) = leftover {
+                error!(
+                    "[Bot] Crash recovery: previous run left an in-flight shulker op: op_id={} type={:?} chest_id={} slot={} state={:?} — manual reconciliation recommended",
+                    entry.operation_id,
+                    entry.operation_type,
+                    entry.chest_id,
+                    entry.slot_index,
+                    entry.state
+                );
+            }
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(journal));
+            if let Err(e) = shared.lock().unwrap().clear_leftover() {
+                warn!("[Bot] Failed to clear journal after startup warning: {}", e);
+            }
+            shared
+        }
+        Err(e) => {
+            warn!("[Bot] Failed to load operation journal: {} — starting with empty journal", e);
+            std::sync::Arc::new(std::sync::Mutex::new(crate::store::journal::Journal::default()))
+        }
+    };
+
     // Create bot instance using config values
     let bot = match Bot::new(
         account_email,
@@ -167,6 +206,7 @@ pub async fn bot_task(
         buffer_chest_position,
         trade_timeout_ms,
         pathfinding_timeout_ms,
+        journal,
     )
     .await
     {
@@ -298,6 +338,7 @@ pub async fn bot_task(
                                     let io_result = chest_io::automated_chest_io(
                                         &bot,
                                         chest_block_pos,
+                                        target_chest.id,
                                         &item,
                                         amount,
                                         "deposit",
@@ -341,6 +382,7 @@ pub async fn bot_task(
                                     let io_result = chest_io::automated_chest_io(
                                         &bot,
                                         chest_block_pos,
+                                        target_chest.id,
                                         &item,
                                         amount,
                                         "withdraw",

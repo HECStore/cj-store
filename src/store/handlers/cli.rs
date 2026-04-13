@@ -4,6 +4,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::messages::{BotInstruction, CliMessage};
+use crate::types::ItemId;
 use crate::types::User;
 use super::super::{Store, state, utils};
 
@@ -82,11 +83,11 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             // Node 0 has reserved chests (forced, cannot change)
             if node_id == 0 {
                 if let Some(chest_0) = node.chests.get_mut(0) {
-                    chest_0.item = "diamond".to_string();
+                    chest_0.item = ItemId::from_normalized("diamond".to_string());
                     info!("Node 0 chest 0 set to diamond (forced, cannot change)");
                 }
                 if let Some(chest_1) = node.chests.get_mut(1) {
-                    chest_1.item = crate::constants::OVERFLOW_CHEST_ITEM.to_string();
+                    chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                     info!("Node 0 chest 1 set to overflow (forced, cannot change)");
                 }
             }
@@ -156,11 +157,11 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                     // Node 0 has reserved chests
                     if node_id == 0 {
                         if let Some(chest_0) = node.chests.get_mut(0) {
-                            chest_0.item = "diamond".to_string();
+                            chest_0.item = ItemId::from_normalized("diamond".to_string());
                             info!("Node 0 chest 0 set to diamond (forced)");
                         }
                         if let Some(chest_1) = node.chests.get_mut(1) {
-                            chest_1.item = crate::constants::OVERFLOW_CHEST_ITEM.to_string();
+                            chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                             info!("Node 0 chest 1 set to overflow (forced)");
                         }
                     }
@@ -255,7 +256,7 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 store.pairs.insert(
                     normalized_item.clone(),
                     crate::types::Pair {
-                        item: normalized_item.clone(),
+                        item: ItemId::from_normalized(normalized_item.clone()),
                         stack_size,
                         item_stock: 0,
                         currency_stock: 0.0,
@@ -407,10 +408,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                         // Node 0 has reserved chests
                         if node_id == 0 {
                             if let Some(chest_0) = node.chests.get_mut(0) {
-                                chest_0.item = "diamond".to_string();
+                                chest_0.item = ItemId::from_normalized("diamond".to_string());
                             }
                             if let Some(chest_1) = node.chests.get_mut(1) {
-                                chest_1.item = crate::constants::OVERFLOW_CHEST_ITEM.to_string();
+                                chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                             }
                         }
                         
@@ -456,22 +457,22 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             info!("[CLI] Clearing stuck order processing state");
             
             let stuck_order_desc = if store.processing_order {
-                if let Some(ref order) = store.current_order {
-                    let desc = format!("Order #{}: {} for {}", order.id, order.description(), order.username);
+                if let Some(ref trade) = store.current_trade {
+                    let desc = format!("Order #{} [{}]: {}", trade.order().id, trade.phase(), trade);
                     warn!("[CLI] Clearing stuck order: {}", desc);
                     Some(desc)
                 } else {
-                    warn!("[CLI] processing_order was true but current_order was None (inconsistent state)");
+                    warn!("[CLI] processing_order was true but current_trade was None (inconsistent state)");
                     Some("Unknown order (inconsistent state)".to_string())
                 }
             } else {
                 info!("[CLI] No stuck order detected (processing_order was already false)");
                 None
             };
-            
+
             // Reset the processing state
             store.processing_order = false;
-            store.current_order = None;
+            store.current_trade = None;
             store.dirty = true;
 
             // Persist the queue immediately (in addition to the dirty flag)

@@ -194,9 +194,9 @@ pub async fn rollback_amount_to_storage(
     if amount <= 0 {
         return RollbackResult::default();
     }
-    // Plan against a clone so we don't mutate real storage; the authoritative
-    // state is re-synced by apply_chest_sync on each successful step.
-    let mut sim = store.storage.clone();
-    let plan = sim.deposit_plan(item, amount, stack_size);
+    // Use the non-mutating planner so we don't clone all of storage just to
+    // compute where items would land. The authoritative state is re-synced by
+    // `apply_chest_sync` on each successful step anyway.
+    let (plan, _planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
     deposit_transfers(store, &plan, item, stack_size, context).await
 }

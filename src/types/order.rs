@@ -59,7 +59,7 @@ pub struct Order {
     /// Type of order (buy, sell, deposit, withdraw, etc.)
     pub order_type: OrderType,
     /// Item involved in the transaction
-    pub item: String,
+    pub item: crate::types::ItemId,
     /// Quantity of items
     pub amount: i32,
     /// UUID of the user who placed the order

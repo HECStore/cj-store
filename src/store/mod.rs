@@ -8,12 +8,14 @@
 //! - Storage (nodes, chests, shulker contents)
 
 pub mod handlers;
+pub mod journal;
 pub mod orders;
 pub mod pricing;
 pub mod queue;
 pub mod rate_limit;
 pub mod rollback;
 pub mod state;
+pub mod trade_state;
 pub mod utils;
 
 use std::collections::{HashMap, VecDeque};
@@ -23,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::messages::{BotInstruction, BotMessage, ChestSyncReport, StoreMessage};
-use crate::types::{Order, Pair, Storage, Trade, User};
+use crate::types::{ItemId, Order, Pair, Storage, Trade, User};
 
 use self::queue::OrderQueue;
 use self::rate_limit::RateLimiter;
@@ -61,8 +63,10 @@ pub struct Store {
     pub rate_limiter: RateLimiter,
     /// Flag to prevent concurrent order processing
     pub processing_order: bool,
-    /// The order currently being processed (for status reporting)
-    pub current_order: Option<queue::QueuedOrder>,
+    /// The trade currently being processed, tracked as a formal state machine.
+    /// `None` when idle; set to `Some(TradeState::Queued(..))` when an order
+    /// is popped and advanced through phases until a terminal state.
+    pub current_trade: Option<trade_state::TradeState>,
 }
 
 impl Store {
@@ -102,7 +106,7 @@ impl Store {
                 needs_save = true;
             }
             // Update the pair's item field to normalized form (without minecraft: prefix)
-            pair.item = normalized_item.clone();
+            pair.item = ItemId::from_normalized(normalized_item.clone());
             // Insert with normalized key
             normalized_pairs.insert(normalized_item, pair);
         }
@@ -171,7 +175,7 @@ impl Store {
             order_queue,
             rate_limiter,
             processing_order: false,
-            current_order: None,
+            current_trade: None,
         })
     }
 
@@ -209,8 +213,8 @@ impl Store {
             if !self.order_queue.is_empty() || self.processing_order {
                 debug!("[Store] Loop state: processing_order={} queue_len={}",
                        self.processing_order, self.order_queue.len());
-                if let Some(ref order) = self.current_order {
-                    debug!("[Store] Current order: #{} {} for {}", order.id, order.description(), order.username);
+                if let Some(ref trade) = self.current_trade {
+                    debug!("[Store] Current trade: {}", trade);
                 }
             }
 
@@ -313,7 +317,7 @@ impl Store {
         };
 
         self.processing_order = true;
-        self.current_order = Some(order.clone());
+        self.current_trade = Some(trade_state::TradeState::new(order.clone()));
 
         // Notify user that their order is being processed
         let processing_msg = format!("Now processing: {}...", order.description());
@@ -329,8 +333,23 @@ impl Store {
         }
 
         self.processing_order = false;
-        self.current_order = None;
+        self.current_trade = None;
         self.dirty = true;
+    }
+
+    /// Advance the in-flight trade through the state machine.
+    ///
+    /// Takes a closure that receives the current `TradeState` by value and
+    /// returns the next state.  If no trade is active the call is a no-op
+    /// (logged at debug level).
+    pub(crate) fn advance_trade(&mut self, transition: impl FnOnce(trade_state::TradeState) -> trade_state::TradeState) {
+        if let Some(state) = self.current_trade.take() {
+            let next = transition(state);
+            debug!("[Store] Trade advanced to: {}", next.phase());
+            self.current_trade = Some(next);
+        } else {
+            debug!("[Store] advance_trade called with no active trade (no-op)");
+        }
     }
 
     /// Handle messages from the bot
@@ -354,5 +373,35 @@ impl Store {
     /// Get node position for a given chest_id
     pub(crate) fn get_node_position(&self, chest_id: i32) -> crate::types::Position {
         utils::get_node_position(self, chest_id)
+    }
+
+    /// Build a fully in-memory `Store` for integration tests.
+    ///
+    /// Bypasses all disk I/O (`Config::load`, `Pair::load_all`, `Storage::load`,
+    /// `Trade::load_all`, `OrderQueue::load`) so tests can exercise handler
+    /// logic without touching `data/`. Callers supply their own bot channel
+    /// and fabricate `pairs`/`users`/`storage` inline.
+    #[cfg(test)]
+    pub fn new_for_test(
+        bot_tx: mpsc::Sender<BotInstruction>,
+        config: crate::config::Config,
+        pairs: HashMap<String, Pair>,
+        users: HashMap<String, User>,
+        storage: crate::types::Storage,
+    ) -> Self {
+        Store {
+            config,
+            pairs,
+            users,
+            orders: VecDeque::new(),
+            trades: Vec::new(),
+            storage,
+            dirty: false,
+            bot_tx,
+            order_queue: queue::OrderQueue::new(),
+            rate_limiter: RateLimiter::new(),
+            processing_order: false,
+            current_trade: None,
+        }
     }
 }

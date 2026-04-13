@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::item_id::ItemId;
 use crate::types::position::Position;
 
 /// Represents a single chest in the storage system.
@@ -24,7 +25,7 @@ use crate::types::position::Position;
 /// **Model**: 54-slot double chest where each slot contains 1 shulker box.
 ///
 /// **Storage**:
-/// - `item`: Item type stored in this chest (empty string = unassigned)
+/// - `item`: Item type stored in this chest (empty = unassigned via `ItemId::EMPTY`)
 /// - `amounts[i]`: Item count inside the shulker box in slot `i`
 ///
 /// **Invariants**:
@@ -49,8 +50,8 @@ pub struct Chest {
     pub index: i32,
     /// World position of the chest (for bot navigation)
     pub position: Position,
-    /// Item type stored in this chest (empty = unassigned)
-    pub item: String,
+    /// Item type stored in this chest (`ItemId::EMPTY` = unassigned)
+    pub item: ItemId,
     /// Item count per slot (54 slots, each contains 1 shulker box)
     /// `amounts[i]` = items inside the shulker in slot `i`
     pub amounts: Vec<i32>,
@@ -175,7 +176,7 @@ impl Chest {
             node_id,
             index,
             position,
-            item: String::new(),  // empty = unassigned chest
+            item: ItemId::EMPTY,  // empty = unassigned chest
             amounts: vec![0; 54], // one entry per slot in a double chest
         }
     }

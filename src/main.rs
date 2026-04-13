@@ -21,6 +21,7 @@ mod bot;
 mod cli;
 mod config;
 mod constants;
+mod error;
 mod fsutil;
 mod messages;
 mod store;

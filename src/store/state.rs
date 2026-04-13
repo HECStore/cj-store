@@ -3,7 +3,7 @@
 use tracing::warn;
 
 use crate::messages::ChestSyncReport;
-use crate::types::{Order, Pair, Trade, User};
+use crate::types::{ItemId, Order, Pair, Trade, User};
 use super::Store;
 
 /// Apply chest sync report from bot (merges with existing storage)
@@ -23,15 +23,15 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                     if chest.item != "diamond" {
                         warn!("Attempted to change node 0 chest 0 item from diamond to {}, enforcing diamond", report.item);
                     }
-                    chest.item = "diamond".to_string();
+                    chest.item = ItemId::from_normalized("diamond".to_string());
                 } else if chest.id == crate::constants::OVERFLOW_CHEST_ID {
                     // Chest 1: dedicated for overflow (mixed items allowed, but keep the "overflow" item type)
                     if chest.item != crate::constants::OVERFLOW_CHEST_ITEM {
                         warn!("Attempted to change node 0 chest 1 item from overflow to {}, enforcing overflow", report.item);
                     }
-                    chest.item = crate::constants::OVERFLOW_CHEST_ITEM.to_string();
+                    chest.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                 } else {
-                    chest.item = report.item;
+                    chest.item = ItemId::from_normalized(report.item);
                 }
                 
                 // Slot merge semantics:
@@ -121,7 +121,7 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
                 crate::types::Storage::DEFAULT_SHULKER_CAPACITY
             } else {
                 // Look up stack_size from pairs, default to 64 if not found
-                store.pairs.get(&chest.item)
+                store.pairs.get(chest.item.as_str())
                     .map(|p| crate::types::Pair::shulker_capacity_for_stack_size(p.stack_size))
                     .unwrap_or(crate::types::Storage::DEFAULT_SHULKER_CAPACITY)
             };

@@ -64,7 +64,7 @@ pub struct Trade {
     /// Type of trade (buy, sell, deposit, withdraw, etc.)
     pub trade_type: TradeType,
     /// Item involved in the trade
-    pub item: String,
+    pub item: crate::types::ItemId,
     /// Quantity of items traded
     pub amount: i32,
     /// Currency amount involved (diamonds)
@@ -83,7 +83,7 @@ impl Trade {
     /// Helper method to create a new trade with current timestamp
     pub fn new(
         trade_type: TradeType,
-        item: String,
+        item: crate::types::ItemId,
         amount: i32,
         amount_currency: f64,
         user_uuid: String,

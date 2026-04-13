@@ -20,6 +20,7 @@
 use tracing::{debug, warn, info};
 
 use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::types::ItemId;
 
 use super::super::{Store, state, utils};
 use super::operator;
@@ -660,12 +661,12 @@ pub async fn handle_player_command(
                 };
 
                 // Check if this order is currently being processed
-                if let Some(ref current) = store.current_order {
-                    if current.id == order_id {
+                if let Some(ref trade) = store.current_trade {
+                    if trade.order().id == order_id {
                         return utils::send_message_to_player(
                             store,
                             player_name,
-                            &format!("Order #{} is currently being processed and cannot be cancelled.", order_id),
+                            &format!("Order #{} is currently being processed ({}) and cannot be cancelled.", order_id, trade.phase()),
                         ).await;
                     }
                 }
@@ -778,33 +779,14 @@ async fn handle_status_command(
     store: &mut Store,
     player_name: &str,
 ) -> Result<(), String> {
-    use crate::messages::QueuedOrderType;
-    
     let queue_len = store.order_queue.len();
     
     // Determine current activity
     let status_msg = if store.processing_order {
         // Bot is actively processing an order
-        if let Some(ref order) = store.current_order {
-            let activity = match &order.order_type {
-                QueuedOrderType::Buy => format!("Buying {} x{}", order.item, order.quantity),
-                QueuedOrderType::Sell => format!("Selling {} x{}", order.item, order.quantity),
-                QueuedOrderType::Deposit { amount } => {
-                    if let Some(amt) = amount {
-                        format!("Processing deposit ({:.2} diamonds)", amt)
-                    } else {
-                        "Processing deposit (flexible)".to_string()
-                    }
-                }
-                QueuedOrderType::Withdraw { amount } => {
-                    if let Some(amt) = amount {
-                        format!("Processing withdrawal ({:.2} diamonds)", amt)
-                    } else {
-                        "Processing withdrawal (full balance)".to_string()
-                    }
-                }
-            };
-            
+        if let Some(ref trade) = store.current_trade {
+            let activity = format!("{} [{}]", trade, trade.phase());
+
             if queue_len > 0 {
                 format!("Status: {}. {} order(s) waiting in queue.", activity, queue_len)
             } else {
@@ -1140,6 +1122,10 @@ pub async fn handle_deposit_balance_queued(
     };
     utils::send_message_to_player(store, player_name, &msg).await?;
 
+    // Advance: Queued -> Withdrawing (empty plan) -> Trading
+    store.advance_trade(|s| s.begin_withdrawal(vec![]));
+    store.advance_trade(|s| s.begin_trading());
+
     // Perform trade: player offers diamonds, bot offers nothing
     info!(
         "[Deposit] Initiating trade: {} offers up to {} diamonds (flexible={})",
@@ -1250,7 +1236,7 @@ pub async fn handle_deposit_balance_queued(
     // Record order
     store.orders.push_back(crate::types::Order {
         order_type: crate::types::order::OrderType::DepositBalance,
-        item: "diamond".to_string(),
+        item: ItemId::from_normalized("diamond".to_string()),
         amount: diamonds_actually_received,
         user_uuid: user_uuid.clone(),
     });
@@ -1258,11 +1244,14 @@ pub async fn handle_deposit_balance_queued(
     // Record trade
     store.trades.push(crate::types::Trade::new(
         crate::types::TradeType::DepositBalance,
-        "diamond".to_string(),
+        ItemId::from_normalized("diamond".to_string()),
         diamonds_actually_received,
         actual_amount,
         user_uuid.clone(),
     ));
+
+    // Advance: Trading -> Committed
+    store.advance_trade(|s| s.commit("diamond".to_string(), diamonds_actually_received, actual_amount));
 
     info!("[Deposit] Completed: user={} amount={}", player_name, actual_amount);
 
@@ -1370,11 +1359,15 @@ pub async fn handle_withdraw_balance_queued(
         ).await;
     }
 
-    // Withdraw diamonds from storage (diamond chest) before trading
+    // Advance: Queued -> Withdrawing (diamonds from storage)
+    store.advance_trade(|s| s.begin_withdrawal(vec![]));
+
+    // Withdraw diamonds from storage (diamond chest) before trading.
+    // Uses the non-mutating `simulate_withdraw_plan` so we can validate
+    // feasibility without cloning all of storage.
     if whole_diamonds > 0 {
-        let mut sim_storage = store.storage.clone();
-        let withdraw_plan = sim_storage.withdraw_plan("diamond", whole_diamonds);
-        let preview_withdrawn: i32 = withdraw_plan.iter().map(|t| t.amount).sum();
+        let (withdraw_plan, preview_withdrawn) =
+            store.storage.simulate_withdraw_plan("diamond", whole_diamonds);
 
         if preview_withdrawn < whole_diamonds {
             tracing::error!(
@@ -1473,6 +1466,9 @@ pub async fn handle_withdraw_balance_queued(
     // the balance was never touched, no balance restoration is needed.
     // This keeps physical diamonds (chests) and ledger balance in lockstep
     // so a user cannot lose diamonds to a failed/cancelled trade.
+
+    // Advance: Withdrawing -> Trading
+    store.advance_trade(|s| s.begin_trading());
 
     // Perform trade: bot offers whole diamonds, player offers nothing
     info!("[Withdraw] Initiating trade: {} diamonds to {}", whole_diamonds, player_name);
@@ -1585,7 +1581,7 @@ pub async fn handle_withdraw_balance_queued(
     // Record order
     store.orders.push_back(crate::types::Order {
         order_type: crate::types::order::OrderType::WithdrawBalance,
-        item: "diamond".to_string(),
+        item: ItemId::from_normalized("diamond".to_string()),
         amount: whole_diamonds,
         user_uuid: user_uuid.clone(),
     });
@@ -1593,11 +1589,14 @@ pub async fn handle_withdraw_balance_queued(
     // Record trade
     store.trades.push(crate::types::Trade::new(
         crate::types::TradeType::WithdrawBalance,
-        "diamond".to_string(),
+        ItemId::from_normalized("diamond".to_string()),
         whole_diamonds,
         amount,
         user_uuid.clone(),
     ));
+
+    // Advance: Trading -> Committed
+    store.advance_trade(|s| s.commit("diamond".to_string(), whole_diamonds, amount));
 
     info!("[Withdraw] Completed: user={} amount={}", player_name, amount);
 

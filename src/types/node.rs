@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::write_atomic;
 use crate::types::chest::Chest;
+use crate::types::ItemId;
 use crate::types::position::Position;
 
 /// Represents a storage node: a cluster of 4 chests with a bot access position.
@@ -71,10 +72,10 @@ impl Node {
             if node_id == 0 {
                 if index == 0 {
                     // Chest 0: dedicated for diamonds
-                    chest.item = "diamond".to_string();
+                    chest.item = ItemId::from_normalized("diamond".to_string());
                 } else if index == 1 {
                     // Chest 1: overflow/failsafe for unknown/leftover items
-                    chest.item = crate::constants::OVERFLOW_CHEST_ITEM.to_string();
+                    chest.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                 }
             }
 
@@ -146,7 +147,7 @@ impl Node {
             // Chest 0: dedicated for diamonds
             if let Some(chest_0) = node.chests.get_mut(0) {
                 if chest_0.item != "diamond" {
-                    chest_0.item = "diamond".to_string();
+                    chest_0.item = ItemId::from_normalized("diamond".to_string());
                     needs_save = true;
                 }
             }
@@ -154,7 +155,7 @@ impl Node {
             // Chest 1: overflow/failsafe for unknown/leftover items
             if let Some(chest_1) = node.chests.get_mut(1) {
                 if chest_1.item != crate::constants::OVERFLOW_CHEST_ITEM {
-                    chest_1.item = crate::constants::OVERFLOW_CHEST_ITEM.to_string();
+                    chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                     needs_save = true;
                 }
             }

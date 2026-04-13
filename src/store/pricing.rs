@@ -84,46 +84,33 @@ pub fn reserves_sufficient(item_stock: i32, currency_stock: f64) -> bool {
 /// Note: Buying all 100 items would cost infinity (you can't drain the pool).
 pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64> {
     let pair = store.pairs.get(item)?;
-    
-    // Validate fee
-    if !validate_fee(store.config.fee) {
-        tracing::warn!("Invalid fee rate: {}", store.config.fee);
+    buy_cost_pure(pair.item_stock, pair.currency_stock, amount, store.config.fee)
+}
+
+/// Pure AMM buy-cost math — no `Store` dependency.
+///
+/// Same semantics as [`calculate_buy_cost`] but callable directly with
+/// reserves and fee. This is the shape that property-based tests exercise.
+pub fn buy_cost_pure(item_stock: i32, currency_stock: f64, amount: i32, fee: f64) -> Option<f64> {
+    if !validate_fee(fee) {
+        tracing::warn!("Invalid fee rate: {}", fee);
         return None;
     }
-    
-    // Check reserves
-    if !reserves_sufficient(pair.item_stock, pair.currency_stock) {
+    if !reserves_sufficient(item_stock, currency_stock) {
         return None;
     }
-    
-    // Validate amount
-    if amount <= 0 {
+    if amount <= 0 || amount >= item_stock {
         return None;
     }
-    
-    // Cannot buy more than or equal to entire stock (would divide by zero or negative).
-    // At amount == item_stock the denominator (x - dx) is 0 => infinite cost;
-    // beyond that it flips sign and would produce a nonsensical "negative" cost.
-    if amount >= pair.item_stock {
-        return None;
-    }
-    
-    let x = pair.item_stock as f64;
-    let y = pair.currency_stock;
+
+    let x = item_stock as f64;
+    let y = currency_stock;
     let dx = amount as f64;
 
-    // cost = y * dx / (x - dx)
-    // Derived from keeping k constant: x*y = (x-dx)*(y+cost) => cost = y*dx/(x-dx)
     let base_cost = y * dx / (x - dx);
-    let cost = base_cost * (1.0 + store.config.fee);
+    let cost = base_cost * (1.0 + fee);
 
-    // Guard against NaN/Infinity sneaking out (e.g. from extreme reserve values
-    // or a denominator that underflowed despite the earlier amount < stock check).
-    if cost.is_finite() && cost > 0.0 {
-        Some(cost)
-    } else {
-        None
-    }
+    if cost.is_finite() && cost > 0.0 { Some(cost) } else { None }
 }
 
 /// Calculate total payout for selling a given amount of items using constant product formula.
@@ -157,42 +144,33 @@ pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64>
 /// - After fee: 90.91 * 0.875 = 79.55
 pub fn calculate_sell_payout(store: &Store, item: &str, amount: i32) -> Option<f64> {
     let pair = store.pairs.get(item)?;
-    
-    // Validate fee
-    if !validate_fee(store.config.fee) {
-        tracing::warn!("Invalid fee rate: {}", store.config.fee);
+    sell_payout_pure(pair.item_stock, pair.currency_stock, amount, store.config.fee)
+}
+
+/// Pure AMM sell-payout math — no `Store` dependency.
+///
+/// Same semantics as [`calculate_sell_payout`] but callable directly with
+/// reserves and fee. Used by property-based tests.
+pub fn sell_payout_pure(item_stock: i32, currency_stock: f64, amount: i32, fee: f64) -> Option<f64> {
+    if !validate_fee(fee) {
+        tracing::warn!("Invalid fee rate: {}", fee);
         return None;
     }
-    
-    // Check reserves
-    if !reserves_sufficient(pair.item_stock, pair.currency_stock) {
+    if !reserves_sufficient(item_stock, currency_stock) {
         return None;
     }
-    
-    // Validate amount
     if amount <= 0 {
         return None;
     }
-    
-    let x = pair.item_stock as f64;
-    let y = pair.currency_stock;
+
+    let x = item_stock as f64;
+    let y = currency_stock;
     let dx = amount as f64;
 
-    // payout = y * dx / (x + dx)
-    // Derived from keeping k constant: x*y = (x+dx)*(y-payout) => payout = y*dx/(x+dx)
-    // As dx -> infinity, payout asymptotically approaches y but never reaches it,
-    // so the pool's currency reserve can never be fully drained by selling.
     let base_payout = y * dx / (x + dx);
-    let payout = base_payout * (1.0 - store.config.fee);
+    let payout = base_payout * (1.0 - fee);
 
-    // A zero payout can occur for tiny `dx` against a large `x` due to
-    // floating-point rounding; treat that as a failed trade rather than
-    // silently accepting a free item transfer.
-    if payout.is_finite() && payout > 0.0 {
-        Some(payout)
-    } else {
-        None
-    }
+    if payout.is_finite() && payout > 0.0 { Some(payout) } else { None }
 }
 
 // ============================================================================
@@ -293,5 +271,119 @@ mod tests {
         // Payout per item should decrease with larger trades (worse for seller)
         assert!(price_per_sell_10 < price_per_sell_1, "Larger sell should have lower price per item");
         assert!(price_per_sell_50 < price_per_sell_10, "Even larger sell should have even lower price per item");
+    }
+
+    // ========================================================================
+    // Property-based tests
+    //
+    // These assert AMM invariants across the full input space instead of a
+    // handful of hand-picked cases. The specific properties checked are the
+    // load-bearing ones that users rely on:
+    //   - `k` never decreases (fee revenue accrues, pool never leaks value)
+    //   - spread is always positive (round-trip buy+sell is strictly lossy)
+    //   - per-item price strictly increases with trade size (slippage)
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    const TEST_FEE: f64 = 0.125;
+
+    proptest! {
+        /// After a buy, `k` must be non-decreasing (fees only grow the pool).
+        /// The base AMM identity holds `k` exactly; the fee markup adds a
+        /// strictly positive delta to `y`, so `k_new >= k_old`.
+        #[test]
+        fn buy_never_decreases_k(
+            stock in 2i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in 1i32..9_999,
+        ) {
+            prop_assume!(qty < stock);
+            let Some(cost) = buy_cost_pure(stock, currency, qty, TEST_FEE) else { return Ok(()); };
+            let k_old = stock as f64 * currency;
+            let k_new = (stock - qty) as f64 * (currency + cost);
+            // Small slack for floating-point rounding on large reserves.
+            prop_assert!(k_new + 1e-6 >= k_old, "k decreased: {} -> {}", k_old, k_new);
+        }
+
+        /// After a sell, `k` must be non-decreasing. Same reasoning as
+        /// `buy_never_decreases_k`: the fee is subtracted from the payout,
+        /// leaving extra `y` in the pool.
+        #[test]
+        fn sell_never_decreases_k(
+            stock in 1i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in 1i32..10_000,
+        ) {
+            let Some(payout) = sell_payout_pure(stock, currency, qty, TEST_FEE) else { return Ok(()); };
+            let k_old = stock as f64 * currency;
+            let k_new = (stock + qty) as f64 * (currency - payout);
+            prop_assert!(k_new + 1e-6 >= k_old, "k decreased: {} -> {}", k_old, k_new);
+        }
+
+        /// For the same reserves and quantity, the buy cost must exceed the
+        /// sell payout. This is the fee spread — it guarantees round-trip
+        /// trades are strictly lossy and prevents arbitrage.
+        #[test]
+        fn buy_cost_exceeds_sell_payout(
+            stock in 2i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in 1i32..9_999,
+        ) {
+            prop_assume!(qty < stock);
+            let (Some(cost), Some(payout)) = (
+                buy_cost_pure(stock, currency, qty, TEST_FEE),
+                sell_payout_pure(stock, currency, qty, TEST_FEE),
+            ) else { return Ok(()); };
+            prop_assert!(cost > payout, "spread not positive: cost {} <= payout {}", cost, payout);
+        }
+
+        /// Per-item buy cost increases with trade size (slippage).
+        /// Buying `n+1` items must cost strictly more per item than buying
+        /// `n`. This encodes the self-balancing property of the AMM.
+        #[test]
+        fn buy_price_per_item_increases(
+            stock in 10i32..10_000,
+            currency in 1.0f64..100_000.0,
+            n in 1i32..1_000,
+        ) {
+            prop_assume!(n + 1 < stock);
+            let (Some(c1), Some(c2)) = (
+                buy_cost_pure(stock, currency, n, TEST_FEE),
+                buy_cost_pure(stock, currency, n + 1, TEST_FEE),
+            ) else { return Ok(()); };
+            let p1 = c1 / n as f64;
+            let p2 = c2 / (n + 1) as f64;
+            prop_assert!(p2 > p1, "price per item did not increase: {} -> {}", p1, p2);
+        }
+
+        /// Per-item sell payout decreases with trade size (slippage against
+        /// the seller). Dual of `buy_price_per_item_increases`.
+        #[test]
+        fn sell_price_per_item_decreases(
+            stock in 10i32..10_000,
+            currency in 1.0f64..100_000.0,
+            n in 1i32..1_000,
+        ) {
+            let (Some(p1), Some(p2)) = (
+                sell_payout_pure(stock, currency, n, TEST_FEE),
+                sell_payout_pure(stock, currency, n + 1, TEST_FEE),
+            ) else { return Ok(()); };
+            let pp1 = p1 / n as f64;
+            let pp2 = p2 / (n + 1) as f64;
+            prop_assert!(pp2 < pp1, "payout per item did not decrease: {} -> {}", pp1, pp2);
+        }
+
+        /// Sell payout is strictly bounded by the currency reserve — you
+        /// can never drain the pool by selling, no matter how much you dump.
+        #[test]
+        fn sell_payout_bounded_by_currency(
+            stock in 1i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in 1i32..1_000_000,
+        ) {
+            let Some(payout) = sell_payout_pure(stock, currency, qty, TEST_FEE) else { return Ok(()); };
+            prop_assert!(payout < currency, "payout {} >= currency {}", payout, currency);
+        }
     }
 }

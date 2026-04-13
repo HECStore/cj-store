@@ -25,7 +25,19 @@ pub fn normalize_item_id(item: &str) -> String {
 /// `_store` is currently unused but retained in the signature to allow future
 /// caching of lookups without requiring call-site changes.
 pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String, String> {
-    User::get_uuid_async(username).await
+    #[cfg(test)]
+    {
+        // Offline deterministic UUID for integration tests: avoids hitting the
+        // Mojang API (which requires network and introduces flakiness). Format:
+        // zero-padded username embedded in the last UUID segment.
+        let trimmed: String = username.chars().take(12).collect();
+        let padded = format!("{:0>12}", trimmed);
+        return Ok(format!("00000000-0000-0000-0000-{}", padded));
+    }
+    #[cfg(not(test))]
+    {
+        User::get_uuid_async(username).await
+    }
 }
 
 /// Ensure user exists in store, creating if missing.
@@ -209,7 +221,7 @@ mod tests {
         // Single transfer
         let transfers = vec![ChestTransfer {
             chest_id: 0,
-            item: "diamond".to_string(),
+            item: crate::types::ItemId::from_normalized("diamond".to_string()),
             amount: 64,
             position: Position::default(),
         }];
@@ -219,13 +231,13 @@ mod tests {
         let transfers = vec![
             ChestTransfer {
                 chest_id: 0,
-                item: "diamond".to_string(),
+                item: crate::types::ItemId::from_normalized("diamond".to_string()),
                 amount: 64,
                 position: Position::default(),
             },
             ChestTransfer {
                 chest_id: 1,
-                item: "iron_ingot".to_string(),
+                item: crate::types::ItemId::from_normalized("iron_ingot".to_string()),
                 amount: 128,
                 position: Position::default(),
             },

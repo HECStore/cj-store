@@ -20,6 +20,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::write_atomic;
+use crate::types::ItemId;
 
 /// Represents a trading pair: item <-> diamonds (currency).
 ///
@@ -47,7 +48,7 @@ use crate::fsutil::write_atomic;
 pub struct Pair {
     /// Item identifier (e.g., "gunpowder", "cobblestone")
     /// Stored WITHOUT the "minecraft:" prefix for cleaner display and storage.
-    pub item: String,
+    pub item: ItemId,
     /// Maximum stack size for this item (1, 16, or 64)
     /// - 64: Most items (cobblestone, diamonds, etc.)
     /// - 16: Ender pearls, eggs, snowballs, signs, banners, buckets
@@ -180,7 +181,7 @@ impl Pair {
                 match fs::read_to_string(&path) {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(pair) => {
-                            let item_name = pair.item.clone();
+                            let item_name = pair.item.to_string();
                             pairs.insert(item_name, pair);
                         }
                         Err(e) => eprintln!(

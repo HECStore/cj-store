@@ -1,11 +1,30 @@
 //! Utility functions for the Store
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
 use tokio::sync::oneshot;
 use tracing::debug;
+#[cfg(not(test))]
+use tracing::info;
 
+use crate::constants::UUID_CACHE_TTL_SECS;
 use crate::messages::BotInstruction;
 use crate::types::User;
 use super::Store;
+
+/// Cached UUID entry: (uuid, timestamp of lookup).
+type UuidCache = HashMap<String, (String, Instant)>;
+
+/// Global UUID cache for Mojang API lookups.
+/// Uses a simple HashMap with TTL-based expiry — entries older than
+/// `UUID_CACHE_TTL_SECS` are treated as stale and re-fetched.
+static UUID_CACHE: OnceLock<Mutex<UuidCache>> = OnceLock::new();
+
+fn uuid_cache() -> &'static Mutex<UuidCache> {
+    UUID_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Normalize item ID: strip "minecraft:" prefix if present.
 /// This ensures consistent item naming across the codebase (without prefix).
@@ -19,11 +38,14 @@ pub fn normalize_item_id(item: &str) -> String {
     item.strip_prefix("minecraft:").unwrap_or(item).to_string()
 }
 
-/// Resolve username to UUID via Mojang API (async)
+/// Resolve username to UUID via Mojang API (async), with in-memory caching.
 ///
-/// Uses the async Mojang API client for better performance without blocking the runtime.
-/// `_store` is currently unused but retained in the signature to allow future
-/// caching of lookups without requiring call-site changes.
+/// Lookups are cached for `UUID_CACHE_TTL_SECS` (default 5 minutes). Repeated
+/// commands from the same player reuse the cached UUID instead of hitting the
+/// Mojang API on every interaction.
+///
+/// `_store` is currently unused but retained in the signature for call-site
+/// stability.
 pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String, String> {
     #[cfg(test)]
     {
@@ -36,8 +58,47 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
     }
     #[cfg(not(test))]
     {
-        User::get_uuid_async(username).await
+        let key = username.to_lowercase();
+        let ttl = std::time::Duration::from_secs(UUID_CACHE_TTL_SECS);
+
+        // Check cache first
+        {
+            let cache = uuid_cache().lock().unwrap();
+            if let Some((uuid, ts)) = cache.get(&key) {
+                if ts.elapsed() < ttl {
+                    debug!("UUID cache hit for '{}' -> {}", username, uuid);
+                    return Ok(uuid.clone());
+                }
+            }
+        }
+
+        // Cache miss or stale — fetch from Mojang API
+        let uuid = User::get_uuid_async(username).await?;
+        info!("UUID cache miss for '{}', fetched {}", username, uuid);
+
+        {
+            let mut cache = uuid_cache().lock().unwrap();
+            cache.insert(key, (uuid.clone(), Instant::now()));
+        }
+
+        Ok(uuid)
     }
+}
+
+/// Invalidate a cached UUID entry (e.g. on username change detection).
+#[allow(dead_code)] // API surface for future username-change detection
+pub fn invalidate_uuid_cache(username: &str) {
+    let key = username.to_lowercase();
+    let mut cache = uuid_cache().lock().unwrap();
+    if cache.remove(&key).is_some() {
+        debug!("Invalidated UUID cache entry for '{}'", username);
+    }
+}
+
+/// Clear the entire UUID cache. Useful for testing or after long idle periods.
+#[cfg(test)]
+pub fn clear_uuid_cache() {
+    uuid_cache().lock().unwrap().clear();
 }
 
 /// Ensure user exists in store, creating if missing.
@@ -243,5 +304,81 @@ mod tests {
             },
         ];
         assert_eq!(summarize_transfers(&transfers, 5), "64x diamond; 128x iron_ingot");
+    }
+
+    // ========================================================================
+    // UUID cache tests
+    // ========================================================================
+
+    #[test]
+    fn test_uuid_cache_insert_and_lookup() {
+        clear_uuid_cache();
+        let cache = uuid_cache();
+        let key = "testplayer".to_string();
+        let uuid = "00000000-0000-0000-0000-000000000001".to_string();
+
+        cache.lock().unwrap().insert(key.clone(), (uuid.clone(), Instant::now()));
+
+        let cached = cache.lock().unwrap().get(&key).cloned();
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().0, uuid);
+    }
+
+    #[test]
+    fn test_uuid_cache_case_insensitive_key() {
+        // The cache uses lowercased keys so "Steve" and "steve" hit the same entry
+        clear_uuid_cache();
+        let cache = uuid_cache();
+        let uuid = "00000000-0000-0000-0000-000000000002".to_string();
+
+        cache.lock().unwrap().insert("steve".to_string(), (uuid.clone(), Instant::now()));
+
+        // Lookup must use the same lowercased key (resolve_user_uuid does this)
+        let hit = cache.lock().unwrap().get("steve").cloned();
+        assert_eq!(hit.unwrap().0, uuid);
+    }
+
+    #[test]
+    fn test_uuid_cache_ttl_expiry() {
+        clear_uuid_cache();
+        let cache = uuid_cache();
+        let key = "expiredplayer".to_string();
+        let uuid = "00000000-0000-0000-0000-000000000003".to_string();
+
+        // Insert with a timestamp far in the past
+        let old_instant = Instant::now() - std::time::Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
+        cache.lock().unwrap().insert(key.clone(), (uuid.clone(), old_instant));
+
+        // Entry exists but is stale
+        let entry = cache.lock().unwrap().get(&key).cloned().unwrap();
+        let ttl = std::time::Duration::from_secs(UUID_CACHE_TTL_SECS);
+        assert!(entry.1.elapsed() >= ttl, "Entry should be expired");
+    }
+
+    #[test]
+    fn test_uuid_cache_invalidate() {
+        clear_uuid_cache();
+        let cache = uuid_cache();
+        let uuid = "00000000-0000-0000-0000-000000000004".to_string();
+        cache.lock().unwrap().insert("removeme".to_string(), (uuid, Instant::now()));
+
+        invalidate_uuid_cache("RemoveMe"); // case-insensitive
+        assert!(cache.lock().unwrap().get("removeme").is_none());
+    }
+
+    #[test]
+    fn test_uuid_cache_clear() {
+        let cache = uuid_cache();
+        cache.lock().unwrap().insert(
+            "a".to_string(),
+            ("uuid-a".to_string(), Instant::now()),
+        );
+        cache.lock().unwrap().insert(
+            "b".to_string(),
+            ("uuid-b".to_string(), Instant::now()),
+        );
+
+        clear_uuid_cache();
+        assert!(cache.lock().unwrap().is_empty());
     }
 }

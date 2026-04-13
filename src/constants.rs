@@ -115,8 +115,21 @@ pub const CONNECTION_CHECK_INTERVAL_SECS: u64 = 1;
 // RETRY CONSTANTS
 // ============================================================================
 
-/// Maximum number of retries for chest operations
+/// Maximum number of retries for chest operations (non-chunk-related failures)
 pub const CHEST_OP_MAX_RETRIES: u32 = 3;
+
+/// Extra retries added when a chunk-not-loaded condition is detected.
+/// Chunks typically reload within ~10s on most servers, so we allow more
+/// attempts with a longer base delay before giving up.
+pub const CHUNK_RELOAD_EXTRA_RETRIES: u32 = 2;
+
+/// Base delay (ms) when waiting for chunks to reload. Longer than the normal
+/// retry base because chunk loading is a server-side operation that can take
+/// several seconds, especially on busy or low-TPS servers.
+pub const CHUNK_RELOAD_BASE_DELAY_MS: u64 = 3_000;
+
+/// Maximum delay (ms) when waiting for chunks to reload.
+pub const CHUNK_RELOAD_MAX_DELAY_MS: u64 = 10_000;
 
 /// Maximum number of retries for shulker operations
 pub const SHULKER_OP_MAX_RETRIES: u32 = 2;
@@ -209,6 +222,14 @@ pub const QUEUE_FILE: &str = "data/queue.json";
 /// Base cooldown between messages (milliseconds)
 /// Players must wait at least this long between commands
 pub const RATE_LIMIT_BASE_COOLDOWN_MS: u64 = 2_000;
+
+// ============================================================================
+// UUID CACHE CONSTANTS
+// ============================================================================
+
+/// Time-to-live for cached Mojang UUID lookups (seconds).
+/// 5 minutes balances freshness (username changes are rare) against API load.
+pub const UUID_CACHE_TTL_SECS: u64 = 300;
 
 /// Maximum cooldown after repeated violations (milliseconds)
 /// Even with exponential backoff, cooldown won't exceed this

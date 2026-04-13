@@ -151,13 +151,13 @@ cj-store/
       rate_limit.rs             # Anti-spam rate limiting with exponential backoff
       rollback.rs               # Shared rollback helper (items/diamonds back to storage on failure)
       state.rs                  # State management (save, audit_state, assert_invariants)
-      utils.rs                  # Helper functions (normalize_item_id, resolve_user_uuid, etc.)
+      utils.rs                  # Helper functions (normalize_item_id, resolve_user_uuid, UUID cache, etc.)
     bot/                        # Bot module (Azalea bot client + whisper parsing → StoreMessage)
       mod.rs                    # Bot struct, BotState, bot_task, event handlers
       connection.rs             # Connection management (connect, disconnect)
       navigation.rs             # Pathfinding (navigate_to_position, go_to_node, go_to_chest)
       shulker.rs               # Shulker operations (place, pickup, open, station position)
-      chest_io.rs               # Chest operations — automated_chest_io dispatches to withdraw_shulkers / deposit_shulkers
+      chest_io.rs               # Chest operations — automated_chest_io dispatches to withdraw_shulkers / deposit_shulkers, chunk-not-loaded retry
       trade.rs                  # Trade automation (execute_trade_with_player, trade GUI handling)
       inventory.rs              # Inventory management (ensure_inventory_empty, move_hotbar_to_inventory, etc.)
     cli.rs                      # dialoguer menu → StoreMessage
@@ -432,7 +432,7 @@ Fields:
 Note: CLI offers an option to make anyone an operator just by typing their username or uuid in, it then asks if the CLI user wants to set the operator field for them to true or false
 
 Notes:
-- `User::get_uuid(username)` calls Mojang's public API (`api.mojang.com`). Both blocking (`get_uuid`) and async (`get_uuid_async`) versions are available, with the async version using connection pooling for better performance.
+- `User::get_uuid(username)` calls Mojang's public API (`api.mojang.com`). Both blocking (`get_uuid`) and async (`get_uuid_async`) versions are available, with the async version using connection pooling for better performance. UUID lookups are cached in-memory with a 5-minute TTL so repeated commands from the same player don't hit the API on every interaction.
 - `pay_async(...)` in `src/store/handlers/player.rs` uses UUIDs as the canonical key and updates the stored username on each payment.
 
 ### Pairs (`data/pairs/<item>.json`)
@@ -729,7 +729,7 @@ The Store parses the first token of the command string. All commands are case-se
   - **Example**: `price cobblestone` shows prices for 64 cobblestone, `price ender_pearl 32` shows prices for 32 ender pearls
   
 - **`bal [player]` / `balance [player]`**
-  - **Validation**: Resolves UUID via Mojang API (may take 1-2 seconds)
+  - **Validation**: Resolves UUID via Mojang API (cached for 5 minutes, so repeat lookups are instant)
   - **Behavior**: Check your own balance, or specify a player name to see their balance
   - **Examples**: `balance` (your balance), `bal Steve` (Steve's balance)
   
@@ -1056,7 +1056,7 @@ If any validation fails, the trade is aborted and the player is notified.
 - **Rust edition**: `2024` (latest Rust edition)
 - **Toolchain**: **nightly Rust** (pinned via `rust-toolchain.toml`) because Azalea's current transitive dependencies may require nightly features.
 - **Network access**:
-  - Mojang API for UUID lookup (`User::get_uuid`)
+  - Mojang API for UUID lookup (`User::get_uuid`), cached in-memory with 5-minute TTL
   - Microsoft auth flow via Azalea account login
 - **Operating System**: Windows, Linux, or macOS (tested on Windows)
 
@@ -1213,7 +1213,7 @@ The system is designed for **transactional integrity** — either a trade comple
 - **Price calculation edge cases**: 
   - If `item_stock == 0` or `currency_stock == 0`, price calculation returns `None` and order is rejected
   - If calculated price is non-finite or <= 0, order is rejected with "Internal error: computed price is invalid"
-- **UUID lookup failures**: If Mojang API is unavailable or username doesn't exist, command fails with error message
+- **UUID lookup failures**: If Mojang API is unavailable or username doesn't exist, command fails with error message. Lookups are cached for 5 minutes, so transient API outages only affect the first command from each player
 - **Concurrent orders**: Multiple orders from same or different players are processed sequentially (no race conditions)
 
 ### Rate Limiting Issues
@@ -1235,6 +1235,7 @@ The system is designed for **transactional integrity** — either a trade comple
 - **Slow operations**: Large withdrawals/deposits may take time as bot processes multiple shulkers. Be patient
 - **High disk I/O**: Autosave runs every 2 seconds when state changes. This is normal but may cause brief pauses
 - **Queue processing**: Orders are processed sequentially. During busy periods, queue wait times increase
+- **Server restarts / chunk unloading**: If the server restarts or chunks unload mid-operation, the bot detects the transient condition and retries with longer backoff (up to ~20s) while chunks reload. If a chest container becomes stale mid-operation, it is automatically reopened
 
 ---
 
@@ -1268,7 +1269,7 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Testing
 
-- **Unit and integration tests**: `cargo test` runs 74 tests covering pricing invariants (including 7 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), and the order-handler integration suite. The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
+- **Unit and integration tests**: `cargo test` runs 79 tests covering pricing invariants (including 7 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), UUID cache behavior (insert/lookup, case-insensitive keys, TTL expiry, invalidation, clear), and the order-handler integration suite. The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
 - **Property-based AMM tests**: `proptest` exercises the pricing functions across thousands of random reserve/quantity combinations, asserting that `k` never decreases, buy cost always exceeds sell payout (positive spread), per-item price increases with trade size (slippage), and sell payout is bounded by the currency reserve.
 - Test with small quantities first before large trades
 - Verify physical nodes exist before adding them via CLI
@@ -1290,10 +1291,11 @@ The following limitations are documented for awareness:
 3. **Trade History Growth**: Trade history (`data/trades/*.json`) creates one file per trade. Over time this can result in many files. Trades older than 1 year can be archived using the `Trade::archive_old_trades()` function. Only the most recent `max_trades_in_memory` trades (default 50,000) are loaded into memory.
 
 4. **Retry Logic**: Bot operations include automatic retry with exponential backoff (500ms base, up to 5s max):
-   - **Chest opening (normal operations)**: Up to 3 retries (`CHEST_OP_MAX_RETRIES`)
+   - **Chest opening (normal operations)**: Up to 3 retries (`CHEST_OP_MAX_RETRIES`). If a chunk-not-loaded condition is detected (block state `None`), the budget is extended by 2 extra retries with a longer backoff (3s base, 10s max) to wait for chunks to reload
    - **Chest opening (validation/discovery)**: NO retries, fast 5-second timeout - fails immediately if no chest exists
    - **Shulker opening**: Up to 2 retries (`SHULKER_OP_MAX_RETRIES`)
    - **Navigation/pathfinding**: Up to 2 retries (`NAVIGATION_MAX_RETRIES`)
+   - **Container recovery**: If a chest container becomes stale mid-operation (e.g., server restart or chunk unload), the withdraw and deposit loops automatically reopen it via the chunk-aware retry path
    
    If all retries fail, the operation is aborted and the trade may need to be retried manually. Retry constants are defined in `src/constants.rs`. Validation/discovery operations use fast-fail behavior to avoid wasting time on non-existent chests.
 
@@ -1427,4 +1429,4 @@ The fee is **not taken as a separate line item** — it's built into the price. 
 
 - **No coordinate disclosure**: Bot never reveals coordinates in chat messages (security requirement).
 - **Operator-only commands**: `additem`, `removeitem`, `addcurrency`, `removecurrency` require operator status (set via CLI).
-- **UUID-based identity**: All user operations use UUIDs (not usernames) as the canonical identifier. Usernames are updated on each interaction but don't affect identity.
+- **UUID-based identity**: All user operations use UUIDs (not usernames) as the canonical identifier. Usernames are updated on each interaction but don't affect identity. UUID lookups are cached in-memory with a 5-minute TTL to reduce Mojang API calls.

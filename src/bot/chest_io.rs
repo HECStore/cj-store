@@ -9,10 +9,18 @@ use tracing::{debug, error, info, warn};
 
 use super::Bot;
 use crate::constants::{
-    CHEST_OP_MAX_RETRIES, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
+    CHEST_OP_MAX_RETRIES, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
+    CHUNK_RELOAD_MAX_DELAY_MS, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
     exponential_backoff_delay,
 };
 use crate::types::Position;
+
+/// Error prefix used to tag chunk-not-loaded / transient world-state failures.
+/// `open_chest_container` checks for this prefix to apply longer backoff and
+/// extra retries, since chunks typically reload within ~10 seconds on most
+/// servers. Permanent errors (wrong block type, bot disconnected) do NOT carry
+/// this prefix and are retried with the normal shorter cadence.
+const CHUNK_NOT_LOADED_PREFIX: &str = "[chunk-not-loaded] ";
 
 /// Locate the first shulker box in the player-inventory portion of an open
 /// double-chest container view.
@@ -275,7 +283,8 @@ async fn open_chest_container_once(
         chest_pos.x, chest_pos.y, chest_pos.z
     );
 
-    // Check block state before opening
+    // Check block state before opening — distinguish chunk-not-loaded (transient)
+    // from wrong-block-type (likely permanent).
     {
         let world = client.world();
         let block_state = world.read().get_block_state(chest_pos);
@@ -284,12 +293,24 @@ async fn open_chest_container_once(
             debug!("open_chest_container_once: Block at position: {}", block_name);
             if !block_name.to_lowercase().contains("chest") {
                 warn!(
-                    "open_chest_container_once: Expected chest but found: {} - open may fail!", 
+                    "open_chest_container_once: Expected chest but found: {} - open may fail!",
                     block_name
                 );
             }
         } else {
-            warn!("open_chest_container_once: Block state at position is None");
+            // Block state is None — the chunk containing this block is not loaded.
+            // This is a transient condition: after a server restart or when the bot
+            // is teleported, chunks take a few seconds to stream in. We tag the
+            // error so the retry loop can apply a longer backoff.
+            warn!(
+                "open_chest_container_once: Block state at ({}, {}, {}) is None (chunk not loaded)",
+                chest_pos.x, chest_pos.y, chest_pos.z
+            );
+            return Err(format!(
+                "{}Block state at ({}, {}, {}) is None - chunk not loaded",
+                CHUNK_NOT_LOADED_PREFIX,
+                chest_pos.x, chest_pos.y, chest_pos.z
+            ));
         }
     }
 
@@ -317,9 +338,15 @@ async fn open_chest_container_once(
     match container {
         Some(c) => Ok(c),
         None => {
+            // Re-check block state: if the chunk was unloaded between our initial
+            // check and the timeout, the open failed because the block entity
+            // vanished — tag as transient so the retry loop waits for the chunk.
+            let world = client.world();
+            let still_loaded = world.read().get_block_state(chest_pos).is_some();
+            let prefix = if still_loaded { "" } else { CHUNK_NOT_LOADED_PREFIX };
             Err(format!(
-                "Failed to open chest at ({}, {}, {}) after {}s timeout",
-                chest_pos.x, chest_pos.y, chest_pos.z, timeout_secs
+                "{}Failed to open chest at ({}, {}, {}) after {}s timeout",
+                prefix, chest_pos.x, chest_pos.y, chest_pos.z, timeout_secs
             ))
         }
     }
@@ -400,15 +427,28 @@ pub async fn open_chest_container(
     chest_pos: BlockPos,
 ) -> Result<azalea::container::ContainerHandle, String> {
     let mut last_error = String::new();
+    let mut chunk_not_loaded_seen = false;
 
-    for attempt in 0..CHEST_OP_MAX_RETRIES {
+    // Start with the normal retry budget; if we detect a chunk-not-loaded
+    // condition we extend the budget once so the bot waits for chunks to
+    // stream back in rather than giving up immediately.
+    let mut max_retries = CHEST_OP_MAX_RETRIES;
+
+    let mut attempt = 0u32;
+    while attempt < max_retries {
         if attempt > 0 {
-            let delay_ms =
-                exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
-            debug!(
-                "Retrying chest open at ({}, {}, {}) attempt {}/{} after {}ms",
+            // Use longer backoff when waiting for chunks to reload
+            let (base, max_delay) = if chunk_not_loaded_seen {
+                (CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_MAX_DELAY_MS)
+            } else {
+                (RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS)
+            };
+            let delay_ms = exponential_backoff_delay(attempt - 1, base, max_delay);
+            info!(
+                "Retrying chest open at ({}, {}, {}) attempt {}/{} after {}ms{}",
                 chest_pos.x, chest_pos.y, chest_pos.z,
-                attempt + 1, CHEST_OP_MAX_RETRIES, delay_ms
+                attempt + 1, max_retries, delay_ms,
+                if chunk_not_loaded_seen { " (waiting for chunk reload)" } else { "" }
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
@@ -416,11 +456,21 @@ pub async fn open_chest_container(
         match open_chest_container_once(bot, chest_pos).await {
             Ok(container) => return Ok(container),
             Err(e) => {
-                last_error = e.clone();
+                // First time we see a chunk-not-loaded error, extend the retry
+                // budget so we don't exhaust normal retries on a transient issue.
+                if !chunk_not_loaded_seen && e.starts_with(CHUNK_NOT_LOADED_PREFIX) {
+                    chunk_not_loaded_seen = true;
+                    max_retries = max_retries.saturating_add(CHUNK_RELOAD_EXTRA_RETRIES);
+                    warn!(
+                        "open_chest_container: Chunk not loaded at ({}, {}, {}), extending retries to {}",
+                        chest_pos.x, chest_pos.y, chest_pos.z, max_retries
+                    );
+                }
+                last_error = e;
                 warn!(
                     "open_chest_container: Attempt {}/{} FAILED at ({}, {}, {}): {}",
                     attempt + 1,
-                    CHEST_OP_MAX_RETRIES,
+                    max_retries,
                     chest_pos.x,
                     chest_pos.y,
                     chest_pos.z,
@@ -428,15 +478,18 @@ pub async fn open_chest_container(
                 );
             }
         }
+        attempt += 1;
     }
 
+    // Strip the internal prefix from the final user-facing message
+    let clean_error = last_error.strip_prefix(CHUNK_NOT_LOADED_PREFIX).unwrap_or(&last_error);
     error!(
         "open_chest_container: FAILED after {} attempts at ({}, {}, {}): {}",
-        CHEST_OP_MAX_RETRIES, chest_pos.x, chest_pos.y, chest_pos.z, last_error
+        max_retries, chest_pos.x, chest_pos.y, chest_pos.z, clean_error
     );
     Err(format!(
         "Failed to open chest at ({}, {}, {}) after {} attempts: {}",
-        chest_pos.x, chest_pos.y, chest_pos.z, CHEST_OP_MAX_RETRIES, last_error
+        chest_pos.x, chest_pos.y, chest_pos.z, max_retries, clean_error
     ))
 }
 
@@ -1035,10 +1088,20 @@ async fn withdraw_shulkers(
                         continue;
                     }
 
+                    // Ensure the chest is still open — it may have been closed by a
+                    // server restart or chunk unload since the last iteration. If the
+                    // container handle is stale, reopen the chest (which itself uses
+                    // the chunk-aware retry loop) before reading contents.
+                    if container.contents().is_none() {
+                        warn!("withdraw_shulkers: Container lost at slot {} scan, reopening chest", slot_idx);
+                        drop(container);
+                        container = open_chest_container(bot, chest_pos).await?;
+                    }
+
                     // Refresh contents to get current state
                     let contents = container
                         .contents()
-                        .ok_or_else(|| "Chest closed".to_string())?;
+                        .ok_or_else(|| "Chest closed after reopen attempt".to_string())?;
                     if slot_idx >= contents.len() {
                         continue;
                     }
@@ -1312,10 +1375,16 @@ async fn deposit_shulkers(
     {
             let mut confirmed_full: std::collections::HashSet<usize> = std::collections::HashSet::new();
             
+            // Ensure the chest is still open before scanning for shulkers.
+            if container.contents().is_none() {
+                warn!("deposit_shulkers: Container lost before shulker scan, reopening chest");
+                drop(container);
+                container = open_chest_container(bot, chest_pos).await?;
+            }
             // First, check if chest has any shulkers at all
             let contents = container
                 .contents()
-                .ok_or_else(|| "Chest closed".to_string())?;
+                .ok_or_else(|| "Chest closed after reopen attempt".to_string())?;
             let mut has_any_shulker = false;
             for slot_idx in 0..contents.len().min(54) {
                 let stack = &contents[slot_idx];
@@ -1367,10 +1436,11 @@ async fn deposit_shulkers(
                     }
                 }
 
-                // Ensure chest is open (it might have been closed in previous iteration)
-                // Check if container is still valid, if not reopen it
-                let chest_open = container.contents().is_some();
-                if !chest_open {
+                // Ensure chest is open (it might have been closed by a server restart,
+                // chunk unload, or previous shulker iteration). Reopen uses the
+                // chunk-aware retry loop so transient unloads are handled.
+                if container.contents().is_none() {
+                    warn!("deposit_shulkers: Container lost at slot {} scan, reopening chest", slot_idx);
                     drop(container);
                     container = open_chest_container(bot, chest_pos).await?;
                 }
@@ -1378,7 +1448,7 @@ async fn deposit_shulkers(
                 // Refresh contents to get current state
                 let contents = container
                     .contents()
-                    .ok_or_else(|| "Chest closed".to_string())?;
+                    .ok_or_else(|| "Chest closed after reopen attempt".to_string())?;
                 if slot_idx >= contents.len() {
                     continue;
                 }

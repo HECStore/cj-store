@@ -2,48 +2,18 @@
 
 ## Context
 
-The codebase started at ~72/100 and is currently at ~95/100 after Tier 1, Tier 2, Tier 3, and most of Tier 4 completed. Solid architecture (single-owner state, typed channels, no race conditions), correct AMM pricing, thorough rollback logic, and atomic persistence remain the strong foundation. `automated_chest_io` is now a thin dispatcher over `prepare_for_chest_io` + `withdraw_shulkers` + `deposit_shulkers`. The hot helpers (`execute_chest_transfers`, `perform_trade`) return typed `StoreError` with the `From<StoreError> for String` shim letting higher layers continue to use string errors during the progressive rollout. A test harness in `src/store/orders.rs` builds `Store` in-memory (`Store::new_for_test`) and runs a mock bot task so buy/pay handler tests exercise real handler code paths. All item-referencing fields use the `ItemId` newtype for compile-time normalization safety. An operation journal (`data/journal.json`) records in-flight shulker lifecycle states so a subsequent startup can detect and warn about crash-interrupted operations. Property-based tests via `proptest` exercise AMM pricing invariants across thousands of random inputs. A formal `TradeState` state machine (`src/store/trade_state.rs`) tracks every in-flight trade through Queued → Withdrawing → Trading → Depositing → Committed (or RolledBack), with transition functions that make invalid phase jumps unrepresentable. Mojang UUID lookups are cached in-memory with a 5-minute TTL so repeated commands from the same player avoid redundant API calls. Chest operations detect chunk-not-loaded conditions (block state `None`) and apply longer backoff with extra retries, distinguishing transient chunk reloads from permanent errors; the withdraw and deposit shulker loops auto-reopen the chest container when it becomes stale mid-operation.
+The codebase started at ~72/100 and is currently at ~95/100 after Tier 1–3 and most of Tier 4 completed. Solid architecture (single-owner state, typed channels, no race conditions), correct AMM pricing, thorough rollback logic, and atomic persistence remain the strong foundation. 79 tests passing, 0 warnings.
 
-### Already shipped
+### Ongoing / incremental work from shipped tiers
 
-- **1.1 Shared rollback helper** — extracted into `src/store/rollback.rs`, replacing ~400 lines of copy-pasted rollback blocks across `orders.rs`, `player.rs`, and `operator.rs`.
-- **1.2 Config wiring** — `trade_timeout_ms` and `pathfinding_timeout_ms` now drive runtime behavior instead of hardcoded durations.
-- **1.3 Split mega-functions** —
-  - `orders.rs`: `handle_buy_order` / `handle_sell_order` refactored around shared `execute_chest_transfers` + `perform_trade` helpers and `BuyPlan` / `SellPlan` structs. Each handler now reads as a linear validate → chest → trade → commit flow.
-  - `chest_io.rs`: `automated_chest_io` is now a thin orchestrator that calls `prepare_for_chest_io` (entity readiness + position verification + hotbar clear), opens the chest, and dispatches to `withdraw_shulkers` or `deposit_shulkers`. Each helper owns its loop state (confirmed-empty / confirmed-full sets) and returns the number of items actually moved. `find_shulker_in_inventory_view` was extracted earlier.
-- **1.4 StoreError** — `src/error.rs` defines the enum via `thiserror`; `From<StoreError> for String` shims existing `Result<T, String>` boundaries. `execute_chest_transfers` and `perform_trade` (the hot path for every order) now return `Result<_, StoreError>`, so timeout / bot-disconnected / chest-op / trade-rejected all surface as typed variants. Higher-level handler signatures still return `String`; migration propagates transparently via `?`.
-- **2.1 Logging pruned ~60%** — redundant entry/exit traces, step-by-step banners, and per-slot debug noise removed across `src/bot/` and `src/store/`.
-- **2.2 Integration tests for order handlers** — `src/store/orders.rs` grew a `#[cfg(test)] mod tests` with a mock-bot task (auto-responds to `Whisper`, `InteractWithChestAndSync`, `TradeWithPlayer`) and `Store::new_for_test` constructor that bypasses disk I/O. `utils::resolve_user_uuid` is cfg-gated to return deterministic UUIDs offline so tests never hit the Mojang API. Four integration tests cover buy validation (out-of-stock, unknown item) and pay transfers (success + insufficient balance).
-- **2.3 Lightweight planner** — `Storage::simulate_withdraw_plan` / `simulate_deposit_plan` added as non-mutating variants. All `storage.clone()` planning sites (orders.rs, player.rs, operator.rs, rollback.rs) replaced. Unit tests cover non-mutation and parity with mutating versions.
-- **2.4 Dead code cleanup** — removed genuinely-unused items (`place_shulker_on_station`, `dump_inventory_to_overflow`, `read_chest_amounts`, `BotInstruction::Chat`, `ChestAction::Check`, queue `clear`/`peek`, `with_minecraft_prefix`). Test-only helpers gated with `#[cfg(test)]`. Intentional API surface kept with targeted `#[allow(dead_code)]` + justification comments. `cargo check` is warning-free.
-- **3.1 Operation journal** — `src/store/journal.rs` records in-flight shulker lifecycle states (`ShulkerTaken` → `ShulkerOnStation` → `ItemsTransferred` → `ShulkerPickedUp` → `ShulkerReplaced`) to `data/journal.json`. On startup, any leftover entry is surfaced as an error-level log so the operator can reconcile. `withdraw_shulkers` and `deposit_shulkers` write state transitions at each checkpoint. `Bot` holds a `SharedJournal` (Arc<Mutex>) initialized in `bot_task`. Three unit tests cover ID uniqueness, state transitions, and load/clear round-trips.
-- **3.2 Type-safe item IDs** — `src/types/item_id.rs` defines `ItemId(String)` with `#[serde(transparent)]`, `Deref<Target=str>`, `Borrow<str>`, `PartialEq<str>`, and `Display`. `ItemId::new()` strips the `minecraft:` prefix and rejects empty strings. Migrated `Pair::item`, `Chest::item`, `Order::item`, `Trade::item`, and `ChestTransfer::item` from raw `String` to `ItemId`. On-disk JSON format unchanged (transparent serde). Twelve unit tests cover normalization, serialization, deref coercion, and equality.
-- **3.3 Property-based AMM tests** — Added `proptest` dev-dependency. Extracted `buy_cost_pure` / `sell_payout_pure` helpers from `pricing.rs` so property tests don't need a full `Store`. Seven proptest cases assert: k never decreases (buy and sell), positive spread, per-item buy price increases with quantity, per-item sell payout decreases with quantity, and sell payout bounded by currency reserve.
-- **4.1 Formal trade state machine** — `src/store/trade_state.rs` defines `TradeState` enum with six variants: `Queued`, `Withdrawing`, `Trading`, `Depositing`, `Committed`, `RolledBack`. Transition functions (`begin_withdrawal`, `begin_trading`, `begin_depositing`, `commit`, `rollback`) consume the previous state, making invalid phase jumps (e.g. Queued → Committed) unrepresentable. `Store.current_order` replaced with `Store.current_trade: Option<TradeState>`; all four handlers (buy, sell, deposit, withdraw) advance the state at each phase. Status/cancel commands and CLI stuck-order diagnostics now report the exact phase. Eleven unit tests cover happy paths, rollback from each phase, invalid-transition panics, and display formatting. 74 tests total, all passing.
-- **4.4 UUID cache** — `src/store/utils.rs` adds a global in-memory `HashMap<String, (String, Instant)>` cache with 5-minute TTL (`UUID_CACHE_TTL_SECS`). `resolve_user_uuid` checks the cache (case-insensitive key) before calling `User::get_uuid_async()`. Cache misses fetch from Mojang API and store the result. `invalidate_uuid_cache()` allows explicit eviction on username-change detection. Five unit tests cover insert/lookup, case-insensitive keys, TTL expiry, invalidation, and clear.
-- **4.5 Chunk-not-loaded handling** — `src/bot/chest_io.rs` now distinguishes transient "chunk not loaded" errors (block state `None`) from permanent failures. `open_chest_container_once` returns errors tagged with a `[chunk-not-loaded]` prefix when the block state is absent. `open_chest_container` detects this prefix and extends the retry budget by `CHUNK_RELOAD_EXTRA_RETRIES` (2) with a longer backoff (`CHUNK_RELOAD_BASE_DELAY_MS` = 3s, capped at 10s). Both `withdraw_shulkers` and `deposit_shulkers` auto-reopen the chest container when `container.contents()` returns `None` mid-operation, using the chunk-aware retry loop. 79 tests total, all passing.
-
-This plan documents the remaining changes needed to reach 100/100, organized into tiers by impact-to-effort ratio.
+- **StoreError deep migration** — the hot path (chest/trade helpers) is migrated; handler-level and bot-layer signatures can continue to migrate opportunistically (progressive rollout, not big-bang).
+- **Order-handler tests** — the test harness and four seed tests are in place. Additional scenarios can be added incrementally; the mock-bot infrastructure supports them without changes.
+- **Journal** — detects crash-interrupted shulker operations on startup (detection, not auto-resume). The journal is cleared after surfacing the warning so the bot can proceed.
+- **ItemId** — `store.pairs` map keys remain `String` for minimal churn; field types are `ItemId`. A future pass could migrate the map keys too.
 
 ---
 
-## Tier 1, Tier 2, & Tier 3: done
-
-All Tier 1, Tier 2, and Tier 3 items are shipped (see "Already shipped" above). Notes on ongoing/incremental work:
-
-- **1.4 StoreError deep migration** — the hot path (chest/trade helpers) is migrated; handler-level and bot-layer signatures can continue to migrate opportunistically. This is intentionally a progressive rollout rather than a big-bang rewrite.
-- **2.2 Order-handler tests** — the test harness and four seed tests are in place. Additional scenarios (`test_buy_success`, `test_sell_rollback`, `test_deposit_flexible`, etc.) can be added incrementally as behavior evolves; the mock-bot infrastructure supports them without changes.
-- **3.1 Journal** — detects crash-interrupted shulker operations on startup (detection, not auto-resume). The journal is cleared after surfacing the warning so the bot can proceed.
-- **3.2 ItemId** — `store.pairs` map keys remain `String` for minimal churn; field types are `ItemId`. A future pass could migrate the map keys too.
-
-## Tier 4: 93 → 95+
-
-### 4.1 Formal state machine for trade lifecycle: done
-
-Shipped (see "Already shipped" above). Notes:
-
-- **TradeState tracking** — `Store.current_trade` replaces the old `current_order: Option<QueuedOrder>` with a richer `Option<TradeState>` that carries the full phase context. Status commands, cancel checks, and CLI stuck-order diagnostics all benefit from knowing the exact phase.
-- **Deposit/withdraw handlers** — these have a simpler lifecycle (no pre-trade chest withdrawal for deposit; withdraw skips the Depositing phase). They still advance through Queued → Withdrawing(empty) → Trading → Committed for consistency.
+## Remaining: Tier 4 (partial)
 
 ### 4.2 Metrics and observability
 
@@ -59,25 +29,9 @@ Shipped (see "Already shipped" above). Notes:
 - Expose histograms: `order_duration_seconds{type}`, `trade_duration_seconds`
 - Optional HTTP endpoint (or just write to `data/metrics.json` periodically)
 
-### 4.4 UUID caching for Mojang API: done
-
-Shipped (see "Already shipped" above). Notes:
-
-- **Cache scope** — global static `Mutex<HashMap>` in `utils.rs`, not on `Store`, so the cache survives across handler calls without threading through mutable state.
-- **Case-insensitive** — cache keys are lowercased so "Steve" and "steve" share one entry.
-- **Invalidation** — `invalidate_uuid_cache()` is available for future username-change detection; TTL-based expiry handles the common case.
-
-### 4.5 Graceful handling of server restarts / chunk unloading: done
-
-Shipped (see "Already shipped" above). Notes:
-
-- **Detection** — `open_chest_container_once` checks `get_block_state()` before and after the open attempt; `None` means the chunk is not loaded and the error is tagged with a `[chunk-not-loaded]` prefix.
-- **Extended retries** — `open_chest_container` adds `CHUNK_RELOAD_EXTRA_RETRIES` (2) on top of the normal budget, with `CHUNK_RELOAD_BASE_DELAY_MS` (3s) backoff so the bot waits for chunks to stream in.
-- **Container recovery** — `withdraw_shulkers` and `deposit_shulkers` check `container.contents()` before each slot scan and auto-reopen via `open_chest_container` (which itself uses the chunk-aware retry loop).
-
 ---
 
-## Tier 5: 95 → 100 (Perfection)
+## Remaining: Tier 5 — 95 → 100 (Perfection)
 
 ### 5.1 Full end-to-end test suite with mock Minecraft server
 
@@ -105,11 +59,11 @@ Shipped (see "Already shipped" above). Notes:
 
 ## Summary
 
-| Tier        | Score    | Key Changes                                                                                                         |
-| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| 1 (done)    | 72 → ~85 | ✅ Rollback helper, config wiring, orders.rs + chest_io.rs splits, StoreError on hot path                           |
-| 2 (done)    | ~85 → 88 | ✅ Logging pruned ~60%, dead-code cleanup, lightweight planner, order-handler tests                                 |
-| 3 (done)    | 88 → 93  | ✅ Crash journal, type-safe ItemId, property-based AMM tests                                                        |
+| Tier        | Score    | Key Changes                                                                                          |
+| ----------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| 1 (done)    | 72 → ~85 | ✅ Rollback helper, config wiring, orders.rs + chest_io.rs splits, StoreError on hot path            |
+| 2 (done)    | ~85 → 88 | ✅ Logging pruned ~60%, dead-code cleanup, lightweight planner, order-handler tests                  |
+| 3 (done)    | 88 → 93  | ✅ Crash journal, type-safe ItemId, property-based AMM tests                                         |
 | 4 (mostly)  | 93 → 95+ | ✅ Trade state machine, UUID cache, chunk-unload handling (79 tests, 0 warnings). Remaining: metrics |
 | 5           | 95 → 100 | E2E tests, formal verification, hot-reload, audit chain                                              |
 

@@ -951,6 +951,7 @@ dependencies = [
  "chrono",
  "dialoguer",
  "notify",
+ "parking_lot",
  "proptest",
  "reqwest",
  "serde",

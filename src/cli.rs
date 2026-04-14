@@ -10,7 +10,26 @@ use crate::messages::{CliMessage, StoreMessage};
 use crate::types::TradeType;
 use dialoguer::{Input, Select};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Retry a dialoguer prompt on transient I/O error rather than aborting.
+///
+/// A terminal read can fail for a variety of non-fatal reasons (EINTR during
+/// terminal resize, lost/reattached stdin on some shells, etc.). Previously
+/// every `.interact()` was wrapped in `.expect(..)`, which killed the entire
+/// CLI task on the first hiccup. The loop re-prompts with a short backoff so
+/// the operator sees the prompt again instead of the process exiting.
+fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result<T, E>) -> T {
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(e) => {
+                warn!("[CLI] {desc}: {e} — retrying");
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
 
 /// Runs the CLI task, providing an interactive menu to manage the store.
 ///
@@ -40,12 +59,13 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
             "Clear stuck order",
             "Exit",
         ];
-        let selection = Select::new()
-            .with_prompt("Select an action")
-            .items(&options)
-            .default(0)
-            .interact()
-            .expect("Failed to read selection");
+        let selection = with_retry("Failed to read selection", || {
+            Select::new()
+                .with_prompt("Select an action")
+                .items(&options)
+                .default(0)
+                .interact()
+        });
 
         match selection {
             0 => get_balances(&store_tx),
@@ -200,20 +220,21 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
 
 /// Prompts for username/UUID and operator status, then sends a SetOperator request.
 fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
-    let username_or_uuid: String = Input::new()
-        .with_prompt("Enter username or UUID")
-        .interact_text()
-        .expect("Failed to read username/UUID");
+    let username_or_uuid: String = with_retry("Failed to read username/UUID", || {
+        Input::new()
+            .with_prompt("Enter username or UUID")
+            .interact_text()
+    });
 
     // Default to "false" (index 0) so accidentally pressing Enter never
     // grants operator privileges by mistake.
-    let is_operator: bool = Select::new()
-        .with_prompt("Set operator status")
-        .items(&["false", "true"])
-        .default(0)
-        .interact()
-        .expect("Failed to read selection")
-        == 1;
+    let is_operator: bool = with_retry("Failed to read selection", || {
+        Select::new()
+            .with_prompt("Set operator status")
+            .items(&["false", "true"])
+            .default(0)
+            .interact()
+    }) == 1;
 
     info!("Setting operator status for {} to {}", username_or_uuid, is_operator);
 
@@ -323,10 +344,11 @@ fn discover_storage(store_tx: &mpsc::Sender<StoreMessage>) {
 
 /// Prompts for node ID, then sends a RemoveNode request.
 fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
-    let node_id: i32 = Input::new()
-        .with_prompt("Enter node ID to remove")
-        .interact_text()
-        .expect("Failed to read node ID");
+    let node_id: i32 = with_retry("Failed to read node ID", || {
+        Input::new()
+            .with_prompt("Enter node ID to remove")
+            .interact_text()
+    });
 
     info!("Requesting to remove node {}", node_id);
 
@@ -353,21 +375,23 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
 
 /// Prompts for item name and stack size, then sends an AddPair request.
 fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
-    let item_name: String = Input::new()
-        .with_prompt("Enter item name (without minecraft: prefix)")
-        .interact_text()
-        .expect("Failed to read item name");
+    let item_name: String = with_retry("Failed to read item name", || {
+        Input::new()
+            .with_prompt("Enter item name (without minecraft: prefix)")
+            .interact_text()
+    });
 
     // Stack size must match Minecraft's hard-coded per-item limit, otherwise
     // the bot's storage math (shulker box layouts, chest capacity) will be
     // off. We expose the three valid values rather than a free-form number
     // so operators can't enter an illegal stack size like 32.
-    let stack_size_selection = Select::new()
-        .with_prompt("Select stack size")
-        .items(&["64 (most items)", "16 (ender pearls, eggs, signs, buckets)", "1 (tools, weapons, armor)"])
-        .default(0)
-        .interact()
-        .expect("Failed to read stack size selection");
+    let stack_size_selection = with_retry("Failed to read stack size selection", || {
+        Select::new()
+            .with_prompt("Select stack size")
+            .items(&["64 (most items)", "16 (ender pearls, eggs, signs, buckets)", "1 (tools, weapons, armor)"])
+            .default(0)
+            .interact()
+    });
 
     let stack_size = match stack_size_selection {
         0 => 64,
@@ -402,10 +426,11 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
 
 /// Prompts for item name, then sends a RemovePair request.
 fn remove_pair(store_tx: &mpsc::Sender<StoreMessage>) {
-    let item_name: String = Input::new()
-        .with_prompt("Enter item name to remove")
-        .interact_text()
-        .expect("Failed to read item name");
+    let item_name: String = with_retry("Failed to read item name", || {
+        Input::new()
+            .with_prompt("Enter item name to remove")
+            .interact_text()
+    });
 
     info!("Requesting to remove pair for {}", item_name);
 
@@ -472,11 +497,12 @@ fn view_storage(store_tx: &mpsc::Sender<StoreMessage>) {
 
 /// Sends a QueryTrades request and displays recent trades.
 fn view_trades(store_tx: &mpsc::Sender<StoreMessage>) {
-    let limit: usize = Input::new()
-        .with_prompt("How many recent trades to show")
-        .default(20)
-        .interact_text()
-        .expect("Failed to read limit");
+    let limit: usize = with_retry("Failed to read limit", || {
+        Input::new()
+            .with_prompt("How many recent trades to show")
+            .default(20)
+            .interact_text()
+    });
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::QueryTrades {

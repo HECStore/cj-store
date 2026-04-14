@@ -35,8 +35,10 @@
 use std::{
     fs, io,
     path::Path,
-    sync::{Mutex, atomic::{AtomicU64, Ordering}},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -210,9 +212,13 @@ impl Journal {
 
 /// Thread-safe handle shared with the bot task.
 ///
-/// Uses `std::sync::Mutex` rather than `tokio::sync::Mutex`: mutations are
-/// short (in-memory update + one atomic file write) and callers must take
-/// care to not hold the guard across `.await` points.
+/// Uses `parking_lot::Mutex` rather than `std::sync::Mutex` or
+/// `tokio::sync::Mutex`: mutations are short (in-memory update + one atomic
+/// file write). parking_lot gives us a non-poisoning lock with no `Result`
+/// return on `lock()`, eliminating the panic path where a prior panic inside
+/// the critical section would otherwise poison the mutex and kill every
+/// subsequent bot operation. Callers still must not hold the guard across
+/// `.await` points.
 pub type SharedJournal = std::sync::Arc<Mutex<Journal>>;
 
 #[cfg(test)]

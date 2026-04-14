@@ -1038,7 +1038,7 @@ pub async fn pay_async(
     // Ensure payee exists
     utils::ensure_user_exists(store, payee_username, &payee_uuid);
 
-    let payer_balance = store.users.get(&payer_uuid).unwrap().balance;
+    let payer_balance = store.expect_user(&payer_uuid, "pay/payer-balance")?.balance;
     if payer_balance < amount {
         warn!(
             "Insufficient balance for payment: {} has {}, needs {}",
@@ -1051,13 +1051,16 @@ pub async fn pay_async(
     }
 
     // Transfer
-    store.users.get_mut(&payer_uuid).unwrap().balance -= amount;
-    store.users.get_mut(&payee_uuid).unwrap().balance += amount;
-    store.dirty = true;
-
-    // Update usernames
-    store.users.get_mut(&payer_uuid).unwrap().username = payer_username.to_owned();
-    store.users.get_mut(&payee_uuid).unwrap().username = payee_username.to_owned();
+    {
+        let payer = store.expect_user_mut(&payer_uuid, "pay/payer-debit")?;
+        payer.balance -= amount;
+        payer.username = payer_username.to_owned();
+    }
+    {
+        let payee = store.expect_user_mut(&payee_uuid, "pay/payee-credit")?;
+        payee.balance += amount;
+        payee.username = payee_username.to_owned();
+    }
     store.dirty = true;
 
     state::assert_invariants(store, "post-pay", true)?;
@@ -1226,7 +1229,7 @@ pub async fn handle_deposit_balance_queued(
     // Add to balance - credit the ACTUAL diamonds received, not the requested amount
     let actual_amount = diamonds_actually_received as f64;
     let new_balance = {
-        let user = store.users.get_mut(&user_uuid).unwrap();
+        let user = store.expect_user_mut(&user_uuid, "deposit-balance/credit")?;
         user.balance += actual_amount;
         user.username = player_name.to_owned();
         user.balance
@@ -1291,7 +1294,7 @@ pub async fn handle_withdraw_balance_queued(
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
-    let user_balance = store.users.get(&user_uuid).unwrap().balance;
+    let user_balance = store.expect_user(&user_uuid, "withdraw-balance/pre-check")?.balance;
     
     // Determine actual withdrawal amount
     let amount = match amount {
@@ -1572,7 +1575,7 @@ pub async fn handle_withdraw_balance_queued(
 
     // Trade succeeded - NOW deduct from balance
     {
-        let user = store.users.get_mut(&user_uuid).unwrap();
+        let user = store.expect_user_mut(&user_uuid, "withdraw-balance/commit")?;
         user.balance -= amount;
         user.username = player_name.to_owned();
     }
@@ -1605,7 +1608,7 @@ pub async fn handle_withdraw_balance_queued(
         let _ = state::save(store);
     }
 
-    let remaining_balance = store.users.get(&user_uuid).unwrap().balance;
+    let remaining_balance = store.expect_user(&user_uuid, "withdraw-balance/post-read")?.balance;
     utils::send_message_to_player(
         store,
         player_name,

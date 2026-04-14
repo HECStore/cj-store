@@ -1273,7 +1273,9 @@ The system is designed for **transactional integrity** — either a trade comple
 - **Bot operations**: Return `Result<T, String>` - errors are logged and propagated to Store
 - **Persistence**: Return `Result<(), Box<dyn Error>>` - errors are logged, state remains dirty for retry
 - **Panic cases**: Only in unrecoverable situations (e.g., invalid chest index in `Chest::new()` - should never happen in normal operation)
-- **Unwrap usage**: Most `unwrap()` calls are after explicit checks (e.g., `if !pairs.contains_key(item) { return error }` followed by `pairs.get(item).unwrap()`)
+- **Invariant lookups**: Store-state lookups that used to read `store.pairs.get(item).unwrap()` / `store.users.get(uuid).unwrap()` now go through `Store::expect_pair` / `Store::expect_user` (and their `_mut` variants) defined in [src/store/mod.rs](src/store/mod.rs). These return a structured `StoreError::UnknownPair` / `UnknownUser` that propagates via `?` instead of panicking the store task, and emit a `tracing::error!` with the call-site context so a broken invariant is still loud.
+- **Bot journal mutex**: [`SharedJournal`](src/store/journal.rs) is a `parking_lot::Mutex` (not `std::sync::Mutex`). Its `lock()` returns the guard directly — no `Result`, no poisoning — so a panic inside the critical section cannot permanently take the bot offline. Callers still must not hold the guard across `.await` points.
+- **CLI prompts**: Every `dialoguer` read in [src/cli.rs](src/cli.rs) goes through the `with_retry` helper, which loops on transient terminal I/O errors (e.g. EINTR during resize) with a 200 ms backoff instead of aborting the CLI task on the first failed read.
 
 ### Item ID Handling
 

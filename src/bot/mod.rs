@@ -185,15 +185,15 @@ pub async fn bot_task(
                     entry.state
                 );
             }
-            let shared = std::sync::Arc::new(std::sync::Mutex::new(journal));
-            if let Err(e) = shared.lock().unwrap().clear_leftover() {
+            let shared = std::sync::Arc::new(parking_lot::Mutex::new(journal));
+            if let Err(e) = shared.lock().clear_leftover() {
                 warn!("[Bot] Failed to clear journal after startup warning: {}", e);
             }
             shared
         }
         Err(e) => {
             warn!("[Bot] Failed to load operation journal: {} — starting with empty journal", e);
-            std::sync::Arc::new(std::sync::Mutex::new(crate::store::journal::Journal::default()))
+            std::sync::Arc::new(parking_lot::Mutex::new(crate::store::journal::Journal::default()))
         }
     };
 

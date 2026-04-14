@@ -18,6 +18,12 @@ pub enum StoreError {
     #[error("Item '{0}' not found")]
     ItemNotFound(String),
 
+    #[error("Unknown pair '{item}' (invariant violation at {context})")]
+    UnknownPair { item: String, context: &'static str },
+
+    #[error("Unknown user '{uuid}' (invariant violation at {context})")]
+    UnknownUser { uuid: String, context: &'static str },
+
     #[error("Insufficient funds: need {need:.2}, have {have:.2}")]
     InsufficientFunds { need: f64, have: f64 },
 

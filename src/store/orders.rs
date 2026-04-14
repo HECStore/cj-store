@@ -217,7 +217,7 @@ async fn validate_and_plan_buy(
     let total_cost = match pricing::calculate_buy_cost(store, item, qty_i32) {
         Some(cost) => cost,
         None => {
-            let pair = store.pairs.get(item).unwrap();
+            let pair = store.expect_pair(item, "buy/price-fail")?;
             let msg = if qty_i32 >= pair.item_stock {
                 format!(
                     "Cannot buy {} {} - would exceed available stock ({}). Try a smaller amount.",
@@ -250,7 +250,7 @@ async fn validate_and_plan_buy(
         return Ok(None);
     }
 
-    let pair = store.pairs.get(item).unwrap();
+    let pair = store.expect_pair(item, "buy/stock-check")?;
     if pair.item_stock < qty_i32 {
         utils::send_message_to_player(
             store,
@@ -500,18 +500,19 @@ pub async fn handle_buy_order(
     let balance_needed = plan.total_cost - diamonds_received_f64;
     let (balance_deduction, surplus) = if balance_needed > 0.0 {
         let deduction = balance_needed.min(current_balance);
-        store.users.get_mut(&plan.user_uuid).unwrap().balance -= deduction;
+        store.expect_user_mut(&plan.user_uuid, "buy/commit-deduct")?.balance -= deduction;
         (deduction, 0.0)
     } else {
         let surplus_amount = -balance_needed;
-        store.users.get_mut(&plan.user_uuid).unwrap().balance += surplus_amount;
+        store.expect_user_mut(&plan.user_uuid, "buy/commit-surplus")?.balance += surplus_amount;
         (0.0, surplus_amount)
     };
-    store.users.get_mut(&plan.user_uuid).unwrap().username = player_name.to_owned();
+    store.expect_user_mut(&plan.user_uuid, "buy/commit-username")?.username = player_name.to_owned();
     store.dirty = true;
 
-    let pair = store.pairs.get_mut(item).unwrap();
-    pair.item_stock = store.storage.total_item_amount(item);
+    let new_item_stock = store.storage.total_item_amount(item);
+    let pair = store.expect_pair_mut(item, "buy/commit-pair")?;
+    pair.item_stock = new_item_stock;
     pair.currency_stock += plan.total_cost;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after buy");
     debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
@@ -626,7 +627,7 @@ async fn validate_and_plan_sell(
         return Ok(None);
     }
 
-    let pair = store.pairs.get(item).unwrap();
+    let pair = store.expect_pair(item, "sell/reserve-check")?;
     if pair.currency_stock < total_payout {
         utils::send_message_to_player(
             store,
@@ -897,11 +898,15 @@ pub async fn handle_sell_order(
     }
 
     // Commit ledgers.
-    let pair = store.pairs.get_mut(item).unwrap();
-    store.users.get_mut(&plan.user_uuid).unwrap().balance += plan.fractional_diamonds;
-    store.users.get_mut(&plan.user_uuid).unwrap().username = player_name.to_owned();
+    {
+        let user = store.expect_user_mut(&plan.user_uuid, "sell/commit-user")?;
+        user.balance += plan.fractional_diamonds;
+        user.username = player_name.to_owned();
+    }
     store.dirty = true;
-    pair.item_stock = store.storage.total_item_amount(item);
+    let new_item_stock = store.storage.total_item_amount(item);
+    let pair = store.expect_pair_mut(item, "sell/commit-pair")?;
+    pair.item_stock = new_item_stock;
     pair.currency_stock -= plan.total_payout;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after sell");
     debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,

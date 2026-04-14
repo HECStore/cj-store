@@ -38,7 +38,7 @@ pub async fn handle_additem_order(
 
     // Plan deposit against a read-only view of storage so we don't pay the
     // cost of cloning the entire structure just to preview placement.
-    let stack_size = store.pairs.get(item).unwrap().stack_size;
+    let stack_size = store.expect_pair(item, "additem/preview")?.stack_size;
     let (preview_deposit_plan, _) =
         store.storage.simulate_deposit_plan(item, qty_i32, stack_size);
 
@@ -222,8 +222,9 @@ pub async fn handle_additem_order(
     }
 
     // Commit: update pair stock from actual storage (bot has already synced chest contents)
-    let pair = store.pairs.get_mut(item).unwrap();
-    pair.item_stock = store.storage.total_item_amount(item);
+    let new_stock = store.storage.total_item_amount(item);
+    let pair = store.expect_pair_mut(item, "additem/commit")?;
+    pair.item_stock = new_stock;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after add_stock");
     store.dirty = true;
 
@@ -433,8 +434,9 @@ pub async fn handle_removeitem_order(
     // Trade succeeded - bot gave items to operator
 
     // Commit: update pair stock from actual storage
-    let pair = store.pairs.get_mut(item).unwrap();
-    pair.item_stock = store.storage.total_item_amount(item);
+    let new_stock = store.storage.total_item_amount(item);
+    let pair = store.expect_pair_mut(item, "removeitem/commit")?;
+    pair.item_stock = new_stock;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after remove_stock");
     store.dirty = true;
 
@@ -494,7 +496,7 @@ pub async fn handle_add_currency(
             .await;
     }
 
-    let pair = store.pairs.get_mut(item).unwrap();
+    let pair = store.expect_pair_mut(item, "add-currency/commit")?;
     pair.currency_stock += amount;
     debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
         "currency_stock invalid after add_currency: {}", pair.currency_stock);
@@ -556,7 +558,7 @@ pub async fn handle_remove_currency(
             .await;
     }
 
-    let pair = store.pairs.get(item).unwrap();
+    let pair = store.expect_pair(item, "remove-currency/check")?;
     if pair.currency_stock < amount {
         return utils::send_message_to_player(
             store,
@@ -569,7 +571,7 @@ pub async fn handle_remove_currency(
         .await;
     }
 
-    let pair = store.pairs.get_mut(item).unwrap();
+    let pair = store.expect_pair_mut(item, "remove-currency/commit")?;
     pair.currency_stock -= amount;
     debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
         "currency_stock invalid after remove_currency: {}", pair.currency_stock);

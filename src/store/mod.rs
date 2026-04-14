@@ -435,6 +435,44 @@ impl Store {
         }
     }
 
+    /// Look up a pair or return a structured `UnknownPair` error.
+    ///
+    /// Use at call sites where the pair is expected to exist because earlier
+    /// code validated it; replaces panic-prone `store.pairs.get(item).unwrap()`.
+    pub(crate) fn expect_pair(&self, item: &str, context: &'static str) -> Result<&crate::types::Pair, crate::error::StoreError> {
+        self.pairs.get(item).ok_or_else(|| {
+            tracing::error!("Invariant violation at {context}: pair '{item}' missing");
+            crate::error::StoreError::UnknownPair { item: item.to_string(), context }
+        })
+    }
+
+    pub(crate) fn expect_pair_mut(&mut self, item: &str, context: &'static str) -> Result<&mut crate::types::Pair, crate::error::StoreError> {
+        match self.pairs.get_mut(item) {
+            Some(p) => Ok(p),
+            None => {
+                tracing::error!("Invariant violation at {context}: pair '{item}' missing");
+                Err(crate::error::StoreError::UnknownPair { item: item.to_string(), context })
+            }
+        }
+    }
+
+    pub(crate) fn expect_user(&self, uuid: &str, context: &'static str) -> Result<&crate::types::User, crate::error::StoreError> {
+        self.users.get(uuid).ok_or_else(|| {
+            tracing::error!("Invariant violation at {context}: user '{uuid}' missing");
+            crate::error::StoreError::UnknownUser { uuid: uuid.to_string(), context }
+        })
+    }
+
+    pub(crate) fn expect_user_mut(&mut self, uuid: &str, context: &'static str) -> Result<&mut crate::types::User, crate::error::StoreError> {
+        match self.users.get_mut(uuid) {
+            Some(u) => Ok(u),
+            None => {
+                tracing::error!("Invariant violation at {context}: user '{uuid}' missing");
+                Err(crate::error::StoreError::UnknownUser { uuid: uuid.to_string(), context })
+            }
+        }
+    }
+
     /// Apply chest sync report from bot (merges bot-reported slot counts into storage)
     pub(crate) fn apply_chest_sync(&mut self, report: ChestSyncReport) -> Result<(), String> {
         state::apply_chest_sync(self, report)

@@ -1134,7 +1134,7 @@ async fn withdraw_shulkers(
                     // Journal: about to remove the shulker from its chest slot.
                     // The guard is scoped so we don't hold the lock across awaits.
                     {
-                        if let Err(e) = bot.journal.lock().unwrap().begin(
+                        if let Err(e) = bot.journal.lock().begin(
                             JournalOp::WithdrawFromChest,
                             chest_id,
                             slot_idx,
@@ -1205,7 +1205,7 @@ async fn withdraw_shulkers(
 
                     // Journal: shulker is now placed on the station.
                     {
-                        if let Err(e) = bot.journal.lock().unwrap().advance(JournalState::ShulkerOnStation) {
+                        if let Err(e) = bot.journal.lock().advance(JournalState::ShulkerOnStation) {
                             warn!("[Journal] advance(ShulkerOnStation) failed: {}", e);
                         }
                     }
@@ -1267,7 +1267,7 @@ async fn withdraw_shulkers(
                     // Journal: items moved from shulker into bot inventory (or
                     // no-op if the shulker turned out not to contain the target).
                     {
-                        if let Err(e) = bot.journal.lock().unwrap().advance(JournalState::ItemsTransferred) {
+                        if let Err(e) = bot.journal.lock().advance(JournalState::ItemsTransferred) {
                             warn!("[Journal] advance(ItemsTransferred) failed: {}", e);
                         }
                     }
@@ -1285,7 +1285,7 @@ async fn withdraw_shulkers(
 
                     // Journal: shulker is back in bot inventory (station is empty).
                     {
-                        if let Err(e) = bot.journal.lock().unwrap().advance(JournalState::ShulkerPickedUp) {
+                        if let Err(e) = bot.journal.lock().advance(JournalState::ShulkerPickedUp) {
                             warn!("[Journal] advance(ShulkerPickedUp) failed: {}", e);
                         }
                     }
@@ -1326,7 +1326,7 @@ async fn withdraw_shulkers(
 
                     // Journal: shulker is back in its chest slot; operation complete.
                     {
-                        let mut j = bot.journal.lock().unwrap();
+                        let mut j = bot.journal.lock();
                         if let Err(e) = j.advance(JournalState::ShulkerReplaced) {
                             warn!("[Journal] advance(ShulkerReplaced) failed: {}", e);
                         }
@@ -1469,7 +1469,7 @@ async fn deposit_shulkers(
                 //   reopen chest -> place shulker back in the same chest slot (verified).
                 // Journal: about to remove shulker from its chest slot.
                 {
-                    if let Err(e) = bot.journal.lock().unwrap().begin(
+                    if let Err(e) = bot.journal.lock().begin(
                         JournalOp::DepositToChest,
                         chest_id,
                         slot_idx,
@@ -1552,7 +1552,7 @@ async fn deposit_shulkers(
 
                 // Journal: shulker is now on the station.
                 {
-                    if let Err(e) = bot.journal.lock().unwrap().advance(JournalState::ShulkerOnStation) {
+                    if let Err(e) = bot.journal.lock().advance(JournalState::ShulkerOnStation) {
                         warn!("[Journal] advance(ShulkerOnStation) failed: {}", e);
                     }
                 }
@@ -1658,7 +1658,7 @@ async fn deposit_shulkers(
 
                         // Journal: no items transferred (full), advancing through lifecycle.
                         {
-                            let mut j = bot.journal.lock().unwrap();
+                            let mut j = bot.journal.lock();
                             let _ = j.advance(JournalState::ItemsTransferred);
                         }
 
@@ -1677,7 +1677,7 @@ async fn deposit_shulkers(
                         .await?;
 
                         {
-                            let _ = bot.journal.lock().unwrap().advance(JournalState::ShulkerPickedUp);
+                            let _ = bot.journal.lock().advance(JournalState::ShulkerPickedUp);
                         }
 
                         // Re-open chest (it was closed when we placed shulker)
@@ -1706,7 +1706,7 @@ async fn deposit_shulkers(
 
                         // Journal: shulker replaced, operation complete for this slot.
                         {
-                            let mut j = bot.journal.lock().unwrap();
+                            let mut j = bot.journal.lock();
                             let _ = j.advance(JournalState::ShulkerReplaced);
                             let _ = j.complete();
                         }
@@ -1724,7 +1724,7 @@ async fn deposit_shulkers(
 
                 // Journal: items moved into shulker.
                 {
-                    let _ = bot.journal.lock().unwrap().advance(JournalState::ItemsTransferred);
+                    let _ = bot.journal.lock().advance(JournalState::ItemsTransferred);
                 }
 
                 // CRITICAL: Clear hotbar BEFORE picking up shulker from station
@@ -1739,7 +1739,7 @@ async fn deposit_shulkers(
 
                 // Journal: shulker picked up from station.
                 {
-                    let _ = bot.journal.lock().unwrap().advance(JournalState::ShulkerPickedUp);
+                    let _ = bot.journal.lock().advance(JournalState::ShulkerPickedUp);
                 }
 
                 // Re-open chest (it was closed when we placed shulker)
@@ -1769,7 +1769,7 @@ async fn deposit_shulkers(
 
                 // Journal: shulker replaced in chest, operation complete.
                 {
-                    let mut j = bot.journal.lock().unwrap();
+                    let mut j = bot.journal.lock();
                     let _ = j.advance(JournalState::ShulkerReplaced);
                     let _ = j.complete();
                 }

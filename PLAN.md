@@ -1,44 +1,56 @@
-# PLAN.md — Roadmap to 100/100 Code Quality
+# cj-store — Codebase Review & Roadmap
 
-## Context
+**Rating: 80 / 100**
 
-The codebase started at ~72/100 and is currently at ~99/100 after Tiers 1–3, most of Tier 4, and Tier 5 completed. Solid architecture (single-owner state, typed channels, no race conditions), correct AMM pricing with 12 proptest invariants and debug_assert guards, thorough rollback logic, atomic persistence, and hot-reloadable config remain the strong foundation. 84 tests passing, 0 warnings.
-
-### Ongoing / incremental work from shipped tiers
-
-- **StoreError deep migration** — the hot path (chest/trade helpers) is migrated; handler-level and bot-layer signatures can continue to migrate opportunistically (progressive rollout, not big-bang).
-- **Order-handler tests** — the test harness and four seed tests are in place. Additional scenarios can be added incrementally; the mock-bot infrastructure supports them without changes.
-- **Journal** — detects crash-interrupted shulker operations on startup (detection, not auto-resume). The journal is cleared after surfacing the warning so the bot can proceed.
-- **ItemId** — `store.pairs` map keys remain `String` for minimal churn; field types are `ItemId`. A future pass could migrate the map keys too.
+Solid architecture, typed errors, journal-based crash recovery, and proptest on AMM pricing. Panic surface in store handlers has been replaced by structured `StoreError::Unknown*` variants via `Store::expect_pair` / `expect_user`; the bot journal now uses `parking_lot::Mutex` (no poisoning); CLI reads retry on transient I/O. Points still lost on an untested bot layer and missing engineering hygiene (CI / lints / metrics).
 
 ---
 
-## Remaining: Tier 4 (partial)
+## What's good
 
-### 4.2 Metrics and observability
+- Clean module boundaries: [src/store/](src/store/) owns state, [src/bot/](src/bot/) owns Azalea I/O, [src/cli.rs](src/cli.rs) owns operator UX, [src/types/](src/types/) owns persisted models.
+- Typed error enum in [src/error.rs](src/error.rs) for hot-path operations.
+- Crash recovery via [src/store/journal.rs](src/store/journal.rs) + rollback helper in [src/store/rollback.rs](src/store/rollback.rs).
+- Property-based tests on AMM pricing in [src/store/pricing.rs](src/store/pricing.rs); focused unit tests in [store/journal.rs](src/store/journal.rs), [store/trade_state.rs](src/store/trade_state.rs), [store/queue.rs](src/store/queue.rs), [store/rate_limit.rs](src/store/rate_limit.rs), [types/item_id.rs](src/types/item_id.rs), [types/node.rs](src/types/node.rs), [types/storage.rs](src/types/storage.rs).
+- Hot-reloadable config (`notify` crate) and structured logging via `tracing` + `tracing-appender`.
+- Clear trade state machine in [src/store/trade_state.rs](src/store/trade_state.rs).
 
-**Problem:** Debugging requires parsing log files. No quantitative view of system health.
+## What's weak
 
-**Files:** New `src/metrics.rs`, modifications to `src/store/mod.rs`
-
-**Change:**
-
-- Add `prometheus` crate
-- Expose counters: `orders_total{type,status}`, `trades_total{type}`, `rollbacks_total`
-- Expose gauges: `queue_depth`, `users_total`, `pairs_total`, `storage_nodes_total`
-- Expose histograms: `order_duration_seconds{type}`, `trade_duration_seconds`
-- Optional HTTP endpoint (or just write to `data/metrics.json` periodically)
+- **Bot layer has zero tests.** [src/bot/chest_io.rs](src/bot/chest_io.rs) (1779 LOC), [src/bot/trade.rs](src/bot/trade.rs) (1045), [src/bot/inventory.rs](src/bot/inventory.rs) (998), [src/bot/navigation.rs](src/bot/navigation.rs), and handler modules ([handlers/player.rs](src/store/handlers/player.rs) 1615, [handlers/operator.rs](src/store/handlers/operator.rs) 607, [handlers/cli.rs](src/store/handlers/cli.rs) 535) lack any `#[test]`.
+- **Missing infra.** No `.github/workflows/`, no `clippy.toml`, no `rustfmt.toml`, no `cargo-deny`, no coverage tool, no metrics, no benchmarks.
+- **Hotspot files too large.** `chest_io.rs` 1779 LOC, `player.rs` 1615, `orders.rs` 1245, `trade.rs` 1045, `storage.rs` 1016 — harder to navigate and review.
 
 ---
 
-## Summary
+## Roadmap to 100
 
-| Tier       | Score     | Key Changes                                                                                          |
-| ---------- | --------- | ---------------------------------------------------------------------------------------------------- |
-| 1 (done)   | 72 → ~85  | ✅ Rollback helper, config wiring, orders.rs + chest_io.rs splits, StoreError on hot path            |
-| 2 (done)   | ~85 → 88  | ✅ Logging pruned ~60%, dead-code cleanup, lightweight planner, order-handler tests                  |
-| 3 (done)   | 88 → 93   | ✅ Crash journal, type-safe ItemId, property-based AMM tests                                         |
-| 4 (mostly) | 93 → 95+  | ✅ Trade state machine, UUID cache, chunk-unload handling. Remaining: metrics (4.2)                  |
-| 5 (done)   | 95+ → ~99 | ✅ Expanded proptest suite (12 invariants) + debug_assert guards, hot-reload config via `notify`     |
+Each tier is ~+5 points. Ship in order.
 
-**Current score:** ~99/100 (Tiers 1, 2, 3, 4.1/4.4/4.5, and 5 complete). Remaining: Tier 4.2 metrics and observability.
+### Tier A → 85: Bot + handler test coverage
+
+- Unit tests for slot math in [src/bot/inventory.rs](src/bot/inventory.rs), station-position calc in [src/bot/shulker.rs](src/bot/shulker.rs), path ordering in [src/bot/navigation.rs](src/bot/navigation.rs).
+- Integration harness that drives `Store::run` end-to-end via `StoreMessage` with a mock `BotInstruction` sink. Cover: `buy` / `sell` / `pay` / `deposit` / `withdraw` / `queue` / `cancel`, rollback on simulated bot failure, journal recovery on restart, rate-limit backoff.
+- Track coverage with `cargo-tarpaulin`; gate CI at ≥70 % on `store/`, ≥40 % on `bot/`.
+
+### Tier B → 90: Engineering hygiene + refactor
+
+- `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --all-features`, `cargo deny check`.
+- Add `clippy.toml` (pedantic subset) and `rustfmt.toml`.
+- Split [src/bot/chest_io.rs](src/bot/chest_io.rs) → `chest_io/mod.rs`, `withdraw.rs`, `deposit.rs`, `dispatch.rs`.
+- Split [src/store/handlers/player.rs](src/store/handlers/player.rs) → one module per command (`buy.rs`, `sell.rs`, `pay.rs`, `deposit.rs`, `withdraw.rs`, `queue.rs`, `status.rs`, `info.rs`).
+- Replace ad-hoc log prefixes with `tracing` spans carrying `user`, `item`, `order_id`.
+
+### Tier C → 95: Observability + resilience
+
+- Prometheus metrics (behind a feature flag): orders/sec, queue depth per user, AMM slippage histogram, trade success rate, chest-I/O latency, journal recovery count.
+- New `/msg <bot> stats` player command and `Stats` CLI menu entry.
+- Periodic tarball snapshot of `data/` with rotation; document restore runbook in [README.md](README.md).
+- `cargo-fuzz` target for `messages::parse_whisper` to harden against malformed input.
+
+### Tier D → 100: Correctness + future features
+
+- Formalize invariants in [src/store/state.rs](src/store/state.rs) `assert_invariants`: conservation (`Σ user balances + Σ pair diamond reserves == known total`), item reserves == physical storage counts, queue ordering. Run every autosave in debug; nightly CI job in release.
+- `loom` (or `shuttle`) test for the journal + rollback state machine against randomized crash points.
+- README "Optional Enhancements" delivered: multi-item trades, order books / limit orders, statistics tracking.
+- `criterion` benchmark suite for AMM pricing and queue processing; regression gate in CI.

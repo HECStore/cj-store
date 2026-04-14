@@ -125,6 +125,26 @@ impl Store {
         // data/ don't mistake it for live state.
         let orders_file = std::path::Path::new("data/orders.json");
         if orders_file.exists() {
+            let count = std::fs::read_to_string(orders_file)
+                .ok()
+                .and_then(|s| serde_json::from_str::<std::collections::VecDeque<Order>>(&s).ok())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let age_secs = std::fs::metadata(orders_file)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs());
+            match age_secs {
+                Some(secs) => warn!(
+                    "Clearing {} pending order(s) from previous session (file last modified {}s ago)",
+                    count, secs
+                ),
+                None => warn!(
+                    "Clearing {} pending order(s) from previous session",
+                    count
+                ),
+            }
             if let Err(e) = std::fs::remove_file(orders_file) {
                 warn!("Failed to clear orders.json on startup: {}", e);
             }
@@ -325,17 +345,40 @@ impl Store {
         self.processing_order = true;
         self.current_trade = Some(trade_state::TradeState::new(order.clone()));
 
+        let started = std::time::Instant::now();
+        info!(
+            order_id = order.id,
+            player = %order.username,
+            item = %order.item,
+            quantity = order.quantity,
+            "order processing started"
+        );
+
         // Notify user that their order is being processed
         let processing_msg = format!("Now processing: {}...", order.description());
         if let Err(e) = utils::send_message_to_player(self, &order.username, &processing_msg).await {
-            warn!("[Store] Failed to notify user {} of order start: {}", order.username, e);
+            warn!(order_id = order.id, player = %order.username, error = %e, "failed to notify user of order start");
         }
 
         // Execute the order (handlers send their own completion/error messages)
         let result = orders::execute_queued_order(self, &order).await;
 
-        if let Err(error_msg) = &result {
-            error!("[Store] Order #{} failed: {}", order.id, error_msg);
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(summary) => info!(
+                order_id = order.id,
+                player = %order.username,
+                duration_ms,
+                summary = %summary,
+                "order processing completed"
+            ),
+            Err(error_msg) => error!(
+                order_id = order.id,
+                player = %order.username,
+                duration_ms,
+                error = %error_msg,
+                "order processing failed"
+            ),
         }
 
         self.processing_order = false;
@@ -415,7 +458,13 @@ impl Store {
     pub(crate) fn advance_trade(&mut self, transition: impl FnOnce(trade_state::TradeState) -> trade_state::TradeState) {
         if let Some(state) = self.current_trade.take() {
             let next = transition(state);
-            debug!("[Store] Trade advanced to: {}", next.phase());
+            let order = next.order();
+            info!(
+                order_id = order.id,
+                player = %order.username,
+                phase = next.phase(),
+                "trade state advanced"
+            );
             self.current_trade = Some(next);
         } else {
             debug!("[Store] advance_trade called with no active trade (no-op)");

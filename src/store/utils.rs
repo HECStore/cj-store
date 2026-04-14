@@ -1,8 +1,10 @@
 //! Utility functions for the Store
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+use parking_lot::Mutex;
 
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -63,7 +65,7 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
 
         // Check cache first
         {
-            let cache = uuid_cache().lock().unwrap();
+            let cache = uuid_cache().lock();
             if let Some((uuid, ts)) = cache.get(&key) {
                 if ts.elapsed() < ttl {
                     debug!("UUID cache hit for '{}' -> {}", username, uuid);
@@ -77,7 +79,7 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
         info!("UUID cache miss for '{}', fetched {}", username, uuid);
 
         {
-            let mut cache = uuid_cache().lock().unwrap();
+            let mut cache = uuid_cache().lock();
             cache.insert(key, (uuid.clone(), Instant::now()));
         }
 
@@ -89,7 +91,7 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
 #[allow(dead_code)] // API surface for future username-change detection
 pub fn invalidate_uuid_cache(username: &str) {
     let key = username.to_lowercase();
-    let mut cache = uuid_cache().lock().unwrap();
+    let mut cache = uuid_cache().lock();
     if cache.remove(&key).is_some() {
         debug!("Invalidated UUID cache entry for '{}'", username);
     }
@@ -98,7 +100,7 @@ pub fn invalidate_uuid_cache(username: &str) {
 /// Clear the entire UUID cache. Useful for testing or after long idle periods.
 #[cfg(test)]
 pub fn clear_uuid_cache() {
-    uuid_cache().lock().unwrap().clear();
+    uuid_cache().lock().clear();
 }
 
 /// Ensure user exists in store, creating if missing.
@@ -317,9 +319,9 @@ mod tests {
         let key = "testplayer".to_string();
         let uuid = "00000000-0000-0000-0000-000000000001".to_string();
 
-        cache.lock().unwrap().insert(key.clone(), (uuid.clone(), Instant::now()));
+        cache.lock().insert(key.clone(), (uuid.clone(), Instant::now()));
 
-        let cached = cache.lock().unwrap().get(&key).cloned();
+        let cached = cache.lock().get(&key).cloned();
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().0, uuid);
     }
@@ -331,10 +333,10 @@ mod tests {
         let cache = uuid_cache();
         let uuid = "00000000-0000-0000-0000-000000000002".to_string();
 
-        cache.lock().unwrap().insert("steve".to_string(), (uuid.clone(), Instant::now()));
+        cache.lock().insert("steve".to_string(), (uuid.clone(), Instant::now()));
 
         // Lookup must use the same lowercased key (resolve_user_uuid does this)
-        let hit = cache.lock().unwrap().get("steve").cloned();
+        let hit = cache.lock().get("steve").cloned();
         assert_eq!(hit.unwrap().0, uuid);
     }
 
@@ -347,10 +349,10 @@ mod tests {
 
         // Insert with a timestamp far in the past
         let old_instant = Instant::now() - std::time::Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
-        cache.lock().unwrap().insert(key.clone(), (uuid.clone(), old_instant));
+        cache.lock().insert(key.clone(), (uuid.clone(), old_instant));
 
         // Entry exists but is stale
-        let entry = cache.lock().unwrap().get(&key).cloned().unwrap();
+        let entry = cache.lock().get(&key).cloned().unwrap();
         let ttl = std::time::Duration::from_secs(UUID_CACHE_TTL_SECS);
         assert!(entry.1.elapsed() >= ttl, "Entry should be expired");
     }
@@ -360,25 +362,25 @@ mod tests {
         clear_uuid_cache();
         let cache = uuid_cache();
         let uuid = "00000000-0000-0000-0000-000000000004".to_string();
-        cache.lock().unwrap().insert("removeme".to_string(), (uuid, Instant::now()));
+        cache.lock().insert("removeme".to_string(), (uuid, Instant::now()));
 
         invalidate_uuid_cache("RemoveMe"); // case-insensitive
-        assert!(cache.lock().unwrap().get("removeme").is_none());
+        assert!(cache.lock().get("removeme").is_none());
     }
 
     #[test]
     fn test_uuid_cache_clear() {
         let cache = uuid_cache();
-        cache.lock().unwrap().insert(
+        cache.lock().insert(
             "a".to_string(),
             ("uuid-a".to_string(), Instant::now()),
         );
-        cache.lock().unwrap().insert(
+        cache.lock().insert(
             "b".to_string(),
             ("uuid-b".to_string(), Instant::now()),
         );
 
         clear_uuid_cache();
-        assert!(cache.lock().unwrap().is_empty());
+        assert!(cache.lock().is_empty());
     }
 }

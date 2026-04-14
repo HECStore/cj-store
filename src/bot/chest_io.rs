@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 use super::Bot;
 use crate::constants::{
     CHEST_OP_MAX_RETRIES, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
-    CHUNK_RELOAD_MAX_DELAY_MS, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
-    exponential_backoff_delay,
+    CHUNK_RELOAD_MAX_DELAY_MS, DELAY_LOOK_AT_MS, DOUBLE_CHEST_SLOTS, RETRY_BASE_DELAY_MS,
+    RETRY_MAX_DELAY_MS, exponential_backoff_delay,
 };
 use crate::types::Position;
 
@@ -970,7 +970,7 @@ pub async fn automated_chest_io(
     let mut slot_counts: Vec<i32> = if let Some(known) = known_counts {
         known.clone()
     } else {
-        vec![-1; 54]
+        vec![-1; DOUBLE_CHEST_SLOTS]
     };
 
     if amount <= 0 {
@@ -1071,7 +1071,7 @@ async fn withdraw_shulkers(
             while remaining > 0 && !all_shulkers_checked {
                 all_shulkers_checked = true; // Assume we're done, set to false if we find a shulker
 
-                for slot_idx in 0..54 {
+                for slot_idx in 0..DOUBLE_CHEST_SLOTS {
                     if remaining <= 0 {
                         break;
                     }
@@ -1386,7 +1386,7 @@ async fn deposit_shulkers(
                 .contents()
                 .ok_or_else(|| "Chest closed after reopen attempt".to_string())?;
             let mut has_any_shulker = false;
-            for slot_idx in 0..contents.len().min(54) {
+            for slot_idx in 0..contents.len().min(DOUBLE_CHEST_SLOTS) {
                 let stack = &contents[slot_idx];
                 if stack.count() > 0 && super::shulker::is_shulker_box(&stack.kind().to_string()) {
                     has_any_shulker = true;
@@ -1406,7 +1406,7 @@ async fn deposit_shulkers(
             // Calculate shulker capacity based on item's stack size (27 slots × stack_size)
             let shulker_capacity = crate::types::Pair::shulker_capacity_for_stack_size(stack_size);
             
-            for slot_idx in 0..54 {
+            for slot_idx in 0..DOUBLE_CHEST_SLOTS {
                 if remaining <= 0 {
                     break;
                 }

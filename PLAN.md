@@ -1,51 +1,101 @@
-# cj-store — Codebase Review & Roadmap
+# cj-store — Quality Assessment & Roadmap
 
-**Rating: 85 / 100**
+**Current score: 72 / 100**
 
-Solid architecture, typed errors, journal-based crash recovery, and proptest on AMM pricing. Panic surface in store handlers has been replaced by structured `StoreError::Unknown*` variants via `Store::expect_pair` / `expect_user`; the bot journal now uses `parking_lot::Mutex` (no poisoning); CLI reads retry on transient I/O. The bot trade-GUI slot helpers are now unit-tested and the order-handler integration suite covers the rejection paths for `buy` / `sell` / `pay` / `deposit` / `withdraw` against an in-memory mock bot. Points still lost on missing engineering hygiene (CI / lints / metrics) and the async chest-I/O, trade-GUI, and navigation paths which remain un-covered (they require Azalea simulation).
+Rating is a weighted read of architecture, error handling, concurrency, tests,
+docs, style, observability, and operations. Scope: everything under `src/`.
 
----
+## Dimension scores
 
-## What's good
+| Dimension           | Score | Headline                                           |
+|---------------------|------:|----------------------------------------------------|
+| Architecture        | 75    | Clean 3-task design; handler layer too fat         |
+| Error handling      | 68    | `StoreError` exists but handlers still use `String`|
+| Concurrency         | 82    | Good lock hygiene; UUID cache uses `std::Mutex`    |
+| Testing             | 55    | Strong proptest on AMM; zero handler/bot tests     |
+| Documentation       | 70    | Great README; handler/schema docs missing          |
+| Code style          | 78    | Idiomatic; `#[allow(dead_code)]` overuse           |
+| Observability       | 72    | `tracing` wired; no structured fields, no metrics  |
+| Config & ops        | 70    | Hot-reload works; recovery runbook missing         |
 
-- Clean module boundaries: [src/store/](src/store/) owns state, [src/bot/](src/bot/) owns Azalea I/O, [src/cli.rs](src/cli.rs) owns operator UX, [src/types/](src/types/) owns persisted models.
-- Typed error enum in [src/error.rs](src/error.rs) for hot-path operations.
-- Crash recovery via [src/store/journal.rs](src/store/journal.rs) + rollback helper in [src/store/rollback.rs](src/store/rollback.rs).
-- Property-based tests on AMM pricing in [src/store/pricing.rs](src/store/pricing.rs); focused unit tests in [store/journal.rs](src/store/journal.rs), [store/trade_state.rs](src/store/trade_state.rs), [store/queue.rs](src/store/queue.rs), [store/rate_limit.rs](src/store/rate_limit.rs), [types/item_id.rs](src/types/item_id.rs), [types/node.rs](src/types/node.rs), [types/storage.rs](src/types/storage.rs); trade-GUI slot math in [bot/trade.rs](src/bot/trade.rs); order-handler integration tests in [store/orders.rs](src/store/orders.rs) via an in-memory `Store::new_for_test` + mock bot harness.
-- Hot-reloadable config (`notify` crate) and structured logging via `tracing` + `tracing-appender`.
-- Clear trade state machine in [src/store/trade_state.rs](src/store/trade_state.rs).
+## Key strengths (keep)
 
-## What's weak
+- Three-task design (Store / Bot / CLI) with mpsc channels — single source of truth in Store.
+- AMM pricing validated by 9 proptest invariants ([src/store/pricing.rs](src/store/pricing.rs)).
+- Rollback tolerates partial failure instead of aborting ([src/store/rollback.rs](src/store/rollback.rs)).
+- Exponential-backoff rate limiter with idle reset ([src/store/rate_limit.rs](src/store/rate_limit.rs)).
+- Journal + atomic writes for shulker ops ([src/store/journal.rs](src/store/journal.rs)).
+- Clean physical-storage model (`Node` / `Chest` / `Storage` in [src/types/](src/types/)).
 
-- **Async bot paths still uncovered.** [src/bot/chest_io.rs](src/bot/chest_io.rs) (1779 LOC), [src/bot/inventory.rs](src/bot/inventory.rs) (998), [src/bot/navigation.rs](src/bot/navigation.rs), and the async half of [src/bot/trade.rs](src/bot/trade.rs) interact with `azalea::Client` and have no tests; happy-path rollback / success flows in [handlers/player.rs](src/store/handlers/player.rs), [handlers/operator.rs](src/store/handlers/operator.rs), and [handlers/cli.rs](src/store/handlers/cli.rs) are only reached via rejection paths today.
-- **Missing infra.** No `.github/workflows/`, no `clippy.toml`, no `rustfmt.toml`, no `cargo-deny`, no coverage tool, no metrics, no benchmarks.
-- **Hotspot files too large.** `chest_io.rs` 1779 LOC, `player.rs` 1615, `orders.rs` 1245, `trade.rs` 1045, `storage.rs` 1016 — harder to navigate and review.
+## Key weaknesses (fix)
 
----
+- **Handler bloat.** `store/handlers/player.rs` (~1.6k LOC) and `operator.rs` (~600 LOC) duplicate buy/sell/deposit/withdraw parse → validate → queue.
+- **`TradeState` is decorative.** Defined in [src/store/trade_state.rs](src/store/trade_state.rs), mutated, then dropped — not used for recovery decisions.
+- **Mixed error types.** Handlers return `Result<(), String>`; `StoreError` only used in core. No `BotError` / `TransactionError` variants.
+- **UUID cache panic surface.** `std::sync::Mutex` + `.unwrap()` in [src/store/utils.rs](src/store/utils.rs); a poisoned lock kills subsequent lookups.
+- **No integration tests.** No `tests/` dir. Handlers, bot IO, orders pipeline — untested end-to-end.
+- **Unbounded caches.** UUID cache + rate-limiter state have cleanup methods marked dead; no periodic task invokes them.
+- **No backpressure.** 128-buffer mpsc blocks senders on saturation; no shedding or timeout.
+- **No metrics.** Zero counters/histograms; post-hoc analysis requires scraping logs.
+- **Orders cleared silently on startup.** Operators get no warning of discarded queue.
+- **Magic numbers escape `constants.rs`** (chunk reload delays, retry counts, chest slot count 54).
 
 ## Roadmap to 100
 
-Each tier is ~+5 points. Ship in order.
+Each phase is independently shippable.
 
-### Tier A → 90: Engineering hygiene + refactor
+### Phase 1 — Quick wins (72 → 80)
 
-- `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --all-features`, `cargo deny check`.
-- Add `clippy.toml` (pedantic subset) and `rustfmt.toml`.
-- Track coverage with a CI-friendly tool (e.g. `cargo-llvm-cov` on Linux runners since `cargo-tarpaulin` has no Windows support); gate at ≥70 % on `store/`, ≥40 % on `bot/`.
-- Split [src/bot/chest_io.rs](src/bot/chest_io.rs) → `chest_io/mod.rs`, `withdraw.rs`, `deposit.rs`, `dispatch.rs`.
-- Split [src/store/handlers/player.rs](src/store/handlers/player.rs) → one module per command (`buy.rs`, `sell.rs`, `pay.rs`, `deposit.rs`, `withdraw.rs`, `queue.rs`, `status.rs`, `info.rs`).
-- Replace ad-hoc log prefixes with `tracing` spans carrying `user`, `item`, `order_id`.
+1. **Split `player.rs`** into `handlers/{buy,sell,deposit,withdraw,info}.rs`.
+2. **Swap `std::sync::Mutex` → `parking_lot::Mutex`** in [src/store/utils.rs](src/store/utils.rs) UUID cache.
+3. **Structured tracing fields**: add `order_id`, `phase`, `duration_ms`, `player` to hot-path logs. Promote `TradeState` transitions to `info`.
+4. **First integration test** under `tests/`: `Store::new_for_test()` → queue buy → assert state delta + chest plan.
+5. **Startup warning** when `orders.json` is cleared: log count + age of oldest.
+6. **Move `54` (chest slots) + stray retry/timeout constants into [src/constants.rs](src/constants.rs).**
 
-### Tier B → 95: Observability + resilience
+### Phase 2 — Structural refactors (80 → 88)
 
-- Prometheus metrics (behind a feature flag): orders/sec, queue depth per user, AMM slippage histogram, trade success rate, chest-I/O latency, journal recovery count.
-- New `/msg <bot> stats` player command and `Stats` CLI menu entry.
-- Periodic tarball snapshot of `data/` with rotation; document restore runbook in [README.md](README.md).
-- `cargo-fuzz` target for `messages::parse_whisper` to harden against malformed input.
+1. **`Persistent` trait** (`load_all` / `save` / `path`) — implement for `Users`, `Pairs`, `Orders`, `TradeLog`. Consolidate `fsutil::write_atomic` usage.
+2. **Error unification.** Add `StoreError::BotError`, `StoreError::Transaction { attempted, succeeded, items }`. Convert handler signatures to `Result<_, StoreError>`.
+3. **`Command` enum + parser.** Replace hand-rolled `parts.get(0)` chains with a typed enum and single `parse_command(&str) -> Result<Command, _>`.
+4. **Handler pattern.** Formalize validate → plan → execute → commit; return a `HandlerOutcome { messages, state_delta }` instead of calling `send_message_to_player` directly.
+5. **Actually use `TradeState`.** Drive recovery branches off it; persist last phase for crash-resume.
+6. **Channel backpressure.** Reject new orders with a typed error when queue > 90% full.
+7. **Periodic cleanup task** for UUID cache + rate-limiter stale entries (hourly).
 
-### Tier C → 100: Correctness + future features
+### Phase 3 — Verification & operability (88 → 95)
 
-- Formalize invariants in [src/store/state.rs](src/store/state.rs) `assert_invariants`: conservation (`Σ user balances + Σ pair diamond reserves == known total`), item reserves == physical storage counts, queue ordering. Run every autosave in debug; nightly CI job in release.
-- `loom` (or `shuttle`) test for the journal + rollback state machine against randomized crash points.
-- README "Optional Enhancements" delivered: multi-item trades, order books / limit orders, statistics tracking.
-- `criterion` benchmark suite for AMM pricing and queue processing; regression gate in CI.
+1. **Integration test suite** (target ~10 scenarios): happy-path buy/sell, insufficient stock, rollback on trade failure, reconnect mid-order, config hot-reload, journal replay.
+2. **`MockBot`** returning canned `ChestSyncReport` / `TradeResult` so handler + orders logic is end-to-end testable.
+3. **Metrics.** Add `metrics` crate with counters (`trades_completed`, `rollbacks`, `errors_by_kind`) and a latency histogram on order processing.
+4. **Proptest expansion** beyond pricing: `TradeState` transition legality, rate-limiter monotonicity, storage-plan invariants.
+5. **`ARCHITECTURE.md`** (diagrams of channel flow + trade state machine) and **`data/SCHEMA.md`** (JSON formats + versioning).
+6. **`RECOVERY.md`** runbook: corrupted `pairs.json`, stuck journal entry, orphaned shulker in inventory.
+7. **`--validate-only` / `--dry-run` flag** for config sanity-check without connecting.
+
+### Phase 4 — Polish to 100
+
+1. **Eliminate `#[allow(dead_code)]`** — use or delete.
+2. **Reduce `.unwrap()`/`.expect()` to an audited short list**, each justified by a comment.
+3. **Benchmarks** (`criterion`) on pricing, storage planning, journal IO; regression thresholds.
+4. **Stress test** with simulated concurrent orders + forced disconnects.
+5. **Config validation**: coordinate bounds, server-address format, y ∈ [−64, 320].
+6. **Rustdoc coverage gate** in CI (`#![warn(missing_docs)]` on public modules).
+7. **Last-known-good snapshotting** of persistent files on clean shutdown.
+
+## Concrete file hotspots
+
+- [src/store/handlers/player.rs](src/store/handlers/player.rs) — split, de-duplicate, add tests.
+- [src/bot/chest_io.rs](src/bot/chest_io.rs) — extract helpers; large monolith.
+- [src/store/utils.rs](src/store/utils.rs) — UUID cache Mutex + cleanup.
+- [src/store/trade_state.rs](src/store/trade_state.rs) — wire into recovery.
+- [src/store/journal.rs](src/store/journal.rs) — replay path + tests.
+- [src/error.rs](src/error.rs) — expand variants, adopt everywhere.
+- [src/constants.rs](src/constants.rs) — absorb escaped magic numbers.
+
+## How to verify progress
+
+- `cargo test` — unit + proptest + (new) integration suite green.
+- `cargo clippy -- -D warnings` clean.
+- `cargo doc --no-deps` builds without missing-docs warnings after Phase 4.
+- Manual: run the bot against a test server, exercise a buy, a sell, a forced disconnect mid-trade, and a config hot-reload; confirm logs show structured fields and metrics counters increment.

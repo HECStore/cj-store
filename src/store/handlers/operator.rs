@@ -224,6 +224,7 @@ pub async fn handle_additem_order(
     // Commit: update pair stock from actual storage (bot has already synced chest contents)
     let pair = store.pairs.get_mut(item).unwrap();
     pair.item_stock = store.storage.total_item_amount(item);
+    debug_assert!(pair.item_stock >= 0, "item_stock went negative after add_stock");
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -434,6 +435,7 @@ pub async fn handle_removeitem_order(
     // Commit: update pair stock from actual storage
     let pair = store.pairs.get_mut(item).unwrap();
     pair.item_stock = store.storage.total_item_amount(item);
+    debug_assert!(pair.item_stock >= 0, "item_stock went negative after remove_stock");
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -494,6 +496,8 @@ pub async fn handle_add_currency(
 
     let pair = store.pairs.get_mut(item).unwrap();
     pair.currency_stock += amount;
+    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "currency_stock invalid after add_currency: {}", pair.currency_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -567,6 +571,8 @@ pub async fn handle_remove_currency(
 
     let pair = store.pairs.get_mut(item).unwrap();
     pair.currency_stock -= amount;
+    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "currency_stock invalid after remove_currency: {}", pair.currency_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(

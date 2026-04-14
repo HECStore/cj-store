@@ -414,6 +414,22 @@ Example (full `data/config.json`):
 
 All timeout and limit settings are optional and fall back to the defaults above if omitted.
 
+### Hot-Reload
+
+`data/config.json` is watched at runtime via the [`notify`](https://crates.io/crates/notify) crate. Edits are debounced (~500 ms) and re-validated; if validation fails, the running config is kept and the error is logged. Never crashes the bot on a bad edit.
+
+| Field | Hot-reloadable? | Notes |
+|-------|-----------------|-------|
+| `fee` | ✅ Yes | Next priced order uses the new rate |
+| `autosave_interval_secs` | ✅ Yes | Next Store loop iteration uses the new debounce |
+| `trade_timeout_ms` | ❌ Restart | Cached in the Bot task at startup; warning logged on edit |
+| `pathfinding_timeout_ms` | ❌ Restart | Cached in the Bot task at startup; warning logged on edit |
+| `position`, `buffer_chest_position` | ❌ Restart | World topology; changing mid-run would break in-flight operations |
+| `account_email`, `server_address` | ❌ Restart | Identity / connection; requires reconnection |
+| `max_orders`, `max_trades_in_memory` | ❌ Restart | Capacity bounds fixed at load time |
+
+Edits to restart-only fields are logged as `warn!("Config field '<name>' changed but requires restart")` — the in-memory config keeps its original value so behavior stays consistent with what the rest of the system was initialized against.
+
 ---
 
 ## Persistence Layout (Authoritative Spec)
@@ -1269,8 +1285,8 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Testing
 
-- **Unit and integration tests**: `cargo test` runs 79 tests covering pricing invariants (including 7 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), UUID cache behavior (insert/lookup, case-insensitive keys, TTL expiry, invalidation, clear), and the order-handler integration suite. The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
-- **Property-based AMM tests**: `proptest` exercises the pricing functions across thousands of random reserve/quantity combinations, asserting that `k` never decreases, buy cost always exceeds sell payout (positive spread), per-item price increases with trade size (slippage), and sell payout is bounded by the currency reserve.
+- **Unit and integration tests**: `cargo test` runs 84 tests covering pricing invariants (including 12 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), UUID cache behavior (insert/lookup, case-insensitive keys, TTL expiry, invalidation, clear), and the order-handler integration suite. The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
+- **Property-based AMM tests**: `proptest` exercises the pricing functions across thousands of random reserve/quantity combinations, asserting that `k` never decreases, buy cost always exceeds sell payout (positive spread), per-item price increases with trade size (slippage), sell payout is bounded by the currency reserve, buys leave reserves strictly positive and finite, sequential buy-then-sell is strictly lossy at the resulting reserves, non-positive quantities always return `None` (no free-trade escape hatch), the base AMM identity `x*y=k` is preserved exactly when `fee=0.0` (isolating the fee as the sole source of `k` growth), and the fee knob is monotonic (higher fee → higher buy cost and lower sell payout). Stock/currency mutation sites in [src/store/orders.rs](src/store/orders.rs) and [src/store/handlers/operator.rs](src/store/handlers/operator.rs) are additionally guarded by `debug_assert!` that verify non-negativity and finiteness in dev/test builds (compiled out of release).
 - Test with small quantities first before large trades
 - Verify physical nodes exist before adding them via CLI
 - Use "Audit state" regularly to catch inconsistencies early

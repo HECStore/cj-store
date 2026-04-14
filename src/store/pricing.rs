@@ -385,5 +385,97 @@ mod tests {
             let Some(payout) = sell_payout_pure(stock, currency, qty, TEST_FEE) else { return Ok(()); };
             prop_assert!(payout < currency, "payout {} >= currency {}", payout, currency);
         }
+
+        /// After a buy, both new reserves remain strictly positive and
+        /// finite. Pairs `sell_payout_bounded_by_currency` on the buy side:
+        /// the pool can never be drained or pushed into NaN/inf territory.
+        #[test]
+        fn buy_leaves_reserves_positive_finite(
+            stock in 2i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in 1i32..9_999,
+        ) {
+            prop_assume!(qty < stock);
+            let Some(cost) = buy_cost_pure(stock, currency, qty, TEST_FEE) else { return Ok(()); };
+            let new_stock = stock - qty;
+            let new_currency = currency + cost;
+            prop_assert!(new_stock > 0, "new item_stock not positive: {}", new_stock);
+            prop_assert!(new_currency.is_finite() && new_currency > currency,
+                "new currency_stock invalid: {}", new_currency);
+        }
+
+        /// Sequential buy-then-sell of the same quantity is strictly lossy
+        /// at the reserves produced by the buy. This is the spread property
+        /// applied over sequential operations rather than identical inputs.
+        #[test]
+        fn buy_then_sell_loses_value(
+            stock in 4i32..10_000,
+            currency in 10.0f64..100_000.0,
+            qty in 1i32..5_000,
+        ) {
+            prop_assume!(qty < stock / 2);
+            let Some(cost) = buy_cost_pure(stock, currency, qty, TEST_FEE) else { return Ok(()); };
+            let mid_stock = stock - qty;
+            let mid_currency = currency + cost;
+            let Some(payout) = sell_payout_pure(mid_stock, mid_currency, qty, TEST_FEE) else { return Ok(()); };
+            prop_assert!(payout < cost,
+                "round-trip not lossy: paid {} got back {}", cost, payout);
+        }
+
+        /// Both pricing functions reject non-positive quantities. Guarantees
+        /// that no "free trade" escape hatch exists at qty == 0 or negative.
+        #[test]
+        fn non_positive_qty_returns_none(
+            stock in 1i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in -100i32..=0,
+        ) {
+            prop_assert!(buy_cost_pure(stock, currency, qty, TEST_FEE).is_none());
+            prop_assert!(sell_payout_pure(stock, currency, qty, TEST_FEE).is_none());
+        }
+
+        /// With fee == 0, the base AMM identity `x*y = k` must be preserved
+        /// exactly (within relative floating-point tolerance). This isolates
+        /// the fee as the sole source of `k` growth.
+        #[test]
+        fn fee_zero_preserves_k(
+            stock in 2i32..10_000,
+            currency in 1.0f64..100_000.0,
+            qty in 1i32..9_999,
+        ) {
+            prop_assume!(qty < stock);
+            let Some(cost) = buy_cost_pure(stock, currency, qty, 0.0) else { return Ok(()); };
+            let k_old = stock as f64 * currency;
+            let k_new = (stock - qty) as f64 * (currency + cost);
+            // Relative tolerance: 1e-9 of k_old
+            let tol = k_old * 1e-9 + 1e-6;
+            prop_assert!((k_new - k_old).abs() <= tol,
+                "k drifted with fee=0: {} -> {} (tol {})", k_old, k_new, tol);
+        }
+
+        /// The fee knob is monotonic: higher fee produces a higher buy cost
+        /// and a lower sell payout, for identical reserves and quantity.
+        #[test]
+        fn fee_monotonic(
+            stock in 4i32..10_000,
+            currency in 10.0f64..100_000.0,
+            qty in 1i32..5_000,
+            f_low in 0.0f64..0.4,
+            delta in 0.01f64..0.5,
+        ) {
+            prop_assume!(qty < stock);
+            let f_high = f_low + delta;
+            prop_assume!(f_high <= 1.0);
+            let (Some(c_lo), Some(c_hi)) = (
+                buy_cost_pure(stock, currency, qty, f_low),
+                buy_cost_pure(stock, currency, qty, f_high),
+            ) else { return Ok(()); };
+            let (Some(p_lo), Some(p_hi)) = (
+                sell_payout_pure(stock, currency, qty, f_low),
+                sell_payout_pure(stock, currency, qty, f_high),
+            ) else { return Ok(()); };
+            prop_assert!(c_hi > c_lo, "buy cost not monotonic in fee: {} -> {}", c_lo, c_hi);
+            prop_assert!(p_hi < p_lo, "sell payout not monotonic in fee: {} -> {}", p_lo, p_hi);
+        }
     }
 }

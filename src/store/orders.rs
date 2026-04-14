@@ -513,6 +513,9 @@ pub async fn handle_buy_order(
     let pair = store.pairs.get_mut(item).unwrap();
     pair.item_stock = store.storage.total_item_amount(item);
     pair.currency_stock += plan.total_cost;
+    debug_assert!(pair.item_stock >= 0, "item_stock went negative after buy");
+    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "currency_stock invalid after buy: {}", pair.currency_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -900,6 +903,9 @@ pub async fn handle_sell_order(
     store.dirty = true;
     pair.item_stock = store.storage.total_item_amount(item);
     pair.currency_stock -= plan.total_payout;
+    debug_assert!(pair.item_stock >= 0, "item_stock went negative after sell");
+    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "currency_stock invalid after sell: {}", pair.currency_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(

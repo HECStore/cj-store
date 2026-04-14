@@ -202,7 +202,9 @@ impl Store {
     ) {
         info!("Store started (autosave every {}s)", self.config.autosave_interval_secs);
         let mut last_save = tokio::time::Instant::now();
-        let min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
+        // Re-read each iteration so hot-reload of `autosave_interval_secs`
+        // takes effect without restart. See `Store::reload_config`.
+        let mut min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
 
         // Main event loop. Each iteration either drains one order from the queue
         // OR blocks on one incoming message - never both concurrently. Orders are
@@ -264,6 +266,10 @@ impl Store {
                             if let Err(e) = handlers::cli::handle_cli_message(&mut self, cli_msg).await {
                                 error!("[Store] Error handling CLI message: {}", e);
                             }
+                        }
+                        StoreMessage::ReloadConfig(new_config) => {
+                            self.reload_config(new_config);
+                            min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
                         }
                     }
 
@@ -335,6 +341,70 @@ impl Store {
         self.processing_order = false;
         self.current_trade = None;
         self.dirty = true;
+    }
+
+    /// Apply a reloaded config, updating only fields that are safe to change
+    /// at runtime. Fields that are cached in other tasks at startup (bot-side
+    /// timeouts, identity/world fields) cannot take effect without a restart;
+    /// changing them logs a warning and the in-memory config keeps the old
+    /// value so behavior stays consistent with what the rest of the system
+    /// sees.
+    ///
+    /// Hot-reloadable:
+    /// - `fee` — next priced order uses the new rate.
+    /// - `autosave_interval_secs` — next loop iteration uses the new debounce.
+    ///
+    /// Restart-required (warns on change):
+    /// - `trade_timeout_ms`, `pathfinding_timeout_ms` — cached in bot task.
+    /// - `position`, `buffer_chest_position` — world topology.
+    /// - `account_email`, `server_address` — identity / connection.
+    /// - `max_orders`, `max_trades_in_memory` — capacity bounds set at load.
+    pub(crate) fn reload_config(&mut self, new: Config) {
+        let mut applied = Vec::new();
+
+        if (self.config.fee - new.fee).abs() > f64::EPSILON {
+            applied.push(format!("fee {} -> {}", self.config.fee, new.fee));
+            self.config.fee = new.fee;
+        }
+        if self.config.autosave_interval_secs != new.autosave_interval_secs {
+            applied.push(format!(
+                "autosave_interval_secs {} -> {}",
+                self.config.autosave_interval_secs, new.autosave_interval_secs
+            ));
+            self.config.autosave_interval_secs = new.autosave_interval_secs;
+        }
+
+        // Warn on restart-only fields that were edited.
+        if self.config.trade_timeout_ms != new.trade_timeout_ms {
+            warn!("Config field 'trade_timeout_ms' changed but requires restart");
+        }
+        if self.config.pathfinding_timeout_ms != new.pathfinding_timeout_ms {
+            warn!("Config field 'pathfinding_timeout_ms' changed but requires restart");
+        }
+        if self.config.position != new.position {
+            warn!("Config field 'position' changed but requires restart");
+        }
+        if self.config.buffer_chest_position != new.buffer_chest_position {
+            warn!("Config field 'buffer_chest_position' changed but requires restart");
+        }
+        if self.config.account_email != new.account_email {
+            warn!("Config field 'account_email' changed but requires restart");
+        }
+        if self.config.server_address != new.server_address {
+            warn!("Config field 'server_address' changed but requires restart");
+        }
+        if self.config.max_orders != new.max_orders {
+            warn!("Config field 'max_orders' changed but requires restart");
+        }
+        if self.config.max_trades_in_memory != new.max_trades_in_memory {
+            warn!("Config field 'max_trades_in_memory' changed but requires restart");
+        }
+
+        if applied.is_empty() {
+            debug!("[Store] Config reload: no hot-reloadable fields changed");
+        } else {
+            info!("[Store] Config reloaded: {}", applied.join(", "));
+        }
     }
 
     /// Advance the in-flight trade through the state machine.

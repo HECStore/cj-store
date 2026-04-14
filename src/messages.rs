@@ -93,6 +93,12 @@ pub enum StoreMessage {
     FromBot(BotMessage),
     /// Message originating from the operator CLI task.
     FromCli(CliMessage),
+    /// Request the Store to hot-reload its in-memory config from
+    /// `data/config.json`. Sent by the file watcher task when the config
+    /// file changes on disk. Only a subset of fields is applied live —
+    /// see `Store::reload_config` for the accepted fields and the warning
+    /// emitted when a restart-only field is edited.
+    ReloadConfig(crate::config::Config),
 }
 
 /// Messages from Bot to Store.

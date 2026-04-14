@@ -12,7 +12,7 @@ use crate::messages::{BotInstruction, StoreMessage};
 use crate::store::Store;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -99,6 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.pathfinding_timeout_ms,
             ));
 
+            // Spawn config file watcher (hot-reload of `fee` and `autosave_interval_secs`).
+            // Other config fields are cached at startup and logged as warnings
+            // if edited — see `Store::reload_config`.
+            spawn_config_watcher(store_tx.clone());
+
             // Spawn CLI task (blocking I/O for interactive menu)
             let cli_handle = tokio::task::spawn_blocking(move || cli_task(store_tx));
 
@@ -127,4 +132,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     Ok(())
+}
+
+/// Watch `data/config.json` and send `StoreMessage::ReloadConfig` to the
+/// Store whenever it changes on disk. Events are debounced (~500 ms) because
+/// editors typically produce a burst of writes on save (rename-over-old,
+/// metadata touch, final write), and we only want one reload per user edit.
+///
+/// Validation failures keep the running config — a malformed edit is logged
+/// but never crashes the bot.
+fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    use std::path::Path;
+    use std::time::Duration;
+
+    // Bridge the sync notify callback into tokio.
+    let (event_tx, mut event_rx) = mpsc::channel::<notify::Result<notify::Event>>(16);
+
+    tokio::spawn(async move {
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            // blocking_send is fine: the callback runs on notify's own thread,
+            // not inside the tokio runtime.
+            let _ = event_tx.blocking_send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("[ConfigWatcher] Failed to create watcher, hot-reload disabled: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(Path::new("data/config.json"), RecursiveMode::NonRecursive) {
+            warn!("[ConfigWatcher] Failed to watch data/config.json, hot-reload disabled: {}", e);
+            return;
+        }
+        info!("[ConfigWatcher] Watching data/config.json for changes");
+
+        while let Some(res) = event_rx.recv().await {
+            match res {
+                Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
+                    // Debounce: drain any further events that arrive within 500ms.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    while event_rx.try_recv().is_ok() {}
+
+                    match crate::config::Config::load() {
+                        Ok(cfg) => {
+                            if store_tx.send(StoreMessage::ReloadConfig(cfg)).await.is_err() {
+                                info!("[ConfigWatcher] Store channel closed, exiting");
+                                return;
+                            }
+                        }
+                        Err(e) => warn!("[ConfigWatcher] Reload failed, keeping old config: {}", e),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("[ConfigWatcher] Watch error: {}", e),
+            }
+        }
+    });
 }

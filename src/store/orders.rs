@@ -1247,4 +1247,178 @@ mod tests {
         assert_eq!(store.users.get(&payer_uuid).unwrap().balance, 5.0);
         assert_eq!(store.users.get(&payee_uuid).unwrap().balance, 100.0);
     }
+
+    #[tokio::test]
+    async fn test_sell_unknown_item_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Seller", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = make_storage("cobblestone", 0);
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let result = handle_sell_order(&mut store, "Seller", "gunpowder", 10).await;
+        assert!(result.is_ok());
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
+        assert!(store.pairs.get("gunpowder").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sell_zero_quantity_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Zed", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair("cobblestone", 100, 500.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage("cobblestone", 100);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let result = handle_sell_order(&mut store, "Zed", "cobblestone", 0).await;
+        assert!(result.is_ok());
+        // Reserves unchanged.
+        assert_eq!(store.pairs.get("cobblestone").unwrap().item_stock, 100);
+        assert_eq!(store.pairs.get("cobblestone").unwrap().currency_stock, 500.0);
+    }
+
+    #[tokio::test]
+    async fn test_deposit_non_positive_amount_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Depositor", 10.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        // Zero amount
+        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", Some(0.0)).await;
+        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 10.0);
+
+        // Negative amount
+        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", Some(-5.0)).await;
+        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 10.0);
+    }
+
+    #[tokio::test]
+    async fn test_deposit_over_max_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("BigSpender", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        // 12 stacks * 64 = 768 is the cap; 1000 exceeds it.
+        let result = player::handle_deposit_balance_queued(&mut store, "BigSpender", Some(1000.0)).await;
+        assert!(result.is_ok());
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_insufficient_balance_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Broke", 3.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let result = player::handle_withdraw_balance_queued(&mut store, "Broke", Some(50.0)).await;
+        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 3.0);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_non_positive_amount_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Neg", 100.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", Some(-1.0)).await;
+        assert!(result.is_ok());
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
+
+        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", Some(0.0)).await;
+        assert!(result.is_ok());
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_full_balance_zero_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Empty", 0.5);
+        users.insert(uuid.clone(), user);
+
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        // Full-balance withdraw (amount=None) on <1 diamond balance: rejected.
+        let result = player::handle_withdraw_balance_queued(&mut store, "Empty", None).await;
+        assert!(result.is_ok());
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 0.5);
+    }
 }

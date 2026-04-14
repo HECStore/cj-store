@@ -1043,3 +1043,57 @@ pub async fn execute_trade_with_player(
     inv.close();
     Err("Trade not ready: player did not confirm or items incorrect within timeout".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_trade_bot_offer_slots() {
+        let slots = trade_bot_offer_slots();
+        assert_eq!(slots.len(), 12);
+        assert_eq!(slots, vec![0, 1, 2, 3, 9, 10, 11, 12, 18, 19, 20, 21]);
+    }
+
+    #[test]
+    fn test_trade_player_offer_slots() {
+        let slots = trade_player_offer_slots();
+        assert_eq!(slots.len(), 12);
+        assert_eq!(slots, vec![5, 6, 7, 8, 14, 15, 16, 17, 23, 24, 25, 26]);
+    }
+
+    #[test]
+    fn test_trade_player_status_slots() {
+        let slots = trade_player_status_slots();
+        assert_eq!(slots.len(), 8);
+        assert_eq!(slots, vec![41, 42, 43, 44, 50, 51, 52, 53]);
+    }
+
+    #[test]
+    fn test_trade_accept_slots() {
+        assert_eq!(trade_accept_slots(), vec![36, 37, 45, 46]);
+    }
+
+    #[test]
+    fn test_trade_cancel_slots() {
+        assert_eq!(trade_cancel_slots(), vec![38, 39, 47, 48]);
+    }
+
+    #[test]
+    fn test_trade_slot_sets_disjoint() {
+        let mut seen: HashSet<usize> = HashSet::new();
+        for set in [
+            trade_bot_offer_slots(),
+            trade_player_offer_slots(),
+            trade_player_status_slots(),
+            trade_accept_slots(),
+            trade_cancel_slots(),
+        ] {
+            for slot in set {
+                assert!(seen.insert(slot), "slot {} appears in multiple sets", slot);
+                assert!(slot < 54, "slot {} out of double-chest range", slot);
+            }
+        }
+    }
+}

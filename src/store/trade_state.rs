@@ -119,7 +119,15 @@ impl TradeState {
     /// Consumes the `Queued` data so the caller cannot accidentally re-use it.
     pub fn begin_withdrawal(self, plan: Vec<ChestTransfer>) -> Self {
         match self {
-            TradeState::Queued(order) => TradeState::Withdrawing { order, plan },
+            TradeState::Queued(order) => {
+                tracing::info!(
+                    order_id = order.id,
+                    player = %order.username,
+                    phase = "withdrawing",
+                    "TradeState transition"
+                );
+                TradeState::Withdrawing { order, plan }
+            }
             other => panic!(
                 "TradeState::begin_withdrawal called from invalid state: {}",
                 other.phase()
@@ -133,10 +141,18 @@ impl TradeState {
     /// the trade GUI.
     pub fn begin_trading(self) -> Self {
         match self {
-            TradeState::Withdrawing { order, plan } => TradeState::Trading {
-                order,
-                withdrawn: plan,
-            },
+            TradeState::Withdrawing { order, plan } => {
+                tracing::info!(
+                    order_id = order.id,
+                    player = %order.username,
+                    phase = "trading",
+                    "TradeState transition"
+                );
+                TradeState::Trading {
+                    order,
+                    withdrawn: plan,
+                }
+            }
             other => panic!(
                 "TradeState::begin_trading called from invalid state: {}",
                 other.phase()
@@ -150,11 +166,19 @@ impl TradeState {
     /// received items/diamonds into storage.
     pub fn begin_depositing(self, trade_result: TradeResult, deposit_plan: Vec<ChestTransfer>) -> Self {
         match self {
-            TradeState::Trading { order, .. } => TradeState::Depositing {
-                order,
-                trade_result,
-                deposit_plan,
-            },
+            TradeState::Trading { order, .. } => {
+                tracing::info!(
+                    order_id = order.id,
+                    player = %order.username,
+                    phase = "depositing",
+                    "TradeState transition"
+                );
+                TradeState::Depositing {
+                    order,
+                    trade_result,
+                    deposit_plan,
+                }
+            }
             other => panic!(
                 "TradeState::begin_depositing called from invalid state: {}",
                 other.phase()
@@ -170,12 +194,23 @@ impl TradeState {
     pub fn commit(self, item: String, quantity: i32, currency_amount: f64) -> Self {
         match self {
             TradeState::Trading { order, .. }
-            | TradeState::Depositing { order, .. } => TradeState::Committed(CompletedTrade {
-                order,
-                item,
-                quantity,
-                currency_amount,
-            }),
+            | TradeState::Depositing { order, .. } => {
+                tracing::info!(
+                    order_id = order.id,
+                    player = %order.username,
+                    phase = "committed",
+                    item = %item,
+                    qty = quantity,
+                    currency = format_args!("{:.2}", currency_amount),
+                    "TradeState transition"
+                );
+                TradeState::Committed(CompletedTrade {
+                    order,
+                    item,
+                    quantity,
+                    currency_amount,
+                })
+            }
             other => panic!(
                 "TradeState::commit called from invalid state: {}",
                 other.phase()
@@ -196,6 +231,13 @@ impl TradeState {
             TradeState::Committed(_) => panic!("Cannot rollback a committed trade"),
             TradeState::RolledBack { .. } => panic!("Trade already rolled back"),
         };
+        tracing::info!(
+            order_id = order.id,
+            player = %order.username,
+            phase = "rolled_back",
+            reason = %reason,
+            "TradeState transition"
+        );
         TradeState::RolledBack { order, reason }
     }
 

@@ -171,7 +171,7 @@ pub async fn place_shulker_in_chest_slot_verified(
     debug!("place_shulker_in_chest_slot_verified: Current shulker locations:");
     for (idx, slot) in updated_slots.iter().enumerate() {
         if slot.count() > 0 && super::shulker::is_shulker_box(&slot.kind().to_string()) {
-            let slot_type = if idx < 54 { "chest" } else { "inventory/hotbar" };
+            let slot_type = if idx < DOUBLE_CHEST_SLOTS { "chest" } else { "inventory/hotbar" };
             debug!("  {} slot {}: {}", slot_type, idx, slot.kind());
         }
     }
@@ -238,7 +238,7 @@ pub async fn place_shulker_in_chest_slot_verified(
         error!("place_shulker_in_chest_slot_verified: Recovery FAILED - shulker locations:");
         for (idx, slot) in final_slots.iter().enumerate() {
             if slot.count() > 0 && super::shulker::is_shulker_box(&slot.kind().to_string()) {
-                let slot_type = if idx < 54 { "chest" } else { "inventory/hotbar" };
+                let slot_type = if idx < DOUBLE_CHEST_SLOTS { "chest" } else { "inventory/hotbar" };
                 error!("  {} slot {}: {}", slot_type, idx, slot.kind());
             }
         }

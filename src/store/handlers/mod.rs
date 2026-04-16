@@ -6,3 +6,10 @@
 pub mod player;
 pub mod operator;
 pub mod cli;
+
+mod buy;
+mod sell;
+mod deposit;
+mod withdraw;
+mod info;
+mod validation;

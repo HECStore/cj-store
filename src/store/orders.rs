@@ -77,7 +77,7 @@ pub(crate) async fn execute_chest_transfers(
             })
             .await
             .map_err(|e| {
-                error!("{} Failed to send chest instruction: {}", log_tag, e);
+                error!(phase = log_tag, chest_id = t.chest_id, "Failed to send chest instruction: {}", e);
                 StoreError::BotDisconnected
             })?;
 
@@ -89,23 +89,23 @@ pub(crate) async fn execute_chest_transfers(
         {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                error!("{} Channel dropped on chest {}: {}", log_tag, t.chest_id, e);
+                error!(phase = log_tag, chest_id = t.chest_id, "Channel dropped: {}", e);
                 return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
             }
             Err(_) => {
-                error!("{} Timeout on chest {}", log_tag, t.chest_id);
+                error!(phase = log_tag, chest_id = t.chest_id, "Chest operation timeout");
                 return Err(StoreError::TradeTimeout(CHEST_OP_TIMEOUT_SECS));
             }
         };
 
         match bot_result {
             Err(err) => {
-                error!("{} Bot reported error on chest {}: {}", log_tag, t.chest_id, err);
+                error!(phase = log_tag, chest_id = t.chest_id, "Bot reported error: {}", err);
                 return Err(StoreError::ChestOp(err));
             }
             Ok(report) => {
                 if let Err(e) = store.apply_chest_sync(report) {
-                    warn!("{} Chest sync warning: {}", log_tag, e);
+                    warn!(phase = log_tag, chest_id = t.chest_id, "Chest sync warning: {}", e);
                 }
             }
         }
@@ -148,7 +148,7 @@ pub(crate) async fn perform_trade(
         })
         .await
         .map_err(|e| {
-            error!("{} Failed to send trade instruction: {}", log_tag, e);
+            error!(phase = log_tag, player = %target_username, "Failed to send trade instruction: {}", e);
             StoreError::BotDisconnected
         })?;
 
@@ -158,11 +158,11 @@ pub(crate) async fn perform_trade(
     )
     .await
     .map_err(|_| {
-        error!("{} Trade timeout", log_tag);
+        error!(phase = log_tag, player = %target_username, "Trade timeout");
         StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000)
     })?
     .map_err(|e| {
-        error!("{} Trade channel dropped: {}", log_tag, e);
+        error!(phase = log_tag, player = %target_username, "Trade channel dropped: {}", e);
         StoreError::BotError(format!("Bot response dropped: {}", e))
     })?;
 
@@ -196,7 +196,7 @@ async fn validate_and_plan_buy(
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
-        warn!("Player {} attempted to buy unavailable item: {}", player_name, item);
+        warn!(phase = "buy.validate", player = %player_name, item = %item, "Attempted to buy unavailable item");
         utils::send_message_to_player(
             store,
             player_name,
@@ -330,7 +330,7 @@ pub async fn handle_buy_order(
     item: &str,
     quantity: u32,
 ) -> Result<(), String> {
-    info!("[Buy] Starting: player={} item={} qty={}", player_name, item, quantity);
+    info!(phase = "buy.start", player = %player_name, item = %item, qty = quantity, "Buy order starting");
     state::assert_invariants(store, "pre-buy", false)?;
 
     let plan = match validate_and_plan_buy(store, player_name, item, quantity).await? {
@@ -378,8 +378,12 @@ pub async fn handle_buy_order(
     store.advance_trade(|s| s.begin_trading());
 
     info!(
-        "[Buy] Initiating trade: {}x {} for {} diamonds",
-        plan.qty_i32, item, plan.diamonds_to_offer
+        phase = "buy.trade",
+        player = %player_name,
+        item = %item,
+        qty = plan.qty_i32,
+        diamonds_offered = plan.diamonds_to_offer,
+        "Initiating buy trade"
     );
     let player_offers = if plan.diamonds_to_offer > 0 {
         vec![TradeItem {
@@ -405,7 +409,7 @@ pub async fn handle_buy_order(
 
     let actual_received = match trade_result {
         Err(err) => {
-            warn!("[Buy] Trade failed: {} - rolling back", err);
+            warn!(phase = "buy.rollback", player = %player_name, item = %item, "Trade failed, rolling back: {}", err);
             let rb = rollback::deposit_transfers(
                 store,
                 &plan.withdraw_plan,
@@ -440,8 +444,13 @@ pub async fn handle_buy_order(
     let total_available = (diamonds_received as f64) + current_balance;
     if total_available < plan.total_cost {
         error!(
-            "Insufficient payment after trade: received {} diamonds + {:.2} balance = {:.2}, need {:.2}",
-            diamonds_received, current_balance, total_available, plan.total_cost
+            phase = "buy.payment_check",
+            player = %player_name,
+            diamonds_received,
+            balance = format_args!("{:.2}", current_balance),
+            total_available = format_args!("{:.2}", total_available),
+            total_cost = format_args!("{:.2}", plan.total_cost),
+            "Insufficient payment after trade"
         );
         let _ = rollback::deposit_transfers(
             store,
@@ -452,10 +461,7 @@ pub async fn handle_buy_order(
         )
         .await;
         if diamonds_received > 0 {
-            warn!(
-                "Attempting to return {} diamonds to player after failed payment validation",
-                diamonds_received
-            );
+            warn!(phase = "buy.payment_check", player = %player_name, diamonds_received, "Attempting to return diamonds after failed payment validation");
         }
         return utils::send_message_to_player(
             store,
@@ -479,10 +485,7 @@ pub async fn handle_buy_order(
         )
         .await;
         if rb.has_failures() {
-            warn!(
-                "[Buy] Failed to deposit some diamonds into storage ({} failed steps) - diamonds may remain in bot inventory",
-                rb.operations_failed
-            );
+            warn!(phase = "buy.diamond_deposit", player = %player_name, operations_failed = rb.operations_failed, "Failed to deposit some diamonds into storage");
         }
     }
 
@@ -491,8 +494,13 @@ pub async fn handle_buy_order(
     let expected_stock = plan.physical_stock - plan.qty_i32;
     if current_stock != expected_stock {
         warn!(
-            "Storage stock mismatch after buy: expected {}, got {} (difference: {})",
-            expected_stock, current_stock, expected_stock - current_stock
+            phase = "buy.commit",
+            player = %player_name,
+            item = %item,
+            expected_stock,
+            current_stock,
+            difference = expected_stock - current_stock,
+            "Storage stock mismatch after buy"
         );
     }
 
@@ -537,13 +545,20 @@ pub async fn handle_buy_order(
     store.advance_trade(|s| s.commit(item.to_string(), plan.qty_i32, plan.total_cost));
 
     info!(
-        "[Buy] Completed: {} {}x{} total={:.2} diamonds={} balance_used={:.2} surplus={:.2}",
-        player_name, quantity, item, plan.total_cost, diamonds_received, balance_deduction, surplus
+        phase = "buy.done",
+        player = %player_name,
+        item = %item,
+        qty = quantity,
+        total_cost = format_args!("{:.2}", plan.total_cost),
+        diamonds_received,
+        balance_used = format_args!("{:.2}", balance_deduction),
+        surplus = format_args!("{:.2}", surplus),
+        "Buy order completed"
     );
     let _ = plan.user_balance_at_plan; // kept for audit log context
 
     if let Err(e) = state::assert_invariants(store, "post-buy", true) {
-        error!("Invariant violation after buy: {}", e);
+        error!(phase = "buy.invariant", player = %player_name, item = %item, "Invariant violation after buy: {}", e);
         let _ = state::save(store);
     }
 
@@ -591,7 +606,7 @@ async fn validate_and_plan_sell(
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
-        warn!("Player {} attempted to sell unavailable item: {}", player_name, item);
+        warn!(phase = "sell.validate", player = %player_name, item = %item, "Attempted to sell unavailable item");
         utils::send_message_to_player(
             store,
             player_name,
@@ -687,7 +702,7 @@ pub async fn handle_sell_order(
     item: &str,
     quantity: u32,
 ) -> Result<(), String> {
-    info!("[Sell] Starting: player={} item={} qty={}", player_name, item, quantity);
+    info!(phase = "sell.start", player = %player_name, item = %item, qty = quantity, "Sell order starting");
     state::assert_invariants(store, "pre-sell", false)?;
 
     let plan = match validate_and_plan_sell(store, player_name, item, quantity).await? {
@@ -723,8 +738,11 @@ pub async fn handle_sell_order(
             store.storage.simulate_withdraw_plan("diamond", plan.whole_diamonds);
         if planned_total < plan.whole_diamonds {
             error!(
-                "[Sell] Insufficient physical diamonds: need {}, storage has {}",
-                plan.whole_diamonds, planned_total
+                phase = "sell.withdraw",
+                player = %player_name,
+                needed = plan.whole_diamonds,
+                available = planned_total,
+                "Insufficient physical diamonds for sell payout"
             );
             return utils::send_message_to_player(
                 store,
@@ -760,8 +778,12 @@ pub async fn handle_sell_order(
     store.advance_trade(|s| s.begin_trading());
 
     info!(
-        "[Sell] Initiating trade: {} offers {}x {} for {} diamonds",
-        player_name, plan.qty_i32, item, plan.whole_diamonds
+        phase = "sell.trade",
+        player = %player_name,
+        item = %item,
+        qty = plan.qty_i32,
+        diamonds_offered = plan.whole_diamonds,
+        "Initiating sell trade"
     );
     let bot_offers = if plan.whole_diamonds > 0 {
         vec![TradeItem {
@@ -787,7 +809,7 @@ pub async fn handle_sell_order(
 
     let actual_received = match trade_result {
         Err(err) => {
-            warn!("[Sell] Trade failed for {}: {}", player_name, err);
+            warn!(phase = "sell.rollback", player = %player_name, item = %item, "Sell trade failed: {}", err);
             let _ = rollback::rollback_amount_to_storage(
                 store,
                 "diamond",
@@ -817,8 +839,12 @@ pub async fn handle_sell_order(
 
     if items_received != plan.qty_i32 {
         warn!(
-            "[Sell] Validation failed: {} promised {}x {} but put {}",
-            player_name, plan.qty_i32, item, items_received
+            phase = "sell.validation",
+            player = %player_name,
+            item = %item,
+            expected = plan.qty_i32,
+            received = items_received,
+            "Sell validation failed: item count mismatch"
         );
         let _ = rollback::rollback_amount_to_storage(
             store,
@@ -931,12 +957,18 @@ pub async fn handle_sell_order(
     store.advance_trade(|s| s.commit(item.to_string(), plan.qty_i32, plan.total_payout));
 
     info!(
-        "[Sell] Completed: {} {}x{} total={:.2} whole={} fractional={:.2}",
-        player_name, quantity, item, plan.total_payout, plan.whole_diamonds, plan.fractional_diamonds
+        phase = "sell.done",
+        player = %player_name,
+        item = %item,
+        qty = quantity,
+        total_payout = format_args!("{:.2}", plan.total_payout),
+        whole_diamonds = plan.whole_diamonds,
+        fractional = format_args!("{:.2}", plan.fractional_diamonds),
+        "Sell order completed"
     );
 
     if let Err(e) = state::assert_invariants(store, "post-sell", true) {
-        error!("[Sell] Invariant violation after sell: {}", e);
+        error!(phase = "sell.invariant", player = %player_name, item = %item, "Invariant violation after sell: {}", e);
         let _ = state::save(store);
     }
 
@@ -967,8 +999,13 @@ pub async fn execute_queued_order(
     order: &QueuedOrder,
 ) -> Result<String, String> {
     info!(
-        "[OrderExec] Order #{} type={:?} item={} qty={} user={}",
-        order.id, order.order_type, order.item, order.quantity, order.username
+        order_id = order.id,
+        phase = "order.start",
+        player = %order.username,
+        order_type = ?order.order_type,
+        item = %order.item,
+        qty = order.quantity,
+        "Executing queued order"
     );
 
     let start_time = std::time::Instant::now();
@@ -994,8 +1031,20 @@ pub async fn execute_queued_order(
 
     let elapsed = start_time.elapsed();
     match &result {
-        Ok(msg) => info!("[OrderExec] Order #{} completed in {:.2}s: {}", order.id, elapsed.as_secs_f64(), msg),
-        Err(msg) => error!("[OrderExec] Order #{} failed after {:.2}s: {}", order.id, elapsed.as_secs_f64(), msg),
+        Ok(msg) => info!(
+            order_id = order.id,
+            phase = "order.done",
+            player = %order.username,
+            duration_ms = elapsed.as_millis() as u64,
+            "Order completed: {}", msg
+        ),
+        Err(msg) => error!(
+            order_id = order.id,
+            phase = "order.failed",
+            player = %order.username,
+            duration_ms = elapsed.as_millis() as u64,
+            "Order failed: {}", msg
+        ),
     }
 
     result

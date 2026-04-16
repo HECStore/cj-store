@@ -140,8 +140,14 @@ cj-store/
     store/                       # Store module (authoritative state + message handlers + autosave)
       mod.rs                    # Store struct, run loop (priority-based: orders before messages), message routing
       handlers/                 # Command handlers
-        mod.rs                  # Handler module exports
-        player.rs              # Player command handlers (buy, sell, balance, pay, queue, cancel)
+        mod.rs                  # Handler module exports (pub use re-exports)
+        player.rs              # Command dispatcher + rate limiting
+        validation.rs           # Shared input validators (item/quantity/username)
+        buy.rs                  # Buy command: validation + enqueue
+        sell.rs                 # Sell command: validation + enqueue
+        deposit.rs              # Deposit: enqueue + handle_deposit_balance_queued
+        withdraw.rs             # Withdraw: enqueue + handle_withdraw_balance_queued
+        info.rs                 # price, balance, pay, items, queue, cancel, status, help
         operator.rs            # Operator handlers (additem, removeitem, add/remove currency)
         cli.rs                 # CLI message handlers
       journal.rs                # Operation journal for crash recovery (tracks in-flight shulker ops)
@@ -151,6 +157,7 @@ cj-store/
       rate_limit.rs             # Anti-spam rate limiting with exponential backoff
       rollback.rs               # Shared rollback helper (items/diamonds back to storage on failure)
       state.rs                  # State management (save, audit_state, assert_invariants)
+      trade_state.rs             # Trade lifecycle state machine (Queued → Withdrawing → Trading → Committed)
       utils.rs                  # Helper functions (normalize_item_id, resolve_user_uuid, UUID cache, etc.)
     bot/                        # Bot module (Azalea bot client + whisper parsing → StoreMessage)
       mod.rs                    # Bot struct, BotState, bot_task, event handlers
@@ -162,9 +169,11 @@ cj-store/
       inventory.rs              # Inventory management (ensure_inventory_empty, move_hotbar_to_inventory, etc.)
     cli.rs                      # dialoguer menu → StoreMessage
     config.rs                   # data/config.json loader/creator
+    constants.rs                # Shared constants (timeouts, retry counts, DOUBLE_CHEST_SLOTS, etc.)
+    error.rs                    # StoreError enum (typed errors for hot-path operations)
+    fsutil.rs                   # Atomic file write helper (temp + rename)
     messages.rs                 # StoreMessage / BotMessage / CliMessage / BotInstruction
     types.rs                    # re-exports model types
-    error.rs                    # StoreError enum (typed errors for hot-path operations)
     types/
       item_id.rs                # ItemId newtype — normalized, non-empty item identifier
       user.rs                   # per-user persistence + Mojang UUID lookup
@@ -449,7 +458,7 @@ Note: CLI offers an option to make anyone an operator just by typing their usern
 
 Notes:
 - `User::get_uuid(username)` calls Mojang's public API (`api.mojang.com`). Both blocking (`get_uuid`) and async (`get_uuid_async`) versions are available, with the async version using connection pooling for better performance. UUID lookups are cached in-memory with a 5-minute TTL so repeated commands from the same player don't hit the API on every interaction.
-- `pay_async(...)` in `src/store/handlers/player.rs` uses UUIDs as the canonical key and updates the stored username on each payment.
+- `pay_async(...)` in `src/store/handlers/info.rs` uses UUIDs as the canonical key and updates the stored username on each payment.
 
 ### Pairs (`data/pairs/<item>.json`)
 

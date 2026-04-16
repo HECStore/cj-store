@@ -29,29 +29,17 @@ docs, style, observability, and operations. Scope: everything under `src/`.
 
 ## Key weaknesses (fix)
 
-- **Handler bloat.** `store/handlers/player.rs` (~1.6k LOC) and `operator.rs` (~600 LOC) duplicate buy/sell/deposit/withdraw parse → validate → queue.
 - **`TradeState` is decorative.** Defined in [src/store/trade_state.rs](src/store/trade_state.rs), mutated, then dropped — not used for recovery decisions.
 - **Mixed error types.** Handlers return `Result<(), String>`; `StoreError` only used in core. No `BotError` / `TransactionError` variants.
-- **UUID cache panic surface.** `std::sync::Mutex` + `.unwrap()` in [src/store/utils.rs](src/store/utils.rs); a poisoned lock kills subsequent lookups.
 - **No integration tests.** No `tests/` dir. Handlers, bot IO, orders pipeline — untested end-to-end.
 - **Unbounded caches.** UUID cache + rate-limiter state have cleanup methods marked dead; no periodic task invokes them.
 - **No backpressure.** 128-buffer mpsc blocks senders on saturation; no shedding or timeout.
 - **No metrics.** Zero counters/histograms; post-hoc analysis requires scraping logs.
 - **Orders cleared silently on startup.** Operators get no warning of discarded queue.
-- **Magic numbers escape `constants.rs`** (chunk reload delays, retry counts, chest slot count 54).
 
 ## Roadmap to 100
 
 Each phase is independently shippable.
-
-### Phase 1 — Quick wins (72 → 80)
-
-1. **Split `player.rs`** into `handlers/{buy,sell,deposit,withdraw,info}.rs`.
-2. **Swap `std::sync::Mutex` → `parking_lot::Mutex`** in [src/store/utils.rs](src/store/utils.rs) UUID cache.
-3. **Structured tracing fields**: add `order_id`, `phase`, `duration_ms`, `player` to hot-path logs. Promote `TradeState` transitions to `info`.
-4. **First integration test** under `tests/`: `Store::new_for_test()` → queue buy → assert state delta + chest plan.
-5. **Startup warning** when `orders.json` is cleared: log count + age of oldest.
-6. **Move `54` (chest slots) + stray retry/timeout constants into [src/constants.rs](src/constants.rs).**
 
 ### Phase 2 — Structural refactors (80 → 88)
 
@@ -85,9 +73,7 @@ Each phase is independently shippable.
 
 ## Concrete file hotspots
 
-- [src/store/handlers/player.rs](src/store/handlers/player.rs) — split, de-duplicate, add tests.
 - [src/bot/chest_io.rs](src/bot/chest_io.rs) — extract helpers; large monolith.
-- [src/store/utils.rs](src/store/utils.rs) — UUID cache Mutex + cleanup.
 - [src/store/trade_state.rs](src/store/trade_state.rs) — wire into recovery.
 - [src/store/journal.rs](src/store/journal.rs) — replay path + tests.
 - [src/error.rs](src/error.rs) — expand variants, adopt everywhere.

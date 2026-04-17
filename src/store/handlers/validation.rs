@@ -12,7 +12,7 @@ use crate::constants::MAX_TRANSACTION_QUANTITY;
 /// # Returns
 /// * `Ok(())` if valid
 /// * `Err(message)` with user-friendly error message if invalid
-pub(super) fn validate_item_name(item: &str) -> Result<(), String> {
+pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
     if item.is_empty() {
         return Err("Item name cannot be empty. Example: buy cobblestone 64".to_string());
     }
@@ -39,7 +39,7 @@ pub(super) fn validate_item_name(item: &str) -> Result<(), String> {
 /// # Returns
 /// * `Ok(quantity)` if valid
 /// * `Err(message)` with user-friendly error message if invalid
-pub(super) fn validate_quantity(quantity_str: &str, operation: &str) -> Result<u32, String> {
+pub(crate) fn validate_quantity(quantity_str: &str, operation: &str) -> Result<u32, String> {
     let quantity: u32 = quantity_str.parse().map_err(|_| {
         format!(
             "Invalid quantity '{}'. Please enter a whole number. Example: {} cobblestone 64",
@@ -66,7 +66,7 @@ pub(super) fn validate_quantity(quantity_str: &str, operation: &str) -> Result<u
 
 /// Validate username format.
 /// Minecraft usernames are 3-16 characters, alphanumeric with underscores.
-pub(super) fn validate_username(username: &str) -> Result<(), String> {
+pub(crate) fn validate_username(username: &str) -> Result<(), String> {
     if username.len() < 3 || username.len() > 16 {
         return Err(format!(
             "Invalid username '{}'. Minecraft usernames are 3-16 characters.",

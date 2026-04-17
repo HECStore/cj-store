@@ -148,7 +148,6 @@ impl RateLimiter {
 
     /// Clean up stale entries (users who haven't sent messages in a while)
     /// Call periodically to prevent memory growth
-    #[allow(dead_code)] // hook for a future periodic-cleanup task
     pub fn cleanup_stale(&mut self, max_age: Duration) {
         let now = Instant::now();
         self.limits.retain(|_, limit| {

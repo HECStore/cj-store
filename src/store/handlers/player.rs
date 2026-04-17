@@ -1,6 +1,7 @@
 //! Player command dispatcher.
 //!
-//! Commands are whispered to the bot and dispatched to sibling modules:
+//! Commands are whispered to the bot, parsed by [`super::super::command::parse_command`]
+//! into a typed [`Command`], and then dispatched to sibling handler modules:
 //! - Order commands (buy/sell/deposit/withdraw) → [`buy`], [`sell`], [`deposit`], [`withdraw`].
 //!   Handlers here only validate and enqueue; actual chest I/O and trade
 //!   GUI interaction happen later on the queue-processor task.
@@ -14,10 +15,10 @@
 //! re-exported so external callers (orders.rs, integration tests) can keep
 //! using `handlers::player::<fn>` paths.
 
-use tracing::warn;
-
+use super::super::command::{parse_command, Command};
 use super::super::{Store, utils};
 use super::{buy, deposit, info, operator, sell, withdraw};
+use crate::error::StoreError;
 
 // Back-compat re-exports: orders.rs and tests reference these via
 // `handlers::player::<fn>`. Keep them resolving through this module.
@@ -30,7 +31,7 @@ pub async fn handle_player_command(
     store: &mut Store,
     player_name: &str,
     command: &str,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     // Resolve user UUID for rate limiting (creates user if needed).
     // UUID is the canonical identity key - rate limiting and ownership
     // must not rely on usernames since players can change them.
@@ -49,36 +50,45 @@ pub async fn handle_player_command(
         return utils::send_message_to_player(store, player_name, &msg).await;
     }
 
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parsed = match parse_command(command) {
+        Ok(cmd) => cmd,
+        Err(msg) => return utils::send_message_to_player(store, player_name, &msg).await,
+    };
 
-    match parts.first() {
-        Some(&"buy") | Some(&"b") => {
-            buy::handle(store, player_name, &user_uuid, &parts, command).await
+    match parsed {
+        Command::Buy { item, quantity } => {
+            buy::handle(store, player_name, &user_uuid, &item, quantity).await
         }
-        Some(&"sell") | Some(&"s") => {
-            sell::handle(store, player_name, &user_uuid, &parts, command).await
+        Command::Sell { item, quantity } => {
+            sell::handle(store, player_name, &user_uuid, &item, quantity).await
         }
-        Some(&"deposit") | Some(&"d") => {
-            deposit::handle_enqueue(store, player_name, &user_uuid, &parts).await
+        Command::Deposit { amount } => {
+            deposit::handle_enqueue(store, player_name, &user_uuid, amount).await
         }
-        Some(&"withdraw") | Some(&"w") => {
-            withdraw::handle_enqueue(store, player_name, &user_uuid, &parts).await
+        Command::Withdraw { amount } => {
+            withdraw::handle_enqueue(store, player_name, &user_uuid, amount).await
         }
-        Some(&"bal") | Some(&"balance") => {
-            info::handle_balance(store, player_name, &parts).await
+        Command::Price { item, quantity } => {
+            info::handle_price(store, player_name, &item, quantity).await
         }
-        Some(&"pay") => info::handle_pay(store, player_name, &parts, command).await,
-        Some(&"price") | Some(&"p") => info::handle_price(store, player_name, &parts).await,
-        Some(&"help") | Some(&"h") => info::handle_help(store, player_name, &parts).await,
-        Some(&"items") => info::handle_items(store, player_name, &parts).await,
-        Some(&"queue") | Some(&"q") => {
-            info::handle_queue(store, player_name, &user_uuid, &parts).await
+        Command::Balance { target } => {
+            info::handle_balance(store, player_name, target.as_deref()).await
         }
-        Some(&"cancel") | Some(&"c") => {
-            info::handle_cancel(store, player_name, &user_uuid, &parts).await
+        Command::Pay { target, amount } => {
+            info::handle_pay(store, player_name, &target, amount).await
         }
-        Some(&"status") => info::handle_status(store, player_name).await,
-        Some(&"additem") | Some(&"ai") => {
+        Command::Items { page } => info::handle_items(store, player_name, page).await,
+        Command::Queue { page } => info::handle_queue(store, player_name, &user_uuid, page).await,
+        Command::Cancel { order_id } => {
+            info::handle_cancel(store, player_name, &user_uuid, order_id).await
+        }
+        Command::Status => info::handle_status(store, player_name).await,
+        Command::Help { topic } => info::handle_help(store, player_name, topic.as_deref()).await,
+
+        // Operator commands: check permission before delegating.
+        // Keeping authorization in the dispatcher (not the parser) means
+        // `parse_command` can stay a pure function on the input string.
+        Command::AddItem { item, quantity } => {
             if !utils::is_operator(store, &user_uuid) {
                 return utils::send_message_to_player(
                     store,
@@ -87,22 +97,9 @@ pub async fn handle_player_command(
                 )
                 .await;
             }
-            if parts.len() >= 3 {
-                let item = utils::normalize_item_id(parts[1]);
-                let quantity: u32 = parts[2]
-                    .parse()
-                    .map_err(|_| "Invalid quantity".to_string())?;
-                operator::handle_additem_order(store, player_name, &item, quantity).await
-            } else {
-                utils::send_message_to_player(
-                    store,
-                    player_name,
-                    "Usage: additem <item> <quantity>",
-                )
-                .await
-            }
+            operator::handle_additem_order(store, player_name, &item, quantity).await
         }
-        Some(&"removeitem") | Some(&"ri") => {
+        Command::RemoveItem { item, quantity } => {
             if !utils::is_operator(store, &user_uuid) {
                 return utils::send_message_to_player(
                     store,
@@ -111,22 +108,9 @@ pub async fn handle_player_command(
                 )
                 .await;
             }
-            if parts.len() >= 3 {
-                let item = utils::normalize_item_id(parts[1]);
-                let quantity: u32 = parts[2]
-                    .parse()
-                    .map_err(|_| "Invalid quantity".to_string())?;
-                operator::handle_removeitem_order(store, player_name, &item, quantity).await
-            } else {
-                utils::send_message_to_player(
-                    store,
-                    player_name,
-                    "Usage: removeitem <item> <quantity>",
-                )
-                .await
-            }
+            operator::handle_removeitem_order(store, player_name, &item, quantity).await
         }
-        Some(&"addcurrency") | Some(&"ac") => {
+        Command::AddCurrency { item, amount } => {
             if !utils::is_operator(store, &user_uuid) {
                 return utils::send_message_to_player(
                     store,
@@ -135,22 +119,9 @@ pub async fn handle_player_command(
                 )
                 .await;
             }
-            if parts.len() >= 3 {
-                let item = utils::normalize_item_id(parts[1]);
-                let amount: f64 = parts[2]
-                    .parse()
-                    .map_err(|_| "Invalid amount".to_string())?;
-                operator::handle_add_currency(store, player_name, &item, amount).await
-            } else {
-                utils::send_message_to_player(
-                    store,
-                    player_name,
-                    "Usage: addcurrency <item> <amount>",
-                )
-                .await
-            }
+            operator::handle_add_currency(store, player_name, &item, amount).await
         }
-        Some(&"removecurrency") | Some(&"rc") => {
+        Command::RemoveCurrency { item, amount } => {
             if !utils::is_operator(store, &user_uuid) {
                 return utils::send_message_to_player(
                     store,
@@ -159,41 +130,7 @@ pub async fn handle_player_command(
                 )
                 .await;
             }
-            if parts.len() >= 3 {
-                let item = utils::normalize_item_id(parts[1]);
-                let amount: f64 = parts[2]
-                    .parse()
-                    .map_err(|_| "Invalid amount".to_string())?;
-                operator::handle_remove_currency(store, player_name, &item, amount).await
-            } else {
-                utils::send_message_to_player(
-                    store,
-                    player_name,
-                    "Usage: removecurrency <item> <amount>",
-                )
-                .await
-            }
-        }
-        Some(unknown_cmd) => {
-            warn!("Unknown command '{}' from {}", unknown_cmd, player_name);
-            utils::send_message_to_player(
-                store,
-                player_name,
-                &format!(
-                    "Unknown command '{}'. Use 'help' to see available commands.",
-                    unknown_cmd
-                ),
-            )
-            .await
-        }
-        None => {
-            warn!("Empty command received from {}", player_name);
-            utils::send_message_to_player(
-                store,
-                player_name,
-                "Use 'help' to see available commands.",
-            )
-            .await
+            operator::handle_remove_currency(store, player_name, &item, amount).await
         }
     }
 }

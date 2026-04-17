@@ -19,6 +19,9 @@
 //! ```
 
 use std::fmt;
+use std::io;
+
+use serde::{Deserialize, Serialize};
 
 use crate::messages::TradeItem;
 use crate::store::queue::QueuedOrder;
@@ -29,7 +32,7 @@ use crate::types::storage::ChestTransfer;
 // =========================================================================
 
 /// Items the bot actually received from the player during a trade GUI exchange.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeResult {
     /// Items received from the player (may differ from what was requested).
     #[allow(dead_code)] // carried for diagnostics/logging via Debug
@@ -37,7 +40,7 @@ pub struct TradeResult {
 }
 
 /// Summary of a fully committed trade (terminal state).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedTrade {
     pub order: QueuedOrder,
     /// Canonical item id that was traded.
@@ -57,7 +60,7 @@ pub struct CompletedTrade {
 /// Stored on `Store::current_trade` while an order is being processed so that
 /// status commands, debug logging, and stuck-order diagnostics can report
 /// exactly where the trade is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeState {
     /// Order was just popped from the queue; validation / planning has not
     /// started yet.
@@ -298,6 +301,48 @@ impl fmt::Display for TradeState {
 }
 
 // =========================================================================
+// Crash-resume persistence
+// =========================================================================
+
+/// File where the in-flight trade state is mirrored. Created at each phase
+/// transition and cleared on order completion, so finding this file at startup
+/// implies the previous session crashed mid-trade.
+pub const TRADE_STATE_FILE: &str = "data/current_trade.json";
+
+/// Write the current trade state to disk atomically.
+pub fn persist(state: &TradeState) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    crate::fsutil::write_atomic(TRADE_STATE_FILE, &json)
+}
+
+/// Load a persisted trade state if present.
+///
+/// Returns `Ok(None)` when the file does not exist (normal case), `Ok(Some)`
+/// when an interrupted trade is found on startup, and `Err` on IO/parse
+/// failure.
+pub fn load_persisted() -> io::Result<Option<TradeState>> {
+    match std::fs::read_to_string(TRADE_STATE_FILE) {
+        Ok(content) => {
+            let state: TradeState = serde_json::from_str(&content)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Ok(Some(state))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the persisted trade state file. No-op if it doesn't exist.
+pub fn clear_persisted() -> io::Result<()> {
+    match std::fs::remove_file(TRADE_STATE_FILE) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
@@ -465,5 +510,33 @@ mod tests {
         let state = state.rollback("timeout".to_string());
         assert!(state.to_string().contains("Rolled back"));
         assert!(state.to_string().contains("timeout"));
+    }
+
+    #[test]
+    fn serde_roundtrip_withdrawing() {
+        let state = TradeState::new(sample_order()).begin_withdrawal(sample_transfers());
+        let json = serde_json::to_string(&state).expect("serialize");
+        let decoded: TradeState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.phase(), state.phase());
+        assert_eq!(decoded.order().id, state.order().id);
+        assert_eq!(decoded.order().username, state.order().username);
+    }
+
+    #[test]
+    fn clear_persisted_is_idempotent_when_missing() {
+        // Running in the project dir where data/current_trade.json typically
+        // does not exist; clearing a missing file must succeed.
+        let path = std::path::Path::new(TRADE_STATE_FILE);
+        if !path.exists() {
+            assert!(clear_persisted().is_ok());
+        }
+    }
+
+    #[test]
+    fn load_persisted_returns_none_when_missing() {
+        let path = std::path::Path::new(TRADE_STATE_FILE);
+        if !path.exists() {
+            assert!(matches!(load_persisted(), Ok(None)));
+        }
     }
 }

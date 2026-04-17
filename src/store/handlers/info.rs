@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 
 use super::super::{Store, state, utils};
 use super::super::pricing;
-use super::validation::{validate_item_name, validate_username};
+use crate::error::StoreError;
 
 // =========================================================================
 // Dispatcher entry points (called from handle_player_command)
@@ -17,54 +17,18 @@ use super::validation::{validate_item_name, validate_username};
 pub(super) async fn handle_price(
     store: &mut Store,
     player_name: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    if parts.len() < 2 {
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            "Usage: price <item> [quantity]. Example: price cobblestone 64",
-        )
-        .await;
-    }
-
-    if let Err(e) = validate_item_name(parts[1]) {
-        return utils::send_message_to_player(store, player_name, &e).await;
-    }
-    let item = utils::normalize_item_id(parts[1]);
-
-    let quantity: Option<u32> = if parts.len() >= 3 {
-        match parts[2].parse() {
-            Ok(q) if q > 0 => Some(q),
-            _ => {
-                return utils::send_message_to_player(
-                    store,
-                    player_name,
-                    &format!("Invalid quantity '{}'. Use a positive number.", parts[2]),
-                )
-                .await;
-            }
-        }
-    } else {
-        None
-    };
-
-    handle_price_command(store, player_name, &item, quantity).await
+    item: &str,
+    quantity: Option<u32>,
+) -> Result<(), StoreError> {
+    handle_price_command(store, player_name, item, quantity).await
 }
 
 pub(super) async fn handle_balance(
     store: &mut Store,
     player_name: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    let target_name = if parts.len() >= 2 {
-        if let Err(e) = validate_username(parts[1]) {
-            return utils::send_message_to_player(store, player_name, &e).await;
-        }
-        parts[1]
-    } else {
-        player_name
-    };
+    target: Option<&str>,
+) -> Result<(), StoreError> {
+    let target_name = target.unwrap_or(player_name);
 
     debug!("Balance check requested by {} for {}", player_name, target_name);
     match get_user_balance_async(store, target_name).await {
@@ -90,49 +54,9 @@ pub(super) async fn handle_balance(
 pub(super) async fn handle_pay(
     store: &mut Store,
     player_name: &str,
-    parts: &[&str],
-    command: &str,
-) -> Result<(), String> {
-    if parts.len() < 3 {
-        warn!("Invalid pay command format from {}: {}", player_name, command);
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            "Usage: pay <player> <amount>. Example: pay Steve 10.5",
-        )
-        .await;
-    }
-
-    let recipient = parts[1];
-    if let Err(e) = validate_username(recipient) {
-        return utils::send_message_to_player(store, player_name, &e).await;
-    }
-
-    let amount: f64 = parts[2].parse().map_err(|_| {
-        format!(
-            "Invalid amount '{}'. Please enter a number. Example: pay Steve 10.5",
-            parts[2]
-        )
-    })?;
-
-    if amount <= 0.0 {
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            "Amount must be positive. Example: pay Steve 10.5",
-        )
-        .await;
-    }
-
-    if amount > 1_000_000.0 {
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            "Amount too large. Maximum is 1,000,000 per payment.",
-        )
-        .await;
-    }
-
+    recipient: &str,
+    amount: f64,
+) -> Result<(), StoreError> {
     info!(
         "Processing payment: {} -> {} ({})",
         player_name, recipient, amount
@@ -155,7 +79,7 @@ pub(super) async fn handle_pay(
         }
         Err(e) => {
             warn!("Payment failed: {} -> {}: {}", player_name, recipient, e);
-            utils::send_message_to_player(store, player_name, &e).await
+            utils::send_message_to_player(store, player_name, &e.to_string()).await
         }
     }
 }
@@ -163,13 +87,8 @@ pub(super) async fn handle_pay(
 pub(super) async fn handle_items(
     store: &mut Store,
     player_name: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    let page: usize = if parts.len() >= 2 {
-        parts[1].parse().unwrap_or(1).max(1)
-    } else {
-        1
-    };
+    page: usize,
+) -> Result<(), StoreError> {
     handle_items_command(store, player_name, page).await
 }
 
@@ -177,14 +96,8 @@ pub(super) async fn handle_queue(
     store: &mut Store,
     player_name: &str,
     user_uuid: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    let page: usize = if parts.len() >= 2 {
-        parts[1].parse().unwrap_or(1).max(1)
-    } else {
-        1
-    };
-
+    page: usize,
+) -> Result<(), StoreError> {
     let user_orders = store.order_queue.get_user_orders(user_uuid);
 
     if user_orders.is_empty() {
@@ -250,29 +163,8 @@ pub(super) async fn handle_cancel(
     store: &mut Store,
     player_name: &str,
     user_uuid: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    if parts.len() < 2 {
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            "Usage: cancel <order_id>. Use 'queue' to see your orders.",
-        )
-        .await;
-    }
-
-    let order_id: u64 = match parts[1].trim_start_matches('#').parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!("Invalid order ID '{}'. Use: cancel <order_id>", parts[1]),
-            )
-            .await;
-        }
-    };
-
+    order_id: u64,
+) -> Result<(), StoreError> {
     if let Some(ref trade) = store.current_trade {
         if trade.order().id == order_id {
             return utils::send_message_to_player(
@@ -300,20 +192,16 @@ pub(super) async fn handle_cancel(
 pub(super) async fn handle_status(
     store: &mut Store,
     player_name: &str,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     handle_status_command(store, player_name).await
 }
 
 pub(super) async fn handle_help(
     store: &mut Store,
     player_name: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    if parts.len() >= 2 {
-        handle_help_command(store, player_name, Some(parts[1])).await
-    } else {
-        handle_help_command(store, player_name, None).await
-    }
+    topic: Option<&str>,
+) -> Result<(), StoreError> {
+    handle_help_command(store, player_name, topic).await
 }
 
 // =========================================================================
@@ -330,7 +218,7 @@ async fn handle_price_command(
     player_name: &str,
     item: &str,
     quantity: Option<u32>,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     let pair = match store.pairs.get(item) {
         Some(p) => p,
         None => {
@@ -387,7 +275,7 @@ async fn handle_price_command(
 async fn handle_status_command(
     store: &mut Store,
     player_name: &str,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     let queue_len = store.order_queue.len();
 
     let status_msg = if store.processing_order {
@@ -427,7 +315,7 @@ async fn handle_items_command(
     store: &mut Store,
     player_name: &str,
     page: usize,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     let items: Vec<String> = store.pairs.keys().cloned().collect();
 
     if items.is_empty() {
@@ -476,7 +364,7 @@ async fn handle_help_command(
     store: &mut Store,
     player_name: &str,
     command: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     let user_uuid = utils::resolve_user_uuid(store, player_name).await.ok();
     let is_op = user_uuid
         .as_ref()
@@ -651,18 +539,21 @@ pub async fn pay_async(
     payer_username: &str,
     payee_username: &str,
     amount: f64,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-pay", false)?;
     if !amount.is_finite() || amount <= 0.0 {
         warn!("Invalid payment amount attempted: {}", amount);
-        return Err("Amount must be positive".to_string());
+        return Err(StoreError::ValidationError("Amount must be positive".to_string()));
     }
 
     let payer_uuid = utils::resolve_user_uuid(store, payer_username).await?;
     let payee_uuid = utils::resolve_user_uuid(store, payee_username).await?;
 
     if !store.users.contains_key(&payer_uuid) {
-        return Err(format!("Payer '{}' not found in store records", payer_username));
+        return Err(StoreError::ValidationError(format!(
+            "Payer '{}' not found in store records",
+            payer_username
+        )));
     }
 
     utils::ensure_user_exists(store, payee_username, &payee_uuid);
@@ -673,10 +564,10 @@ pub async fn pay_async(
             "Insufficient balance for payment: {} has {}, needs {}",
             payer_username, payer_balance, amount
         );
-        return Err(format!(
+        return Err(StoreError::ValidationError(format!(
             "Insufficient balance. Required: {}, Available: {}",
             amount, payer_balance
-        ));
+        )));
     }
 
     {

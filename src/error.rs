@@ -51,6 +51,12 @@ pub enum StoreError {
     #[error("Plan infeasible: {0}")]
     PlanInfeasible(String),
 
+    #[error("Queue full: {0} orders pending, try again later")]
+    QueueFull(usize),
+
+    #[error("{0}")]
+    InvariantViolation(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -58,5 +64,19 @@ pub enum StoreError {
 impl From<StoreError> for String {
     fn from(err: StoreError) -> Self {
         err.to_string()
+    }
+}
+
+/// Bridge legacy `String` errors into the typed hierarchy.
+///
+/// Several internal helpers (validation, state invariants, queue operations)
+/// still return plain `Result<T, String>` because their error messages are
+/// already user-facing copy that would just round-trip through a ValidationError
+/// variant. Keeping this From impl lets `?` in a `StoreError`-returning
+/// function seamlessly consume those legacy results without sprinkling
+/// `.map_err(StoreError::ValidationError)` at every call site.
+impl From<String> for StoreError {
+    fn from(msg: String) -> Self {
+        StoreError::ValidationError(msg)
     }
 }

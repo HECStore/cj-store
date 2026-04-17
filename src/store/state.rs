@@ -2,15 +2,16 @@
 
 use tracing::warn;
 
+use crate::error::StoreError;
 use crate::messages::ChestSyncReport;
 use crate::types::{ItemId, Order, Pair, Trade, User};
 use super::Store;
 
 /// Apply chest sync report from bot (merges with existing storage)
-/// 
+///
 /// Slots with count >= 0 are updated, slots with count == -1 are left unchanged.
 /// This allows partial updates where only processed slots are reported.
-pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<(), String> {
+pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<(), StoreError> {
     // Find the chest and merge slot counts with the bot-reported truth.
     for node in &mut store.storage.nodes {
         for chest in &mut node.chests {
@@ -51,7 +52,10 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
             }
         }
     }
-    Err(format!("Chest {} not found in storage", report.chest_id))
+    Err(StoreError::ChestOp(format!(
+        "Chest {} not found in storage",
+        report.chest_id
+    )))
 }
 
 /// Save all store data to disk
@@ -189,7 +193,7 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
 /// `Err`. Intended for use at well-defined checkpoints (e.g. after loading,
 /// before saving) where silently continuing on a broken state would be worse
 /// than aborting the operation.
-pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Result<(), String> {
+pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Result<(), StoreError> {
     use crate::store::utils;
     let issues = audit_state(store, repair);
     // When repair is on, audit_state always prepends a "Repair applied..."
@@ -203,9 +207,9 @@ pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Resu
     if relevant.is_empty() {
         return Ok(());
     }
-    Err(utils::fmt_issues(
+    Err(StoreError::InvariantViolation(utils::fmt_issues(
         &format!("Invariant violation ({})", context),
         &relevant,
         8,
-    ))
+    )))
 }

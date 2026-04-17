@@ -3,6 +3,7 @@
 use tracing::{debug, info, warn};
 
 use super::super::{Store, state, utils};
+use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
 
@@ -14,37 +15,8 @@ pub(super) async fn handle_enqueue(
     store: &mut Store,
     player_name: &str,
     user_uuid: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    let amount: Option<f64> = if parts.len() >= 2 {
-        match parts[1].parse() {
-            Ok(amt) => {
-                if amt <= 0.0 {
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        "Amount must be positive",
-                    )
-                    .await;
-                }
-                Some(amt)
-            }
-            Err(_) => {
-                return utils::send_message_to_player(
-                    store,
-                    player_name,
-                    &format!(
-                        "Invalid amount '{}'. Use a number. Example: deposit 64",
-                        parts[1]
-                    ),
-                )
-                .await;
-            }
-        }
-    } else {
-        None
-    };
-
+    amount: Option<f64>,
+) -> Result<(), StoreError> {
     debug!(
         "Queueing deposit order: {} amount={:?}",
         player_name, amount
@@ -88,7 +60,7 @@ pub async fn handle_deposit_balance_queued(
     store: &mut Store,
     player_name: &str,
     amount: Option<f64>,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     info!("[Deposit] Starting: player={} amount={:?}", player_name, amount);
     state::assert_invariants(store, "pre-deposit-balance", false)?;
 
@@ -171,7 +143,10 @@ pub async fn handle_deposit_balance_queued(
 
     if let Err(e) = send_result {
         tracing::error!("[Deposit] Failed to send trade instruction: {}", e);
-        return Err(format!("Failed to send trade instruction to bot: {}", e));
+        return Err(StoreError::BotError(format!(
+            "Failed to send trade instruction to bot: {}",
+            e
+        )));
     }
 
     let trade_result = match tokio::time::timeout(
@@ -183,11 +158,11 @@ pub async fn handle_deposit_balance_queued(
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
             tracing::error!("[Deposit] Trade channel dropped: {}", e);
-            return Err(format!("Bot response dropped: {}", e));
+            return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
         }
         Err(_) => {
             tracing::error!("[Deposit] Trade timeout");
-            return Err("Bot timed out waiting for trade completion".to_string());
+            return Err(StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000));
         }
     };
 

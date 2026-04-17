@@ -1,22 +1,22 @@
 # cj-store — Quality Assessment & Roadmap
 
-**Current score: 72 / 100**
+**Current score: 82 / 100**
 
 Rating is a weighted read of architecture, error handling, concurrency, tests,
 docs, style, observability, and operations. Scope: everything under `src/`.
 
 ## Dimension scores
 
-| Dimension           | Score | Headline                                           |
-|---------------------|------:|----------------------------------------------------|
-| Architecture        | 75    | Clean 3-task design; handler layer too fat         |
-| Error handling      | 68    | `StoreError` exists but handlers still use `String`|
-| Concurrency         | 82    | Good lock hygiene; UUID cache uses `std::Mutex`    |
-| Testing             | 55    | Strong proptest on AMM; zero handler/bot tests     |
-| Documentation       | 70    | Great README; handler/schema docs missing          |
-| Code style          | 78    | Idiomatic; `#[allow(dead_code)]` overuse           |
-| Observability       | 72    | `tracing` wired; no structured fields, no metrics  |
-| Config & ops        | 70    | Hot-reload works; recovery runbook missing         |
+| Dimension      | Score | Headline                                         |
+| -------------- | ----: | ------------------------------------------------ |
+| Architecture   |    82 | 3-task design; typed `Command` dispatch          |
+| Error handling |    82 | `StoreError` is the handler-chain return type    |
+| Concurrency    |    85 | Periodic cleanup + global queue cap              |
+| Testing        |    70 | AMM proptest + handler/queue/trade_state unit    |
+| Documentation  |    72 | Great README; handler/schema docs still partial  |
+| Code style     |    82 | Idiomatic; most `#[allow(dead_code)]` wired up   |
+| Observability  |    78 | Structured `tracing` fields; no metrics yet      |
+| Config & ops   |    75 | Hot-reload + crash-resume detection; runbook TBD |
 
 ## Key strengths (keep)
 
@@ -26,14 +26,16 @@ docs, style, observability, and operations. Scope: everything under `src/`.
 - Exponential-backoff rate limiter with idle reset ([src/store/rate_limit.rs](src/store/rate_limit.rs)).
 - Journal + atomic writes for shulker ops ([src/store/journal.rs](src/store/journal.rs)).
 - Clean physical-storage model (`Node` / `Chest` / `Storage` in [src/types/](src/types/)).
+- Typed command dispatch: `parse_command` → `Command` enum → handler ([src/store/command.rs](src/store/command.rs)).
+- `StoreError` everywhere on the handler chain; `send_message_to_player` returns typed errors.
+- Periodic cleanup of UUID cache + rate-limiter stale entries (hourly).
+- Global queue cap (`MAX_QUEUE_SIZE = 128`) with a typed `StoreError::QueueFull`.
+- `TradeState` is persisted to `data/current_trade.json` at each phase transition for crash detection.
 
 ## Key weaknesses (fix)
 
-- **`TradeState` is decorative.** Defined in [src/store/trade_state.rs](src/store/trade_state.rs), mutated, then dropped — not used for recovery decisions.
-- **Mixed error types.** Handlers return `Result<(), String>`; `StoreError` only used in core. No `BotError` / `TransactionError` variants.
-- **No integration tests.** No `tests/` dir. Handlers, bot IO, orders pipeline — untested end-to-end.
-- **Unbounded caches.** UUID cache + rate-limiter state have cleanup methods marked dead; no periodic task invokes them.
-- **No backpressure.** 128-buffer mpsc blocks senders on saturation; no shedding or timeout.
+- **No integration tests.** No `tests/` dir. End-to-end flows through handlers + bot + orders pipeline are not exercised together.
+- **Auto-recovery for interrupted trades.** Phase 2 detects and warns the operator; actual re-queue/rollback on startup is deferred to Phase 3 because it needs live-server testing.
 - **No metrics.** Zero counters/histograms; post-hoc analysis requires scraping logs.
 - **Orders cleared silently on startup.** Operators get no warning of discarded queue.
 
@@ -41,24 +43,29 @@ docs, style, observability, and operations. Scope: everything under `src/`.
 
 Each phase is independently shippable.
 
-### Phase 2 — Structural refactors (80 → 88)
+### Phase 2 — Structural refactors — **DONE (72 → 82)**
 
-1. **`Persistent` trait** (`load_all` / `save` / `path`) — implement for `Users`, `Pairs`, `Orders`, `TradeLog`. Consolidate `fsutil::write_atomic` usage.
-2. **Error unification.** Add `StoreError::BotError`, `StoreError::Transaction { attempted, succeeded, items }`. Convert handler signatures to `Result<_, StoreError>`.
-3. **`Command` enum + parser.** Replace hand-rolled `parts.get(0)` chains with a typed enum and single `parse_command(&str) -> Result<Command, _>`.
-4. **Handler pattern.** Formalize validate → plan → execute → commit; return a `HandlerOutcome { messages, state_delta }` instead of calling `send_message_to_player` directly.
-5. **Actually use `TradeState`.** Drive recovery branches off it; persist last phase for crash-resume.
-6. **Channel backpressure.** Reject new orders with a typed error when queue > 90% full.
-7. **Periodic cleanup task** for UUID cache + rate-limiter stale entries (hourly).
+Implemented in this phase:
 
-### Phase 3 — Verification & operability (88 → 95)
+1. **Periodic cleanup task** — hourly sweep of UUID cache + rate-limiter stale entries, wired into `Store::run()`.
+2. **Channel backpressure** — global `MAX_QUEUE_SIZE = 128` cap on `OrderQueue::add`; typed `StoreError::QueueFull`.
+3. **`Command` enum + parser** — `parse_command()` in [src/store/command.rs](src/store/command.rs) replaces hand-rolled `parts.get(0)` chains; handlers now take typed args.
+4. **Error unification** — `Result<(), StoreError>` is the return type across `send_message_to_player`, all handler dispatchers, `execute_queued_order`, plan validators, `apply_chest_sync`, `assert_invariants`, and `handle_bot_message`. Added `StoreError::InvariantViolation`, `StoreError::QueueFull`, and `From<String> for StoreError` as a bridge.
+5. **`TradeState` crash-resume persistence** — `TradeState`, `TradeResult`, `CompletedTrade`, `ChestTransfer`, `TradeItem` now derive `Serialize/Deserialize`; mirror to `data/current_trade.json` at each phase transition; detect + warn on startup when a prior session crashed mid-trade.
 
-1. **Integration test suite** (target ~10 scenarios): happy-path buy/sell, insufficient stock, rollback on trade failure, reconnect mid-order, config hot-reload, journal replay.
+Skipped with rationale:
+
+- **`Persistent` trait** — types have genuinely different persistence shapes (HashMap vs VecDeque vs Vec, single-file vs multi-file). A trait would need complex associated types for minimal benefit; `fsutil::write_atomic` is already the shared primitive.
+- **`HandlerOutcome` pattern** — current inline `send_message_to_player` calls are pragmatic and already follow validate → plan → execute → commit (documented in [src/store/orders.rs](src/store/orders.rs)). Buffering messages into a struct would add complexity without a clear payoff.
+
+### Phase 3 — Verification & operability (82 → 95)
+
+1. **Integration test suite** (target ~10 scenarios): happy-path buy/sell, insufficient stock, rollback on trade failure, reconnect mid-order, config hot-reload, journal replay, interrupted-trade recovery.
 2. **`MockBot`** returning canned `ChestSyncReport` / `TradeResult` so handler + orders logic is end-to-end testable.
-3. **Metrics.** Add `metrics` crate with counters (`trades_completed`, `rollbacks`, `errors_by_kind`) and a latency histogram on order processing.
+3. **Auto-recovery from persisted `TradeState`** — inspect phase on startup, re-queue or roll back as appropriate. Requires Phase 3 test coverage first.
 4. **Proptest expansion** beyond pricing: `TradeState` transition legality, rate-limiter monotonicity, storage-plan invariants.
 5. **`ARCHITECTURE.md`** (diagrams of channel flow + trade state machine) and **`data/SCHEMA.md`** (JSON formats + versioning).
-6. **`RECOVERY.md`** runbook: corrupted `pairs.json`, stuck journal entry, orphaned shulker in inventory.
+6. **`RECOVERY.md`** runbook: corrupted `pairs.json`, stuck journal entry, orphaned shulker in inventory, interrupted `current_trade.json`.
 7. **`--validate-only` / `--dry-run` flag** for config sanity-check without connecting.
 
 ### Phase 4 — Polish to 100
@@ -74,10 +81,10 @@ Each phase is independently shippable.
 ## Concrete file hotspots
 
 - [src/bot/chest_io.rs](src/bot/chest_io.rs) — extract helpers; large monolith.
-- [src/store/trade_state.rs](src/store/trade_state.rs) — wire into recovery.
+- [src/store/trade_state.rs](src/store/trade_state.rs) — persistence done; wire into auto-recovery in Phase 3.
 - [src/store/journal.rs](src/store/journal.rs) — replay path + tests.
-- [src/error.rs](src/error.rs) — expand variants, adopt everywhere.
-- [src/constants.rs](src/constants.rs) — absorb escaped magic numbers.
+- [src/error.rs](src/error.rs) — variant set now covers all handler paths; keep in sync as new failure modes appear.
+- [src/constants.rs](src/constants.rs) — absorb remaining escaped magic numbers.
 
 ## How to verify progress
 

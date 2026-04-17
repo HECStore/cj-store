@@ -4,6 +4,7 @@ use tracing::{debug, info, warn};
 
 use super::super::{Store, state, utils};
 use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
 
@@ -15,37 +16,8 @@ pub(super) async fn handle_enqueue(
     store: &mut Store,
     player_name: &str,
     user_uuid: &str,
-    parts: &[&str],
-) -> Result<(), String> {
-    let amount: Option<f64> = if parts.len() >= 2 {
-        match parts[1].parse() {
-            Ok(amt) => {
-                if amt <= 0.0 {
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        "Amount must be positive",
-                    )
-                    .await;
-                }
-                Some(amt)
-            }
-            Err(_) => {
-                return utils::send_message_to_player(
-                    store,
-                    player_name,
-                    &format!(
-                        "Invalid amount '{}'. Use a number. Example: withdraw 64",
-                        parts[1]
-                    ),
-                )
-                .await;
-            }
-        }
-    } else {
-        None
-    };
-
+    amount: Option<f64>,
+) -> Result<(), StoreError> {
     debug!(
         "Queueing withdraw order: {} amount={:?}",
         player_name, amount
@@ -89,7 +61,7 @@ pub async fn handle_withdraw_balance_queued(
     store: &mut Store,
     player_name: &str,
     amount: Option<f64>,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     info!("[Withdraw] Starting: player={} amount={:?}", player_name, amount);
     state::assert_invariants(store, "pre-withdraw-balance", false)?;
 
@@ -215,7 +187,10 @@ pub async fn handle_withdraw_balance_queued(
 
             if let Err(e) = send_result {
                 tracing::error!("[Withdraw] Failed to send chest instruction: {}", e);
-                return Err(format!("Failed to send chest instruction to bot: {}", e));
+                return Err(StoreError::BotError(format!(
+                    "Failed to send chest instruction to bot: {}",
+                    e
+                )));
             }
 
             let bot_result = match tokio::time::timeout(
@@ -227,11 +202,13 @@ pub async fn handle_withdraw_balance_queued(
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => {
                     tracing::error!("[Withdraw] Channel dropped: {}", e);
-                    return Err(format!("Bot response dropped: {}", e));
+                    return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
                 }
                 Err(_) => {
                     tracing::error!("[Withdraw] Timeout waiting for bot");
-                    return Err("Bot timed out withdrawing diamonds from storage".to_string());
+                    return Err(StoreError::ChestOp(
+                        "Bot timed out withdrawing diamonds from storage".to_string(),
+                    ));
                 }
             };
 
@@ -292,7 +269,10 @@ pub async fn handle_withdraw_balance_queued(
             "[Withdraw] trade-send-failed",
         )
         .await;
-        return Err(format!("Failed to send trade instruction to bot: {}", e));
+        return Err(StoreError::BotError(format!(
+            "Failed to send trade instruction to bot: {}",
+            e
+        )));
     }
 
     let trade_result = match tokio::time::timeout(

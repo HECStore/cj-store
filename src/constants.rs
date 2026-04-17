@@ -212,6 +212,12 @@ pub const OVERFLOW_CHEST_ID: i32 = 1;
 /// Maximum number of orders a single user can have queued at once
 pub const MAX_ORDERS_PER_USER: usize = 8;
 
+/// Global cap on the number of orders across all users.
+/// Provides backpressure against overload independent of the per-user cap,
+/// so a coordinated burst of many users can't exhaust bot memory or stall
+/// processing latency into hours.
+pub const MAX_QUEUE_SIZE: usize = 128;
+
 /// File path for persisting the order queue
 pub const QUEUE_FILE: &str = "data/queue.json";
 
@@ -238,3 +244,17 @@ pub const RATE_LIMIT_MAX_COOLDOWN_MS: u64 = 60_000;
 /// Time after which violation count resets if user stops spamming (milliseconds)
 /// After this duration of no messages, consecutive_violations resets to 0
 pub const RATE_LIMIT_RESET_AFTER_MS: u64 = 30_000;
+
+// ============================================================================
+// PERIODIC CLEANUP CONSTANTS
+// ============================================================================
+
+/// Interval between periodic maintenance sweeps (seconds).
+/// Hourly is frequent enough to keep caches bounded under normal load
+/// without adding noticeable overhead on an otherwise idle store.
+pub const CLEANUP_INTERVAL_SECS: u64 = 3_600;
+
+/// Rate-limiter entries older than this are dropped by the periodic sweep (seconds).
+/// Five minutes is well past any legitimate cooldown window, so the entry
+/// cannot still be throttling a user when it is removed.
+pub const RATE_LIMIT_STALE_AFTER_SECS: u64 = 300;

@@ -40,6 +40,8 @@
 use std::fs;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::chest::Chest;
 use crate::types::ItemId;
 use crate::types::node::Node;
@@ -51,7 +53,7 @@ use crate::types::position::Position;
 /// the bot needs to interact with and how much to transfer.
 ///
 /// The bot receives these plans and executes them sequentially.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChestTransfer {
     /// Chest ID (node_id * 4 + index)
     pub chest_id: i32,

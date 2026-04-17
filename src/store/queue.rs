@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-use crate::constants::{MAX_ORDERS_PER_USER, QUEUE_FILE};
+use crate::constants::{MAX_ORDERS_PER_USER, MAX_QUEUE_SIZE, QUEUE_FILE};
 use crate::fsutil::write_atomic;
 use crate::messages::QueuedOrderType;
 
@@ -184,6 +184,20 @@ impl OrderQueue {
         item: String,
         quantity: u32,
     ) -> Result<(u64, usize), String> {
+        // Global backpressure: reject new orders when the queue is already
+        // saturated. MAX_ORDERS_PER_USER alone is not enough — a coordinated
+        // burst of distinct users could still blow the queue past any memory
+        // or latency budget. This cap protects every user, including future
+        // arrivals who would otherwise wait behind an unbounded backlog.
+        if self.orders.len() >= MAX_QUEUE_SIZE {
+            warn!("[Queue] Order from {} rejected: queue at capacity ({}/{})",
+                  username, self.orders.len(), MAX_QUEUE_SIZE);
+            return Err(format!(
+                "The store queue is currently full ({} orders). Please try again later.",
+                self.orders.len()
+            ));
+        }
+
         // Enforce MAX_ORDERS_PER_USER to prevent a single player from flooding
         // the queue and blocking other users behind a long tail of their orders.
         let user_count = self.user_order_count(&user_uuid);
@@ -424,6 +438,37 @@ mod tests {
         // Can cancel own order
         assert!(queue.cancel("uuid1", id1).is_ok());
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn test_global_queue_cap() {
+        let mut queue = OrderQueue::new();
+
+        // Fill up to MAX_QUEUE_SIZE with distinct users (below per-user cap)
+        for i in 0..MAX_QUEUE_SIZE {
+            let uuid = format!("uuid-{}", i);
+            let user = format!("player-{}", i);
+            assert!(queue
+                .add(
+                    uuid,
+                    user,
+                    QueuedOrderType::Buy,
+                    "cobblestone".to_string(),
+                    1,
+                )
+                .is_ok());
+        }
+
+        // Any new order should now be rejected even from a fresh user
+        let result = queue.add(
+            "uuid-overflow".to_string(),
+            "overflow-player".to_string(),
+            QueuedOrderType::Buy,
+            "cobblestone".to_string(),
+            1,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("full"));
     }
 
     #[test]

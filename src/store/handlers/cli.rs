@@ -3,13 +3,14 @@
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
+use crate::error::StoreError;
 use crate::messages::{BotInstruction, CliMessage};
 use crate::types::ItemId;
 use crate::types::User;
 use super::super::{Store, state, utils};
 
 /// Handle messages from the CLI
-pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Result<(), String> {
+pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Result<(), StoreError> {
     match message {
         CliMessage::QueryBalances { respond_to } => {
             // Read-only snapshot: clones the user map so the CLI receives an
@@ -335,8 +336,8 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             if let Err(e) = store.bot_tx.send(BotInstruction::Restart).await {
                 let error_msg = format!("Failed to send restart instruction: {}", e);
                 error!("{}", error_msg);
-                let _ = respond_to.send(Err(error_msg.clone()));
-                return Err(error_msg);
+                let _ = respond_to.send(Err(error_msg));
+                return Err(StoreError::BotDisconnected);
             }
             let _ = respond_to.send(Ok(()));
             Ok(())

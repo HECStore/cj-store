@@ -7,6 +7,7 @@
 //! - Trades (execution history)
 //! - Storage (nodes, chests, shulker contents)
 
+pub mod command;
 pub mod handlers;
 pub mod journal;
 pub mod orders;
@@ -175,6 +176,24 @@ impl Store {
 
         let rate_limiter = RateLimiter::new();
 
+        // Detect a trade that was in flight when the previous process exited.
+        // We surface the incident loudly and clear the file; automatic
+        // recovery (rollback/re-queue) is deliberately out of scope here
+        // because it would need to touch physical chests and trade state,
+        // which must be done with the operator in the loop.
+        match trade_state::load_persisted() {
+            Ok(Some(state)) => {
+                tracing::error!(
+                    "Found interrupted trade on startup: {}. The previous session crashed mid-trade - \
+                     operator should inspect in-world state (bot inventory, chests, player) before resuming.",
+                    state
+                );
+                let _ = trade_state::clear_persisted();
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Failed to load persisted trade state: {}", e),
+        }
+
         info!(
             "Store initialized successfully with {} pairs, {} users, {} orders, {} nodes",
             pairs.len(),
@@ -222,6 +241,9 @@ impl Store {
     ) {
         info!("Store started (autosave every {}s)", self.config.autosave_interval_secs);
         let mut last_save = tokio::time::Instant::now();
+        let mut last_cleanup = tokio::time::Instant::now();
+        let cleanup_interval = tokio::time::Duration::from_secs(crate::constants::CLEANUP_INTERVAL_SECS);
+        let rate_limit_stale_after = std::time::Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS);
         // Re-read each iteration so hot-reload of `autosave_interval_secs`
         // takes effect without restart. See `Store::reload_config`.
         let mut min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
@@ -307,6 +329,16 @@ impl Store {
                             self.dirty = false;
                         }
                     }
+
+                    // Periodic in-memory cleanup: drops stale rate-limiter
+                    // and UUID-cache entries so long-running instances don't
+                    // accumulate HashMap entries for users who never return.
+                    if last_cleanup.elapsed() >= cleanup_interval {
+                        self.rate_limiter.cleanup_stale(rate_limit_stale_after);
+                        utils::cleanup_uuid_cache();
+                        debug!("[Store] Periodic cleanup completed");
+                        last_cleanup = tokio::time::Instant::now();
+                    }
                 }
                 None => {
                     info!("[Store] Channel closed, exiting");
@@ -383,6 +415,12 @@ impl Store {
 
         self.processing_order = false;
         self.current_trade = None;
+        // Trade reached a terminal state (either committed or failed with
+        // rollback already run) - clear the on-disk mirror so a restart
+        // doesn't re-detect this completed trade as interrupted.
+        if let Err(e) = trade_state::clear_persisted() {
+            warn!("[Store] Failed to clear persisted trade state: {}", e);
+        }
         self.dirty = true;
     }
 
@@ -465,6 +503,12 @@ impl Store {
                 phase = next.phase(),
                 "trade state advanced"
             );
+            // Mirror the new phase to disk so a crash between here and the
+            // next transition leaves enough information on disk for the
+            // operator to detect and investigate on restart.
+            if let Err(e) = trade_state::persist(&next) {
+                warn!("[Store] Failed to persist trade state: {}", e);
+            }
             self.current_trade = Some(next);
         } else {
             debug!("[Store] advance_trade called with no active trade (no-op)");
@@ -472,7 +516,7 @@ impl Store {
     }
 
     /// Handle messages from the bot
-    async fn handle_bot_message(&mut self, message: BotMessage) -> Result<(), String> {
+    async fn handle_bot_message(&mut self, message: BotMessage) -> Result<(), crate::error::StoreError> {
         match message {
             BotMessage::PlayerCommand {
                 player_name,
@@ -523,7 +567,7 @@ impl Store {
     }
 
     /// Apply chest sync report from bot (merges bot-reported slot counts into storage)
-    pub(crate) fn apply_chest_sync(&mut self, report: ChestSyncReport) -> Result<(), String> {
+    pub(crate) fn apply_chest_sync(&mut self, report: ChestSyncReport) -> Result<(), crate::error::StoreError> {
         state::apply_chest_sync(self, report)
     }
 

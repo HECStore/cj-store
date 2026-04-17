@@ -191,7 +191,7 @@ async fn validate_and_plan_buy(
     player_name: &str,
     item: &str,
     quantity: u32,
-) -> Result<Option<BuyPlan>, String> {
+) -> Result<Option<BuyPlan>, StoreError> {
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
@@ -208,7 +208,7 @@ async fn validate_and_plan_buy(
 
     let qty_i32: i32 = quantity
         .try_into()
-        .map_err(|_| "Quantity too large".to_string())?;
+        .map_err(|_| StoreError::ValidationError("Quantity too large".to_string()))?;
     if qty_i32 <= 0 {
         utils::send_message_to_player(store, player_name, "Quantity must be positive").await?;
         return Ok(None);
@@ -329,7 +329,7 @@ pub async fn handle_buy_order(
     player_name: &str,
     item: &str,
     quantity: u32,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     info!(phase = "buy.start", player = %player_name, item = %item, qty = quantity, "Buy order starting");
     state::assert_invariants(store, "pre-buy", false)?;
 
@@ -601,7 +601,7 @@ async fn validate_and_plan_sell(
     player_name: &str,
     item: &str,
     quantity: u32,
-) -> Result<Option<SellPlan>, String> {
+) -> Result<Option<SellPlan>, StoreError> {
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
@@ -618,7 +618,7 @@ async fn validate_and_plan_sell(
 
     let qty_i32: i32 = quantity
         .try_into()
-        .map_err(|_| "Quantity too large".to_string())?;
+        .map_err(|_| StoreError::ValidationError("Quantity too large".to_string()))?;
     if qty_i32 <= 0 {
         utils::send_message_to_player(store, player_name, "Quantity must be positive").await?;
         return Ok(None);
@@ -701,7 +701,7 @@ pub async fn handle_sell_order(
     player_name: &str,
     item: &str,
     quantity: u32,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     info!(phase = "sell.start", player = %player_name, item = %item, qty = quantity, "Sell order starting");
     state::assert_invariants(store, "pre-sell", false)?;
 
@@ -997,7 +997,7 @@ pub async fn handle_sell_order(
 pub async fn execute_queued_order(
     store: &mut Store,
     order: &QueuedOrder,
-) -> Result<String, String> {
+) -> Result<String, StoreError> {
     info!(
         order_id = order.id,
         phase = "order.start",

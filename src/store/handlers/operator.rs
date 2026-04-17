@@ -3,6 +3,7 @@
 use tracing::{error, info, warn};
 
 use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::error::StoreError;
 use crate::messages::TradeItem;
 use crate::types::{ItemId, Order, Trade, TradeType};
 use super::super::{Store, state, utils};
@@ -13,7 +14,7 @@ pub async fn handle_additem_order(
     player_name: &str,
     item: &str,
     quantity: u32,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     info!("[Additem] === STARTING ADDITEM ORDER === player={} item={} qty={}", player_name, item, quantity);
     state::assert_invariants(store, "pre-additem", false)?;
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
@@ -71,7 +72,7 @@ pub async fn handle_additem_order(
     
     if let Err(e) = trade_send_result {
         error!("[Additem] FAILED to send trade instruction: {}", e);
-        return Err(format!("Failed to send trade instruction to bot: {}", e));
+        return Err(StoreError::BotError(format!("Failed to send trade instruction to bot: {}", e)));
     }
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
@@ -265,7 +266,7 @@ pub async fn handle_removeitem_order(
     player_name: &str,
     item: &str,
     quantity: u32,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-removeitem", false)?;
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
@@ -402,7 +403,7 @@ pub async fn handle_removeitem_order(
             "[Removeitem] trade-send-failed",
         )
         .await;
-        return Err(format!("Failed to send trade instruction to bot: {}", e));
+        return Err(StoreError::BotError(format!("Failed to send trade instruction to bot: {}", e)));
     }
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
@@ -477,7 +478,7 @@ pub async fn handle_add_currency(
     player_name: &str,
     item: &str,
     amount: f64,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-add-currency", false)?;
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
@@ -539,7 +540,7 @@ pub async fn handle_remove_currency(
     player_name: &str,
     item: &str,
     amount: f64,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-remove-currency", false)?;
     let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -103,6 +103,23 @@ pub fn clear_uuid_cache() {
     uuid_cache().lock().clear();
 }
 
+/// Drop UUID cache entries older than `UUID_CACHE_TTL_SECS`.
+///
+/// Stale entries never serve a cache hit (the TTL check in `resolve_user_uuid`
+/// rejects them), but unless they are removed they keep growing the HashMap
+/// indefinitely. The periodic cleanup task calls this to bound memory.
+pub fn cleanup_uuid_cache() {
+    let mut cache = uuid_cache().lock();
+    let now = Instant::now();
+    let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
+    let before = cache.len();
+    cache.retain(|_, (_, inserted)| now.duration_since(*inserted) < ttl);
+    let removed = before - cache.len();
+    if removed > 0 {
+        debug!("Cleaned up {} stale UUID cache entries", removed);
+    }
+}
+
 /// Ensure user exists in store, creating if missing.
 ///
 /// UUIDs are the canonical identity key (usernames can change), so we look up
@@ -154,19 +171,30 @@ pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position
 /// Uses a oneshot channel so we can await the bot's acknowledgement and
 /// surface send failures (bot disconnected, channel closed) back to the caller
 /// instead of silently dropping the message.
-pub async fn send_message_to_player(store: &Store, player_name: &str, message: &str) -> Result<(), String> {
+///
+/// Returns a typed [`StoreError`] so callers can match on the failure kind
+/// (e.g. retry on `BotDisconnected`, escalate on other variants).
+pub async fn send_message_to_player(
+    store: &Store,
+    player_name: &str,
+    message: &str,
+) -> Result<(), crate::error::StoreError> {
     debug!("Sending message to {}: {}", player_name, message);
     let (tx, rx) = oneshot::channel();
-    store.bot_tx
+    store
+        .bot_tx
         .send(BotInstruction::Whisper {
             target: player_name.to_string(),
             message: message.to_string(),
             respond_to: tx,
         })
         .await
-        .map_err(|e| format!("Failed to send bot instruction: {}", e))?;
+        .map_err(|_| crate::error::StoreError::BotDisconnected)?;
 
-    rx.await.map_err(|e| format!("Bot response dropped: {}", e))?
+    // Inner result: the bot's own response - if it's Err(String), surface as BotError.
+    rx.await
+        .map_err(|_| crate::error::StoreError::BotDisconnected)?
+        .map_err(crate::error::StoreError::BotError)
 }
 
 /// Helper to format transfer summaries (excludes coordinates for security).
@@ -366,6 +394,30 @@ mod tests {
 
         invalidate_uuid_cache("RemoveMe"); // case-insensitive
         assert!(cache.lock().get("removeme").is_none());
+    }
+
+    #[test]
+    fn test_cleanup_uuid_cache_drops_stale_entries() {
+        clear_uuid_cache();
+        let cache = uuid_cache();
+
+        // Fresh entry
+        cache.lock().insert(
+            "fresh".to_string(),
+            ("uuid-fresh".to_string(), Instant::now()),
+        );
+        // Stale entry (older than TTL)
+        let stale_ts = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
+        cache.lock().insert(
+            "stale".to_string(),
+            ("uuid-stale".to_string(), stale_ts),
+        );
+
+        cleanup_uuid_cache();
+
+        let guard = cache.lock();
+        assert!(guard.contains_key("fresh"), "fresh entry should be retained");
+        assert!(!guard.contains_key("stale"), "stale entry should be dropped");
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub enum QueuedOrderType {
 }
 
 /// An item with quantity, used in trade negotiations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeItem {
     /// Item identifier (e.g., "minecraft:diamond")
     pub item: String,

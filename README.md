@@ -141,7 +141,7 @@ cj-store/
       mod.rs                    # Store struct, run loop (priority-based: orders before messages), message routing
       handlers/                 # Command handlers
         mod.rs                  # Handler module exports (pub use re-exports)
-        player.rs              # Command dispatcher + rate limiting
+        player.rs              # Command dispatcher + rate limiting (routes typed Command variants)
         validation.rs           # Shared input validators (item/quantity/username)
         buy.rs                  # Buy command: validation + enqueue
         sell.rs                 # Sell command: validation + enqueue
@@ -150,6 +150,7 @@ cj-store/
         info.rs                 # price, balance, pay, items, queue, cancel, status, help
         operator.rs            # Operator handlers (additem, removeitem, add/remove currency)
         cli.rs                 # CLI message handlers
+      command.rs                # Command enum + parse_command() (typed whisper parsing)
       journal.rs                # Operation journal for crash recovery (tracks in-flight shulker ops)
       orders.rs                 # Order execution (handle_buy_order, handle_sell_order, execute_queued_order)
       pricing.rs                # Constant product AMM pricing + property-based tests (proptest)
@@ -157,7 +158,7 @@ cj-store/
       rate_limit.rs             # Anti-spam rate limiting with exponential backoff
       rollback.rs               # Shared rollback helper (items/diamonds back to storage on failure)
       state.rs                  # State management (save, audit_state, assert_invariants)
-      trade_state.rs             # Trade lifecycle state machine (Queued → Withdrawing → Trading → Committed)
+      trade_state.rs             # Trade lifecycle state machine (Queued → Withdrawing → Trading → Committed) + crash-resume persistence to data/current_trade.json
       utils.rs                  # Helper functions (normalize_item_id, resolve_user_uuid, UUID cache, etc.)
     bot/                        # Bot module (Azalea bot client + whisper parsing → StoreMessage)
       mod.rs                    # Bot struct, BotState, bot_task, event handlers
@@ -190,6 +191,7 @@ cj-store/
     journal.json                # In-flight shulker operation (crash recovery, normally empty)
     orders.json                 # Order audit log (session-only, cleared on restart)
     queue.json                  # Pending order queue (persistent, resumes on restart)
+    current_trade.json          # Mirror of the in-flight TradeState (absent unless a trade is in progress or a prior session crashed mid-trade)
     pairs/*.json
     users/*.json
     storage/<node_id>.json
@@ -235,6 +237,8 @@ All cross-component communication is explicit:
 **Important behavior**:
 - **Autosave**: debounced by `autosave_interval_secs` in config (default 2s); saves only when state is dirty. A final save always happens on shutdown, and a non-debounced save runs immediately after every completed order to guarantee trade/balance/stock updates are never lost to a crash.
 - **Order processing**: Multiple players can send commands simultaneously, but order commands are queued and processed one at a time by the Store task, ensuring no conflicts.
+- **Periodic cleanup**: every `CLEANUP_INTERVAL_SECS` (1 h) the Store sweeps stale rate-limiter state and stale UUID cache entries so long-running processes don't accumulate unbounded per-user state.
+- **Crash-resume detection**: the in-flight `TradeState` is mirrored to `data/current_trade.json` at every phase transition and cleared on completion. Finding this file at startup means the previous session crashed mid-trade; the Store logs a loud error and clears the file. Automatic re-queue/rollback is not done yet — inspect in-world state manually.
 
 ### Order Queue System
 
@@ -288,6 +292,7 @@ The bot uses a **FIFO order queue** to handle multiple buy/sell/deposit/withdraw
 | Property | Value | Details |
 |----------|-------|---------|
 | **Max orders per player** | 8 | Prevents queue monopolization |
+| **Global queue cap** | 128 (`MAX_QUEUE_SIZE`) | Enqueue is rejected with a user-facing message when the queue is saturated; protects the Store task from unbounded backlog |
 | **Queue persistence** | Yes | Saved to `data/queue.json`, survives restarts |
 | **Trade accept timeout** | 30 seconds | Order cancelled if player doesn't accept the trade request |
 | **Trade completion timeout** | `trade_timeout_ms` (default 45 s) | Order cancelled if trade doesn't complete |
@@ -1277,9 +1282,9 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Error Handling Patterns
 
-- **`StoreError` enum**: `src/error.rs` defines a typed error enum (via `thiserror`) with a `From<StoreError> for String` shim so existing `Result<T, String>` call sites can migrate progressively. The hot-path helpers `execute_chest_transfers` and `perform_trade` already return typed variants (`BotDisconnected`, `TradeTimeout`, `ChestOp`, `TradeRejected`).
-- **Store operations**: Return `Result<(), String>` - errors are logged and sent to player via whisper
-- **Bot operations**: Return `Result<T, String>` - errors are logged and propagated to Store
+- **`StoreError` enum**: [src/error.rs](src/error.rs) defines the typed error enum (via `thiserror`) used across the entire handler chain. Variants cover every hot-path failure mode: `ItemNotFound`, `UnknownPair`, `UnknownUser`, `InsufficientFunds`, `InsufficientStock`, `BotDisconnected`, `TradeTimeout`, `TradeRejected`, `BotError`, `ValidationError`, `ChestOp`, `PlanInfeasible`, `QueueFull`, `InvariantViolation`, `Io`. `From<StoreError> for String` and `From<String> for StoreError` bridge the few remaining helpers that still produce plain strings so `?` keeps working both directions.
+- **Store operations**: Return `Result<(), StoreError>` — errors are logged and sent to player via whisper. This is now the uniform return type for `send_message_to_player`, the dispatcher in [src/store/handlers/player.rs](src/store/handlers/player.rs), every command handler (`buy`/`sell`/`deposit`/`withdraw`/`info`/`operator`/`cli`), the order execution entry point `execute_queued_order`, the plan validators, `apply_chest_sync`, and `assert_invariants`.
+- **Bot operations**: Return `Result<T, String>` internally, converted to `StoreError::BotError`/`ChestOp`/`TradeTimeout`/etc. at the Store boundary.
 - **Persistence**: Return `Result<(), Box<dyn Error>>` - errors are logged, state remains dirty for retry
 - **Panic cases**: Only in unrecoverable situations (e.g., invalid chest index in `Chest::new()` - should never happen in normal operation)
 - **Invariant lookups**: Store-state lookups that used to read `store.pairs.get(item).unwrap()` / `store.users.get(uuid).unwrap()` now go through `Store::expect_pair` / `Store::expect_user` (and their `_mut` variants) defined in [src/store/mod.rs](src/store/mod.rs). These return a structured `StoreError::UnknownPair` / `UnknownUser` that propagates via `?` instead of panicking the store task, and emit a `tracing::error!` with the call-site context so a broken invariant is still loud.
@@ -1296,7 +1301,7 @@ The system is designed for **transactional integrity** — either a trade comple
 
 ### Testing
 
-- **Unit and integration tests**: `cargo test` runs 97 tests covering pricing invariants (including 12 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), UUID cache behavior (insert/lookup, case-insensitive keys, TTL expiry, invalidation, clear), the trade-GUI slot-math helpers in [src/bot/trade.rs](src/bot/trade.rs) (bot/player offer slots, status/accept/cancel slots, slot-set disjointness), and the order-handler integration suite — which now additionally exercises the rejection paths for `sell` (unknown item, zero quantity), `deposit` (non-positive amount, amount over the 768-diamond cap), and `withdraw` (insufficient balance, non-positive amount, full-balance with <1 diamond). The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
+- **Unit and integration tests**: `cargo test` runs 116 tests covering pricing invariants (including 12 property-based tests via `proptest`), storage planner parity, queue FIFO/user-limit behavior, rate-limiter backoff, journal lifecycle, `ItemId` normalization/serialization, trade state-machine transitions (happy paths, rollbacks, invalid-transition panics), UUID cache behavior (insert/lookup, case-insensitive keys, TTL expiry, invalidation, clear), the trade-GUI slot-math helpers in [src/bot/trade.rs](src/bot/trade.rs) (bot/player offer slots, status/accept/cancel slots, slot-set disjointness), and the order-handler integration suite — which now additionally exercises the rejection paths for `sell` (unknown item, zero quantity), `deposit` (non-positive amount, amount over the 768-diamond cap), and `withdraw` (insufficient balance, non-positive amount, full-balance with <1 diamond). The integration tests in [src/store/orders.rs](src/store/orders.rs) build a `Store` in-memory via `Store::new_for_test` and spawn a mock bot task so handler paths can be exercised without disk I/O or Mojang lookups (`utils::resolve_user_uuid` is cfg-gated to return deterministic offline UUIDs under `#[cfg(test)]`).
 - **Property-based AMM tests**: `proptest` exercises the pricing functions across thousands of random reserve/quantity combinations, asserting that `k` never decreases, buy cost always exceeds sell payout (positive spread), per-item price increases with trade size (slippage), sell payout is bounded by the currency reserve, buys leave reserves strictly positive and finite, sequential buy-then-sell is strictly lossy at the resulting reserves, non-positive quantities always return `None` (no free-trade escape hatch), the base AMM identity `x*y=k` is preserved exactly when `fee=0.0` (isolating the fee as the sole source of `k` growth), and the fee knob is monotonic (higher fee → higher buy cost and lower sell payout). Stock/currency mutation sites in [src/store/orders.rs](src/store/orders.rs) and [src/store/handlers/operator.rs](src/store/handlers/operator.rs) are additionally guarded by `debug_assert!` that verify non-negativity and finiteness in dev/test builds (compiled out of release).
 - Test with small quantities first before large trades
 - Verify physical nodes exist before adding them via CLI
@@ -1331,6 +1336,8 @@ The following limitations are documented for awareness:
 6. **No Partial Fulfillment**: If a trade cannot be fully fulfilled (e.g., not enough items in storage), the entire trade fails. Partial fulfillment is not supported.
 
 7. **Memory Usage**: All users, pairs, and trades (up to `max_trades_in_memory`) are loaded into memory on startup. Orders start fresh each session (not loaded from disk). Adjust limits in config for large stores.
+
+8. **Interrupted Trade Recovery Is Detection-Only**: The in-flight `TradeState` is persisted to `data/current_trade.json` at each phase transition and cleared on completion. If that file is present on startup, the previous session crashed mid-trade — the Store logs a loud error describing the last known phase and clears the file. Automatic re-queue or rollback is not yet implemented; operators must manually inspect bot inventory, chests, and the affected player's state before resuming.
 
 ---
 

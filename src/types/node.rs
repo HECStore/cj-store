@@ -282,24 +282,6 @@ impl Node {
         }
     }
 
-    /// Returns the shulker station position for this node.
-    /// Layout (top down, P is southeast corner):
-    /// ```
-    /// NCCN  <- z-2
-    /// NCCN  <- z-1
-    /// XSNP  <- z (S at x-2, P at x)
-    /// ```
-    /// Shulker station is 2 blocks west of P, at the same Y and Z level.
-    /// Reserved for future use (currently calculated inline in bot.rs).
-    #[allow(dead_code)] // reserved; bot currently computes inline
-    pub fn shulker_station_position(&self) -> Position {
-        Position {
-            x: self.position.x - 2,
-            y: self.position.y,
-            z: self.position.z,
-        }
-    }
-
     /// Calculate chest position from node ID, chest index, and node position.
     ///
     /// This is a static method that can calculate a chest's world position
@@ -506,15 +488,4 @@ mod tests {
         assert_eq!(node.chests[3].item, "");
     }
 
-    #[test]
-    fn test_shulker_station_position() {
-        let origin = Position { x: 0, y: 64, z: 0 };
-        let node = Node::new(0, &origin);
-
-        let station = node.shulker_station_position();
-        // Station should be at (x-2, y, z) relative to node position
-        assert_eq!(station.x, node.position.x - 2);
-        assert_eq!(station.y, node.position.y);
-        assert_eq!(station.z, node.position.z);
-    }
 }

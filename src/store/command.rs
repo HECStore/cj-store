@@ -1,7 +1,7 @@
 //! Typed player-command parser.
 //!
 //! `parse_command` converts a raw whispered string like `"buy cobblestone 64"`
-//! into a structured [`Command`]. The dispatcher in [`handlers::player`] can
+//! into a structured [`Command`]. The dispatcher in `handlers::player` can
 //! then match on the enum variant instead of peeking into a `Vec<&str>` by
 //! index, which makes the control flow explicit and the argument types
 //! obvious at the call site.

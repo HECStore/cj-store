@@ -58,54 +58,6 @@ pub struct Chest {
 }
 
 impl Chest {
-    /// Utility helper (reserved for future bot navigation logic).
-    /// 
-    /// # Returns
-    /// * `Some(Position)` - The node position for valid chest indices (0-3)
-    /// * `None` - If chest index is invalid
-    /// 
-    /// **Note**: In normal operation, chest index should always be 0-3.
-    /// Invalid indices indicate a data corruption or programming error.
-    /// 
-    /// # Layout (looking north from P)
-    /// ```
-    /// 01  <- y+1 (top row)
-    /// 23  <- y (bottom row)
-    /// ```
-    /// All chests at z-1 (south face), x-2 (left) or x-1 (right).
-    #[allow(dead_code)] // reverse-lookup API for future tooling
-    pub fn node_position(&self) -> Option<Position> {
-        match self.index {
-            0 => Some(Position {
-                x: self.position.x + 2,  // Chest at x-2, so P at x
-                y: self.position.y - 1,  // Chest at y+1, so P at y
-                z: self.position.z + 1,  // Chest at z-1, so P at z
-            }),
-            1 => Some(Position {
-                x: self.position.x + 1,  // Chest at x-1, so P at x
-                y: self.position.y - 1,  // Chest at y+1, so P at y
-                z: self.position.z + 1,  // Chest at z-1, so P at z
-            }),
-            2 => Some(Position {
-                x: self.position.x + 2,  // Chest at x-2, so P at x
-                y: self.position.y,      // Chest at y, so P at y
-                z: self.position.z + 1,  // Chest at z-1, so P at z
-            }),
-            3 => Some(Position {
-                x: self.position.x + 1,  // Chest at x-1, so P at x
-                y: self.position.y,      // Chest at y, so P at y
-                z: self.position.z + 1,  // Chest at z-1, so P at z
-            }),
-            _ => {
-                // Unlike Chest::new() which panics on invalid index, this getter
-                // logs and returns None because it may be called on deserialized
-                // data where a corrupted JSON file should not crash the bot.
-                tracing::error!("Invalid chest index: {} (expected 0-3)", self.index);
-                None
-            }
-        }
-    }
-
     /// Creates a new Chest with the given node_id, node position, and index.
     /// The chest ID is calculated as node_id * 4 + index.
     /// Item is initialized as empty string and amounts as vector of 54 zeros.

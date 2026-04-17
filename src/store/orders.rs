@@ -3,8 +3,8 @@
 //! High-level flow for any trade is always the same four phases:
 //!   1. **Validate** — basic input/pair/balance/stock checks.
 //!   2. **Plan** — compute a chest transfer plan against storage *without*
-//!      mutating it (see [`Storage::simulate_withdraw_plan`] /
-//!      [`Storage::simulate_deposit_plan`]).
+//!      mutating it (see `Storage::simulate_withdraw_plan` /
+//!      `Storage::simulate_deposit_plan`).
 //!   3. **Execute** — ask the bot to perform each chest operation and the
 //!      trade GUI handoff with the player.
 //!   4. **Commit** — update ledgers (pair stock, user balance, trade log)

@@ -134,8 +134,8 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
     // early would drop it and the server would only notice via keep-alive timeout.
     if had_client {
         let mut elapsed = tokio::time::Duration::from_millis(0);
-        let check_interval = tokio::time::Duration::from_millis(100);
-        let max_wait = tokio::time::Duration::from_millis(2000);
+        let check_interval = tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS);
+        let max_wait = tokio::time::Duration::from_millis(crate::constants::DELAY_DISCONNECT_MS);
 
         while elapsed < max_wait {
             tokio::time::sleep(check_interval).await;
@@ -154,7 +154,7 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
         let mut task_guard = bot.client_task.lock().await;
         if let Some(task) = task_guard.take() {
             task.abort();
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_DISCONNECT_MS)).await;
             true
         } else {
             false

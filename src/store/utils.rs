@@ -87,16 +87,6 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
     }
 }
 
-/// Invalidate a cached UUID entry (e.g. on username change detection).
-#[allow(dead_code)] // API surface for future username-change detection
-pub fn invalidate_uuid_cache(username: &str) {
-    let key = username.to_lowercase();
-    let mut cache = uuid_cache().lock();
-    if cache.remove(&key).is_some() {
-        debug!("Invalidated UUID cache entry for '{}'", username);
-    }
-}
-
 /// Clear the entire UUID cache. Useful for testing or after long idle periods.
 #[cfg(test)]
 pub fn clear_uuid_cache() {
@@ -172,7 +162,7 @@ pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position
 /// surface send failures (bot disconnected, channel closed) back to the caller
 /// instead of silently dropping the message.
 ///
-/// Returns a typed [`StoreError`] so callers can match on the failure kind
+/// Returns a typed `StoreError` so callers can match on the failure kind
 /// (e.g. retry on `BotDisconnected`, escalate on other variants).
 pub async fn send_message_to_player(
     store: &Store,
@@ -383,17 +373,6 @@ mod tests {
         let entry = cache.lock().get(&key).cloned().unwrap();
         let ttl = std::time::Duration::from_secs(UUID_CACHE_TTL_SECS);
         assert!(entry.1.elapsed() >= ttl, "Entry should be expired");
-    }
-
-    #[test]
-    fn test_uuid_cache_invalidate() {
-        clear_uuid_cache();
-        let cache = uuid_cache();
-        let uuid = "00000000-0000-0000-0000-000000000004".to_string();
-        cache.lock().insert("removeme".to_string(), (uuid, Instant::now()));
-
-        invalidate_uuid_cache("RemoveMe"); // case-insensitive
-        assert!(cache.lock().get("removeme").is_none());
     }
 
     #[test]

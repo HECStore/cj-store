@@ -82,7 +82,11 @@ pub struct Storage {
     pub nodes: Vec<Node>,
 }
 
-#[allow(dead_code)] // storage lookup/mutation API kept as cohesive surface
+// Several methods below (`new`, `deposit_plan`, `withdraw_plan`, overflow
+// accessors, direct-mutation helpers) are test-only — production mutates the
+// storage via `apply_chest_sync`. They are kept as a cohesive API surface
+// exercised by the unit tests in this file.
+#[allow(dead_code)]
 impl Storage {
     /// Number of slots per chest (standard double chest = 54 slots)
     pub const SLOTS_PER_CHEST: usize = 54;
@@ -203,30 +207,6 @@ impl Storage {
             .sum()
     }
 
-    /// Returns mutable refs to all chests that contain `item`.
-    /// Reserved for future algorithms/CLI tooling.
-    pub fn chests_with_item_mut(&mut self, item: &str) -> Vec<&mut Chest> {
-        let mut out = Vec::new();
-        for node in &mut self.nodes {
-            for chest in &mut node.chests {
-                if chest.item == item {
-                    out.push(chest);
-                }
-            }
-        }
-        out
-    }
-
-    /// Returns chest IDs that contain `item`.
-    /// Reserved for future algorithms/CLI tooling.
-    pub fn chest_ids_with_item(&self, item: &str) -> Vec<i32> {
-        self.nodes
-            .iter()
-            .flat_map(|n| &n.chests)
-            .filter(|c| c.item == item)
-            .map(|c| c.id)
-            .collect()
-    }
 
     /// Find a chest by id.
     /// Reserved for future bot/chest routing logic.
@@ -253,7 +233,7 @@ impl Storage {
 
     /// Plans withdrawal of `qty` items **without mutating** storage state.
     ///
-    /// This is the read-only counterpart to [`withdraw_plan`]. It walks the
+    /// This is the read-only counterpart to `withdraw_plan`. It walks the
     /// same deterministic node/chest/slot order and computes the exact same
     /// plan, but never touches `Chest.amounts`, so callers no longer need to
     /// `.clone()` the entire `Storage` struct just to preview an operation.
@@ -305,7 +285,7 @@ impl Storage {
 
     /// Plans a deposit of `qty` items **without mutating** storage state.
     ///
-    /// Read-only counterpart to [`deposit_plan`]. Mirrors the exact placement
+    /// Read-only counterpart to `deposit_plan`. Mirrors the exact placement
     /// rules (reserved chests on node 0, prefer partial shulkers, spill into
     /// empty chests, grow by one node when nothing else is available). Because
     /// this method never mutates, "growing by one node" is represented as a
@@ -902,17 +882,6 @@ mod tests {
         assert_eq!(storage.total_item_amount("emerald"), 0);
     }
 
-    #[test]
-    fn test_chest_ids_with_item() {
-        let mut storage = test_storage();
-
-        // Deposit to create assignment (stack size 64)
-        storage.deposit_plan("lapis_lazuli", 50, 64);
-
-        let chest_ids = storage.chest_ids_with_item("lapis_lazuli");
-        assert!(!chest_ids.is_empty());
-    }
-
     // -----------------------------------------------------------------
     // simulate_withdraw_plan / simulate_deposit_plan (non-mutating)
     // -----------------------------------------------------------------
@@ -1002,17 +971,6 @@ mod tests {
 
         let (plan, planned) = storage.simulate_deposit_plan("redstone", 500, 64);
         assert_eq!(planned, 500);
-        // All planned transfers should go into a chest that already contains redstone.
-        let redstone_chest_ids: std::collections::HashSet<i32> = storage
-            .chest_ids_with_item("redstone")
-            .into_iter()
-            .collect();
-        for t in &plan {
-            // Either an existing redstone chest (phase 1) or an empty chest being
-            // newly claimed (phase 2). Phase 1 must be exhausted before phase 2,
-            // so at minimum the first entry should be an existing assignment.
-            let _ = redstone_chest_ids.contains(&t.chest_id);
-        }
         assert!(!plan.is_empty());
     }
 }

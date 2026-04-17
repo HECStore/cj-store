@@ -60,23 +60,45 @@ Skipped with rationale:
 
 ### Phase 3 — Verification & operability (82 → 95)
 
+Already landed:
+
+- **`ARCHITECTURE.md`** (channel flow + trade state machine diagrams) —
+  [ARCHITECTURE.md](ARCHITECTURE.md).
+- **`DATA_SCHEMA.md`** (JSON on-disk formats + versioning policy) —
+  [DATA_SCHEMA.md](DATA_SCHEMA.md).
+- **`RECOVERY.md`** runbook for corrupted pairs, stuck journal, orphaned
+  shulker, interrupted trade — [RECOVERY.md](RECOVERY.md).
+- **`--validate-only` / `--dry-run` flag** for config sanity-check without
+  connecting ([src/main.rs](src/main.rs) `run_validate_only`).
+
+Remaining:
+
 1. **Integration test suite** (target ~10 scenarios): happy-path buy/sell, insufficient stock, rollback on trade failure, reconnect mid-order, config hot-reload, journal replay, interrupted-trade recovery.
 2. **`MockBot`** returning canned `ChestSyncReport` / `TradeResult` so handler + orders logic is end-to-end testable.
 3. **Auto-recovery from persisted `TradeState`** — inspect phase on startup, re-queue or roll back as appropriate. Requires Phase 3 test coverage first.
 4. **Proptest expansion** beyond pricing: `TradeState` transition legality, rate-limiter monotonicity, storage-plan invariants.
-5. **`ARCHITECTURE.md`** (diagrams of channel flow + trade state machine) and **`data/SCHEMA.md`** (JSON formats + versioning).
-6. **`RECOVERY.md`** runbook: corrupted `pairs.json`, stuck journal entry, orphaned shulker in inventory, interrupted `current_trade.json`.
-7. **`--validate-only` / `--dry-run` flag** for config sanity-check without connecting.
 
 ### Phase 4 — Polish to 100
 
-1. **Eliminate `#[allow(dead_code)]`** — use or delete.
-2. **Reduce `.unwrap()`/`.expect()` to an audited short list**, each justified by a comment.
-3. **Benchmarks** (`criterion`) on pricing, storage planning, journal IO; regression thresholds.
-4. **Stress test** with simulated concurrent orders + forced disconnects.
-5. **Config validation**: coordinate bounds, server-address format, y ∈ [−64, 320].
-6. **Rustdoc coverage gate** in CI (`#![warn(missing_docs)]` on public modules).
-7. **Last-known-good snapshotting** of persistent files on clean shutdown.
+Already landed:
+
+- **Eliminate unnecessary `#[allow(dead_code)]`** — swept; remaining
+  instances are either `#[cfg(test)]` or test-only API surfaces with an
+  honest comment.
+- **Config validation** strengthened: coordinate bounds, `y ∈ [-64, 320]`,
+  server-address format (no scheme, no whitespace, ASCII only, optional
+  port must parse as `u16`) — see `Config::validate` in
+  [src/config.rs](src/config.rs).
+- **Rustdoc coverage gate**: `#![deny(rustdoc::broken_intra_doc_links)]`
+  and `#![deny(rustdoc::invalid_html_tags)]` wired in
+  [src/main.rs](src/main.rs); `cargo doc --no-deps` is clean.
+
+Remaining:
+
+1. **Reduce `.unwrap()`/`.expect()` to an audited short list**, each justified by a comment.
+2. **Benchmarks** (`criterion`) on pricing, storage planning, journal IO; regression thresholds.
+3. **Stress test** with simulated concurrent orders + forced disconnects.
+4. **Last-known-good snapshotting** of persistent files on clean shutdown.
 
 ## Concrete file hotspots
 
@@ -84,7 +106,10 @@ Skipped with rationale:
 - [src/store/trade_state.rs](src/store/trade_state.rs) — persistence done; wire into auto-recovery in Phase 3.
 - [src/store/journal.rs](src/store/journal.rs) — replay path + tests.
 - [src/error.rs](src/error.rs) — variant set now covers all handler paths; keep in sync as new failure modes appear.
-- [src/constants.rs](src/constants.rs) — absorb remaining escaped magic numbers.
+- [src/constants.rs](src/constants.rs) — top-level magic numbers absorbed
+  (disconnect/debounce/flush/retry/check-interval); `src/bot/chest_io.rs`
+  still has inline `Duration::from_millis(..)` call sites that were left
+  untouched pending the chest_io extraction in Phase 3.
 
 ## How to verify progress
 

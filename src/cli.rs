@@ -25,7 +25,7 @@ fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result
             Ok(v) => return v,
             Err(e) => {
                 warn!("[CLI] {desc}: {e} — retrying");
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(crate::constants::DELAY_MEDIUM_MS));
             }
         }
     }

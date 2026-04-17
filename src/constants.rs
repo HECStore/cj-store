@@ -93,6 +93,13 @@ pub const DELAY_SHULKER_PLACE_MS: u64 = 750;
 /// Delay for disconnect operations (2 seconds)
 pub const DELAY_DISCONNECT_MS: u64 = 2_000;
 
+/// Debounce window for config file-change events (milliseconds).
+/// Editors typically emit a burst of writes on save (rename-over-old, metadata
+/// touch, final write); we want exactly one reload per user edit, so we wait
+/// this long after the first event before reloading and drain anything that
+/// arrived in the meantime.
+pub const DELAY_CONFIG_DEBOUNCE_MS: u64 = 500;
+
 /// Additional buffer after disconnect for TCP cleanup.
 /// Without this extra pause, reconnect attempts can race the OS releasing
 /// the old socket and fail with "address in use" or half-closed state errors.

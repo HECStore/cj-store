@@ -895,12 +895,12 @@ pub async fn transfer_items_with_shulker(
 /// **Note**: This function assumes the bot is already at the node position.
 /// Navigation should be handled by the caller.
 ///
-/// **Returns**: A Vec<i32> of length 54 containing item counts for each shulker slot.
+/// **Returns**: A `Vec<i32>` of length 54 containing item counts for each shulker slot.
 /// Slots that were processed contain the accurate count after the operation.
 /// Slots that were NOT processed contain -1 (caller should keep existing values for those).
 ///
 /// **known_counts**: Optional pre-existing knowledge about shulker contents.
-/// If provided, slots with known_counts[i] == 0 will be skipped for withdrawals (known empty).
+/// If provided, slots with `known_counts[i] == 0` will be skipped for withdrawals (known empty).
 /// For deposits, slots at or above shulker capacity (27 × stack_size) will be skipped.
 /// This avoids needlessly taking out and placing back shulkers that are known to be empty/full.
 ///

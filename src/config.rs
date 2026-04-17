@@ -122,9 +122,39 @@ impl Config {
             ));
         }
         
-        // Validate server_address
-        if self.server_address.trim().is_empty() {
+        // Validate server_address. Accept either a bare hostname / IPv4, or
+        // host:port, with only characters legal in a Minecraft server address
+        // (letters, digits, '.', '-', ':'). Rejects whitespace, schemes like
+        // "https://", and trailing paths — all common copy-paste mistakes.
+        let addr = self.server_address.trim();
+        if addr.is_empty() {
             errors.push("server_address cannot be empty".to_string());
+        } else if addr.contains("://") || addr.contains('/') {
+            errors.push(format!(
+                "server_address must be a bare host or host:port (no scheme/path): {}",
+                self.server_address
+            ));
+        } else if addr.chars().any(|c| c.is_whitespace()) {
+            errors.push(format!(
+                "server_address must not contain whitespace: {:?}",
+                self.server_address
+            ));
+        } else if !addr.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':') {
+            errors.push(format!(
+                "server_address contains unsupported characters: {}",
+                self.server_address
+            ));
+        } else if let Some((_, port)) = addr.rsplit_once(':') {
+            // If a port was provided, make sure it's a valid u16.
+            // `rsplit_once(':')` also matches bare IPv6-like inputs, but since
+            // we reject ':' beyond the host:port form above (would fail the
+            // charset check for IPv6 brackets), this is fine.
+            if port.parse::<u16>().is_err() {
+                errors.push(format!(
+                    "server_address port must be a number 0-65535: {}",
+                    self.server_address
+                ));
+            }
         }
         
         // Validate position (Minecraft coordinate limits: -30,000,000 to 30,000,000 for X/Z).

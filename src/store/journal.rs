@@ -190,7 +190,7 @@ impl Journal {
     }
 
     /// View the currently-active entry, if any.
-    #[allow(dead_code)] // diagnostic API for tooling / future operator commands
+    #[cfg(test)]
     pub fn current(&self) -> Option<&JournalEntry> {
         self.entry.as_ref()
     }

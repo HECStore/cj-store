@@ -137,15 +137,6 @@ impl RateLimiter {
         }
     }
 
-    /// Get the current violation count for a user (for debugging/logging)
-    #[allow(dead_code)] // operator-tooling API, kept for future admin commands
-    pub fn get_violations(&self, user_uuid: &str) -> u32 {
-        self.limits
-            .get(user_uuid)
-            .map(|l| l.consecutive_violations)
-            .unwrap_or(0)
-    }
-
     /// Clean up stale entries (users who haven't sent messages in a while)
     /// Call periodically to prevent memory growth
     pub fn cleanup_stale(&mut self, max_age: Duration) {

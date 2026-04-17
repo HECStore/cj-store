@@ -60,7 +60,6 @@ pub struct Pair {
     pub currency_stock: f64,
 }
 
-#[allow(dead_code)] // persistence + capacity helpers kept as cohesive type API
 impl Pair {
     // Directory where all individual pair files will be stored.
     // One file per pair keeps diffs small and avoids rewriting the whole catalog on every update.
@@ -69,15 +68,7 @@ impl Pair {
     /// Number of slots in a shulker box (27 = 3 rows × 9 columns).
     /// Used as the unit of storage capacity since the store organizes stock in shulker boxes.
     pub const SHULKER_BOX_SLOTS: i32 = 27;
-    
-    /// Calculate the maximum item capacity of a shulker box for this item.
-    /// 
-    /// A shulker box has 27 slots, each holding up to `stack_size` items.
-    /// Returns: 27 × stack_size
-    pub fn shulker_capacity(&self) -> i32 {
-        Self::SHULKER_BOX_SLOTS * self.stack_size
-    }
-    
+
     /// Calculate shulker capacity for a given stack size.
     /// Use this when you don't have a Pair instance but know the stack size.
     pub fn shulker_capacity_for_stack_size(stack_size: i32) -> i32 {
@@ -107,23 +98,6 @@ impl Pair {
     fn get_pair_file_path(item_name: &str) -> PathBuf {
         let sanitized_name = Self::sanitize_item_name_for_filename(item_name);
         PathBuf::from(Self::PAIRS_DIR).join(format!("{}.json", sanitized_name))
-    }
-
-    /// Loads a single `Pair` from `data/pairs/{item_name}.json`.
-    /// Returns an `io::Error` with `ErrorKind::NotFound` if the file does not exist.
-    pub fn load(item_name: &str) -> io::Result<Self> {
-        let path = Self::get_pair_file_path(item_name);
-
-        if path.exists() {
-            let json_str = fs::read_to_string(&path)?;
-            let pair: Self = serde_json::from_str(&json_str)?;
-            Ok(pair)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Pair file not found: {}", path.display()),
-            ))
-        }
     }
 
     /// Saves this single `Pair` instance to `data/pairs/{self.item}.json`.
@@ -175,9 +149,6 @@ impl Pair {
             let path = entry.path();
 
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-                // Here, we can't directly call Pair::load because Pair::load expects an item_name
-                // and attempts to read a file based on that. Instead, we read the file
-                // and then deserialize it, which is the core logic of Pair::load.
                 match fs::read_to_string(&path) {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(pair) => {

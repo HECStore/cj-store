@@ -25,10 +25,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::write_atomic;
 
+// The Mojang lookup path is gated behind `#[cfg(not(test))]` so tests don't
+// issue real HTTP requests. The supporting HTTP client, the request struct,
+// and `get_uuid_async` therefore only have callers outside test builds — the
+// cfg_attr below silences the test-only dead_code warnings without allowing
+// dead code in the production build.
+
 /// Global async HTTP client for Mojang API calls.
 /// Using a single client enables connection pooling and better performance.
+#[cfg_attr(test, allow(dead_code))]
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+#[cfg_attr(test, allow(dead_code))]
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -68,25 +76,15 @@ pub struct User {
     pub operator: bool,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Deserialize)]
 struct MojangResponse {
     id: String,
 }
 
-#[allow(dead_code)] // persistence + lookup API kept as cohesive surface
 impl User {
     // Directory where all individual user files will be stored
     const USERS_DIR: &str = "data/users";
-
-    /// Convenience constructor (reserved for future tooling).
-    pub fn new(username: String) -> Self {
-        User {
-            uuid: Self::get_uuid(&username).unwrap_or_default(),
-            balance: 0.0,
-            username,
-            operator: false,
-        }
-    }
 
     /// Resolves a Minecraft username to a Mojang UUID via the public API (async version).
     ///
@@ -101,6 +99,7 @@ impl User {
     /// - Timeout: Request took longer than 10 seconds
     ///
     /// **Preferred**: Use this async version instead of the blocking `get_uuid()`.
+    #[cfg_attr(test, allow(dead_code))]
     pub async fn get_uuid_async(username: &str) -> Result<String, String> {
         let url = format!(
             "https://api.mojang.com/users/profiles/minecraft/{}",
@@ -151,75 +150,9 @@ impl User {
         Ok(formatted)
     }
 
-    /// Resolves a Minecraft username to a Mojang UUID via the public API (blocking version).
-    ///
-    /// **Note**: This is a blocking wrapper around `get_uuid_async()`. 
-    /// Prefer using `get_uuid_async()` directly when in an async context.
-    ///
-    /// **API Endpoint**: `https://api.mojang.com/users/profiles/minecraft/{username}`
-    ///
-    /// **Returns**: Hyphenated UUID string (e.g., `550e8400-e29b-41d4-a716-446655440000`)
-    ///
-    /// **Error Cases**:
-    /// - HTTP 204: Player not found (username doesn't exist)
-    /// - Other HTTP errors: API failure
-    /// - Network errors: Connection issues
-    pub fn get_uuid(username: &str) -> Result<String, String> {
-        let url = format!(
-            "https://api.mojang.com/users/profiles/minecraft/{}",
-            username
-        );
-
-        // NOTE: blocking::get creates a fresh client per call (no pooling).
-        // The async variant above reuses HTTP_CLIENT and should be preferred.
-        let response = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
-
-        // Mojang API returns 204 No Content when player doesn't exist
-        if response.status() == 204 {
-            return Err("Player not found".to_string());
-        }
-
-        if !response.status().is_success() {
-            return Err(format!("API error: {}", response.status()));
-        }
-
-        let mojang_response: MojangResponse = response.json().map_err(|e| e.to_string())?;
-
-        // Mojang API returns UUID without hyphens; format it with hyphens
-        // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        let id = &mojang_response.id;
-        let formatted = format!(
-            "{}-{}-{}-{}-{}",
-            &id[0..8],
-            &id[8..12],
-            &id[12..16],
-            &id[16..20],
-            &id[20..32]
-        );
-
-        Ok(formatted)
-    }
-
     // Helper function to get the file path for a single user
     fn get_user_file_path(uuid: &str) -> PathBuf {
         PathBuf::from(Self::USERS_DIR).join(format!("{}.json", uuid))
-    }
-
-    /// Loads a single `User` from `data/users/{uuid}.json`.
-    /// Reserved for future tooling/debugging.
-    pub fn load(uuid: &str) -> io::Result<Self> {
-        let path = Self::get_user_file_path(uuid);
-
-        if path.exists() {
-            let json_str = fs::read_to_string(&path)?;
-            let user: Self = serde_json::from_str(&json_str)?;
-            Ok(user)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("User file not found: {}", path.display()),
-            ))
-        }
     }
 
     /// Saves this single `User` instance to `data/users/{self.uuid}.json`.
@@ -263,9 +196,6 @@ impl User {
             let path = entry.path();
 
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-                // Here, we can't directly call User::load because User::load expects an uuid
-                // and attempts to read a file based on that. Instead, we read the file
-                // and then deserialize it, which is the core logic of User::load.
                 match fs::read_to_string(&path) {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(user) => {

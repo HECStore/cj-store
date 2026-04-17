@@ -7,6 +7,11 @@
 //!
 //! See `README.md` for architecture overview and usage.
 
+// Rustdoc hygiene: fail the build on broken intra-doc links or malformed HTML.
+// Enforced in main.rs so CI (`cargo doc --no-deps`) catches any regression.
+#![deny(rustdoc::broken_intra_doc_links)]
+#![deny(rustdoc::invalid_html_tags)]
+
 use crate::cli::cli_task;
 use crate::messages::{BotInstruction, StoreMessage};
 use crate::store::Store;
@@ -29,6 +34,26 @@ mod types;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CLI flag parsing — kept tiny on purpose (no clap dependency).
+    // Supported:
+    //   --validate-only / --dry-run : load + validate config, then exit.
+    //   --help / -h                 : usage and exit.
+    let args: Vec<String> = std::env::args().collect();
+    for a in args.iter().skip(1) {
+        match a.as_str() {
+            "--validate-only" | "--dry-run" => return run_validate_only(),
+            "--help" | "-h" => {
+                print_usage();
+                return Ok(());
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                print_usage();
+                return Err(format!("unknown argument: {other}").into());
+            }
+        }
+    }
+
     // Initialize logging: file-only output to `data/logs/store.log`
     // This avoids cluttering stdout/stderr and provides persistent logs.
     // See README.md "Logging" section for details.
@@ -129,9 +154,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Brief yield so the tracing file appender can flush final log lines
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS)).await;
 
     Ok(())
+}
+
+/// Print CLI usage to stdout.
+fn print_usage() {
+    println!("cj-store — Minecraft store bot");
+    println!();
+    println!("USAGE:");
+    println!("    cj-store [OPTIONS]");
+    println!();
+    println!("OPTIONS:");
+    println!("    --validate-only, --dry-run   Load and validate data/config.json, then exit");
+    println!("                                 without connecting to the server");
+    println!("    -h, --help                   Show this help");
+}
+
+/// Load config, run validation, print result, and exit without connecting.
+///
+/// Useful for CI checks or for operators to sanity-check a config edit before
+/// restarting the bot. Exit code is 0 on success, 1 on validation error.
+fn run_validate_only() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔍 Validating data/config.json ...");
+    match crate::config::Config::load() {
+        Ok(cfg) => {
+            println!("✅ Config OK");
+            println!("   position:            ({}, {}, {})", cfg.position.x, cfg.position.y, cfg.position.z);
+            println!("   fee:                 {}", cfg.fee);
+            println!("   server_address:      {}", cfg.server_address);
+            println!(
+                "   account_email:       {}",
+                if cfg.account_email.is_empty() { "<empty>" } else { cfg.account_email.as_str() }
+            );
+            println!("   trade_timeout_ms:    {}", cfg.trade_timeout_ms);
+            println!("   pathfinding_timeout_ms: {}", cfg.pathfinding_timeout_ms);
+            println!("   max_orders:          {}", cfg.max_orders);
+            println!("   max_trades_in_memory: {}", cfg.max_trades_in_memory);
+            println!("   autosave_interval_secs: {}", cfg.autosave_interval_secs);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("❌ Config invalid: {e}");
+            Err(e.into())
+        }
+    }
 }
 
 /// Watch `data/config.json` and send `StoreMessage::ReloadConfig` to the
@@ -170,8 +238,8 @@ fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
         while let Some(res) = event_rx.recv().await {
             match res {
                 Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
-                    // Debounce: drain any further events that arrive within 500ms.
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Debounce: drain any further events that arrive within the window.
+                    tokio::time::sleep(Duration::from_millis(crate::constants::DELAY_CONFIG_DEBOUNCE_MS)).await;
                     while event_rx.try_recv().is_ok() {}
 
                     match crate::config::Config::load() {

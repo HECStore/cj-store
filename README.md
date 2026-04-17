@@ -4,6 +4,16 @@
 
 A feature-complete Minecraft "store clerk" bot that handles in-game trading via whisper commands, with durable on-disk state and physical storage integration.
 
+## Related docs
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — runtime topology, event loop, trade
+  state machine, channel diagrams.
+- [DATA_SCHEMA.md](DATA_SCHEMA.md) — quick reference for every JSON file
+  under `data/`.
+- [RECOVERY.md](RECOVERY.md) — operator runbook for corrupted pairs,
+  stuck journal, orphaned shulker, interrupted trade.
+- [PLAN.md](PLAN.md) — quality-assessment scorecard and roadmap.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -1103,6 +1113,19 @@ If you want to build on stable:
 ```bash
 cargo run
 ```
+
+### Validate Config Without Connecting
+
+To sanity-check `data/config.json` after an edit — parses the file, runs
+`Config::validate`, and exits without logging in to Minecraft:
+
+```bash
+cargo run -- --dry-run
+# or the equivalent --validate-only
+```
+
+Exit code is `0` on success, `1` on validation error. Useful in CI or
+before restarting a production bot.
 
 ---
 

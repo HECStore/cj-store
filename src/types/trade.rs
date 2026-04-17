@@ -17,18 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::write_atomic;
 
-/// Default maximum number of trades to keep in memory.
-/// Trades older than this limit may be archived or removed.
-/// This prevents unbounded memory growth on startup.
-/// Can be overridden in config.json via the `max_trades_in_memory` field.
-#[allow(dead_code)] // fallback constant for config loading
-pub const DEFAULT_MAX_TRADES_IN_MEMORY: usize = 50_000;
-
-/// Number of days to retain trade files on disk.
-/// Trades older than this are candidates for archival/deletion.
-#[allow(dead_code)] // retention window used by archive_old_trades
-pub const TRADE_RETENTION_DAYS: i64 = 365;
-
 /// The category of a recorded trade.
 ///
 /// Customer-facing transactions (`Buy`, `Sell`) are distinguished from
@@ -75,7 +63,6 @@ pub struct Trade {
     pub timestamp: DateTime<Utc>,
 }
 
-#[allow(dead_code)] // persistence/archival API kept as cohesive surface
 impl Trade {
     // Directory where all individual trade files will be stored
     const TRADES_DIR: &str = "data/trades";
@@ -126,35 +113,6 @@ impl Trade {
         Ok(())
     }
 
-    /// Loads a single `Trade` from `data/trades/{timestamp}.json`.
-    /// Reserved for future tooling/debugging.
-    pub fn load(timestamp: &DateTime<Utc>) -> io::Result<Self> {
-        let path = Self::get_trade_file_path(timestamp);
-
-        if path.exists() {
-            let json_str = fs::read_to_string(&path)?;
-            let trade: Self = serde_json::from_str(&json_str)?;
-            Ok(trade)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Trade file not found: {}", path.display()),
-            ))
-        }
-    }
-
-    /// Loads all `Trade`s by reading every JSON file in the `data/trades/` directory.
-    /// Files that cannot be deserialized are skipped with a warning.
-    /// If the directory does not exist, it returns an empty `Vec<Trade>`.
-    /// Returns trades sorted by timestamp (oldest first).
-    /// 
-    /// **Memory limit**: Only loads the most recent DEFAULT_MAX_TRADES_IN_MEMORY trades.
-    /// Older trades remain on disk but aren't loaded into memory.
-    /// Use `load_all_with_limit` for a custom limit.
-    pub fn load_all() -> io::Result<Vec<Self>> {
-        Self::load_all_with_limit(DEFAULT_MAX_TRADES_IN_MEMORY)
-    }
-    
     /// Loads all `Trade`s with a custom memory limit.
     /// Files that cannot be deserialized are skipped with a warning.
     /// If the directory does not exist, it returns an empty `Vec<Trade>`.
@@ -225,56 +183,6 @@ impl Trade {
         Ok(trades)
     }
     
-    /// Get count of trades currently in memory.
-    pub fn count(trades: &[Self]) -> usize {
-        trades.len()
-    }
-    
-    /// Archive old trades to a separate file and remove individual trade files.
-    /// This is useful for maintenance to reduce file count in the trades directory.
-    /// 
-    /// **Note**: This is a utility function for manual maintenance.
-    /// It's not called automatically during normal operation.
-    pub fn archive_old_trades(trades: &mut Vec<Self>, days_to_keep: i64) -> io::Result<usize> {
-        let cutoff = Utc::now() - chrono::Duration::days(days_to_keep);
-        let dir_path = Path::new(Self::TRADES_DIR);
-        
-        // Find trades older than cutoff
-        let (old_trades, recent_trades): (Vec<_>, Vec<_>) = trades
-            .drain(..)
-            .partition(|t| t.timestamp < cutoff);
-        
-        // Put recent trades back
-        *trades = recent_trades;
-        
-        let archived_count = old_trades.len();
-        
-        if archived_count > 0 {
-            // Create archive file
-            let archive_path = dir_path.join(format!("archive_{}.json", Utc::now().format("%Y%m%d_%H%M%S")));
-            let json_str = serde_json::to_string_pretty(&old_trades)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            write_atomic(&archive_path, &json_str)?;
-            
-            // Remove individual old trade files
-            for trade in &old_trades {
-                let trade_path = Self::get_trade_file_path(&trade.timestamp);
-                if trade_path.exists() {
-                    let _ = fs::remove_file(&trade_path);
-                }
-            }
-            
-            tracing::info!(
-                "Archived {} trades older than {} days to {}",
-                archived_count,
-                days_to_keep,
-                archive_path.display()
-            );
-        }
-        
-        Ok(archived_count)
-    }
-
     /// Saves a Vec of `Trade`s, where each `Trade` is saved to its own file
     /// in the `data/trades/` directory using the `trade.save()` method.
     /// This method overwrites existing files and then removes any orphaned files.

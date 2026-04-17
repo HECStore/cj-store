@@ -109,6 +109,8 @@ pub async fn handle_deposit_balance_queued(
             MAX_TRADE_DIAMONDS
         )
     } else {
+        // unwrap: `is_flexible` is true iff `amount.is_none()`, so this branch
+        // is only reached when `amount` is `Some`.
         format!(
             "Deposit {:.2} diamonds: Please offer {} diamonds in the trade.",
             amount.unwrap(),

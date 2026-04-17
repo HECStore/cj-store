@@ -175,7 +175,7 @@ cj-store/
       connection.rs             # Connection management (connect, disconnect)
       navigation.rs             # Pathfinding (navigate_to_position, go_to_node, go_to_chest)
       shulker.rs               # Shulker operations (place, pickup, open, station position)
-      chest_io.rs               # Chest operations — automated_chest_io dispatches to withdraw_shulkers / deposit_shulkers, chunk-not-loaded retry
+      chest_io.rs               # Chest operations — automated_chest_io dispatches to withdraw_shulkers / deposit_shulkers; transfer_items_with_shulker dispatches to transfer_withdraw_from_shulker / transfer_deposit_into_shulker; chunk-not-loaded retry
       trade.rs                  # Trade automation (execute_trade_with_player, trade GUI handling)
       inventory.rs              # Inventory management (ensure_inventory_empty, move_hotbar_to_inventory, etc.)
     cli.rs                      # dialoguer menu → StoreMessage

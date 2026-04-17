@@ -237,6 +237,10 @@ async fn handle_price_command(
     let buy_total = pricing::calculate_buy_cost(store, item, qty_i32);
     let sell_total = pricing::calculate_sell_payout(store, item, qty_i32);
 
+    // Re-fetch the pair below: the original `pair` borrow had to be dropped
+    // before the `pricing::*` calls (which need `&store`). The pair cannot
+    // disappear in between — `pricing::*` only reads reserves, never mutates
+    // the pairs map, and we already returned early above when it was missing.
     match (buy_total, sell_total) {
         (Some(buy_cost), Some(sell_payout)) => {
             let buy_per = buy_cost / (qty as f64);

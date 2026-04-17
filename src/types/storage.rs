@@ -190,6 +190,7 @@ impl Storage {
         }
         let node = Node::new(node_id, &self.position);
         self.nodes.push(node);
+        // unwrap: pushed on the line above, so `last_mut()` cannot return None.
         self.nodes.last_mut().unwrap()
     }
 

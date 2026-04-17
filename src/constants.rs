@@ -75,11 +75,21 @@ pub const DELAY_SHORT_MS: u64 = 100;
 /// Medium delay for standard operations
 pub const DELAY_MEDIUM_MS: u64 = 200;
 
+/// Delay after a click / interact that updates container state.
+/// Slightly longer than `DELAY_MEDIUM_MS` to give the server time to
+/// echo the new slot contents before the next read.
+pub const DELAY_INTERACT_MS: u64 = 300;
+
 /// Delay after placing/breaking blocks
 pub const DELAY_BLOCK_OP_MS: u64 = 350;
 
 /// Delay after looking at a block before interacting with it
 pub const DELAY_LOOK_AT_MS: u64 = 250;
+
+/// Long settle delay used after multi-step shulker / pickup sequences,
+/// where item-drop physics or chunk updates need extra time to converge
+/// before the next read or click.
+pub const DELAY_SETTLE_MS: u64 = 500;
 
 /// Delay for network operations that need server round-trip
 pub const DELAY_NETWORK_MS: u64 = 450;

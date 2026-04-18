@@ -426,14 +426,4 @@ Player-facing messages that are sometimes misread as errors.
 
 ## 10. Performance tuning
 
-- **Slow large withdrawals / deposits** — chest I/O is serialized and
-  per-shulker. A 6-stack withdrawal can easily take 30 s. Not a bug.
-- **High disk I/O every ~2 s** — the autosave debounce. Tune
-  `autosave_interval_secs` if it's thrashing, but remember that raising
-  it widens the crash-loss window.
-- **Queue stalling during bursts** — orders process one at a time. There is
-  no parallelism here, intentionally.
-- **Server restarts / chunk unloads mid-operation** — the bot detects the
-  transient `ChunkNotLoaded` path and retries with longer backoff (up to
-  ~20 s). Stale containers are reopened automatically via the chunk-aware
-  retry. No action needed unless the retries exhaust.
+Moved to [DEVELOPMENT.md § Performance tuning](DEVELOPMENT.md#performance-tuning).

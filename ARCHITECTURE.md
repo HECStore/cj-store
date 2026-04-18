@@ -1,8 +1,11 @@
 # cj-store — Architecture
 
 Complement to [README.md](README.md). README covers *what* the system does;
-this document diagrams *how* the pieces fit together. For JSON file formats
-see [DATA_SCHEMA.md](DATA_SCHEMA.md); for operational playbooks see
+this document diagrams *how* the pieces fit together. For the user/operator
+command reference see [COMMANDS.md](COMMANDS.md); for developer reference
+(build, error model, testing, limitations, perf tuning) see
+[DEVELOPMENT.md](DEVELOPMENT.md); for JSON file formats see
+[DATA_SCHEMA.md](DATA_SCHEMA.md); for operational playbooks see
 [RECOVERY.md](RECOVERY.md).
 
 ## Runtime topology
@@ -157,9 +160,9 @@ unrepresentable.
 `TradeState` is mirrored to `data/current_trade.json` at every transition
 and cleared on a terminal state. On startup the Store looks for a leftover
 file: its presence means the previous run crashed mid-trade. The current
-behavior is log-and-clear; automatic re-queue/rollback is Phase 3
-([PLAN.md](PLAN.md)). When that lands, the startup path in `Store::new`
-inspects the persisted phase and routes:
+behavior is log-and-clear; automatic re-queue/rollback is a planned
+Phase 3. When that lands, the startup path in `Store::new` inspects the
+persisted phase and routes:
 
 ```text
   Queued        -> re-add to OrderQueue front
@@ -623,7 +626,7 @@ Failure at any step aborts the trade and notifies the player.
 | 36    | Reserved for shulker | Hotbar slot 0, always kept clear                      |
 | 37-44 | General hotbar       | Cleared to inventory (9-35) after each trade          |
 
-### Pricing (constant-product AMM)
+## Pricing (constant-product AMM)
 
 Formulas in [src/store/pricing.rs](src/store/pricing.rs); see
 [Uniswap V2 protocol overview](https://docs.uniswap.org/contracts/v2/concepts/protocol-overview/how-uniswap-works)
@@ -708,182 +711,6 @@ is written. See [src/store/rollback.rs](src/store/rollback.rs).
 | Storage state   | Synced from real chest contents after each operation    |
 | Balance changes | Applied atomically with trade completion                |
 | Pair reserves   | Updated only after full transaction success            |
-
-## Commands
-
-### Player commands (all users)
-
-All commands arrive as `/msg <bot> <command>`. Items are normalized
-(the `minecraft:` prefix is stripped). See
-[src/store/command.rs](src/store/command.rs) for parsing and
-[src/store/handlers/](src/store/handlers/) for dispatch.
-
-| Command   | Alias | Usage                        | Description                                        |
-| --------- | ----- | ---------------------------- | -------------------------------------------------- |
-| `buy`     | `b`   | `buy <item> <qty>`           | Buy items from the store                           |
-| `sell`    | `s`   | `sell <item> <qty>`          | Sell items to the store                            |
-| `price`   | `p`   | `price <item> [qty]`         | Check buy/sell prices                              |
-| `balance` | `bal` | `balance [player]`           | Check diamond balance                              |
-| `pay`     | —     | `pay <player> <amount>`      | Transfer diamonds to another player                |
-| `deposit` | `d`   | `deposit [amount]`           | Deposit physical diamonds to balance               |
-| `withdraw`| `w`   | `withdraw [amount]`          | Withdraw balance to physical diamonds              |
-| `items`   | —     | `items [page]`               | List tradeable items (4 per page)                  |
-| `queue`   | `q`   | `queue [page]`               | View your pending orders (4 per page)              |
-| `cancel`  | `c`   | `cancel <order_id>`          | Cancel a pending order                             |
-| `status`  | —     | `status`                     | Check bot status and queue                         |
-| `help`    | `h`   | `help [command]`             | Show help                                          |
-
-Semantics:
-
-- **buy** — transactional; validates pair, quantity, funds, stock; withdraws
-  from storage, trades to player, commits ledger, records Trade. Flexible
-  payment: balance + trade diamonds in any combination. Surplus diamonds
-  credited to balance.
-- **sell** — transactional; validates reserve, space, payout; trades items
-  in, deposits to storage, commits ledger, records Trade. Bot offers whole
-  diamonds; fractional payout credited to balance.
-- **price** — inline; shows buy and sell price for qty (defaults to one
-  stack based on item's `stack_size`).
-- **balance / bal [player]** — inline; UUID cached 5 min.
-- **pay** — inline; validates funds; UUID-based transfer; both usernames
-  updated to latest. Payer gets `Paid X diamonds to Y`; payee (if online)
-  gets `You received X diamonds from Y`.
-- **deposit / d [amount]** — queued; cap 768 (12 stacks). No amount →
-  credits actual diamonds offered.
-- **withdraw / w [amount]** — queued; cap 768; requires ≥1 whole diamond.
-  No amount → withdraws full whole-diamond balance (fractional stays).
-- **items / queue / cancel / status / help** — inline quick commands.
-  `cancel` only works on *pending* orders; an order that has already
-  started processing cannot be cancelled. `status` shows one of:
-  `Idle. No orders being processed. Queue is empty.` / `Buying cobblestone
-  x64. 3 order(s) waiting in queue.` / `Processing deposit (128.00
-  diamonds).` — never reveals coordinates.
-
-### Operator commands (require operator status)
-
-Set via CLI menu option 3.
-
-| Command          | Alias | Usage                    | Description                        |
-| ---------------- | ----- | ------------------------ | ---------------------------------- |
-| `additem`        | `ai`  | `additem <item> <qty>`   | Deposit stock via `/trade`         |
-| `removeitem`     | `ri`  | `removeitem <item> <qty>`| Withdraw stock via `/trade`        |
-| `addcurrency`    | `ac`  | `addcurrency <item> <amt>` | Add diamonds to pair reserve     |
-| `removecurrency` | `rc`  | `removecurrency <item> <amt>` | Remove diamonds from reserve  |
-
-### CLI menu (operator interface)
-
-Blocking dialoguer menu in [src/cli.rs](src/cli.rs). All prompts go through
-`with_retry` so a transient terminal-I/O error (e.g. EINTR on resize) is
-retried rather than killing the CLI.
-
-1. **Get user balances** — list all users + balances.
-2. **Get pairs** — all pairs with stock, reserve, calculated buy/sell.
-3. **Set operator status** — prompt for username/UUID, toggle `operator`.
-4. **Add node (no validation)** — writes model-only; operator must ensure
-   the physical node exists.
-5. **Add node (with bot validation)** — bot navigates, opens all 4 chests
-   with fast 5 s timeout, verifies every slot holds a shulker. Fail-fast;
-   typically completes in under 30 seconds.
-6. **Discover storage (scan)** — bot starts at the next unregistered id
-   and walks the spiral, adding every valid node. Stops on the first
-   missing/invalid position.
-7. **Remove node** — deletes `data/storage/{id}.json`. Destructive.
-8. **Add pair** — prompts for item + stack size {1, 16, 64}. Stocks start
-   zero; seed via `additem` / `addcurrency`.
-9. **Remove pair** — warns if stock > 0. Cannot remove `diamond`.
-10. **View storage** — origin, node count, per-node chest summary.
-11. **View recent trades** — trade history (default last 20). Shows
-    timestamp, type, amount, item, currency, user UUID per trade.
-12. **Audit state** — check invariants, report drift without fixing.
-13. **Repair state** — audit + fix safe drift (recomputes `pair.item_stock`).
-14. **Restart Bot** — `BotInstruction::Restart`; disconnect + reconnect.
-15. **Exit** — graceful shutdown (≈ 5–6 s; see "Shutdown sequence" above).
-
-## Development notes
-
-### Error handling
-
-- **`StoreError` enum** ([src/error.rs](src/error.rs)) is the uniform return
-  type for every handler, `execute_queued_order`, plan validators,
-  `apply_chest_sync`, and `assert_invariants`. Variants: `ItemNotFound`,
-  `UnknownPair`, `UnknownUser`, `InsufficientFunds`, `InsufficientStock`,
-  `BotDisconnected`, `TradeTimeout`, `TradeRejected`, `BotError`,
-  `ValidationError`, `ChestOp`, `PlanInfeasible`, `QueueFull`,
-  `InvariantViolation`, `Io`. Bridged to `String` both ways so `?` still
-  flows through the few remaining string-returning helpers.
-- **Bot operations** return `Result<T, String>` internally, converted to
-  the appropriate `StoreError` variant at the Store boundary.
-- **Persistence** returns `Result<(), Box<dyn Error>>`. Save failures leave
-  the Store dirty so it retries on the next tick and again on shutdown.
-- **Invariant lookups** use `Store::expect_pair` / `expect_user`
-  ([src/store/mod.rs](src/store/mod.rs)) instead of `.unwrap()`. A missing
-  key becomes `StoreError::UnknownPair` / `UnknownUser` and a
-  `tracing::error!` — never a panic of the Store task.
-- **Bot journal mutex** is a `parking_lot::Mutex` — no poisoning, no
-  `Result` wrapping. A panic inside the critical section cannot
-  permanently take the bot offline. Callers must not hold the guard across
-  `.await`.
-
-### Item ID handling
-
-- **`ItemId` newtype** ([src/types/item_id.rs](src/types/item_id.rs)) wraps
-  every item-referencing field (`Pair::item`, `Chest::item`, `Order::item`,
-  `Trade::item`, `ChestTransfer::item`). Construction strips `minecraft:`
-  and rejects empty strings, so normalization bugs are compile errors.
-- **Serde**: `#[serde(transparent)]` keeps the on-disk form a bare string
-  — fully backwards compatible.
-- **Bot interaction**: `ItemId::with_minecraft_prefix()` re-adds the prefix
-  when matching Azalea item IDs.
-- **Player input**: both `diamond` and `minecraft:diamond` are accepted.
-
-### Testing
-
-- `cargo test` runs 116 tests. Covers: pricing invariants (12 proptest
-  cases), storage planner parity, queue FIFO + per-user limits, rate-limiter
-  backoff, journal lifecycle, `ItemId` normalization, trade state-machine
-  transitions (happy paths, rollbacks, invalid-transition panics), UUID
-  cache TTL, trade-GUI slot math, and the order-handler integration suite
-  including `sell` / `deposit` / `withdraw` rejection paths.
-- **Property-based AMM tests** via `proptest` assert: `k` never decreases,
-  buy cost > sell payout (positive spread), per-item price rises with trade
-  size, sell payout bounded by reserve, reserves stay strictly positive and
-  finite, buy-then-sell is strictly lossy at resulting reserves, non-positive
-  quantity always returns `None`, `x*y=k` exact at `fee=0.0`, fee knob is
-  monotonic.
-- **`debug_assert!`** guards in [src/store/orders.rs](src/store/orders.rs)
-  and [src/store/handlers/operator.rs](src/store/handlers/operator.rs)
-  verify non-negativity and finiteness in dev/test builds; compiled out of
-  release.
-- **Integration tests** build a `Store` in-memory via `Store::new_for_test`
-  and spawn a mock bot task; `utils::resolve_user_uuid` is cfg-gated to
-  deterministic offline UUIDs under `#[cfg(test)]`.
-
-### Known limitations
-
-1. **Physical node validation is optional** — "Add node (no validation)"
-   trusts the operator. Prefer options 5 or 6 when extending storage.
-2. **Order audit log is session-only** — `data/orders.json` is cleared on
-   each startup. For history use `data/trades/*.json`. The pending queue
-   (`queue.json`) IS persistent.
-3. **Trade history grows unbounded** — one file per trade. Archive via
-   `Trade::archive_old_trades()` (1 year cutoff). Only the newest
-   `max_trades_in_memory` (default 50 000) are loaded into memory.
-4. **Retry logic**: chest opening has up to 3 retries
-   (`CHEST_OP_MAX_RETRIES`), extended to 5 on chunk-not-loaded (3 s base,
-   10 s max backoff); validation/discovery uses zero retries with a 5 s
-   timeout. Shulker opening: 2 retries. Navigation: 2 retries. Container
-   recovery reopens stale chests via the chunk-aware path. Constants in
-   [src/constants.rs](src/constants.rs).
-5. **Single-server design** — no coordination between instances; multiple
-   bots on one data directory will corrupt state.
-6. **No partial fulfillment** — if the full quantity can't be satisfied,
-   the order fails. No split orders.
-7. **Memory usage** — all users, pairs, and (up to `max_trades_in_memory`)
-   trades load into memory on startup. Tune in config for large stores.
-8. **Interrupted-trade recovery is detection-only** — `current_trade.json`
-   is mirrored at every phase. On startup the Store logs and clears it;
-   automatic re-queue/rollback is Phase 3 (see [RECOVERY.md](RECOVERY.md)
-   section 4 for the manual playbook).
 
 ## Where to start reading
 

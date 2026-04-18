@@ -1,10 +1,10 @@
 # cj-store — Data Schema
 
-Reference for every JSON file the bot reads or writes under `data/`. The
-README's [Persistence Layout](README.md#persistence-layout-authoritative-spec)
-section walks through the fields in prose; this document is the quick
-lookup — *where* each file lives, *what shape* it has, and *what owns it*
-at runtime.
+Reference for every JSON file the bot reads or writes under `data/`.
+Companion to [ARCHITECTURE.md](ARCHITECTURE.md) (runtime owners of each
+file) and [RECOVERY.md](RECOVERY.md) (what to do when one is corrupt or
+stuck). This document is the quick lookup — *where* each file lives,
+*what shape* it has, and *what owns it* at runtime.
 
 All files are hand-writable JSON. Writes go through `fsutil::write_atomic`
 (write to `<file>.tmp`, then rename) so a crash mid-save never corrupts the
@@ -78,7 +78,7 @@ above if omitted.
 
 ### Constraints
 
-Enforced by `Config::validate` in [src/config.rs](../src/config.rs):
+Enforced by `Config::validate` in [src/config.rs](src/config.rs):
 
 - `fee ∈ [0.0, 1.0]`
 - `position.y ∈ [-64, 320]`
@@ -106,7 +106,7 @@ initialized against.
 ## `data/pairs/<item>.json`
 
 One file per trading pair. Filename is the canonical item id (no
-`minecraft:` prefix). See [src/types/pair.rs](../src/types/pair.rs).
+`minecraft:` prefix). See [src/types/pair.rs](src/types/pair.rs).
 
 ```json
 {
@@ -128,7 +128,7 @@ One file per trading pair. Filename is the canonical item id (no
 ## `data/users/<uuid>.json`
 
 One file per known player. Filename is the hyphenated Mojang UUID. See
-[src/types/user.rs](../src/types/user.rs).
+[src/types/user.rs](src/types/user.rs).
 
 ```json
 {
@@ -149,8 +149,8 @@ One file per known player. Filename is the hyphenated Mojang UUID. See
 ## `data/storage/<node_id>.json`
 
 One file per physical node (cluster of 4 chests). Filename is the numeric
-`node_id` starting at 0. See [src/types/node.rs](../src/types/node.rs) and
-[src/types/chest.rs](../src/types/chest.rs).
+`node_id` starting at 0. See [src/types/node.rs](src/types/node.rs) and
+[src/types/chest.rs](src/types/chest.rs).
 
 ```json
 {
@@ -186,7 +186,7 @@ Invariants:
 
 In-memory audit log, mirrored to disk for visibility. Cleared on each
 startup — the source of truth for historical orders is
-`data/trades/*.json`. See [src/types/order.rs](../src/types/order.rs).
+`data/trades/*.json`. See [src/types/order.rs](src/types/order.rs).
 
 ```json
 [
@@ -201,13 +201,13 @@ startup — the source of truth for historical orders is
 
 `order_type` is one of `"Buy" | "Sell" | "AddItem" | "RemoveItem" |
 "DepositBalance" | "WithdrawBalance" | "AddCurrency" | "RemoveCurrency"` —
-see [src/types/order.rs](../src/types/order.rs). Only runtime tracking for
+see [src/types/order.rs](src/types/order.rs). Only runtime tracking for
 the current session; historical records live in `data/trades/*.json`.
 
 ## `data/queue.json`
 
 Pending orders waiting to be processed. Survives restarts. See
-[src/store/queue.rs](../src/store/queue.rs).
+[src/store/queue.rs](src/store/queue.rs).
 
 ```json
 {
@@ -238,7 +238,7 @@ Pending orders waiting to be processed. Survives restarts. See
 
 Active shulker-box operation, written every phase. A non-empty file at
 startup means the previous run crashed mid chest I/O. See
-[src/store/journal.rs](../src/store/journal.rs).
+[src/store/journal.rs](src/store/journal.rs).
 
 Historically serialized as a one-entry array for forward compatibility;
 `load_from` reads a `Vec<JournalEntry>` and keeps only the last.
@@ -263,7 +263,7 @@ Historically serialized as a one-entry array for forward compatibility;
 
 In-flight `TradeState` snapshot, rewritten on every phase transition and
 deleted on terminal state. Any non-empty file at startup means a mid-trade
-crash. See [src/store/trade_state.rs](../src/store/trade_state.rs).
+crash. See [src/store/trade_state.rs](src/store/trade_state.rs).
 
 The file holds one `TradeState` serialized as an externally-tagged enum —
 shape differs by variant. Example (`Withdrawing`):
@@ -288,7 +288,7 @@ shape differs by variant. Example (`Withdrawing`):
 ```
 
 Other variants: `Queued`, `Trading`, `Depositing`, `Committed`, `RolledBack`.
-See [RECOVERY.md](../RECOVERY.md) for what to do if this file is present on
+See [RECOVERY.md](RECOVERY.md) for what to do if this file is present on
 startup.
 
 ## `data/trades/<timestamp>.json`
@@ -310,7 +310,7 @@ the bot's custom ISO-8601 form: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnn+HH-MM`
 
 `trade_type` is one of `"Buy" | "Sell" | "AddStock" | "RemoveStock" |
 "DepositBalance" | "WithdrawBalance" | "AddCurrency" | "RemoveCurrency"`
-— see [src/types/trade.rs](../src/types/trade.rs).
+— see [src/types/trade.rs](src/types/trade.rs).
 On startup the Store loads at most `max_trades_in_memory` files (newest
 first); older files stay on disk untouched.
 

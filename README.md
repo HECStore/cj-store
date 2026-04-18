@@ -10,8 +10,10 @@ integration.
 
 | Doc                                  | What's in it                                                                    |
 | ------------------------------------ | ------------------------------------------------------------------------------- |
-| [ARCHITECTURE.md](ARCHITECTURE.md)   | Runtime topology, trade state machine, commands, pricing, rollback, dev notes  |
+| [ARCHITECTURE.md](ARCHITECTURE.md)   | Runtime topology, trade state machine, AMM pricing, rollback, storage model    |
+| [COMMANDS.md](COMMANDS.md)           | Player + operator whisper commands and the 15-option CLI menu                  |
 | [DATA_SCHEMA.md](DATA_SCHEMA.md)     | Every JSON file under `data/` — config, pairs, users, storage, queue, journal  |
+| [DEVELOPMENT.md](DEVELOPMENT.md)     | Build setup, error model, item IDs, testing, known limitations, perf tuning    |
 | [RECOVERY.md](RECOVERY.md)           | Operator runbook — corrupted pairs, stuck journal, orphaned shulker, troubleshooting |
 
 ## What it does
@@ -19,8 +21,7 @@ integration.
 - Listens for `/msg <bot> <command>` whispers from players
 - Runs **buy** / **sell** / **price** / **balance** / **pay** /
   **deposit** / **withdraw** / **queue** / **cancel** / **status** /
-  **help** / **items** — full details in
-  [ARCHITECTURE.md § Commands](ARCHITECTURE.md#commands)
+  **help** / **items** — full details in [COMMANDS.md](COMMANDS.md)
 - Prices via **constant-product AMM** (`x × y = k`, Uniswap-style) so
   larger trades pay slippage and the pool can never be drained
 - Fulfills trades physically: walks to chests, extracts items from
@@ -93,15 +94,6 @@ Players can then:
 - Order books / limit orders
 - Multi-item trades
 - Statistics and analytics
-
-## Build notes
-
-- **Rust edition 2024**; **nightly toolchain** pinned via
-  `rust-toolchain.toml`. `.cargo/config.toml` uses `-Z...` flags that
-  require nightly — remove them to build on stable.
-- Tested on Windows; Linux and macOS should work unchanged.
-- Logging goes **only** to `data/logs/store.log` (stdout prints a
-  "how to tail" hint on startup).
 
 ## Security
 

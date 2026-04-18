@@ -298,3 +298,142 @@ at startup means the bot crashed between "mark committed/rolled back" and
 - After any manual edit to `data/pairs/` or `data/storage/`, run the CLI
   `audit-state` with `repair: false` first to see the drift, then with
   `repair: true` only if the suggested repair is what you want.
+
+---
+
+## Known issues (non-actionable warnings)
+
+These show up in `data/logs/store.log` and are **handled** — no operator
+action needed. Listed so you recognize them.
+
+- **Packet decode errors** (e.g. `set_equipment ... Unexpected enum variant`).
+  Protocol drift between the server build and Azalea's decoder. The bot
+  reconnects with exponential backoff.
+- **Duplicate-login disconnect**. The same Microsoft account logged in
+  somewhere else. The bot reconnects automatically; if it keeps happening,
+  log out from other clients.
+- **"Global logger already set"** on reinit. The tracing bootstrap is
+  idempotent — this is swallowed silently.
+
+If any of these stop self-healing (bot stays offline for more than a few
+minutes), the reconnect backoff itself has probably given up; restart via
+CLI "Restart Bot" or restart the process.
+
+---
+
+## 5. Bot connection problems
+
+**"Failed to connect"**. Check `account_email` and `server_address` in
+`data/config.json`. Re-run with `cargo run -- --dry-run` to validate the
+file without attempting login.
+
+**"Duplicate login"**. The account is active elsewhere. Log out of all
+other clients (including the Minecraft launcher if it's auto-joining) and
+restart the bot.
+
+**"Protocol decode errors" that don't self-heal**. The server is running a
+Minecraft version that Azalea can't talk to. Either downgrade the server or
+wait for an Azalea update — nothing configuration can fix from this side.
+
+---
+
+## 6. Storage drift and missing stock
+
+**"Chest not found"**. The physical chest doesn't exist where the model
+says it should. Verify the node was built correctly before adding it via
+CLI option 5 (validated add) instead of option 4 (unvalidated).
+
+**"Storage mismatch" / audit-state reports drift**. Pair stock disagrees
+with chest sum. Causes: items moved manually in-world, a crashed chest op
+(see section 2), or a legitimate bug. Fix: CLI option 13 "Repair state"
+recomputes `pair.item_stock` from the actual storage contents.
+
+**"Node 0 chest 0" item-assignment errors**. Chest 0 of node 0 is dedicated
+to diamonds; the system refuses other items. Don't try to override it.
+
+**"Out of physical stock"** (pair says stock, storage disagrees). Happens
+when items were removed externally or after a mid-op crash. Run "Repair
+state"; if that doesn't help, add items back via operator `additem`.
+
+**"Storage full"**. All assigned chests are full and no empty chests are
+available. The system will assign a new chest in an existing node or
+provoke a new node — but a new node requires the physical build to exist
+in-world. Add nodes via CLI options 4 / 5 first.
+
+---
+
+## 7. Trade failures seen by players
+
+- **"Trade timeout"**. Player didn't accept the trade request within 30 s.
+  The order is cancelled; player can re-queue. Nothing to fix server-side.
+- **"Trade closed before items could be validated"**. Player cancelled
+  immediately. Safe — no items or currency exchanged.
+- **"Trade cancelled by player before completion"**. Player cancelled after
+  validation. Same as above — safe.
+- **"Trade validation failed"**. Items in the GUI don't match expected
+  (wrong item, wrong count, or extras). Bot aborts and notifies the player.
+  No recovery needed.
+- **"Inventory full"**. Bot's inventory has filled up unexpectedly. It
+  should self-manage via the hotbar-to-inventory sweep after each trade,
+  and via `buffer_chest_position` if configured. If it persists, stop the
+  bot and clear the inventory manually — see section 3.
+
+---
+
+## 8. Validation and edge cases
+
+These show up as inline error messages to players. None require operator
+action; they're documented here as a cross-reference.
+
+- Negative, zero, non-numeric, or > `i32::MAX` quantities — rejected.
+- Non-existent pair — "Item 'X' is not available for trading".
+- Insufficient stock (physical or ledger) — order rejected.
+- Insufficient funds (balance + offered diamonds for buys; reserve for
+  sells) — order rejected.
+- Price calculation impossible (`item_stock == 0` or `currency_stock == 0`,
+  or computed cost non-finite / ≤ 0) — order rejected with "Internal
+  error: computed price is invalid" (the "internal error" wording is
+  intentional — it means a pair has drained and the operator needs to
+  re-seed reserves).
+- Mojang API unreachable / unknown username — lookup fails for the first
+  command from that player; subsequent commands in the 5-minute cache
+  window succeed.
+
+---
+
+## 9. Rate-limiter and queue messages
+
+Player-facing messages that are sometimes misread as errors.
+
+- **"Please wait X seconds before sending another message"** — player
+  messaging too fast. Backoff doubles (2 s → 4 s → 8 s → … → 60 s) on each
+  violation, resets after 30 s idle. Not an operator concern unless a
+  player is claiming the cooldowns are wrong.
+- **"Queue full. You have 8 pending orders"** — per-user cap. Wait for
+  orders to drain.
+- **"Order #X not found in queue"** — the order already processed or was
+  cancelled. Player can run `queue` to see current ids.
+- **"You can only cancel your own orders"** — players can only cancel
+  their own queue entries. Operator intervention not possible via this
+  path; edit `data/queue.json` by hand if needed, then restart.
+- **Order still pending long after queuing** — FIFO processing; check
+  total queue depth with `queue`.
+- **Orders resume after restart** — the queue is persistent
+  ([DATA_SCHEMA.md](DATA_SCHEMA.md#dataqueuejson)), so a restart doesn't
+  drop pending work.
+
+---
+
+## 10. Performance tuning
+
+- **Slow large withdrawals / deposits** — chest I/O is serialized and
+  per-shulker. A 6-stack withdrawal can easily take 30 s. Not a bug.
+- **High disk I/O every ~2 s** — the autosave debounce. Tune
+  `autosave_interval_secs` if it's thrashing, but remember that raising
+  it widens the crash-loss window.
+- **Queue stalling during bursts** — orders process one at a time. There is
+  no parallelism here, intentionally.
+- **Server restarts / chunk unloads mid-operation** — the bot detects the
+  transient `ChunkNotLoaded` path and retries with longer backoff (up to
+  ~20 s). Stale containers are reopened automatically via the chunk-aware
+  retry. No action needed unless the retries exhaust.

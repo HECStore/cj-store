@@ -34,10 +34,14 @@ Notes:
 
 ## `data/config.json`
 
-Human-edited. Loaded at startup; hot-reloaded on file change (only a subset
-of fields takes effect live — see README *Hot-Reload* table). The
-`--validate-only` / `--dry-run` CLI flag validates this file without
-connecting to the server.
+Human-edited. Loaded at startup; created with defaults on first run (the
+bot then fails on auth — expected; edit the file and run again). The
+`--validate-only` / `--dry-run` CLI flag parses this file, runs
+`Config::validate`, and exits without logging in — exit code `0` on
+success, `1` on validation error (useful in CI or before restarting a
+production bot). Hot-reloaded on file change (debounced ≈500 ms via the
+[`notify`](https://crates.io/crates/notify) crate); a bad edit keeps the
+running config and logs the error.
 
 ```json
 {
@@ -54,13 +58,50 @@ connecting to the server.
 }
 ```
 
-Constraints (see `Config::validate` in [src/config.rs](../src/config.rs)):
+### Fields
+
+| Setting                   | Type             | Default | Description                                                                                                          |
+| ------------------------- | ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `position`                | `{x, y, z}`      | —       | Storage origin — where Node 0 lives in the world                                                                     |
+| `fee`                     | `f64`            | —       | Fee rate (e.g. `0.125` = 12.5 %) — added to buys, subtracted from sells                                              |
+| `account_email`           | string           | —       | Microsoft account email for Azalea login (**required**)                                                              |
+| `server_address`          | string           | —       | Minecraft server hostname, e.g. `"corejourney.org"` (**required**)                                                   |
+| `buffer_chest_position`   | `{x,y,z} \| null`| `null`  | Optional chest the bot can dump overflow into                                                                        |
+| `trade_timeout_ms`        | `u64`            | 45000   | Max wait for a trade-GUI interaction before aborting                                                                 |
+| `pathfinding_timeout_ms`  | `u64`            | 60000   | Max wait for the bot to reach a destination before aborting                                                          |
+| `max_orders`              | `usize`          | 10000   | Prune target for the in-memory order audit log (session-only)                                                        |
+| `max_trades_in_memory`    | `usize`          | 50000   | Max trades loaded into memory on startup (older trades stay on disk)                                                 |
+| `autosave_interval_secs`  | `u64`            | 2       | Minimum interval between debounced autosaves                                                                         |
+
+All timeout and limit fields are optional and fall back to the defaults
+above if omitted.
+
+### Constraints
+
+Enforced by `Config::validate` in [src/config.rs](../src/config.rs):
 
 - `fee ∈ [0.0, 1.0]`
 - `position.y ∈ [-64, 320]`
-- `server_address` — non-empty; no `://`, no `/`, no whitespace; only
-  ASCII alphanum / `.` / `-` / `:`; optional `:port` must parse as `u16`
+- `server_address` non-empty; no `://`, no `/`, no whitespace; only ASCII
+  alphanum / `.` / `-` / `:`; optional `:port` must parse as `u16`
 - all timeouts / limits positive
+
+### Hot-reload matrix
+
+| Field                                      | Hot-reloadable? | Notes                                                                   |
+| ------------------------------------------ | --------------- | ----------------------------------------------------------------------- |
+| `fee`                                      | ✅ Yes          | Next priced order uses the new rate                                     |
+| `autosave_interval_secs`                   | ✅ Yes          | Next Store loop iteration uses the new debounce                         |
+| `trade_timeout_ms`                         | ❌ Restart      | Cached in the Bot task at startup; warning logged on edit               |
+| `pathfinding_timeout_ms`                   | ❌ Restart      | Cached in the Bot task at startup; warning logged on edit               |
+| `position`, `buffer_chest_position`        | ❌ Restart      | World topology; changing mid-run would break in-flight operations       |
+| `account_email`, `server_address`          | ❌ Restart      | Identity / connection; requires reconnection                            |
+| `max_orders`, `max_trades_in_memory`       | ❌ Restart      | Capacity bounds fixed at load time                                      |
+
+Edits to restart-only fields emit `warn!("Config field '<name>' changed
+but requires restart")` and the in-memory config keeps its original value
+so behavior stays consistent with what the rest of the system was
+initialized against.
 
 ## `data/pairs/<item>.json`
 
@@ -158,7 +199,10 @@ startup — the source of truth for historical orders is
 ]
 ```
 
-`order_type` is one of `"Buy" | "Sell" | "Deposit" | "Withdraw"`.
+`order_type` is one of `"Buy" | "Sell" | "AddItem" | "RemoveItem" |
+"DepositBalance" | "WithdrawBalance" | "AddCurrency" | "RemoveCurrency"` —
+see [src/types/order.rs](../src/types/order.rs). Only runtime tracking for
+the current session; historical records live in `data/trades/*.json`.
 
 ## `data/queue.json`
 
@@ -264,7 +308,9 @@ the bot's custom ISO-8601 form: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnn+HH-MM`
 }
 ```
 
-`trade_type`: `"Buy" | "Sell" | "Deposit" | "Withdraw"`.
+`trade_type` is one of `"Buy" | "Sell" | "AddStock" | "RemoveStock" |
+"DepositBalance" | "WithdrawBalance" | "AddCurrency" | "RemoveCurrency"`
+— see [src/types/trade.rs](../src/types/trade.rs).
 On startup the Store loads at most `max_trades_in_memory` files (newest
 first); older files stay on disk untouched.
 

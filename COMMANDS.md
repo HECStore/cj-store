@@ -30,55 +30,36 @@ equivalent to `/msg <bot> buy cobblestone 64`.
 | `status`  | —     | `status`                     | Check bot status and queue                         |
 | `help`    | `h`   | `help [command]`             | Show help                                          |
 
-### Semantics
+### Per-command detail
 
-Every command runs in one of three modes.
+Each command runs in one of three modes:
 
-- **Inline** — handled synchronously on the Store loop; the bot replies
-  in the same tick. No disk writes, no chest I/O, no `/trade` GUI.
-  Commands: `price`, `balance`, `pay`, `items`, `queue`, `cancel`,
-  `status`, `help`.
-- **Queued** — persisted to `data/queue.json` and serviced in FIFO
-  order. No physical I/O required when it pops. Commands: `deposit` /
-  `withdraw` that move balance without a trade-GUI exchange.
-- **Transactional** — queued, and when popped rides the full
-  `TradeState` lifecycle: validate → withdraw from storage → `/trade`
-  GUI → deposit to storage → commit. Rolls back atomically on any
-  failure. Commands: `buy`, `sell`, operator `additem`, operator
-  `removeitem`.
+- **Inline** — answered in the same Store-loop tick; no disk, no I/O, no `/trade`.
+- **Queued** — persisted to `data/queue.json`; serviced FIFO; no `/trade`.
+- **Transactional** — queued, then rides the full `TradeState` lifecycle
+  (validate → withdraw → `/trade` → deposit → commit) with atomic rollback.
 
-### Quick reference
+| Command | Mode | Behavior |
+| ------- | ---- | -------- |
+| `buy` | Transactional | Validates pair/qty/funds/stock. Payment is flexible: balance + trade diamonds in any combo; surplus diamonds are credited back to balance. |
+| `sell` | Transactional | Validates reserve/space/payout. Bot offers whole diamonds only; fractional payout is credited to balance. |
+| `price` | Inline | Buy and sell price for `qty` (default: one stack of the item's `stack_size`). |
+| `balance` | Inline | UUID cached for 5 min. |
+| `pay` | Inline | UUID-based transfer; both usernames refreshed. Payer: `Paid X diamonds to Y`; payee (if online): `You received X diamonds from Y`. |
+| `deposit` | Queued | Cap = `12 × 64 = 768` (trade GUI offer slots × max stack). No `amount` → credits whatever the player offers. |
+| `withdraw` | Queued | Cap = 768 (same derivation). Requires ≥1 whole diamond. No `amount` → withdraws the whole-diamond balance; fractional stays. |
+| `items` / `queue` | Inline | Paginated, 4 per page. |
+| `cancel` | Inline | *Pending* orders only. A processing order replies `Order #<id> is currently being processed (<phase>) and cannot be cancelled.` |
+| `status` | Inline | Never reveals coordinates. Examples below. |
+| `help` | Inline | Per-command or overview. |
 
-- **buy** — transactional; validates pair, quantity, funds, stock; withdraws
-  from storage, trades to player, commits ledger, records Trade. Flexible
-  payment: balance + trade diamonds in any combination. Surplus diamonds
-  credited to balance.
-- **sell** — transactional; validates reserve, space, payout; trades items
-  in, deposits to storage, commits ledger, records Trade. Bot offers whole
-  diamonds; fractional payout credited to balance.
-- **price** — inline; shows buy and sell price for qty (defaults to one
-  stack based on item's `stack_size`).
-- **balance / bal [player]** — inline; UUID cached 5 min.
-- **pay** — inline; validates funds; UUID-based transfer; both usernames
-  updated to latest. Payer gets `Paid X diamonds to Y`; payee (if online)
-  gets `You received X diamonds from Y`.
-- **deposit / d [amount]** — queued; cap 768 (12 trade-GUI slots × 64-item
-  max-stack — not an arbitrary limit). No amount → credits actual diamonds
-  offered.
-- **withdraw / w [amount]** — queued; cap 768 (same derivation); requires
-  ≥1 whole diamond. No amount → withdraws full whole-diamond balance
-  (fractional stays).
-- **items** — inline; paginates tradeable items, 4 per page.
-- **queue** — inline; shows your pending orders, 4 per page.
-- **cancel** — inline; only works on *pending* orders. An order already
-  being processed gets the exact reply `Order #<id> is currently being
-  processed (<phase>) and cannot be cancelled.` (`<phase>` is the current
-  `TradeState` phase).
-- **status** — inline; shows one of: `Idle. No orders being processed.
-  Queue is empty.` / `Buying cobblestone x64. 3 order(s) waiting in
-  queue.` / `Processing deposit (128.00 diamonds).` — never reveals
-  coordinates.
-- **help** — inline; per-command help or overview.
+`status` replies:
+
+| State                | Reply                                                       |
+| -------------------- | ----------------------------------------------------------- |
+| Idle, empty queue    | `Idle. No orders being processed. Queue is empty.`          |
+| Executing a trade    | `Buying cobblestone x64. 3 order(s) waiting in queue.`      |
+| Executing a deposit  | `Processing deposit (128.00 diamonds).`                     |
 
 ## Operator commands (require operator status)
 
@@ -101,6 +82,10 @@ to the AMM reserve; no in-game diamonds move.
 Blocking dialoguer menu in [src/cli.rs](src/cli.rs) — 16 entries. All
 prompts go through `with_retry` so a transient terminal-I/O error (e.g.
 EINTR on resize) is retried rather than killing the CLI.
+
+> Numbering below is **1-based** (how the menu renders to the operator).
+> In [src/cli.rs](src/cli.rs) the items are 0-indexed, so "option 15
+> Clear stuck order" is index `14` in the source.
 
 1. **Get user balances** — list all users + balances.
 2. **Get pairs** — all pairs with stock, reserve, calculated buy/sell.

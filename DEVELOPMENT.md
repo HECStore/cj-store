@@ -59,14 +59,8 @@ instead of `.unwrap()`. A missing key becomes `StoreError::UnknownPair` /
 `parking_lot::Mutex` — no poisoning, no `Result` wrapping. A panic inside
 the critical section cannot permanently take the bot offline (unlike
 `std::sync::Mutex` where a poisoned guard would have to be explicitly
-recovered).
-
-**Async trap:** callers must not hold the guard across `.await`. Holding
-the guard while suspending blocks every other caller on that mutex until
-the current task resumes — and if the task is blocked waiting on some
-other resource that in turn wants the journal guard, you have a deadlock
-that no async-runtime scheduling can break. Scope the `lock()` narrowly
-around the field reads/writes, then drop it before any `.await`.
+recovered). The usual async discipline — never hold the guard across
+`.await` — applies and is enforced at call sites.
 
 ## Item ID handling
 
@@ -84,14 +78,13 @@ around the field reads/writes, then drop it before any `.await`.
 
 ## Testing
 
-- `cargo test` runs the full test suite (unit + integration + proptest). Covers:
-  pricing invariants (11 proptest cases), storage planner parity, queue
-  FIFO + per-user limits, rate-limiter backoff, journal lifecycle,
-  `ItemId` normalization, trade state-machine transitions (happy paths,
-  rollbacks, invalid-transition panics), UUID cache TTL, trade-GUI slot
-  math, and the order-handler integration suite including `sell` /
-  `deposit` / `withdraw` rejection paths. Exact count drifts with each
-  commit — see `cargo test --no-run` output for the current number.
+- `cargo test` runs the full suite (unit + integration + proptest). Coverage:
+  pricing invariants, storage planner parity, queue FIFO + per-user limits,
+  rate-limiter backoff, journal lifecycle, `ItemId` normalization, trade
+  state-machine transitions (happy paths, rollbacks, invalid-transition
+  panics), UUID cache TTL, trade-GUI slot math, and the order-handler
+  integration suite including `sell`/`deposit`/`withdraw` rejection paths.
+  For exact counts at HEAD, see `cargo test --no-run` output.
 - **Property-based AMM tests** via `proptest` assert: `k` never decreases,
   buy cost > sell payout (positive spread), per-item price rises with trade
   size, sell payout bounded by reserve, reserves stay strictly positive and

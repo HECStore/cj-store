@@ -25,17 +25,9 @@ atomically to JSON under `data/`.
 
 ## What it does
 
-- Listens for `/msg <bot> <command>` whispers from players
-- Runs **buy** / **sell** / **price** / **balance** / **pay** /
-  **deposit** / **withdraw** / **queue** / **cancel** / **status** /
-  **help** / **items** — full details in [COMMANDS.md](COMMANDS.md)
-- Prices via **constant-product AMM** (`x × y = k`, Uniswap-style) so
-  larger trades pay slippage and the pool can never be drained
-- Fulfills trades physically: walks to chests, extracts items from
-  shulker boxes, uses the server's `/trade` GUI, deposits received items
-  back into storage
-- Persists every commit atomically to JSON under `data/`
-- Operator menu (CLI) for balances, pairs, nodes, audit/repair, restart
+- Serves player whispers (`/msg <bot> …`) — full command list in [COMMANDS.md](COMMANDS.md).
+- Prices via **constant-product AMM** (`x × y = k`, Uniswap-style) so big trades pay slippage and pools can't drain.
+- Fulfills trades physically: walks to chests, opens shulkers, uses the server's `/trade` GUI, deposits back — all commits atomic JSON under `data/`.
 
 ## Quick start
 
@@ -99,32 +91,17 @@ Players can then:
 
 ## Feature status
 
-**Implemented**
+What's shipped is described across the other docs. Things that are **not yet
+implemented** and that someone reading the code might expect:
 
-- All player + operator commands (see [COMMANDS.md](COMMANDS.md))
-- Trade GUI automation (`/trade`) with timeouts and rollback
-- Storage-backed fulfillment with automated shulker-box I/O and spiral node
-  expansion
-- Constant-product AMM pricing with slippage
-- Persistent FIFO order queue (8 per user, 128 global) and anti-spam rate
-  limiter with exponential backoff
-- Crash *detection* for in-flight trades and chest ops — the bot flags the
-  inconsistency on startup and clears its journal; physical and ledger
-  reconciliation is an operator task, see [RECOVERY.md](RECOVERY.md)
-- Debounced atomic autosave + hot-reloadable `config.json` fields (see
-  [DATA_SCHEMA.md § Hot-reload matrix](DATA_SCHEMA.md#hot-reload-matrix))
+- Automatic crash-resume. Today the bot *detects* an interrupted trade or
+  chest op on startup, logs it, and clears the journal; reconciling the
+  world and ledger is an operator task (see [RECOVERY.md](RECOVERY.md)).
+  Planned behavior: [ARCHITECTURE.md § Planned: automatic crash-resume](ARCHITECTURE.md#planned-automatic-crash-resume).
+- Order books / limit orders, multi-item trades, statistics.
 
 See [DEVELOPMENT.md § Known limitations](DEVELOPMENT.md#known-limitations)
 for the full list of things that are intentionally not handled.
-
-**Planned**
-
-- Automatic crash-resume (re-queue or rollback on startup instead of
-  today's detect-and-clear) — see
-  [ARCHITECTURE.md § Trade state machine](ARCHITECTURE.md#trade-state-machine)
-- Order books / limit orders
-- Multi-item trades
-- Statistics and analytics
 
 ## Security
 
@@ -141,9 +118,9 @@ CLI option 3. All user operations are keyed on Mojang UUID, not username.
 — not a password. Azalea signs in via Microsoft's OAuth device-code flow
 and caches the refresh token under the OS's standard Minecraft auth
 path (outside this repo), so `data/` contains no secrets. `data/users/`
-holds Mojang UUIDs and last-seen usernames only. If you intend to share
-or publish this repo, still add `data/` to `.gitignore` — economic state
-(balances, reserves, trade history) is sensitive even without credentials.
+holds Mojang UUIDs and last-seen usernames only. Economic state
+(balances, reserves, trade history) in `data/` is still sensitive —
+`.gitignore` it before publishing.
 
 ## License
 

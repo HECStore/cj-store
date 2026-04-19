@@ -232,6 +232,22 @@ being popped from the queue but before reaching a terminal state.
 > per-phase procedure below only when items, balances, or reserves
 > need manual reconciliation.
 
+**Commit math.** Every committed order mutates pair reserves and user
+balance deterministically. Use this table to reconstruct what a crashed
+commit *would* have done; each phase-subsection below refers back to it.
+
+| Order type          | `pair.item_stock` | `pair.currency_stock` | `user.balance`     |
+| ------------------- | ----------------- | --------------------- | ------------------ |
+| `Buy` (qty, cost)   | `− qty`           | `+ cost`              | unchanged†         |
+| `Sell` (qty, payout)| `+ qty`           | `− payout`            | `+ fractional`†    |
+| `DepositBalance`    | unchanged         | unchanged             | `+ amount`         |
+| `WithdrawBalance`   | unchanged         | unchanged             | `− amount`         |
+
+† Buy may debit balance if the player paid via balance; sell pays whole
+diamonds via trade and credits only the fractional remainder. See
+[src/store/orders.rs](src/store/orders.rs) `execute_queued_order` for the
+authoritative math.
+
 **Fix**
 
 Open `data/current_trade.json`. The outermost key is the phase name. Then:
@@ -273,10 +289,10 @@ bot's inventory — reach for player reports only if that's ambiguous.
      Treat as cancelled. Section 3 applies; put the shulker back into
      its chest slot.
    - is missing (and the player, if online, now has those items) → the
-     trade **confirmed** before the crash. Treat as committed: manually
-     mirror what a normal commit would do for that pair — for a `Buy`,
-     decrement `item_stock` by `quantity` and increment `currency_stock`
-     by the paid diamond amount; for a `Sell`, do the inverse.
+     trade **confirmed** before the crash. Treat as committed: apply the
+     [Commit math table](#4-interrupted-datacurrent_tradejson) for the
+     order's type. (Note: storage counts were *not* synced back after the
+     crash, so run `audit-state` after restart.)
 3. **Only if step 2 is ambiguous**, contact the affected player. If they
    say the trade went through, treat as committed; otherwise treat as
    cancelled. Server logs can corroborate either way.
@@ -295,24 +311,14 @@ multiple chest ops.
 3. Go into the world, find any shulkers on the station / in the bot /
    on the floor near the destination chest, and put them in the chest
    slot named by the relevant plan entry.
-4. Manually update the pair(s):
-   - For `Buy` orders: the pair's `item_stock` should *decrease* by
-     `quantity`, and `currency_stock` should *increase* by the diamond
-     amount paid. Check the order and apply.
-   - For `Sell` orders: inverse — `item_stock` up by `items_received`
-     sum, `currency_stock` down by the payout.
-   - For `Deposit` / `Withdraw`: no pair changes; these move user balance
-     only.
-5. Manually update the user's `balance` in `data/users/<uuid>.json`
-   (add payout for `Sell`, add credit for `Deposit`, deduct for
-   `Withdraw`, no change for `Buy`). Reference
-   [src/store/orders.rs](src/store/orders.rs) `execute_queued_order` for
-   the exact commit math.
-6. Append a manual entry to `data/trades/<now>.json` matching the
+4. Manually mirror the commit using the [Commit math table](#4-interrupted-datacurrent_tradejson)
+   at the top of this section — apply the row for this order's type to
+   `data/pairs/<item>.json` and `data/users/<uuid>.json`.
+5. Append a manual entry to `data/trades/<now>.json` matching the
    completed trade so the audit log isn't missing it. Shape is in
    [DATA_SCHEMA.md](DATA_SCHEMA.md#datatradestimestampjson).
-7. Delete `data/current_trade.json`.
-8. Start the bot and run `audit-state` — it must report no drift.
+6. Delete `data/current_trade.json`.
+7. Start the bot and run `audit-state` — it must report no drift.
 
 ### Phase: `Committed` / `RolledBack`
 
@@ -328,8 +334,7 @@ Don't just delete the file blindly, though:
 2. Open `data/current_trade.json`. Note the `order` body (item, quantity,
    user, order type).
 3. For `Committed`: verify `pair.item_stock`, `pair.currency_stock`, and
-   the user's `balance` reflect the commit (use the math in the
-   `Depositing` procedure above as a reference for what a commit does).
+   the user's `balance` match the [Commit math table](#4-interrupted-datacurrent_tradejson).
    If they don't match — the crash landed *between* the state change and
    the file delete but somehow skipped the ledger write — follow the
    `Depositing` procedure to reconcile.
@@ -390,19 +395,14 @@ in-world. Add nodes via CLI options 4 / 5 first.
 
 ## 7. Trade failures seen by players
 
-- **"Trade timeout"**. Player didn't accept the trade request within 30 s.
-  The order is cancelled; player can re-queue. Nothing to fix server-side.
-- **"Trade closed before items could be validated"**. Player cancelled
-  immediately. Safe — no items or currency exchanged.
-- **"Trade cancelled by player before completion"**. Player cancelled after
-  validation. Same as above — safe.
-- **"Trade validation failed"**. Items in the GUI don't match expected
-  (wrong item, wrong count, or extras). Bot aborts and notifies the player.
-  No recovery needed.
-- **"Inventory full"**. Bot's inventory has filled up unexpectedly. It
-  should self-manage via the hotbar-to-inventory sweep after each trade,
-  and via `buffer_chest_position` if configured. If it persists, stop the
-  bot and clear the inventory manually — see section 3.
+Most trade-failure messages (`Trade timeout`, `Trade cancelled by player`,
+`Trade validation failed`, etc.) are self-explanatory, safe, and require
+no operator action — the player can just re-submit. The exception:
+
+- **"Inventory full"**. The hotbar-to-inventory sweep and (optional)
+  `buffer_chest_position` normally keep the bot's inventory drained. If
+  this persists, stop the bot and clear the inventory manually — see
+  section 3.
 
 ---
 
@@ -429,24 +429,16 @@ action; they're documented here as a cross-reference.
 
 ## 9. Rate-limiter and queue messages
 
-Player-facing messages that are sometimes misread as errors.
+Rate-limit and queue-full messages are intended player feedback, not
+errors. The only operator-relevant note:
 
-- **"Please wait X seconds before sending another message"** — player
-  messaging too fast. Backoff doubles (2 s → 4 s → 8 s → … → 60 s) on each
-  violation, resets after 30 s idle. Not an operator concern unless a
-  player is claiming the cooldowns are wrong.
-- **"Queue full. You have 8 pending orders"** — per-user cap. Wait for
-  orders to drain.
-- **"Order #X not found in queue"** — the order already processed or was
-  cancelled. Player can run `queue` to see current ids.
-- **"You can only cancel your own orders"** — players can only cancel
-  their own queue entries. Operator intervention not possible via this
-  path; edit `data/queue.json` by hand if needed, then restart.
-- **Order still pending long after queuing** — FIFO processing; check
-  total queue depth with `queue`.
-- **Orders resume after restart** — the queue is persistent
-  ([DATA_SCHEMA.md](DATA_SCHEMA.md#dataqueuejson)), so a restart doesn't
-  drop pending work.
+- To cancel someone else's queue entry (the in-game `cancel` command
+  rejects this as `"You can only cancel your own orders"`), stop the
+  bot, edit `data/queue.json` by hand, and restart.
+
+See [ARCHITECTURE.md § Rate limiting](ARCHITECTURE.md#rate-limiting-anti-spam)
+and [ARCHITECTURE.md § Queue limits](ARCHITECTURE.md#queue-limits) for the
+rules behind the messages.
 
 ---
 
@@ -469,7 +461,7 @@ Player-facing messages that are sometimes misread as errors.
 
 ---
 
-## Benign log noise
+## Appendix: benign log noise
 
 These show up in `data/logs/store.log`, are self-handled by the bot, and
 need no operator action. Listed so you recognize them when scanning logs.

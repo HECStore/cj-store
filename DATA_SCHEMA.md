@@ -278,18 +278,16 @@ deleted on terminal state. Any non-empty file at startup means a mid-trade
 crash. See [src/store/trade_state.rs](src/store/trade_state.rs).
 
 The file holds one `TradeState` serialized as an externally-tagged enum —
-shape differs by variant. Example (`Withdrawing`):
+shape differs by variant. Two examples matter most for recovery:
+
+`Withdrawing` (bot was pulling from storage, no player interaction yet):
 
 ```json
 {
   "Withdrawing": {
     "order": {
-      "id": 42,
-      "user_uuid": "uuid-X",
-      "username": "PlayerX",
-      "order_type": "Buy",
-      "item": "cobblestone",
-      "quantity": 64,
+      "id": 42, "user_uuid": "uuid-X", "username": "PlayerX",
+      "order_type": "Buy", "item": "cobblestone", "quantity": 64,
       "queued_at": "2026-04-17T14:41:14Z"
     },
     "plan": [
@@ -299,8 +297,28 @@ shape differs by variant. Example (`Withdrawing`):
 }
 ```
 
-Other variants: `Queued`, `Trading`, `Depositing`, `Committed`, `RolledBack`.
-See [RECOVERY.md](RECOVERY.md) for what to do if this file is present on
+`Depositing` (GUI completed; bot was putting items back — hardest to
+hand-reconcile, referenced by [RECOVERY.md § 4](RECOVERY.md#phase-depositing)):
+
+```json
+{
+  "Depositing": {
+    "order": { /* same QueuedOrder shape as above */ },
+    "trade_result": {
+      "items_received": [
+        { "item": "cobblestone", "count": 64 }
+      ]
+    },
+    "deposit_plan": [
+      { "chest_id": 2, "slot_index": 0, "amount": 64 }
+    ]
+  }
+}
+```
+
+Other variants: `Queued(QueuedOrder)`, `Trading { order, withdrawn }`,
+`Committed(CompletedTrade)`, `RolledBack { order, reason }`. See
+[RECOVERY.md](RECOVERY.md) for what to do if this file is present on
 startup.
 
 ## `data/trades/<timestamp>.json`
@@ -343,8 +361,6 @@ to migrate by hand when needed. Until a versioning scheme is introduced:
 - **Renames and removals** of fields or enum variants are breaking and
   require a one-shot migration script checked in under `tools/` (no
   tooling exists yet because no such migration has been needed).
-- Unknown / garbled fields silently fall back to defaults; there is no
-  `deny_unknown_fields` anywhere in the codebase. That is convenient for
-  forward-compat but it means a typo in a hand edit (`"currency_sotck"`)
-  loads as zero instead of erroring. Hand-audit after any schema-shape
-  change.
+- No `deny_unknown_fields` anywhere: typos in hand edits (`"currency_sotck"`)
+  silently load as the default instead of erroring. Hand-audit after any
+  schema-shape change.

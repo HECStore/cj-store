@@ -8,18 +8,9 @@ command reference see [COMMANDS.md](COMMANDS.md); for developer reference
 [DATA_SCHEMA.md](DATA_SCHEMA.md); for operational playbooks see
 [RECOVERY.md](RECOVERY.md).
 
-## Reading order
-
-If you are new to the codebase, start here, then drop into the section that
-matches what you're trying to change:
-
-| You want to understand…             | Jump to                                                                       |
-| ----------------------------------- | ----------------------------------------------------------------------------- |
-| The three-task layout               | [Runtime topology](#runtime-topology)                                         |
-| How a whisper becomes an order      | [Command dispatch pipeline](#command-dispatch-pipeline)                       |
-| One trade, end to end               | [Trade state machine](#trade-state-machine)                                   |
-| Physical chests and shulkers        | [Storage physical model](#storage-physical-model)                             |
-| Where to start reading in *code*    | [Where to start reading](#where-to-start-reading) (end of this document)      |
+Top-to-bottom reading order: runtime → dispatch → trade lifecycle → storage
+model → pricing → failure handling. For code pointers, jump to
+[Where to start reading](#where-to-start-reading) at the end.
 
 ## Runtime topology
 
@@ -276,85 +267,58 @@ not predicted.
 4. Bot signals done. Store performs a final save and replies to CLI.
 5. CLI drops `store_tx`; Store's receive loop ends; `try_join!` returns.
 
-Total wall-clock ≈ 5–6 s. The two `DELAY_DISCONNECT_MS` waits are
-deliberate and sequential, not a safety-margin double: the first waits for
-Azalea to flush the `Disconnect` packet to the server, the second waits
-for the OS to tear down the TCP socket after the task is aborted. They
-are independent events — collapsing them lets a subsequent reconnect race
-Azalea's background task.
-
-The Store task breaks from its loop immediately after handling the
-shutdown message — it does not wait for channel closure. All state is
-saved twice: once in the shutdown handler, once in final cleanup as a
-safety measure.
+Total wall-clock ≈ 5–6 s. The two `DELAY_DISCONNECT_MS` waits are *independent*
+events (packet flush, then TCP teardown after the Azalea task is aborted) —
+collapsing them lets a subsequent reconnect race Azalea's background task.
+The Store breaks out of its loop immediately on shutdown and saves state
+twice (shutdown handler + final cleanup) as belt-and-suspenders.
 
 ## Source tree
+
+Only the non-obvious files are annotated. Module names carry the rest.
 
 ```text
 cj-store/
   Cargo.toml
-  .cargo/config.toml            # optional fast-build flags (Bevy-style; -Z flags need nightly)
+  .cargo/config.toml            # optional fast-build flags (-Z needs nightly)
   src/
-    main.rs                     # starts Store + Bot + CLI tasks
-    store/                       # authoritative state + handlers + autosave
+    main.rs                     # spawns Store + Bot + CLI; try_join! on shutdown
+    store/                      # authoritative state + handlers + autosave
       mod.rs                    # Store struct, run loop, message routing
       handlers/
-        mod.rs                  # handler module exports
-        player.rs              # command dispatcher + rate limiting
-        validation.rs           # shared input validators
-        buy.rs                  # buy: validation + enqueue
-        sell.rs                 # sell: validation + enqueue
-        deposit.rs              # deposit: enqueue + handle_deposit_balance_queued
-        withdraw.rs             # withdraw: enqueue + handle_withdraw_balance_queued
+        player.rs               # whisper dispatcher + rate limiting
+        validation.rs
+        buy.rs   sell.rs
+        deposit.rs  withdraw.rs
         info.rs                 # price, balance, pay, items, queue, cancel, status, help
-        operator.rs            # additem, removeitem, add/remove currency
-        cli.rs                 # CLI message handlers
-      command.rs                # Command enum + parse_command() (typed whisper parsing)
-      journal.rs                # chest I/O crash-recovery journal
-      orders.rs                 # order execution (execute_queued_order, handle_buy/sell)
+        operator.rs             # additem, removeitem, add/remove currency
+        cli.rs                  # CLI-originated message handlers
+      command.rs                # Command enum + parse_command
+      journal.rs                # chest-I/O crash-recovery journal
+      orders.rs                 # execute_queued_order, handle_buy/sell
       pricing.rs                # constant-product AMM + proptest
-      queue.rs                  # QueuedOrder, OrderQueue, persistence
-      rate_limit.rs             # anti-spam with exponential backoff
-      rollback.rs               # shared rollback helper
-      state.rs                  # save, audit_state, assert_invariants
-      trade_state.rs             # Trade lifecycle SM + crash-resume persistence
-      utils.rs                  # normalize_item_id, resolve_user_uuid, UUID cache
-    bot/                        # Azalea client + whisper parsing
-      mod.rs                    # Bot struct, BotState, bot_task, event handlers
-      connection.rs             # connect, disconnect
-      navigation.rs             # pathfinding helpers
-      shulker.rs               # shulker place/pickup/open, station position
-      chest_io.rs               # withdraw_shulkers / deposit_shulkers dispatch
+      queue.rs                  # OrderQueue persistence
+      rate_limit.rs             # anti-spam backoff
+      rollback.rs
+      state.rs                  # save, audit, invariants
+      trade_state.rs            # TradeState SM + crash-resume mirror
+      utils.rs                  # normalize_item_id, UUID cache
+    bot/
+      mod.rs                    # Bot struct, event loop
+      connection.rs  navigation.rs  shulker.rs
+      chest_io.rs               # withdraw_shulkers / deposit_shulkers
       trade.rs                  # /trade GUI automation
-      inventory.rs              # ensure_inventory_empty, move_hotbar_to_inventory
+      inventory.rs              # ensure_inventory_empty, hotbar sweep
     cli.rs                      # dialoguer menu → StoreMessage
-    config.rs                   # data/config.json loader/creator
-    constants.rs                # timeouts, retry counts, DOUBLE_CHEST_SLOTS, etc.
-    error.rs                    # StoreError enum
-    fsutil.rs                   # atomic file write helper (temp + rename)
+    config.rs  constants.rs  error.rs
+    fsutil.rs                   # atomic write (temp + rename)
     messages.rs                 # StoreMessage / BotMessage / CliMessage / BotInstruction
-    types.rs                    # types/ module entry: re-exports + shared TradeType enum
+    types.rs                    # entry; re-exports + TradeType
     types/
       item_id.rs                # normalized ItemId newtype
-      user.rs                   # per-user persistence + Mojang UUID lookup
-      pair.rs                   # per-item "pair" persistence (data/pairs/*.json)
-      order.rs                  # global queue persistence (data/orders.json)
-      trade.rs                  # per-trade persistence (data/trades/*.json)
-      storage.rs                # storage graph loader/saver
-      node.rs                   # node placement + per-node chest load/save
-      chest.rs                  # chest schema + per-chest load/save
-      position.rs               # simple x/y/z
-  data/
-    config.json
-    logs/store.log
-    journal.json                # in-flight shulker op (normally empty)
-    orders.json                 # session-only audit log
-    queue.json                  # persistent pending order queue
-    current_trade.json          # in-flight TradeState mirror
-    pairs/*.json
-    users/*.json
-    storage/<node_id>.json
-    trades/*.json
+      user.rs  pair.rs  order.rs  trade.rs
+      storage.rs  node.rs  chest.rs  position.rs
+  data/                         # see DATA_SCHEMA.md
 ```
 
 ## Node layout and chest capacity
@@ -474,32 +438,10 @@ box. `amounts[i]` is the item count **inside** the shulker in slot `i`.
 The Store uses a FIFO queue so quick commands (balance/price/help) stay
 responsive even while trades execute. See [src/store/queue.rs](src/store/queue.rs).
 
-### Order lifecycle
-
-This is the same trade-state machine shown in
-[§ Trade state machine](#trade-state-machine), just collapsed to the
-coarse-grained states a player sees in feedback messages:
-`QUEUED` = `TradeState::Queued`, `PROCESSING` covers
-`Withdrawing`/`Trading`/`Depositing`, `SUCCESS` = `Committed`,
+Order lifecycle is the same machine as [§ Trade state machine](#trade-state-machine).
+The coarse states a player sees map onto it as: `QUEUED` = `Queued`,
+`PROCESSING` = `Withdrawing`/`Trading`/`Depositing`, `SUCCESS` = `Committed`,
 `CANCELLED` = `RolledBack`.
-
-```text
-  QUEUED
-    │  player sends command
-    │  validation: item, quantity, user limits
-    ↓
-  "Order #47 queued (position 3/5). Est. wait: ~2 min."
-    │
-    │  (FIFO wait)
-    ↓
-  PROCESSING
-    │  bot prepares items, sends /trade request
-    ↓
-  ─┬─ Trade accepted + completed ──→ SUCCESS
-   ├─ Trade timeout (30s accept, 45s complete) ──→ CANCELLED
-   ├─ Player cancelled trade ──→ CANCELLED
-   └─ Validation failed ──→ CANCELLED + ROLLBACK
-```
 
 ### Queue limits
 
@@ -549,9 +491,10 @@ Player: buy iron_ingot 32       [allowed after waiting]
 
 ## Trade protocol (`/trade`)
 
-The only mechanism for moving items between bot and player. The bot can
-trade at most **12 stacks per transaction** (768 items at stack-64). Full
-shulker boxes cannot be traded — only loose items.
+The only mechanism for moving items between bot and player. Each side of
+the GUI has **12 offer slots**, so the per-trade cap is `12 × stack_size`:
+768 for stack-64, 192 for stack-16, 12 for unstackable. Full shulker boxes
+cannot be traded — only loose items.
 
 ### Trade lifecycle
 
@@ -636,34 +579,21 @@ Before accepting any trade, the bot verifies:
 
 Failure at any step aborts the trade and notifies the player.
 
-### Withdrawal flow (buy orders)
+### Withdrawal / deposit flow
 
-```
-1. Navigate to node position P
-2. Open chest containing the needed shulker
-3. Take shulker from chest → hotbar slot 0
-4. Place shulker on station (S, 2 blocks west)
-5. Open shulker and transfer items to inventory (9-35)
-6. Break shulker (drops as item)
-7. Walk to pickup position (X, 3 blocks west of P)
-8. Pick up dropped shulker
-9. Return to P and put shulker back in its chest slot
-10. Repeat if more items needed
-```
+Per-shulker hop sequence (same for both directions, differs only in which
+way items move at step 3):
 
-### Deposit flow (sell orders)
+1. **Chest → hotbar.** Navigate to node P, open chest, take shulker into
+   hotbar slot 0.
+2. **Hotbar → station.** Place shulker on station block S (2 blocks west).
+3. **Transfer.** Open shulker; move items in (deposit) or out (withdraw)
+   between shulker GUI and inventory slots 9–35.
+4. **Station → inventory.** Break shulker; walk to pickup X; grab drop.
+5. **Inventory → chest.** Walk back to P; place shulker back in its slot.
 
-```
-1. Navigate to node position P
-2. Find chest for this item (or empty chest to assign)
-3. Take shulker from chest → hotbar slot 0
-4. Place shulker on station (S)
-5. Open shulker and transfer items from inventory
-6. If shulker full: put back, get next shulker
-7. Break shulker and pick up at X
-8. Put shulker back in its chest slot
-9. Repeat if more items to deposit
-```
+Repeat until the trade's plan is exhausted. Full implementation in
+[src/bot/chest_io.rs](src/bot/chest_io.rs).
 
 ### Inventory slot rules
 

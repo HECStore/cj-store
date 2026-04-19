@@ -9,16 +9,16 @@
 //! - **Shulker**: Each shulker box contains items (up to 27 slots × 64 items = 1728 items max)
 //!
 //! ## Layout
-//! Each node has this footprint (top-down):
+//! Each node has this footprint (top-down, bot at P facing north):
 //! ```
-//! NNNN
-//! NCCN  (chests, 2 blocks tall)
-//! NCCN
-//! NSNP  (N = nothing/empty, S = shulker station, P = bot position)
+//! NCCN  (chests, 2 blocks tall — back row)
+//! NCCN  (chests — front row, clickable face)
+//! XSNP  (X = pickup, S = shulker station, N = empty, P = bot position)
 //! ```
 //!
-//! Nodes are arranged in a **spiral pattern**, spaced 3 blocks apart.
-//! See `README.md` "Persistence layout - Storage graph" for details.
+//! Nodes are arranged in a **clockwise spiral**, spaced 3 blocks apart.
+//! See `ARCHITECTURE.md` § Node layout for the full diagram and chest-id
+//! numbering.
 //!
 //! ## Storage Operations
 //! - **`deposit_plan()`**: Allocates items to chests (creates new nodes if needed)

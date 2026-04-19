@@ -92,10 +92,10 @@ Queued → Withdrawing → Trading → Depositing → Committed
      known good value (from a `data.bak.*` snapshot or `data/logs/store.log`
      around the last price quote).
 4. If the file is unfixable, delete it. The pair will be gone on next
-   startup; operators can recreate it via the CLI `addpair` flow, which
-   sets both stocks to zero. Zero-stock pairs will refuse all buys/sells,
-   so expect to also use `additem` / `addcurrency` operator whispers to
-   seed stock before players can trade.
+   startup; operators can recreate it via CLI menu option 8 "Add pair",
+   which sets both stocks to zero. Zero-stock pairs will refuse all
+   buys/sells, so expect to also use `additem` / `addcurrency` operator
+   whispers to seed stock before players can trade.
 5. Restart the bot. Watch the log for `Loaded N pairs`.
 6. In the CLI, run `audit-state` to cross-check that pair stocks match the
    chest totals.

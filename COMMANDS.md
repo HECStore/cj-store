@@ -94,7 +94,8 @@ EINTR on resize) is retried rather than killing the CLI.
    the physical node exists.
 5. **Add node (with bot validation)** — bot navigates, opens all 4 chests
    with fast 5 s timeout, verifies every slot holds a shulker. Fail-fast;
-   typically completes in under 30 seconds.
+   typically completes in well under a minute, but allow up to 2 minutes
+   on a laggy server.
 6. **Discover storage (scan)** — bot starts at the next unregistered id
    and walks the spiral, adding every valid node. Stops on the first
    missing/invalid position.

@@ -107,21 +107,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // See `Store::new()` for initialization details.
             let store = Store::new(bot_tx.clone()).await?;
 
+            // Snapshot the config fields needed by bot_task before `store` is
+            // moved into `run` — avoids a redundant second disk read of
+            // data/config.json here.
+            let account_email = store.config.account_email.clone();
+            let server_address = store.config.server_address.clone();
+            let buffer_chest_position = store.config.buffer_chest_position;
+            let trade_timeout_ms = store.config.trade_timeout_ms;
+            let pathfinding_timeout_ms = store.config.pathfinding_timeout_ms;
+
             // Spawn Store task (authoritative source of truth for all store data)
             let store_handle = tokio::spawn(store.run(store_rx, bot_tx.clone()));
-
-            // Load config for bot creation
-            let config = crate::config::Config::load()?;
 
             // Spawn Bot task (local due to Azalea's !Send requirements)
             let bot_handle = tokio::task::spawn_local(crate::bot::bot_task(
                 store_tx.clone(),
                 bot_rx,
-                config.account_email,
-                config.server_address,
-                config.buffer_chest_position,
-                config.trade_timeout_ms,
-                config.pathfinding_timeout_ms,
+                account_email,
+                server_address,
+                buffer_chest_position,
+                trade_timeout_ms,
+                pathfinding_timeout_ms,
             ));
 
             // Spawn config file watcher (hot-reload of `fee` and `autosave_interval_secs`).
@@ -138,24 +144,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await;
 
-    match result {
+    // Track whether any task failed so we can exit non-zero after flushing
+    // logs. Without this, systemd/CI see exit code 0 even when the bot
+    // crashed.
+    let had_error = match result {
         Ok(Ok(_)) => {
             info!("[Main] All tasks completed");
             println!("✅ Application shutdown complete");
+            false
         }
         Ok(Err(e)) => {
             error!("[Main] Main loop error: {}", e);
             eprintln!("❌ Error during runtime: {}", e);
+            true
         }
         Err(e) => {
             error!("[Main] LocalSet join error: {}", e);
             eprintln!("❌ Error during runtime: {}", e);
+            true
         }
-    }
+    };
 
     // Brief yield so the tracing file appender can flush final log lines
     tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS)).await;
 
+    if had_error {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -188,6 +203,10 @@ fn run_validate_only() -> Result<(), Box<dyn std::error::Error>> {
                 "   account_email:       {}",
                 if cfg.account_email.is_empty() { "<empty>" } else { cfg.account_email.as_str() }
             );
+            match cfg.buffer_chest_position {
+                Some(p) => println!("   buffer_chest_position: ({}, {}, {})", p.x, p.y, p.z),
+                None => println!("   buffer_chest_position: <none>"),
+            }
             println!("   trade_timeout_ms:    {}", cfg.trade_timeout_ms);
             println!("   pathfinding_timeout_ms: {}", cfg.pathfinding_timeout_ms);
             println!("   max_orders:          {}", cfg.max_orders);
@@ -241,6 +260,15 @@ fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
                     // Debounce: drain any further events that arrive within the window.
                     tokio::time::sleep(Duration::from_millis(crate::constants::DELAY_CONFIG_DEBOUNCE_MS)).await;
                     while event_rx.try_recv().is_ok() {}
+
+                    // `Config::load` writes a default config if the file is
+                    // missing. Skip the reload in that case so a transient
+                    // deletion (e.g. atomic rename) never silently replaces
+                    // the operator's config with defaults.
+                    if !Path::new("data/config.json").exists() {
+                        warn!("[ConfigWatcher] data/config.json missing, skipping reload");
+                        continue;
+                    }
 
                     match crate::config::Config::load() {
                         Ok(cfg) => {

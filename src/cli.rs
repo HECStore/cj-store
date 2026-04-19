@@ -152,16 +152,26 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
     // Fetch the configured fee rate first so buy/sell prices reflect the
     // actual spread the store charges. We fall back to 12.5% (the default
     // configured fee) if the query fails for any reason, so the operator
-    // still sees a sensible price estimate rather than an error.
+    // still sees a sensible price estimate rather than an error — but log
+    // a warning, because a silent fallback on a non-default fee would
+    // display materially wrong prices.
+    const DEFAULT_FEE_FALLBACK: f64 = 0.125;
     let (fee_tx, fee_rx) = oneshot::channel();
     let fee_msg = StoreMessage::FromCli(CliMessage::QueryFee {
         respond_to: fee_tx,
     });
 
     let fee = if store_tx.blocking_send(fee_msg).is_ok() {
-        fee_rx.blocking_recv().unwrap_or(0.125) // Default to 12.5% if query fails
+        match fee_rx.blocking_recv() {
+            Ok(f) => f,
+            Err(_) => {
+                warn!("[CLI] QueryFee response failed, displaying prices with fallback fee {}", DEFAULT_FEE_FALLBACK);
+                DEFAULT_FEE_FALLBACK
+            }
+        }
     } else {
-        0.125 // Default to 12.5% if send fails
+        warn!("[CLI] QueryFee send failed, displaying prices with fallback fee {}", DEFAULT_FEE_FALLBACK);
+        DEFAULT_FEE_FALLBACK
     };
 
     let (response_tx, response_rx) = oneshot::channel();

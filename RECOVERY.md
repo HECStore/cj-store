@@ -183,11 +183,12 @@ confuse the next chest operation.
 
 **Symptoms**
 
-- Bot log shows `[ChestIO] unexpected shulker in inventory slot N on entry`.
 - `buffer_chest_position` is configured and a shulker ends up there on
   every startup.
 - Trade GUI rejects a bot offer because a slot the bot meant to place
   diamonds into already had a shulker.
+- Logs from `ensure_shulker_in_hotbar_slot_0` or `recover_shulker_to_slot_0`
+  show repeated recovery attempts at the start of a chest op.
 
 **Fix**
 

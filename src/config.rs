@@ -44,6 +44,7 @@ use crate::constants::{FEE_MIN, FEE_MAX};
 /// - `max_trades_in_memory`: Maximum trades to load (default: 50000)
 /// - `autosave_interval_secs`: Autosave interval (default: 2s)
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Storage origin position (where node 0 is located)
     pub position: Position,

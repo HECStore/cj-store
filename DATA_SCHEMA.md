@@ -81,10 +81,12 @@ above if omitted.
 Enforced by `Config::validate` in [src/config.rs](src/config.rs):
 
 - `fee ∈ [0.0, 1.0]`
-- `position.y ∈ [-64, 320]`
 - `server_address` non-empty; no `://`, no `/`, no whitespace; only ASCII
   alphanum / `.` / `-` / `:`; optional `:port` must parse as `u16`
 - all timeouts / limits positive
+
+A `position.y` outside the modded-vanilla range `[-64, 320]` logs a
+warning but does not fail validation — some servers extend world height.
 
 ### Hot-reload matrix
 
@@ -177,9 +179,11 @@ One file per physical node (cluster of 4 chests). Filename is the numeric
 Invariants (checked by CLI option 12 "Audit state" where noted):
 
 - Exactly 4 chests per node, indices 0..=3. *Enforced at load time.*
-- `chest.id = node.id * 4 + chest.index`. *Enforced at load time.*
+- `chest.id = node.id * 4 + chest.index`. *Convention followed by every
+  writer; not verified on load.*
 - `amounts.len() == 54` (one entry per shulker-box slot in the double
-  chest). *Enforced at load time; load fails on mismatch.*
+  chest). *Normalized at load time: a vector of the wrong length is
+  silently resized to 54 (padded with zeros or truncated).*
 - Chest with `item == "overflow"` is the bot's write-only failsafe — the
   only chest that may hold mixed item types. *Enforced at deposit planning;
   the withdraw planner refuses to source from it.*
@@ -361,6 +365,10 @@ to migrate by hand when needed. Until a versioning scheme is introduced:
 - **Renames and removals** of fields or enum variants are breaking and
   require a one-shot migration script checked in under `tools/` (no
   tooling exists yet because no such migration has been needed).
-- No `deny_unknown_fields` anywhere: typos in hand edits (`"currency_sotck"`)
-  silently load as the default instead of erroring. Hand-audit after any
-  schema-shape change.
+- `deny_unknown_fields` is set on `Config` (the only hand-edited file), so
+  a typo like `"fe": 0.125` or `"buffer_chset_position"` now fails the
+  load with a clear error. It is deliberately **not** set on the other
+  JSON types (`Pair`, `Trade`, `Order`, `User`, `Storage`, `Queue`,
+  journal, trade-state), which are bot-written — adding it there would
+  block forward-compat reads of files written by a slightly newer binary.
+  Hand-audit those after any schema-shape change.

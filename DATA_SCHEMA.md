@@ -12,18 +12,18 @@ existing file.
 
 ## File map
 
-| Path                             | Owner (in `Store`)    | Written by                              | Required? | Versioned? |
-| -------------------------------- | --------------------- | --------------------------------------- | --------- | ---------- |
-| `data/config.json`               | `Store.config`        | human edit; hot-reloaded                | ✅        | No         |
-| `data/pairs/<item>.json`         | `Store.pairs`         | autosave, trade commits                 | ✅ (≥1)   | No         |
-| `data/users/<uuid>.json`         | `Store.users`         | autosave, deposit/withdraw, pay         | created   | No         |
-| `data/storage/<node_id>.json`    | `Store.storage`       | `apply_chest_sync`, autosave            | ✅ (≥1)   | No         |
-| `data/orders.json`               | `Store.orders`        | autosave (cleared on each startup)      | optional  | No         |
-| `data/queue.json`                | `Store.order_queue`   | every `add`/`pop`; survives restart     | optional  | No         |
-| `data/journal.json`              | `Journal` (chest I/O) | every shulker-op phase change           | optional  | No         |
-| `data/current_trade.json`        | `Store.current_trade` | every `TradeState` transition           | optional  | No         |
-| `data/trades/<timestamp>.json`   | `Store.trades`        | one file per committed trade            | optional  | No         |
-| `data/logs/store.log`            | `tracing` appender    | every log line                          | optional  | —          |
+| Path                             | Owner (in `Store`)    | Written when                                     | Created when              | Versioned? |
+| -------------------------------- | --------------------- | ------------------------------------------------ | ------------------------- | ---------- |
+| `data/config.json`               | `Store.config`        | on operator edit (hot-reloaded)                  | startup                   | No         |
+| `data/pairs/<item>.json`         | `Store.pairs`         | on every trade commit + debounced autosave       | ≥1 before first trade     | No         |
+| `data/users/<uuid>.json`         | `Store.users`         | on deposit / withdraw / pay + debounced autosave | created on first observe  | No         |
+| `data/storage/<node_id>.json`    | `Store.storage`       | on every `apply_chest_sync` + debounced autosave | ≥1 before first trade     | No         |
+| `data/orders.json`               | `Store.orders`        | on debounced autosave (cleared at startup)       | runtime-created           | No         |
+| `data/queue.json`                | `Store.order_queue`   | on every push / pop (survives restart)           | runtime-created           | No         |
+| `data/journal.json`              | `Journal` (chest I/O) | on every shulker-op phase change                 | runtime-created           | No         |
+| `data/current_trade.json`        | `Store.current_trade` | on every `TradeState` transition                 | runtime-created           | No         |
+| `data/trades/<timestamp>.json`   | `Store.trades`        | once per committed trade (immutable thereafter)  | runtime-created           | No         |
+| `data/logs/store.log`            | `tracing` appender    | on every log line                                | runtime-created           | —          |
 
 Notes:
 
@@ -66,7 +66,7 @@ running config and logs the error.
 | `fee`                     | `f64`            | —       | Fee rate (e.g. `0.125` = 12.5 %) — added to buys, subtracted from sells                                              |
 | `account_email`           | string           | —       | Microsoft account email for Azalea login (**required**)                                                              |
 | `server_address`          | string           | —       | Minecraft server hostname, e.g. `"corejourney.org"` (**required**)                                                   |
-| `buffer_chest_position`   | `{x,y,z} \| null`| `null`  | Optional chest the bot can dump overflow into                                                                        |
+| `buffer_chest_position`   | `{x,y,z} \| null`| `null`  | Optional emergency-dump chest. Used when a shulker cannot be returned to its slot (slot unexpectedly occupied, chunk not loaded, etc.) — a non-fatal fallback so the bot doesn't stall mid-operation. Leave `null` and the bot instead keeps the shulker in its inventory and logs an alert |
 | `trade_timeout_ms`        | `u64`            | 45000   | Max wait for a trade-GUI interaction before aborting                                                                 |
 | `pathfinding_timeout_ms`  | `u64`            | 60000   | Max wait for the bot to reach a destination before aborting                                                          |
 | `max_orders`              | `usize`          | 10000   | Prune target for the in-memory order audit log (session-only)                                                        |
@@ -94,7 +94,7 @@ Enforced by `Config::validate` in [src/config.rs](src/config.rs):
 | `autosave_interval_secs`                   | ✅ Yes          | Next Store loop iteration uses the new debounce                         |
 | `trade_timeout_ms`                         | ❌ Restart      | Cached in the Bot task at startup; warning logged on edit               |
 | `pathfinding_timeout_ms`                   | ❌ Restart      | Cached in the Bot task at startup; warning logged on edit               |
-| `position`, `buffer_chest_position`        | ❌ Restart      | World topology; changing mid-run would break in-flight operations       |
+| `position`, `buffer_chest_position`        | ❌ Restart      | World topology; navigation state is seeded at startup and changing either mid-run would break in-flight operations |
 | `account_email`, `server_address`          | ❌ Restart      | Identity / connection; requires reconnection                            |
 | `max_orders`, `max_trades_in_memory`       | ❌ Restart      | Capacity bounds fixed at load time                                      |
 
@@ -117,13 +117,17 @@ One file per trading pair. Filename is the canonical item id (no
 }
 ```
 
-- `stack_size` ∈ {1, 16, 64}.
-- `item_stock` must match the sum of all in-world inventory for this item
-  across every chest whose `item == "<item>"`. Drift is flagged by the
-  `audit-state` CLI command.
-- `currency_stock` is the diamond reserve. The AMM uses `k = item_stock *
-  currency_stock` so changing either directly (without the other) re-prices
-  the pair — don't hand-edit unless you know what you're doing.
+- `stack_size` ∈ {1, 16, 64}. Set at pair creation via CLI option 8 and
+  not intended to change afterwards — the AMM and the deposit planner
+  both assume it's constant for the lifetime of the pair.
+- `item_stock` must match the sum of all in-world inventory for this
+  item across every chest whose `item == "<item>"`. Drift is flagged by
+  CLI option 12 "Audit state".
+- `currency_stock` is the diamond reserve. Normal trades update it as
+  part of the commit — credited on buys, debited on sells — so the AMM
+  invariant `k = item_stock × currency_stock` grows only by the fee on
+  each trade. Changing either stock directly (without the other) re-prices
+  the pair instantly; don't hand-edit unless you know what you're doing.
 
 ## `data/users/<uuid>.json`
 
@@ -132,7 +136,7 @@ One file per known player. Filename is the hyphenated Mojang UUID. See
 
 ```json
 {
-  "uuid": "00000000-0000-0000-0000-0000000Alice",
+  "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
   "username": "Alice",
   "balance": 0.0,
   "operator": false
@@ -170,23 +174,30 @@ One file per physical node (cluster of 4 chests). Filename is the numeric
 }
 ```
 
-Invariants:
+Invariants (checked by CLI option 12 "Audit state" where noted):
 
-- Exactly 4 chests per node, indices 0..=3.
-- `chest.id = node.id * 4 + chest.index`.
+- Exactly 4 chests per node, indices 0..=3. *Enforced at load time.*
+- `chest.id = node.id * 4 + chest.index`. *Enforced at load time.*
 - `amounts.len() == 54` (one entry per shulker-box slot in the double
-  chest).
+  chest). *Enforced at load time; load fails on mismatch.*
 - Chest with `item == "overflow"` is the bot's write-only failsafe — the
-  only chest that may hold mixed item types.
+  only chest that may hold mixed item types. *Enforced at deposit planning;
+  the withdraw planner refuses to source from it.*
 - `amounts[n] <= max_stack * SHULKER_BOX_SLOTS` where `SHULKER_BOX_SLOTS =
   27`. Exceeding this means the shulker is over-capacity (impossible
-  in-world; a schema violation).
+  in-world; a schema violation). *Checked by audit-state.*
+- For every `pair`, `pair.item_stock == sum(chest.amounts[] for chest.item
+  == pair.item across all nodes)`. *Checked by audit-state; repaired by
+  CLI option 13.*
 
 ## `data/orders.json`
 
-In-memory audit log, mirrored to disk for visibility. Cleared on each
-startup — the source of truth for historical orders is
-`data/trades/*.json`. See [src/types/order.rs](src/types/order.rs).
+Session-scoped audit log. The Store mirrors it to disk so an operator can
+tail the file or view it after a crash, but the bot rebuilds it from scratch
+on every startup — the persistent source of truth for historical orders is
+always `data/trades/*.json`. This file exists primarily to back CLI
+option 11 ("View recent trades") without forcing a full rescan of
+`data/trades/` on every invocation. See [src/types/order.rs](src/types/order.rs).
 
 ```json
 [
@@ -194,7 +205,7 @@ startup — the source of truth for historical orders is
     "order_type": "Buy",
     "item": "cobblestone",
     "amount": 500,
-    "user_uuid": "00000000-0000-0000-0000-0000000Alice"
+    "user_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
   }
 ]
 ```
@@ -227,7 +238,8 @@ Pending orders waiting to be processed. Survives restarts. See
 ```
 
 - `id` is monotonic across the queue's lifetime; `next_id` persists so ids
-  don't collide after a restart.
+  don't collide after a restart — this is what makes `cancel <id>` and
+  similar operator references unambiguous across a process restart.
 - `order_type` for queue entries uses the `QueuedOrderType` enum which adds
   the `Deposit { amount: Option<f64> }` and `Withdraw { amount: Option<f64> }`
   variants on top of plain `"Buy"` / `"Sell"`.
@@ -293,9 +305,11 @@ startup.
 
 ## `data/trades/<timestamp>.json`
 
-One immutable file per committed trade. Filename is the commit timestamp in
-the bot's custom ISO-8601 form: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnn+HH-MM`
-(colons replaced with dashes because Windows file names don't allow `:`).
+One immutable file per committed trade. Filename is the commit timestamp
+in ISO-8601, but with `:` replaced by `-` because Windows disallows `:`
+in filenames: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnn+HH-MM`. The `timestamp`
+field inside the file is the real ISO-8601 form (with colons) — use that
+when parsing.
 
 ```json
 {
@@ -303,7 +317,7 @@ the bot's custom ISO-8601 form: `YYYY-MM-DDTHH-MM-SS.nnnnnnnnn+HH-MM`
   "item": "cobblestone",
   "amount": 500,
   "amount_currency": 11250000.0,
-  "user_uuid": "00000000-0000-0000-0000-0000000Alice",
+  "user_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
   "timestamp": "2026-04-12T18:35:25.066418800Z"
 }
 ```
@@ -320,12 +334,17 @@ There is currently no `schema_version` field on any file. This is
 intentional — the project is pre-1.0 and the set of files is small enough
 to migrate by hand when needed. Until a versioning scheme is introduced:
 
-- **Additive changes** (new optional fields, new enum variants that
-  existing code ignores) are safe. Use `#[serde(default)]` on the Rust
-  side.
-- **Renames and removals** are breaking and require a one-shot migration
-  script checked in under `tools/` (no tooling exists yet because no such
-  migration has been needed).
-- Reject-on-unknown is NOT set anywhere, so a garbled field becomes
-  default rather than a load error — prefer hand-auditing after
-  schema-shape edits.
+- **Additive changes** (new optional fields) are safe. Use
+  `#[serde(default)]` on the Rust side so older files still load.
+- **Adding an enum variant** is only safe if the variant name does not
+  appear in any existing file. Serde encodes Rust enum variants by their
+  Rust name, so renaming `Buy` → `BuyOrder` is a breaking change even
+  though the wire format "looks the same".
+- **Renames and removals** of fields or enum variants are breaking and
+  require a one-shot migration script checked in under `tools/` (no
+  tooling exists yet because no such migration has been needed).
+- Unknown / garbled fields silently fall back to defaults; there is no
+  `deny_unknown_fields` anywhere in the codebase. That is convenient for
+  forward-compat but it means a typo in a hand edit (`"currency_sotck"`)
+  loads as zero instead of erroring. Hand-audit after any schema-shape
+  change.

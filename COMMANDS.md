@@ -11,7 +11,9 @@ option 3.
 ## Player commands (all users)
 
 All commands arrive as `/msg <bot> <command>`. Items are normalized
-(the `minecraft:` prefix is stripped).
+(the `minecraft:` prefix is stripped). Every command name accepts the
+short alias shown in the table — `/msg <bot> b cobblestone 64` is
+equivalent to `/msg <bot> buy cobblestone 64`.
 
 | Command   | Alias | Usage                        | Description                                        |
 | --------- | ----- | ---------------------------- | -------------------------------------------------- |
@@ -28,7 +30,24 @@ All commands arrive as `/msg <bot> <command>`. Items are normalized
 | `status`  | —     | `status`                     | Check bot status and queue                         |
 | `help`    | `h`   | `help [command]`             | Show help                                          |
 
-Semantics:
+### Semantics
+
+Every command runs in one of three modes.
+
+- **Inline** — handled synchronously on the Store loop; the bot replies
+  in the same tick. No disk writes, no chest I/O, no `/trade` GUI.
+  Commands: `price`, `balance`, `pay`, `items`, `queue`, `cancel`,
+  `status`, `help`.
+- **Queued** — persisted to `data/queue.json` and serviced in FIFO
+  order. No physical I/O required when it pops. Commands: `deposit` /
+  `withdraw` that move balance without a trade-GUI exchange.
+- **Transactional** — queued, and when popped rides the full
+  `TradeState` lifecycle: validate → withdraw from storage → `/trade`
+  GUI → deposit to storage → commit. Rolls back atomically on any
+  failure. Commands: `buy`, `sell`, operator `additem`, operator
+  `removeitem`.
+
+### Quick reference
 
 - **buy** — transactional; validates pair, quantity, funds, stock; withdraws
   from storage, trades to player, commits ledger, records Trade. Flexible
@@ -43,20 +62,25 @@ Semantics:
 - **pay** — inline; validates funds; UUID-based transfer; both usernames
   updated to latest. Payer gets `Paid X diamonds to Y`; payee (if online)
   gets `You received X diamonds from Y`.
-- **deposit / d [amount]** — queued; cap 768 (12 stacks). No amount →
-  credits actual diamonds offered.
-- **withdraw / w [amount]** — queued; cap 768; requires ≥1 whole diamond.
-  No amount → withdraws full whole-diamond balance (fractional stays).
-- **items / queue / cancel / status / help** — inline quick commands.
-  `cancel` only works on *pending* orders; an order that has already
-  started processing cannot be cancelled. `status` shows one of:
-  `Idle. No orders being processed. Queue is empty.` / `Buying cobblestone
-  x64. 3 order(s) waiting in queue.` / `Processing deposit (128.00
-  diamonds).` — never reveals coordinates.
+- **deposit / d [amount]** — queued; cap 768 (12 trade-GUI slots × 64-item
+  max-stack — not an arbitrary limit). No amount → credits actual diamonds
+  offered.
+- **withdraw / w [amount]** — queued; cap 768 (same derivation); requires
+  ≥1 whole diamond. No amount → withdraws full whole-diamond balance
+  (fractional stays).
+- **items** — inline; paginates tradeable items, 4 per page.
+- **queue** — inline; shows your pending orders, 4 per page.
+- **cancel** — inline; only works on *pending* orders. An order already
+  being processed gets the exact reply `Order #<id> is currently being
+  processed (<phase>) and cannot be cancelled.` (`<phase>` is the current
+  `TradeState` phase).
+- **status** — inline; shows one of: `Idle. No orders being processed.
+  Queue is empty.` / `Buying cobblestone x64. 3 order(s) waiting in
+  queue.` / `Processing deposit (128.00 diamonds).` — never reveals
+  coordinates.
+- **help** — inline; per-command help or overview.
 
 ## Operator commands (require operator status)
-
-Set via CLI menu option 3.
 
 | Command          | Alias | Usage                    | Description                        |
 | ---------------- | ----- | ------------------------ | ---------------------------------- |
@@ -65,11 +89,18 @@ Set via CLI menu option 3.
 | `addcurrency`    | `ac`  | `addcurrency <item> <amt>` | Add diamonds to pair reserve     |
 | `removecurrency` | `rc`  | `removecurrency <item> <amt>` | Remove diamonds from reserve  |
 
+`additem` and `removeitem` open a `/trade` GUI with the operator: for
+`additem` the operator offers the stock items and the bot's side of the
+trade is empty (the bot then deposits what it received); for `removeitem`
+the roles are reversed. `addcurrency` and `removecurrency` mutate the
+pair's `currency_stock` directly — these are bookkeeping-only changes
+to the AMM reserve; no in-game diamonds move.
+
 ## CLI menu (operator interface)
 
-Blocking dialoguer menu in [src/cli.rs](src/cli.rs). All prompts go through
-`with_retry` so a transient terminal-I/O error (e.g. EINTR on resize) is
-retried rather than killing the CLI.
+Blocking dialoguer menu in [src/cli.rs](src/cli.rs) — 16 entries. All
+prompts go through `with_retry` so a transient terminal-I/O error (e.g.
+EINTR on resize) is retried rather than killing the CLI.
 
 1. **Get user balances** — list all users + balances.
 2. **Get pairs** — all pairs with stock, reserve, calculated buy/sell.
@@ -87,10 +118,23 @@ retried rather than killing the CLI.
    zero; seed via `additem` / `addcurrency`.
 9. **Remove pair** — warns if stock > 0. Cannot remove `diamond`.
 10. **View storage** — origin, node count, per-node chest summary.
-11. **View recent trades** — trade history (default last 20). Shows
-    timestamp, type, amount, item, currency, user UUID per trade.
+11. **View recent trades** — trade history, newest first (default last
+    20; operator can type a custom count). Shows timestamp, type, amount,
+    item, currency, user UUID per trade.
 12. **Audit state** — check invariants, report drift without fixing.
 13. **Repair state** — audit + fix safe drift (recomputes `pair.item_stock`).
 14. **Restart Bot** — `BotInstruction::Restart`; disconnect + reconnect.
-15. **Exit** — graceful shutdown (≈ 5–6 s; see
+15. **Clear stuck order** — force-releases the Store's `processing_order`
+    flag and returns the in-flight queue entry that was blocking it. Use
+    after a crash mid-trade (non-empty `data/current_trade.json`) to let
+    the queue resume without editing JSON by hand. Returns the cleared
+    order description to the CLI. Note this only unblocks the queue — it
+    does **not** reconcile physical chests or ledger state. If you
+    suspect drift (a shulker left on the station, items missing, pair
+    stock off), run through
+    [RECOVERY.md § 4](RECOVERY.md#4-interrupted-datacurrent_tradejson)
+    first.
+16. **Exit** — graceful shutdown (≈ 5–6 s; see
     [ARCHITECTURE.md § Shutdown sequence](ARCHITECTURE.md#shutdown-sequence)).
+    Pending queue entries in `data/queue.json` are preserved and resume
+    on the next startup.

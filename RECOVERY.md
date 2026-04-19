@@ -14,6 +14,10 @@ architecture / on-disk formats see [ARCHITECTURE.md](ARCHITECTURE.md) and
    ```bash
    cp -r data data.bak.$(date -u +%Y%m%d-%H%M%S)
    ```
+   PowerShell equivalent:
+   ```powershell
+   Copy-Item -Recurse data "data.bak.$(Get-Date -Format yyyyMMdd-HHmmss)"
+   ```
    Every procedure below is reversible as long as a snapshot exists.
 3. **Validate the config after any edit.** `cargo run -- --dry-run`
    exits 0 if `data/config.json` parses and passes `Config::validate`. It
@@ -22,6 +26,36 @@ architecture / on-disk formats see [ARCHITECTURE.md](ARCHITECTURE.md) and
 4. **Check the tail of the log.** Relevant warnings and errors go to
    `data/logs/store.log`. Look for `[Store]`, `[Bot]`, `[Journal]`, and
    `[Connection]` prefixes.
+
+## Terminology & decoding
+
+The same scraps of arithmetic and state-name mapping show up in several
+recovery procedures. Keep this subsection open in another tab while
+working through any of them.
+
+**Chest IDs.**
+
+- Forward: `chest_id = node_id * 4 + chest_index`
+- Reverse: `node_id = chest_id / 4`, `chest_index = chest_id % 4`
+
+**Journal state → in-world state.** Use this when decoding a leftover
+`data/journal.json` entry:
+
+| `state`              | Where the shulker is                                                         |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `ShulkerTaken`       | In the bot's inventory; chest slot is empty                                  |
+| `ShulkerOnStation`   | On the station block (2 blocks west of the node's standing position)         |
+| `ItemsTransferred`   | On the station; its contents moved into/out of the bot's inventory           |
+| `ShulkerPickedUp`    | In the bot's inventory again after items were transferred                    |
+| `ShulkerReplaced`    | Back in its chest slot; the journal entry was about to be cleared            |
+
+**Trade phase ladder.** `TradeState` advances strictly forward; any two
+adjacent phases are at most one crash apart:
+
+```
+Queued → Withdrawing → Trading → Depositing → Committed
+                                               └── RolledBack (any failure)
+```
 
 ---
 
@@ -95,22 +129,16 @@ inconsistent — that's what this playbook is for.
 
 First identify the operation from the leftover entry. The fields to look
 at are `operation_type` (`WithdrawFromChest` / `DepositToChest`),
-`chest_id`, `slot_index`, and `state`. Decode `chest_id` to `(node_id,
-chest_index)` as `node_id = chest_id / 4`, `chest_index = chest_id % 4`.
-
-Then, physically, in the world:
-
-| `state`              | What's on the ground / in the bot |
-| -------------------- | --------------------------------- |
-| `ShulkerTaken`       | Shulker is in bot's inventory; chest slot is empty |
-| `ShulkerOnStation`   | Shulker is on the station block  |
-| `ItemsTransferred`   | Shulker on station; its contents have been moved into/out of bot's inventory |
-| `ShulkerPickedUp`    | Shulker is in bot's inventory (post-transfer) |
-| `ShulkerReplaced`    | Shulker is back in its chest slot; journal was about to be cleared |
+`chest_id`, `slot_index`, and `state`. Decode `chest_id` and map `state`
+using the [Terminology & decoding](#terminology--decoding) section above.
 
 Recovery steps (pick one):
 
 **Option A — let the bot self-correct (preferred when possible)**
+
+Fewer hand-edits, and `apply_chest_sync` is the authoritative
+reconciliation path the bot already runs on every chest visit — so you're
+re-using well-exercised code instead of hand-computing a sum.
 
 1. Stop the bot.
 2. Physically break and pick up any loose shulker on the station or in the
@@ -163,21 +191,19 @@ confuse the next chest operation.
 
 **Fix**
 
-1. Stop the bot.
-2. Log in to the server as a normal player (or use /co inspect / whatever
-   your server provides) and stand next to the bot.
-3. Restart the bot, then immediately in the CLI pick "Restart bot" —
-   wait for it to reconnect. On connect the bot will walk to a node for
-   its next operation; interrupt this by setting a deliberate pause:
-   easier approach below.
-4. Alternative: stop the bot, log in yourself at the bot's last-known
-   position (around `position` in config), and manually break any shulker
-   *you* dropped from the bot's killed process. The server should drop
-   the bot's inventory to the ground on a disconnect after a few minutes;
-   pick it up and put it back in the correct chest (the one the journal
-   entry, if any, names — see section 2).
-5. Start the bot. On first chest op it will detect the shulker slot is
-   already empty and repopulate it from the journal/sync path.
+1. Stop the bot (CLI "Exit", or Ctrl-C if unresponsive).
+2. Log in to the server as a normal player and stand near the bot's
+   last-known `position` (from `data/config.json`). When the server drops
+   the disconnected bot's inventory to the ground after a few minutes,
+   pick up the loose shulker and put it back into the chest slot named
+   by any leftover journal entry (see section 2 for decoding `chest_id`
+   and `slot_index`).
+3. Start the bot. On its first chest op it will `apply_chest_sync` the
+   affected chest and reconcile the per-slot counts from what's actually
+   in-world.
+4. If the CLI also reports a frozen queue ("processing_order stuck"),
+   run menu option 15 "Clear stuck order" to release it before the next
+   order can be serviced.
 
 **Prevention**: always exit via the CLI "Exit" menu. A graceful shutdown
 runs through the full disconnect sequence and never leaves in-flight
@@ -197,6 +223,14 @@ being popped from the queue but before reaching a terminal state.
   state file.
 - A player reports their last buy/sell "never finished" — no trade
   confirmation, no balance change, but items moved.
+
+> [!TIP]
+> If the *only* symptom is that the queue has stopped advancing (no
+> physical/ledger drift suspected), CLI menu option 15 **"Clear stuck
+> order"** is the shortest path: it releases `processing_order` and
+> returns the blocked queue entry, no JSON editing needed. Use the
+> per-phase procedure below only when items, balances, or reserves
+> need manual reconciliation.
 
 **Fix**
 
@@ -220,30 +254,32 @@ The bot had started moving items out of storage but had not opened the
 trade GUI. No player-side effect yet.
 
 1. Stop the bot.
-2. Follow section 2 recovery: physically put back any shulker on the
-   station / in the bot's inventory / on the ground, and reconcile the
-   affected pair's `item_stock` via `audit-state`.
+2. Follow [§ 2 Option A steps 2–4](#2-stuck-datajournaljson-entry)
+   (reseat shulker, reconcile via `audit-state`).
 3. Delete `data/current_trade.json` — the order is cancelled.
 4. Inform the player no trade happened; no balance change needed.
 
 ### Phase: `Trading`
 
-The trade GUI was open with the player. The state is unrecoverable
-without player input: you don't know whether the GUI was confirmed,
-partial, or cancelled.
+The trade GUI was open with the player when the bot crashed. You can
+almost always reconstruct whether the trade confirmed by looking at the
+bot's inventory — reach for player reports only if that's ambiguous.
 
 1. Stop the bot.
-2. Physically check the bot's inventory and any buffer chest. The "bot
-   offers" half of the trade GUI items either:
-   - is still in the bot's inventory (trade never confirmed) — section 3
-     applies; put the shulker back.
-   - is missing (trade confirmed) — the player got the items, so you owe
-     yourself a ledger entry. Decide: either treat the trade as committed
-     (manually deduct from `item_stock` / credit `currency_stock` — mirror
-     what a normal `Buy` commit would do for that pair) or eat the loss.
-3. Contact the affected player. If they say the trade went through on
-   their end, treat as committed; if not, treat as cancelled and Mojang/
-   server logs back you up either way.
+2. **Physical inventory check first.** Look at the bot's inventory and
+   the buffer chest (if configured). The "bot offers" half of the trade
+   either:
+   - is still in the bot's inventory → the trade **never confirmed**.
+     Treat as cancelled. Section 3 applies; put the shulker back into
+     its chest slot.
+   - is missing (and the player, if online, now has those items) → the
+     trade **confirmed** before the crash. Treat as committed: manually
+     mirror what a normal commit would do for that pair — for a `Buy`,
+     decrement `item_stock` by `quantity` and increment `currency_stock`
+     by the paid diamond amount; for a `Sell`, do the inverse.
+3. **Only if step 2 is ambiguous**, contact the affected player. If they
+   say the trade went through, treat as committed; otherwise treat as
+   cancelled. Server logs can corroborate either way.
 4. Delete `data/current_trade.json`.
 
 ### Phase: `Depositing`
@@ -280,60 +316,48 @@ multiple chest ops.
 
 ### Phase: `Committed` / `RolledBack`
 
-These are terminal states; the file should have been deleted. Finding one
-at startup means the bot crashed between "mark committed/rolled back" and
-"delete file". No recovery needed — just delete the file.
+These are terminal states. The file should already be deleted; finding
+one at startup means the bot crashed *after* marking the trade terminal
+but *before* removing the file. The ledger mutation itself already
+happened (or was already rolled back — the state name tells you which),
+so usually nothing is missing.
+
+Don't just delete the file blindly, though:
+
+1. Stop the bot.
+2. Open `data/current_trade.json`. Note the `order` body (item, quantity,
+   user, order type).
+3. For `Committed`: verify `pair.item_stock`, `pair.currency_stock`, and
+   the user's `balance` reflect the commit (use the math in the
+   `Depositing` procedure above as a reference for what a commit does).
+   If they don't match — the crash landed *between* the state change and
+   the file delete but somehow skipped the ledger write — follow the
+   `Depositing` procedure to reconcile.
+4. For `RolledBack`: verify the ledger is *unchanged* (no pair or
+   balance update for this order), and that no stray shulker is in the
+   bot's inventory or on the station (section 3 if there is).
+5. Delete `data/current_trade.json`.
 
 ---
 
-## Reference
-
-- The bot itself **never** touches `data.bak.*` directories, so snapshots
-  left alongside `data/` are safe.
-- Every file listed here is described in
-  [DATA_SCHEMA.md](DATA_SCHEMA.md).
-- All writes through `fsutil::write_atomic` are durable across power
-  loss; the only way to get a half-written JSON file is if someone (or
-  something) writes to `data/` outside the bot.
-- After any manual edit to `data/pairs/` or `data/storage/`, run the CLI
-  `audit-state` with `repair: false` first to see the drift, then with
-  `repair: true` only if the suggested repair is what you want.
-
----
-
-## Known issues (non-actionable warnings)
-
-These show up in `data/logs/store.log` and are **handled** — no operator
-action needed. Listed so you recognize them.
-
-- **Packet decode errors** (e.g. `set_equipment ... Unexpected enum variant`).
-  Protocol drift between the server build and Azalea's decoder. The bot
-  reconnects with exponential backoff.
-- **Duplicate-login disconnect**. The same Microsoft account logged in
-  somewhere else. The bot reconnects automatically; if it keeps happening,
-  log out from other clients.
-- **"Global logger already set"** on reinit. The tracing bootstrap is
-  idempotent — this is swallowed silently.
-
-If any of these stop self-healing (bot stays offline for more than a few
-minutes), the reconnect backoff itself has probably given up; restart via
-CLI "Restart Bot" or restart the process.
-
----
-
-## 5. Bot connection problems
+## 5. Bot connection problems (operator action required)
 
 **"Failed to connect"**. Check `account_email` and `server_address` in
 `data/config.json`. Re-run with `cargo run -- --dry-run` to validate the
 file without attempting login.
 
-**"Duplicate login"**. The account is active elsewhere. Log out of all
-other clients (including the Minecraft launcher if it's auto-joining) and
-restart the bot.
+**"Duplicate login"**. Minecraft allows exactly one authenticated
+connection per account: the moment a second client logs in, the server
+kicks whichever one is already connected — in practice, the bot is the
+one that gets kicked. If the bot keeps disconnecting with a duplicate-
+login reason, log out of every other client using this account
+(including any Minecraft launcher that auto-joins on startup) and then
+restart the bot, or let its reconnect backoff do it.
 
 **"Protocol decode errors" that don't self-heal**. The server is running a
-Minecraft version that Azalea can't talk to. Either downgrade the server or
-wait for an Azalea update — nothing configuration can fix from this side.
+Minecraft version that Azalea can't talk to. Either downgrade the server
+or wait for an Azalea update — nothing on the configuration side can fix
+this.
 
 ---
 
@@ -344,8 +368,10 @@ says it should. Verify the node was built correctly before adding it via
 CLI option 5 (validated add) instead of option 4 (unvalidated).
 
 **"Storage mismatch" / audit-state reports drift**. Pair stock disagrees
-with chest sum. Causes: items moved manually in-world, a crashed chest op
-(see section 2), or a legitimate bug. Fix: CLI option 13 "Repair state"
+with chest sum. Example: `pair.item_stock` says 100, storage chests for
+that item sum to 80 — 20 items went missing without going through the
+bot. Causes: items moved manually in-world, a crashed chest op (see
+section 2), or a legitimate bug. Fix: CLI option 13 "Repair state"
 recomputes `pair.item_stock` from the actual storage contents.
 
 **"Node 0 chest 0" item-assignment errors**. Chest 0 of node 0 is dedicated
@@ -424,6 +450,39 @@ Player-facing messages that are sometimes misread as errors.
 
 ---
 
-## 10. Performance tuning
+## Reference
 
-Moved to [DEVELOPMENT.md § Performance tuning](DEVELOPMENT.md#performance-tuning).
+- The bot itself **never** touches `data.bak.*` directories, so snapshots
+  left alongside `data/` are safe.
+- Every file listed here is described in
+  [DATA_SCHEMA.md](DATA_SCHEMA.md).
+- All writes through `fsutil::write_atomic` are durable across power
+  loss; the only way to get a half-written JSON file is if someone (or
+  something) writes to `data/` outside the bot.
+- After any manual edit to `data/pairs/` or `data/storage/`, run CLI
+  menu option 12 **"Audit state"** first (read-only — reports drift
+  without touching anything); only if the reported drift matches what
+  you expected, run option 13 **"Repair state"** to let the Store
+  recompute `pair.item_stock` from the chest sums.
+- For performance tuning (slow chest I/O, autosave thrash, queue stalls)
+  see [DEVELOPMENT.md § Performance tuning](DEVELOPMENT.md#performance-tuning).
+
+---
+
+## Benign log noise
+
+These show up in `data/logs/store.log`, are self-handled by the bot, and
+need no operator action. Listed so you recognize them when scanning logs.
+
+- **Packet decode errors** (e.g. `set_equipment ... Unexpected enum variant`).
+  Protocol drift between the server build and Azalea's decoder. Usually
+  single-packet; the connection is not dropped.
+- **Duplicate-login disconnect, handled automatically**. The bot reconnects
+  with exponential backoff. See section 5 for when this stops being
+  "handled" and becomes operator work.
+- **"Global logger already set"** on reinit. The tracing bootstrap is
+  idempotent — the warning is swallowed silently.
+
+If any of these stop self-healing and the bot stays offline for more
+than a few minutes, the reconnect backoff has probably given up;
+restart via CLI "Restart Bot" or restart the process.

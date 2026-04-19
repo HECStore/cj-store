@@ -8,6 +8,19 @@ command reference see [COMMANDS.md](COMMANDS.md); for developer reference
 [DATA_SCHEMA.md](DATA_SCHEMA.md); for operational playbooks see
 [RECOVERY.md](RECOVERY.md).
 
+## Reading order
+
+If you are new to the codebase, start here, then drop into the section that
+matches what you're trying to change:
+
+| You want to understand…             | Jump to                                                                       |
+| ----------------------------------- | ----------------------------------------------------------------------------- |
+| The three-task layout               | [Runtime topology](#runtime-topology)                                         |
+| How a whisper becomes an order      | [Command dispatch pipeline](#command-dispatch-pipeline)                       |
+| One trade, end to end               | [Trade state machine](#trade-state-machine)                                   |
+| Physical chests and shulkers        | [Storage physical model](#storage-physical-model)                             |
+| Where to start reading in *code*    | [Where to start reading](#where-to-start-reading) (end of this document)      |
+
 ## Runtime topology
 
 Three cooperating tasks, spawned once from [main.rs](src/main.rs) and joined
@@ -43,8 +56,10 @@ no shared mutable state, no mutexes on business data.
 Channels:
 
 - `mpsc::Sender<StoreMessage>` — shared by Bot and CLI; funnels everything
-  inbound to the Store. Buffered at 128; see [main.rs](src/main.rs) for why
-  that number.
+  inbound to the Store. Buffered at 128: large enough to absorb bursts
+  (e.g. many whispers during an event) without blocking senders, small
+  enough that sustained back-pressure surfaces as a visible queue stall
+  if the Store falls behind.
 - `mpsc::Sender<BotInstruction>` — Store to Bot outbound. Also 128.
 - `oneshot::Sender<T>` — carried inside specific message variants when a
   request needs a reply (CLI queries, trade results, validation outcomes).
@@ -121,8 +136,8 @@ through the handler chain.
 ```
 
 All handler functions return `Result<(), StoreError>` —
-[src/error.rs](src/error.rs). The unification landed in Phase 2 so rollback,
-messaging, and queue interactions share one error surface.
+[src/error.rs](src/error.rs). Rollback, player messaging, and queue
+interactions share a single error surface.
 
 ## Trade state machine
 
@@ -159,27 +174,41 @@ unrepresentable.
 
 `TradeState` is mirrored to `data/current_trade.json` at every transition
 and cleared on a terminal state. On startup the Store looks for a leftover
-file: its presence means the previous run crashed mid-trade. The current
-behavior is log-and-clear; automatic re-queue/rollback is a planned
-Phase 3. When that lands, the startup path in `Store::new` inspects the
-persisted phase and routes:
+file: its presence means the previous run crashed mid-trade.
 
-```text
-  Queued        -> re-add to OrderQueue front
-  Withdrawing   -> roll back any completed transfers, reject order
-  Trading       -> reject order (player trade state unknown)
-  Depositing    -> rolll back withdraw, reject order
-  Committed     -> nothing (transient; shouldn't survive a crash here)
-  RolledBack    -> nothing (already terminal)
-```
+**Today** the startup behavior is *log-and-clear*: the leftover state is
+written to the log, the file is removed, and the Store starts fresh.
+Physical chests and the ledger may be inconsistent with each other — that
+is what [RECOVERY.md § 4](RECOVERY.md#4-interrupted-datacurrent_tradejson)
+exists for. If the *only* symptom is a frozen queue (no physical drift
+suspected), CLI menu entry 15 ("Clear stuck order") releases
+`processing_order` and returns the blocked queue entry without any hand
+edits; see [COMMANDS.md § CLI menu](COMMANDS.md#cli-menu-operator-interface).
 
-See [RECOVERY.md](RECOVERY.md) for the manual playbook in the meantime.
+### Planned: automatic crash-resume
+
+Not yet implemented. When it lands, startup in `Store::new` will inspect
+the persisted phase and route:
+
+| Phase on disk | Planned startup action                                    |
+| ------------- | ---------------------------------------------------------- |
+| `Queued`      | Re-add to `OrderQueue` front                               |
+| `Withdrawing` | Roll back any completed transfers, reject the order        |
+| `Trading`     | Reject the order (player trade state is unknown)           |
+| `Depositing`  | Roll back the withdraw, reject the order                   |
+| `Committed`   | Nothing (terminal — shouldn't survive a crash here)        |
+| `RolledBack`  | Nothing (terminal)                                         |
 
 ## Operation journal (chest I/O crash recovery)
 
-Distinct from `TradeState`: the journal tracks a single in-flight *shulker
-operation* (the lower-level chest transfer that Withdrawing/Depositing use).
-See [src/store/journal.rs](src/store/journal.rs).
+The journal sits **one level below** `TradeState`: where `TradeState`
+tracks a whole player order (Withdrawing → Trading → Depositing), the
+journal tracks the single in-flight *shulker box operation* that the
+current phase is executing. The two are deliberately separate because
+shulker ops also happen **outside** trades — operator `additem` /
+`removeitem` whispers go directly through the chest-I/O layer without
+ever creating a `TradeState`. The journal catches crashes in either
+code path. See [src/store/journal.rs](src/store/journal.rs).
 
 ```text
   Journal::begin(op_type, chest_id, slot)
@@ -196,7 +225,9 @@ See [src/store/journal.rs](src/store/journal.rs).
 
 Every state change atomically rewrites `data/journal.json`. On startup the
 Store reads any leftover entry, logs it as a diagnostic, and clears the
-file. Replay of partial shulker ops is deferred to Phase 3.
+file. Automatic replay of partial shulker ops is
+[planned](#planned-automatic-crash-resume) but not yet implemented; today
+the operator works through [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-entry).
 
 ## Storage physical model
 
@@ -215,6 +246,14 @@ Slot `n` of a chest represents the contents of the shulker box that lives
 in that chest slot. `amounts[n]` is the count of the chest's single item
 type inside that shulker. The bot never mixes item types in a shulker
 (except the overflow chest, which is write-only from the bot's side).
+
+> [!IMPORTANT]
+> The system **assumes every chest slot contains exactly 1 shulker box**.
+> `amounts[i]` tracks items *inside* the shulker in slot `i`, not the
+> shulker itself — the shulker is assumed to always be present. If a slot
+> is empty or holds a non-shulker item, operations on that chest will
+> fail. This is the single load-bearing invariant of the storage model;
+> the deposit planner, withdraw planner, and chest-sync all rely on it.
 
 Mutations land through `Storage::apply_chest_sync` — the bot walks to a
 chest, opens it, reads a canonical 54-slot `amounts` vector, and ships it
@@ -237,9 +276,12 @@ not predicted.
 4. Bot signals done. Store performs a final save and replies to CLI.
 5. CLI drops `store_tx`; Store's receive loop ends; `try_join!` returns.
 
-Total wall-clock ≈ 5–6 s. The doubled 2 s wait is intentional: flushing the
-disconnect packet and releasing the TCP socket are independent delays and
-collapsing them causes "address in use" on fast reconnect.
+Total wall-clock ≈ 5–6 s. The two `DELAY_DISCONNECT_MS` waits are
+deliberate and sequential, not a safety-margin double: the first waits for
+Azalea to flush the `Disconnect` packet to the server, the second waits
+for the OS to tear down the TCP socket after the task is aborted. They
+are independent events — collapsing them lets a subsequent reconnect race
+Azalea's background task.
 
 The Store task breaks from its loop immediately after handling the
 shutdown message — it does not wait for channel closure. All state is
@@ -251,7 +293,7 @@ safety measure.
 ```text
 cj-store/
   Cargo.toml
-  .cargo/config.toml            # optional fast-build flags
+  .cargo/config.toml            # optional fast-build flags (Bevy-style; -Z flags need nightly)
   src/
     main.rs                     # starts Store + Bot + CLI tasks
     store/                       # authoritative state + handlers + autosave
@@ -291,6 +333,7 @@ cj-store/
     error.rs                    # StoreError enum
     fsutil.rs                   # atomic file write helper (temp + rename)
     messages.rs                 # StoreMessage / BotMessage / CliMessage / BotInstruction
+    types.rs                    # types/ module entry: re-exports + shared TradeType enum
     types/
       item_id.rs                # normalized ItemId newtype
       user.rs                   # per-user persistence + Mojang UUID lookup
@@ -314,10 +357,12 @@ cj-store/
     trades/*.json
 ```
 
-## Storage physical model (detail)
+## Node layout and chest capacity
 
-The bot models a physical storage layout of chests clustered into **nodes**.
-Each node is 4 double chests the bot can reach from one standing position.
+The previous section covered the in-memory data model. This section
+covers the *physical* in-world layout that that data model mirrors. The
+bot models storage as chests clustered into **nodes** — each node is 4
+double chests the bot can reach from one standing position.
 
 ### Node layout
 
@@ -421,13 +466,8 @@ box. `amounts[i]` is the item count **inside** the shulker in slot `i`.
   "Repair state" reclaims it.
 - When existing chests fill, the deposit planner grabs the next empty chest
   (preferring the same node) or provokes a new node.
-
-> [!IMPORTANT]
-> The system **assumes every chest slot contains exactly 1 shulker box**.
-> `amounts[i]` tracks items *inside* the shulker in slot `i`, not the
-> shulker itself — the shulker is assumed to always be present. If a slot
-> is empty or holds a non-shulker item, operations on that chest will
-> fail.
+- Every chest slot must contain exactly one shulker box — see
+  [Storage physical model](#storage-physical-model) for the full invariant.
 
 ## Order queue system
 
@@ -435,6 +475,13 @@ The Store uses a FIFO queue so quick commands (balance/price/help) stay
 responsive even while trades execute. See [src/store/queue.rs](src/store/queue.rs).
 
 ### Order lifecycle
+
+This is the same trade-state machine shown in
+[§ Trade state machine](#trade-state-machine), just collapsed to the
+coarse-grained states a player sees in feedback messages:
+`QUEUED` = `TradeState::Queued`, `PROCESSING` covers
+`Withdrawing`/`Trading`/`Depositing`, `SUCCESS` = `Committed`,
+`CANCELLED` = `RolledBack`.
 
 ```text
   QUEUED
@@ -556,6 +603,9 @@ shulker boxes cannot be traded — only loose items.
 
 ### Slot mapping
 
+Slot numbering is the standard Minecraft container convention:
+`slot = row × 9 + column`, row-major, zero-indexed.
+
 | Area           | Rows | Columns | Slot numbers                   |
 | -------------- | ---- | ------- | ------------------------------ |
 | Bot offer      | 0-2  | 0-3     | 0-3, 9-12, 18-21               |
@@ -564,8 +614,6 @@ shulker boxes cannot be traded — only loose items.
 | Bot cancel     | 4-5  | 2-3     | 38-39, 47-48 (red wool)        |
 | Player status  | 4-5  | 5-8     | 41-44, 50-53 (dyes)            |
 | Separator      | all  | 4       | iron bars, non-interactable    |
-
-Slot formula: `slot = row × 9 + column`.
 
 Player status dye meanings:
 
@@ -630,10 +678,22 @@ Failure at any step aborts the trade and notifies the player.
 
 Formulas in [src/store/pricing.rs](src/store/pricing.rs); see
 [Uniswap V2 protocol overview](https://docs.uniswap.org/contracts/v2/concepts/protocol-overview/how-uniswap-works)
-for the mathematical background. `k = item_stock × currency_stock`:
+for the mathematical background.
 
-- **Buy**: `cost = currency_stock × quantity / (item_stock - quantity) × (1 + fee)`
-- **Sell**: `payout = currency_stock × quantity / (item_stock + quantity) × (1 - fee)`
+Each pair holds two reserves:
+
+- `x = item_stock` — items in storage
+- `y = currency_stock` — diamonds in the reserve
+
+The invariant is `k = x × y`. A trade must preserve `k` (ignoring fees):
+the player takes `Δx` items and pays diamonds such that the new product
+equals the old product. Solving that for the trade size gives:
+
+- **Buy** (player takes `q` items): `cost = y × q / (x - q) × (1 + fee)`
+- **Sell** (player delivers `q` items): `payout = y × q / (x + q) × (1 - fee)`
+
+The fee is applied *after* the pure-CPMM price. Fees stay in the pool on
+both sides, so `k` only ever grows.
 
 Properties:
 

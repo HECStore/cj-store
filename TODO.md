@@ -350,7 +350,6 @@
 
 - [ ] Review logging: fn `write_atomic`
 
-- Added parent-directory `fsync` after rename in `write_atomic` (Unix only via `#[cfg(unix)]`; silently ignored on other platforms).
 - [ ] Add a unit test for the rename-failure → copy-fallback path (inject failure via a test-only hook or `cfg`-gated wrapper so it runs portably).
 
 ### src/messages.rs
@@ -533,10 +532,6 @@
 - [ ] Review logging: impl `Default for ItemId` :: fn `default`
 - [ ] Review logging: tests module
 
-- Consolidated `ItemId` construction: all call sites now use `ItemId::new` instead of `from_normalized(normalize_item_id(...))` (changed `store/mod.rs`, `handlers/validation.rs`, `handlers/cli.rs`, `store/command.rs`, `store/state.rs`).
-- Deleted `store::utils::normalize_item_id` and its test; `Bot::normalize_item_id` now inlines the strip logic directly.
-- Strengthened non-empty invariant: added `debug_assert!(!s.is_empty())` inside `ItemId::from_normalized`; `ItemId::EMPTY` retained as the unassigned-chest-slot sentinel.
-
 ### src/types/node.rs
 
 - struct `Node`
@@ -573,7 +568,6 @@
 - [ ] Review logging: impl Node :: fn `calc_chest_position`
 - [ ] Review logging: tests module
 
-- Migrated `types/` layer (`node.rs`, `pair.rs`, `user.rs`) from `eprintln!` to `tracing::warn!` for non-fatal load/save warnings (`trade.rs` already used `tracing::warn!`).
 - [ ] Add a direct test for `Node::load`'s re-enforcement of node 0's reserved chests (diamond at index 0, overflow at index 1) — currently exercised only indirectly.
 
 ### src/types/chest.rs
@@ -627,10 +621,6 @@
 - [ ] Review logging: impl Trade :: fn `save`
 - [ ] Review logging: impl Trade :: fn `load_all_with_limit`
 - [ ] Review logging: impl Trade :: fn `save_all`
-
-- Made `Trade::load_all_with_limit` scalable: sorts filenames lexicographically, takes the last `max_trades` entries, then deserializes only those files.
-- Guarded `Trade::save_all` against empty-`Vec` input: returns `Err(InvalidInput)` immediately to prevent silently wiping `data/trades`.
-- Fixed the misleading `Utc::now()` comment: documented the real collision bound (two trades at the exact same nanosecond) instead of the false "monotonic" claim.
 
 ### src/types/order.rs
 
@@ -836,9 +826,6 @@
 - [ ] Review logging: impl Storage :: const fn `overflow_chest_id`
 - [ ] Review logging: tests module
 
-- Kept `Storage::DEFAULT_SHULKER_CAPACITY`: has two callers in `store/state.rs`.
-- Deleted `Storage::withdraw_item` and `Storage::deposit_item` (confirmed no callers).
-
 ---
 
 ## bot/
@@ -993,8 +980,6 @@
 - [ ] Review logging: async fn `ensure_shulker_in_hotbar_slot_0`
 - [ ] Review logging: async fn `recover_shulker_to_slot_0`
 
-- Refactored `ensure_shulker_in_hotbar_slot_0`: extracted `ShulkerSource` enum and `place_shulker_in_hotbar_slot_0(source)` helper, collapsing three nested branches into a ~50-line driver.
-
 ### src/bot/chest_io.rs
 
 - const `CHUNK_NOT_LOADED_PREFIX`
@@ -1054,9 +1039,6 @@
 - [ ] Review logging: async fn `automated_chest_io`
 - [ ] Review logging: async fn `withdraw_shulkers`
 - [ ] Review logging: async fn `deposit_shulkers`
-
-- Extracted `place_shulker_on_station` and `finish_shulker_round_trip` helpers from `withdraw_shulkers` / `deposit_shulkers`, eliminating ~200 lines of duplicated skeleton.
-- Changed `slot_counts` / `amounts` in `automated_chest_io` and `ChestSyncReport` from `Vec<i32>` to `[i32; DOUBLE_CHEST_SLOTS]` (`ChestSyncReport` has no Serde derives and is never persisted).
 
 ### src/bot/shulker.rs
 
@@ -1449,8 +1431,6 @@
 - [ ] Review logging: async fn `handle_sell_order`
 - [ ] Review logging: async fn `execute_queued_order`
 - [ ] Review logging: tests module
-
-- Renamed `player_offers` to `items_player_must_give` in `spawn_mock_bot` to clarify its direction-neutral meaning.
 
 ### src/store/pricing.rs
 
@@ -1948,9 +1928,6 @@
 - [ ] Review logging: async fn `handle_add_currency`
 - [ ] Review logging: async fn `handle_remove_currency`
 
-- Added `tracing::error!` with full context (item, player, quantities) when rollback-during-rollback fails in `handle_removeitem_order`; operator also receives a player-facing CRITICAL ERROR message.
-- Promoted all 4 negative-stock `debug_assert!` calls to `assert!` with descriptive panic messages that fire in release builds.
-
 ### src/store/handlers/cli.rs
 
 - async fn `handle_cli_message`
@@ -1962,8 +1939,6 @@
 - [ ] Review testability: async fn `handle_cli_message`
 
 - [ ] Review logging: async fn `handle_cli_message`
-
-- Added `BASE_CURRENCY_ITEM: &str = "diamond"` constant in `constants.rs`; replaced all 4 hardcoded `"diamond"` string checks in `cli.rs` with it.
 
 ### src/store/handlers/info.rs
 

@@ -60,13 +60,18 @@ pub struct Order {
     pub user_uuid: String,
 }
 
-impl Order {
-    const ORDERS_FILE: &'static str = "data/orders.json";
+/// Canonical filesystem path for the session-only orders file.
+///
+/// Exposed at module scope (not as an `impl Order` const) so unrelated callers
+/// that need to reference the same path — e.g. `Store::new` deleting stale
+/// orders on startup — can `use` it instead of duplicating the literal.
+pub const ORDERS_FILE: &str = "data/orders.json";
 
+impl Order {
     /// Saves a VecDeque of Orders to a single JSON file.
     /// Automatically prunes to the specified limit before saving.
     pub fn save_all_with_limit(orders: &VecDeque<Self>, max_orders: usize) -> io::Result<()> {
-        let file_path = Path::new(Self::ORDERS_FILE);
+        let file_path = Path::new(ORDERS_FILE);
 
         // Ensure the parent directory exists
         if let Some(parent) = file_path.parent() {

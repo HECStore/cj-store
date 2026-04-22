@@ -564,7 +564,7 @@ async fn validate_node_physically(
             )).await;
         }
         
-        let chest_pos = Node::calc_chest_position(node_id, chest_index, node_position);
+        let chest_pos = Node::calc_chest_position(chest_index, node_position);
         let block_pos = azalea::BlockPos::new(chest_pos.x, chest_pos.y, chest_pos.z);
         
         debug!("Validating chest {} at ({}, {}, {})",

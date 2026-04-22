@@ -704,7 +704,7 @@ pub async fn execute_trade_with_player(
         });
     }
     
-    while start.elapsed() < tokio::time::Duration::from_secs(40) {
+    while start.elapsed() < tokio::time::Duration::from_millis(bot.trade_timeout_ms) {
         // Check if trade menu is still open before trying to get contents
         let current = client.get_inventory();
         if current.id() == 0 {
@@ -1092,7 +1092,7 @@ mod tests {
         ] {
             for slot in set {
                 assert!(seen.insert(slot), "slot {} appears in multiple sets", slot);
-                assert!(slot < 54, "slot {} out of double-chest range", slot);
+                assert!(slot < crate::constants::DOUBLE_CHEST_SLOTS, "slot {} out of double-chest range", slot);
             }
         }
     }

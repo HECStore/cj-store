@@ -2,7 +2,7 @@
 
 use tracing::{error, info, warn};
 
-use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::error::StoreError;
 use crate::messages::TradeItem;
 use crate::types::{ItemId, Order, Trade, TradeType};
@@ -103,8 +103,8 @@ pub async fn handle_additem_order(
         let node_position = store.get_node_position(t.chest_id);
         let chest = crate::types::Chest {
             id: t.chest_id,
-            node_id: t.chest_id / 4,
-            index: t.chest_id % 4,
+            node_id: t.chest_id / CHESTS_PER_NODE as i32,
+            index: t.chest_id % CHESTS_PER_NODE as i32,
             position: t.position,
             item: t.item.clone(),
             amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
@@ -328,8 +328,8 @@ pub async fn handle_removeitem_order(
         let node_position = store.get_node_position(t.chest_id);
         let chest = crate::types::Chest {
             id: t.chest_id,
-            node_id: t.chest_id / 4,
-            index: t.chest_id % 4,
+            node_id: t.chest_id / CHESTS_PER_NODE as i32,
+            index: t.chest_id % CHESTS_PER_NODE as i32,
             position: t.position,
             item: t.item.clone(),
             amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],

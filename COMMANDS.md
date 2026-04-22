@@ -47,7 +47,7 @@ Each command runs in one of three modes:
 | `balance` | Inline | UUID cached for 5 min. |
 | `pay` | Inline | UUID-based transfer; both usernames refreshed. Payer: `Paid X diamonds to Y`; payee (if online): `You received X diamonds from Y`. |
 | `deposit` | Queued | Cap = `12 × 64 = 768` (trade GUI offer slots × max stack). No `amount` → credits whatever the player offers. |
-| `withdraw` | Queued | Cap = 768 (same derivation). Requires ≥1 whole diamond. No `amount` → withdraws the whole-diamond balance; fractional stays. |
+| `withdraw` | Queued | Cap = 768 (same derivation). Requires ≥1 whole diamond. No `amount` → withdraws the whole-diamond balance, capped at 768 per transaction; if the balance exceeds 768 the bot whispers an explicit cap notice so the player knows to issue `/withdraw` again for the rest. Fractional balance stays. |
 | `items` / `queue` | Inline | Paginated, 4 per page. |
 | `cancel` | Inline | *Pending* orders only. A processing order replies `Order #<id> is currently being processed (<phase>) and cannot be cancelled.` |
 | `status` | Inline | Never reveals coordinates. Examples below. |

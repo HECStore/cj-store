@@ -344,14 +344,15 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
         }
         CliMessage::AuditState { repair, respond_to } => {
             let report = state::audit_state(store, repair);
-            // audit_state returns a header line plus one line per fix. A
-            // report length > 1 in repair mode means at least one mutation
-            // happened, so we must persist. (A length-1 report is just the
-            // "nothing to fix" header.)
-            if repair && report.len() > 1 {
+            // Persist if we ran repair and actually fixed something - either a
+            // resolved issue (removed from `issues`) or a remaining issue
+            // (surfaced for the operator). The absence of state divergence is
+            // rare enough that over-persisting costs nothing, while under-
+            // persisting would lose the fix on next crash.
+            if repair && report.repair_applied {
                 store.dirty = true;
             }
-            let _ = respond_to.send(report);
+            let _ = respond_to.send(report.to_lines());
             Ok(())
         }
         CliMessage::DiscoverStorage { respond_to } => {

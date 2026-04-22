@@ -340,14 +340,8 @@ impl Storage {
                 if remaining <= 0 {
                     break;
                 }
-                if node_idx == 0 {
-                    if chest_idx == crate::constants::DIAMOND_CHEST_ID as usize && item != "diamond" {
-                        continue;
-                    }
-                    if chest_idx == crate::constants::OVERFLOW_CHEST_ID as usize
-                        && item != crate::constants::OVERFLOW_CHEST_ITEM {
-                        continue;
-                    }
+                if Self::is_reserved_chest_blocked_for(item, node_idx, chest_idx) {
+                    continue;
                 }
                 if chest.item != item {
                     continue;
@@ -533,17 +527,12 @@ impl Storage {
                 if qty <= 0 {
                     return plan; // Early exit when we've deposited everything
                 }
-                // Skip node 0 reserved chests for non-matching items:
-                // - Chest 0: dedicated for diamonds only
-                // - Chest 1: dedicated for overflow only (bot deposits unknown/leftover items)
-                if node_idx == 0 {
-                    if chest_idx == crate::constants::DIAMOND_CHEST_ID as usize && item != "diamond" {
-                        continue;
-                    }
-                    if chest_idx == crate::constants::OVERFLOW_CHEST_ID as usize
-                        && item != crate::constants::OVERFLOW_CHEST_ITEM {
-                        continue;
-                    }
+                // Skip node 0 reserved chests for non-matching items.
+                // The reserved-chest policy (chest 0 → diamond, chest 1 →
+                // overflow) lives in `is_reserved_chest_blocked_for` — keep
+                // this call site in sync if the rules ever change.
+                if Self::is_reserved_chest_blocked_for(item, node_idx, chest_idx) {
+                    continue;
                 }
                 let chest = &mut self.nodes[node_idx].chests[chest_idx];
                 if chest.item != item {
@@ -736,6 +725,32 @@ impl Storage {
     /// Get the overflow chest ID (always 1, since it's node 0 chest 1).
     pub const fn overflow_chest_id() -> i32 {
         crate::constants::OVERFLOW_CHEST_ID
+    }
+
+    /// Is the (node_idx, chest_idx) slot a reserved chest whose item type
+    /// doesn't match `item`? Returns true when the chest is off-limits for the
+    /// given item (i.e. the caller should skip this slot in plan / allocation
+    /// passes), false otherwise.
+    ///
+    /// The reserved slots are all in node 0:
+    ///   * chest `DIAMOND_CHEST_ID` (0) — only "diamond"
+    ///   * chest `OVERFLOW_CHEST_ID` (1) — only the overflow sentinel item
+    ///
+    /// Centralising the check here avoids three places needing to stay in
+    /// sync with the reserved-chest rules in
+    /// [`simulate_deposit_plan`], [`deposit_plan`], and
+    /// [`find_empty_chest_index`].
+    pub fn is_reserved_chest_blocked_for(item: &str, node_idx: usize, chest_idx: usize) -> bool {
+        if node_idx != 0 {
+            return false;
+        }
+        if chest_idx == crate::constants::DIAMOND_CHEST_ID as usize {
+            return item != "diamond";
+        }
+        if chest_idx == crate::constants::OVERFLOW_CHEST_ID as usize {
+            return item != crate::constants::OVERFLOW_CHEST_ITEM;
+        }
+        false
     }
 }
 

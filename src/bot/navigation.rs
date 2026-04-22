@@ -6,7 +6,7 @@
 use azalea::BlockPos;
 use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::PathfinderClientExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::constants::{
     DELAY_MEDIUM_MS, NAVIGATION_MAX_RETRIES, PATHFINDING_CHECK_INTERVAL_MS,
@@ -195,8 +195,11 @@ pub async fn go_to_chest(bot: &Bot, chest: &Chest, node_position: &Position) -> 
     })?;
     
     // The chest should be accessible from the node position
-    // Bot is now centered on the node block, facing the center
-    info!(
+    // Bot is now centered on the node block, facing the center.
+    // Logged at `debug!` (not `info!`) because go_to_chest is on the hot path
+    // for every trade/chest operation; one line per chest visit is too chatty
+    // for default production logs.
+    debug!(
         "At node ({}, {}, {}), chest {} accessible at ({}, {}, {})",
         node_position.x, node_position.y, node_position.z,
         chest.id,

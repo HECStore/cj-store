@@ -142,11 +142,12 @@ pub fn is_operator(store: &Store, user_uuid: &str) -> bool {
 
 /// Get node position for a given chest_id.
 ///
-/// Each node holds 4 chests, so the node id is `chest_id / 4`. If the node
-/// isn't materialized in `storage.nodes` yet, we deterministically recompute
-/// its position from the storage origin so callers always get a valid location.
+/// Each node holds `CHESTS_PER_NODE` chests, so the node id is
+/// `chest_id / CHESTS_PER_NODE`. If the node isn't materialized in
+/// `storage.nodes` yet, we deterministically recompute its position from the
+/// storage origin so callers always get a valid location.
 pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position {
-    let node_id = chest_id / 4;
+    let node_id = chest_id / crate::constants::CHESTS_PER_NODE as i32;
     store.storage.nodes.iter()
         .find(|n| n.id == node_id)
         .map(|n| n.position)

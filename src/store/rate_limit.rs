@@ -137,12 +137,14 @@ impl RateLimiter {
         }
     }
 
-    /// Clean up stale entries (users who haven't sent messages in a while)
-    /// Call periodically to prevent memory growth
-    pub fn cleanup_stale(&mut self, max_age: Duration) {
+    /// Clean up stale entries (users who haven't sent messages in a while).
+    /// Call periodically to prevent memory growth.
+    /// `stale_threshold` is the inactivity window beyond which a user entry
+    /// is forgotten (any entry older than now - stale_threshold is dropped).
+    pub fn cleanup_stale(&mut self, stale_threshold: Duration) {
         let now = Instant::now();
         self.limits.retain(|_, limit| {
-            now.duration_since(limit.last_message_time) < max_age
+            now.duration_since(limit.last_message_time) < stale_threshold
         });
     }
 }

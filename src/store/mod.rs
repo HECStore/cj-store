@@ -124,7 +124,7 @@ impl Store {
         // audit log) and pair reserves ARE persisted - only the transient order
         // log is dropped. The stale file on disk is removed so operators inspecting
         // data/ don't mistake it for live state.
-        let orders_file = std::path::Path::new("data/orders.json");
+        let orders_file = std::path::Path::new(crate::types::order::ORDERS_FILE);
         if orders_file.exists() {
             let count = std::fs::read_to_string(orders_file)
                 .ok()

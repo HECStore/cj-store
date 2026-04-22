@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::Path;
+use tracing::warn;
 
 use crate::types::Position;
 use crate::fsutil::write_atomic;
@@ -115,8 +116,10 @@ impl Config {
         // whole load failing. Authentication itself will surface the error
         // later if they try to actually connect.
         if self.account_email.trim().is_empty() {
-            // This is a warning, not an error - bot may fail to connect
-            eprintln!("Warning: account_email is empty in config - bot will fail to authenticate");
+            // This is a warning, not an error - bot may fail to connect.
+            // Route through `tracing::warn!` so the warning lands in the log
+            // file on hot-reload via the config watcher, not just the TTY.
+            warn!("account_email is empty in config - bot will fail to authenticate");
         } else if !self.account_email.contains('@') {
             errors.push(format!(
                 "account_email doesn't look like an email address: {}",
@@ -146,11 +149,22 @@ impl Config {
                 "server_address contains unsupported characters: {}",
                 self.server_address
             ));
-        } else if let Some((_, port)) = addr.rsplit_once(':') {
-            // If a port was provided, make sure it's a valid u16.
+        } else if let Some((host, port)) = addr.rsplit_once(':') {
+            // If a port was provided, make sure both the host is non-empty
+            // and the port is a valid u16. Without the host check, inputs
+            // like ":25565" pass the outer is_empty test (they're not empty
+            // strings) but produce a bare-colon address that every resolver
+            // rejects anyway.
+            //
             // `rsplit_once(':')` also matches bare IPv6-like inputs, but since
             // we reject ':' beyond the host:port form above (would fail the
             // charset check for IPv6 brackets), this is fine.
+            if host.is_empty() {
+                errors.push(format!(
+                    "server_address host is empty: {}",
+                    self.server_address
+                ));
+            }
             if port.parse::<u16>().is_err() {
                 errors.push(format!(
                     "server_address port must be a number 0-65535: {}",
@@ -169,11 +183,14 @@ impl Config {
                 COORD_LIMIT, self.position.x, self.position.y, self.position.z
             ));
         }
-        // Y coordinate typically -64 to 320 in modern Minecraft
+        // Y coordinate typically -64 to 320 in modern Minecraft.
+        // Routed through `tracing::warn!` so a hot-reload warning lands in the
+        // log file (the config watcher runs after the tracing subscriber is
+        // installed, so stderr would be missed).
         if self.position.y < -64 || self.position.y > 320 {
             // Warning only - some servers have different limits
-            eprintln!(
-                "Warning: position Y coordinate ({}) is outside typical range (-64 to 320)",
+            warn!(
+                "position Y coordinate ({}) is outside typical range (-64 to 320)",
                 self.position.y
             );
         }

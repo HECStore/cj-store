@@ -497,11 +497,11 @@ pub async fn open_chest_container(
 /// Transfer items from/to a shulker box.
 /// direction: "withdraw" = from shulker to bot inventory (slots 9-35, NOT hotbar), "deposit" = from bot inventory (slots 9-35) to shulker
 pub async fn transfer_items_with_shulker(
-    _bot: &Bot,
     shulker_container: &azalea::container::ContainerHandle,
     item: &str,
     amount: i32,
     direction: &str,
+    stack_size: i32,
 ) -> Result<i32, String> {
     let target_id = Bot::normalize_item_id(item);
 
@@ -515,7 +515,7 @@ pub async fn transfer_items_with_shulker(
             transfer_withdraw_from_shulker(shulker_container, &target_id, amount).await?
         }
         "deposit" => {
-            transfer_deposit_into_shulker(shulker_container, &target_id, amount).await?
+            transfer_deposit_into_shulker(shulker_container, &target_id, amount, stack_size).await?
         }
         _ => {
             error!("transfer_items_with_shulker: Invalid direction: {}", direction);
@@ -705,6 +705,7 @@ async fn transfer_deposit_into_shulker(
     shulker_container: &azalea::container::ContainerHandle,
     target_id: &str,
     amount: i32,
+    stack_size: i32,
 ) -> Result<i32, String> {
     use azalea::inventory::operations::PickupClick;
 
@@ -838,11 +839,11 @@ async fn transfer_deposit_into_shulker(
             for i in 0..shulker_size {
                 let slot_item = &all_slots[i];
                 if slot_item.count() == 0 {
-                    // Empty slot - can hold up to 64
-                    target_slots.push((i, 64));
+                    // Empty slot - can hold up to one stack
+                    target_slots.push((i, stack_size));
                 } else if Bot::normalize_item_id(&slot_item.kind().to_string()) == target_id {
-                    // Same item type - can add up to 64 - current
-                    let space = 64 - slot_item.count();
+                    // Same item type - can add up to (stack_size - current)
+                    let space = stack_size - slot_item.count();
                     if space > 0 {
                         target_slots.push((i, space));
                     }
@@ -985,7 +986,6 @@ async fn prepare_for_chest_io(bot: &Bot, node_position: &Position) -> Result<(),
             node_position.x, node_position.y, node_position.z
         ));
     }
-    drop(client);
 
     if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
         warn!(
@@ -1042,6 +1042,7 @@ pub async fn automated_chest_io(
                 &station_pos,
                 container,
                 &mut slot_counts,
+                stack_size,
             )
             .await?
         }
@@ -1098,6 +1099,7 @@ async fn withdraw_shulkers(
     station_pos: &Position,
     mut container: azalea::container::ContainerHandle,
     slot_counts: &mut Vec<i32>,
+    stack_size: i32,
 ) -> Result<i32, String> {
     use crate::store::journal::{JournalOp, JournalState};
     let mut remaining = amount;
@@ -1275,11 +1277,11 @@ async fn withdraw_shulkers(
                         // Transfer items from shulker to bot inventory (up to remaining amount)
                         let to_withdraw = remaining.min(shulker_item_count);
                         let moved = transfer_items_with_shulker(
-                            bot,
                             &shulker_container,
                             item,
                             to_withdraw,
                             "withdraw",
+                            stack_size,
                         )
                         .await?;
                         debug!("Withdrew {} items from shulker", moved);
@@ -1650,11 +1652,11 @@ async fn deposit_shulkers(
                     // Transfer items from bot inventory to shulker
                     let to_deposit = remaining.min(total_space).min(bot_item_count);
                     let moved = transfer_items_with_shulker(
-                        bot,
                         &shulker_container,
                         item,
                         to_deposit,
                         "deposit",
+                        stack_size,
                     )
                     .await?;
                     debug!("Deposited {} items into shulker", moved);

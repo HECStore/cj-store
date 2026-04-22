@@ -125,7 +125,21 @@ impl Journal {
             ));
         }
         let json = fs::read_to_string(path)?;
-        let entries: Vec<JournalEntry> = serde_json::from_str(&json).unwrap_or_default();
+        // Corrupt JSON → empty journal. We keep the swallow-and-continue
+        // behaviour (the journal is a diagnostic aid, not a hard dependency),
+        // but surface a warning so operators don't silently lose in-flight
+        // state on a malformed file. `unwrap_or_default()` on its own would
+        // hide the corruption entirely.
+        let entries: Vec<JournalEntry> = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "[Journal] Failed to parse {:?} ({}); treating as empty - any in-flight operation record is lost",
+                    path, e
+                );
+                Vec::new()
+            }
+        };
         let leftover = entries.into_iter().last();
         Ok((
             Self { entry: None, path: path.to_path_buf() },

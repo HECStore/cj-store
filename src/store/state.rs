@@ -87,15 +87,43 @@ pub fn save(store: &Store) -> Result<(), Box<dyn std::error::Error + Send + Sync
     Ok(())
 }
 
+/// Structured report from [`audit_state`].
+///
+/// `issues` is the plain list of problems found (safe-to-repair issues are
+/// removed from this list when `repair=true` and the fix succeeded).
+/// `repair_applied` is `true` iff `audit_state` was called with `repair=true`;
+/// callers use it to decide whether to persist the store. Keeping the two
+/// fields separate avoids the old fragile coupling where repair status was
+/// smuggled as a "Repair applied..." string at position 0 of the vec.
+#[derive(Debug, Clone, Default)]
+pub struct AuditReport {
+    pub issues: Vec<String>,
+    pub repair_applied: bool,
+}
+
+impl AuditReport {
+    /// Render the report as human-readable lines, suitable for pushing into a
+    /// chat/CLI message. The "Repair applied..." marker (if any) is emitted
+    /// first so the output is visually similar to the pre-refactor format.
+    pub fn to_lines(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.issues.len() + usize::from(self.repair_applied));
+        if self.repair_applied {
+            out.push("Repair applied: recomputed Pair.item_stock from Storage".to_string());
+        }
+        out.extend(self.issues.iter().cloned());
+        out
+    }
+}
+
 /// Audit store state and optionally repair issues.
 ///
 /// Walks users, storage chests and pairs looking for broken invariants and
-/// returns a human-readable list of problems. When `repair` is true, issues
-/// that have a safe automatic fix (currently: Pair.item_stock drifting from
-/// the physical chest total) are corrected in place, and the returned vec is
-/// prefixed with a "Repair applied" marker line so callers can tell repairs
-/// ran even when no other issues remain.
-pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
+/// returns a structured `AuditReport`. When `repair` is true, issues that
+/// have a safe automatic fix (currently: Pair.item_stock drifting from the
+/// physical chest total) are corrected in place and removed from the issues
+/// list; `report.repair_applied` is set so callers can tell repairs ran even
+/// when no other issues remain.
+pub fn audit_state(store: &mut Store, repair: bool) -> AuditReport {
     let mut issues = Vec::new();
 
     // Users: NaN/Inf would poison any later arithmetic, and negative balances
@@ -180,11 +208,7 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
         }
     }
 
-    if repair {
-        issues.insert(0, "Repair applied: recomputed Pair.item_stock from Storage".to_string());
-    }
-
-    issues
+    AuditReport { issues, repair_applied: repair }
 }
 
 /// Assert store invariants, optionally repairing issues.
@@ -195,21 +219,15 @@ pub fn audit_state(store: &mut Store, repair: bool) -> Vec<String> {
 /// than aborting the operation.
 pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Result<(), StoreError> {
     use crate::store::utils;
-    let issues = audit_state(store, repair);
-    // When repair is on, audit_state always prepends a "Repair applied..."
-    // marker line; skip it so we only surface problems that repair couldn't
-    // handle.
-    let relevant = if repair {
-        issues.into_iter().skip(1).collect::<Vec<_>>()
-    } else {
-        issues
-    };
-    if relevant.is_empty() {
+    let report = audit_state(store, repair);
+    // `report.issues` already excludes the "Repair applied" marker, so we can
+    // check it directly without fragile string-based filtering.
+    if report.issues.is_empty() {
         return Ok(());
     }
     Err(StoreError::InvariantViolation(utils::fmt_issues(
         &format!("Invariant violation ({})", context),
-        &relevant,
+        &report.issues,
         8,
     )))
 }

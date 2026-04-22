@@ -293,19 +293,16 @@ impl Node {
         }
     }
 
-    /// Thin wrapper around [`Chest::calc_position`] kept for a stable call site
-    /// in the bot validation path, which passes the node_id for future use.
+    /// Thin wrapper around [`Chest::calc_position`] kept here for path/naming
+    /// stability with the bot validation call site.
     ///
     /// # Arguments
-    /// * `_node_id` - Node ID (unused; retained because the bot validation path
-    ///   carries it through for logging context)
     /// * `chest_index` - Chest index (0-3)
     /// * `node_position` - World position of the node
     ///
     /// # Panics
     /// Panics if chest_index is not in range 0-3.
     pub fn calc_chest_position(
-        _node_id: i32,
         chest_index: i32,
         node_position: &Position,
     ) -> Position {
@@ -415,25 +412,25 @@ mod tests {
         // Left column: x-2, Right column: x-1
 
         // Chest 0: left, top (x-2, y+1, z-1)
-        let chest0 = Node::calc_chest_position(0, 0, &node_pos);
+        let chest0 = Node::calc_chest_position(0, &node_pos);
         assert_eq!(chest0.x, 98); // x-2
         assert_eq!(chest0.y, 65); // y+1
         assert_eq!(chest0.z, 199); // z-1
 
         // Chest 1: right, top (x-1, y+1, z-1)
-        let chest1 = Node::calc_chest_position(0, 1, &node_pos);
+        let chest1 = Node::calc_chest_position(1, &node_pos);
         assert_eq!(chest1.x, 99); // x-1
         assert_eq!(chest1.y, 65); // y+1
         assert_eq!(chest1.z, 199); // z-1
 
         // Chest 2: left, bottom (x-2, y, z-1)
-        let chest2 = Node::calc_chest_position(0, 2, &node_pos);
+        let chest2 = Node::calc_chest_position(2, &node_pos);
         assert_eq!(chest2.x, 98); // x-2
         assert_eq!(chest2.y, 64); // same y
         assert_eq!(chest2.z, 199); // z-1
 
         // Chest 3: right, bottom (x-1, y, z-1)
-        let chest3 = Node::calc_chest_position(0, 3, &node_pos);
+        let chest3 = Node::calc_chest_position(3, &node_pos);
         assert_eq!(chest3.x, 99); // x-1
         assert_eq!(chest3.y, 64); // same y
         assert_eq!(chest3.z, 199); // z-1

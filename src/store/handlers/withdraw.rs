@@ -3,7 +3,7 @@
 use tracing::{debug, info, warn};
 
 use super::super::{Store, state, utils};
-use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
@@ -93,6 +93,19 @@ pub async fn handle_withdraw_balance_queued(
                     &format!("No whole diamonds to withdraw. Balance: {:.2} (need at least 1.00)", user_balance),
                 ).await;
             }
+            // If the user's balance exceeds the per-trade cap, tell them
+            // explicitly so they know to issue another /withdraw for the rest
+            // instead of assuming the full balance came out in one go.
+            if whole_balance > MAX_TRADE_DIAMONDS as f64 {
+                utils::send_message_to_player(
+                    store,
+                    player_name,
+                    &format!(
+                        "Balance {:.2} exceeds the per-trade cap of {} diamonds; withdrawing {} this transaction. Use /withdraw again for the rest.",
+                        user_balance, MAX_TRADE_DIAMONDS, MAX_TRADE_DIAMONDS
+                    ),
+                ).await?;
+            }
             whole_balance.min(MAX_TRADE_DIAMONDS as f64)
         }
     };
@@ -163,8 +176,8 @@ pub async fn handle_withdraw_balance_queued(
             let node_position = store.get_node_position(t.chest_id);
             let chest = crate::types::Chest {
                 id: t.chest_id,
-                node_id: t.chest_id / 4,
-                index: t.chest_id % 4,
+                node_id: t.chest_id / CHESTS_PER_NODE as i32,
+                index: t.chest_id % CHESTS_PER_NODE as i32,
                 position: t.position,
                 item: t.item.clone(),
                 amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],

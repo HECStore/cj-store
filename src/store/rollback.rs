@@ -13,7 +13,7 @@
 //! much as possible is restored even when one chest is unreachable.
 
 use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::messages::{BotInstruction, ChestAction};
@@ -133,13 +133,21 @@ pub async fn deposit_transfers(
         .await
         {
             Ok(Ok(Ok(report))) => {
+                // The bot confirmed the physical transfer, so items ARE back
+                // in storage; we always credit `items_returned`. But if
+                // `apply_chest_sync` fails, the store's in-memory view has
+                // drifted from physical reality — that's a failure the operator
+                // needs to see. Count it as failed (so `has_failures()` flips)
+                // and log at error level to match the other error paths.
                 if let Err(e) = store.apply_chest_sync(report) {
-                    warn!(
-                        "{} Rollback step {} chest sync warning: {}",
+                    error!(
+                        "{} Rollback step {} chest sync FAILED (state divergence): {}",
                         context, step_num, e
                     );
+                    result.operations_failed += 1;
+                } else {
+                    result.operations_succeeded += 1;
                 }
-                result.operations_succeeded += 1;
                 result.items_returned += t.amount;
             }
             Ok(Ok(Err(e))) => {

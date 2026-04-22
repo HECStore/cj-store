@@ -14,6 +14,7 @@
 //! rest of the permission system.
 
 use super::handlers::validation::{validate_item_name, validate_quantity, validate_username};
+use crate::types::ItemId;
 
 /// A parsed player command.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,7 +93,7 @@ fn parse_item_quantity(parts: &[&str], verb: &str) -> Result<(String, u32), Stri
         return Err(format!("Usage: {} <item> <quantity>. Example: {} cobblestone 64", verb, verb));
     }
     validate_item_name(parts[1])?;
-    let item = super::utils::normalize_item_id(parts[1]);
+    let item = ItemId::new(parts[1]).map_err(|e| e.to_string())?.to_string();
     let quantity = validate_quantity(parts[2], verb)?;
     Ok((item, quantity))
 }
@@ -102,7 +103,7 @@ fn parse_item_amount(parts: &[&str], verb: &str) -> Result<(String, f64), String
         return Err(format!("Usage: {} <item> <amount>", verb));
     }
     validate_item_name(parts[1])?;
-    let item = super::utils::normalize_item_id(parts[1]);
+    let item = ItemId::new(parts[1]).map_err(|e| e.to_string())?.to_string();
     let amount: f64 = parts[2]
         .parse()
         .map_err(|_| format!("Invalid amount '{}'. Please enter a number.", parts[2]))?;
@@ -133,7 +134,7 @@ fn parse_price(parts: &[&str]) -> Result<Command, String> {
         return Err("Usage: price <item> [quantity]. Example: price cobblestone 64".to_string());
     }
     validate_item_name(parts[1])?;
-    let item = super::utils::normalize_item_id(parts[1]);
+    let item = ItemId::new(parts[1]).map_err(|e| e.to_string())?.to_string();
 
     let quantity: Option<u32> = if parts.len() >= 3 {
         match parts[2].parse::<u32>() {

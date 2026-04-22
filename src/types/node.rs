@@ -167,8 +167,8 @@ impl Node {
 
             if needs_save
                 && let Err(e) = node.save() {
-                    eprintln!(
-                        "Warning: Failed to save node 0 reserved chest assignments: {}",
+                    tracing::warn!(
+                        "Failed to save node 0 reserved chest assignments: {}",
                         e
                     );
                 }

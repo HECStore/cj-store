@@ -226,7 +226,10 @@ pub async fn handle_additem_order(
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "additem/commit")?;
     pair.item_stock = new_stock;
-    debug_assert!(pair.item_stock >= 0, "item_stock went negative after add_stock");
+    assert!(pair.item_stock >= 0,
+        "[Additem] INVARIANT VIOLATED: item_stock went negative after add_stock \
+        (item={}, stock={}). This indicates a storage accounting bug.",
+        item, pair.item_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -395,7 +398,7 @@ pub async fn handle_removeitem_order(
         // Rollback: withdrawal already moved items from chests into the bot.
         // Re-deposit each planned chunk back into its source chest via the shared helper.
         let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
-        let _ = super::super::rollback::deposit_transfers(
+        let rb = super::super::rollback::deposit_transfers(
             store,
             &preview_withdraw_plan,
             item,
@@ -403,6 +406,19 @@ pub async fn handle_removeitem_order(
             "[Removeitem] trade-send-failed",
         )
         .await;
+        if rb.has_failures() {
+            error!(
+                "[Removeitem] CRITICAL: rollback failed after trade-send error — \
+                {} item(s) of '{}' are stranded in the bot's inventory and require \
+                manual operator recovery. player={} qty_requested={} rb_returned={} rb_failed_steps={}",
+                qty_i32 - rb.items_returned,
+                item,
+                player_name,
+                qty_i32,
+                rb.items_returned,
+                rb.operations_failed,
+            );
+        }
         return Err(StoreError::BotError(format!("Failed to send trade instruction to bot: {}", e)));
     }
 
@@ -416,7 +432,7 @@ pub async fn handle_removeitem_order(
         // Rollback: items are still in the bot's inventory. Deposit them back using
         // the same plan we withdrew with via the shared helper.
         let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
-        let _ = super::super::rollback::deposit_transfers(
+        let rb = super::super::rollback::deposit_transfers(
             store,
             &preview_withdraw_plan,
             item,
@@ -424,6 +440,31 @@ pub async fn handle_removeitem_order(
             "[Removeitem] trade-failed",
         )
         .await;
+        if rb.has_failures() {
+            error!(
+                "[Removeitem] CRITICAL: rollback failed after trade failure — \
+                {} item(s) of '{}' are stranded in the bot's inventory and require \
+                manual operator recovery. player={} qty_requested={} trade_error='{}' \
+                rb_returned={} rb_failed_steps={}",
+                qty_i32 - rb.items_returned,
+                item,
+                player_name,
+                qty_i32,
+                err,
+                rb.items_returned,
+                rb.operations_failed,
+            );
+            return utils::send_message_to_player(
+                store,
+                player_name,
+                &format!(
+                    "Removeitem CRITICAL ERROR: trade failed and rollback also partially failed. \
+                    {} item(s) may be stuck in bot inventory. Contact administrator. trade_error='{}'",
+                    qty_i32 - rb.items_returned, err
+                ),
+            )
+            .await;
+        }
 
         return utils::send_message_to_player(
             store,
@@ -438,7 +479,10 @@ pub async fn handle_removeitem_order(
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "removeitem/commit")?;
     pair.item_stock = new_stock;
-    debug_assert!(pair.item_stock >= 0, "item_stock went negative after remove_stock");
+    assert!(pair.item_stock >= 0,
+        "[Removeitem] INVARIANT VIOLATED: item_stock went negative after remove_stock \
+        (item={}, stock={}). This indicates a storage accounting bug.",
+        item, pair.item_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -499,8 +543,10 @@ pub async fn handle_add_currency(
 
     let pair = store.expect_pair_mut(item, "add-currency/commit")?;
     pair.currency_stock += amount;
-    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
-        "currency_stock invalid after add_currency: {}", pair.currency_stock);
+    assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "[AddCurrency] INVARIANT VIOLATED: currency_stock invalid after add_currency \
+        (item={}, stock={}). This indicates a currency accounting bug.",
+        item, pair.currency_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -574,8 +620,10 @@ pub async fn handle_remove_currency(
 
     let pair = store.expect_pair_mut(item, "remove-currency/commit")?;
     pair.currency_stock -= amount;
-    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
-        "currency_stock invalid after remove_currency: {}", pair.currency_stock);
+    assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "[RemoveCurrency] INVARIANT VIOLATED: currency_stock invalid after remove_currency \
+        (item={}, stock={}). This indicates a currency accounting bug.",
+        item, pair.currency_stock);
     store.dirty = true;
 
     store.trades.push(Trade::new(

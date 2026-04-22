@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::fsutil::write_atomic;
 use crate::types::ItemId;
 
+use tracing::warn;
+
 /// Represents a trading pair: item <-> diamonds (currency).
 ///
 /// **Persistence**: Saved to `data/pairs/{item}.json`
@@ -150,13 +152,13 @@ impl Pair {
                             let item_name = pair.item.to_string();
                             pairs.insert(item_name, pair);
                         }
-                        Err(e) => eprintln!(
-                            "Warning: Could not deserialize pair from {}: {}",
+                        Err(e) => warn!(
+                            "Could not deserialize pair from {}: {}",
                             path.display(),
                             e
                         ),
                     },
-                    Err(e) => eprintln!("Warning: Could not read file {}: {}", path.display(), e),
+                    Err(e) => warn!("Could not read file {}: {}", path.display(), e),
                 }
             }
         }

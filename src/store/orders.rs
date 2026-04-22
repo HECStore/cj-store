@@ -1162,7 +1162,7 @@ mod tests {
                                 item, amount, ..
                             } => (item, amount),
                         };
-                        let mut amounts = vec![-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
                         // Compute new value for slot 0 based on the prior state
                         let prior = target_chest.amounts.first().copied().unwrap_or(0);
                         amounts[0] = (prior + delta).max(0);
@@ -1173,18 +1173,19 @@ mod tests {
                         }));
                     }
                     BotInstruction::TradeWithPlayer {
-                        bot_offers,
-                        player_offers,
+                        bot_offers: _,
+                        player_offers: items_player_must_give,
                         respond_to,
                         ..
                     } => {
-                        // Succeed: the player "delivered" exactly what they
-                        // were supposed to. For buys, that's `player_offers`
-                        // (typically diamonds); for sells, it's bot_offers
-                        // echoing back. We return player_offers so
-                        // post-trade accounting uses what the player gave.
-                        let _ = bot_offers;
-                        let _ = respond_to.send(Ok(player_offers));
+                        // Simulate a successful trade: the bot reports that
+                        // the player delivered exactly what was requested.
+                        // `perform_trade` returns the items the bot received
+                        // from the player, which is always `player_offers`
+                        // from the instruction (diamonds on a buy, the traded
+                        // item on a sell). Callers use this list for
+                        // post-trade accounting.
+                        let _ = respond_to.send(Ok(items_player_must_give));
                     }
                     _ => {
                         // Other variants aren't exercised by these tests.

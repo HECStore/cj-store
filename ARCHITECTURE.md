@@ -318,7 +318,7 @@ cj-store/
       rollback.rs
       state.rs                  # save, audit, invariants
       trade_state.rs            # TradeState SM + crash-resume mirror
-      utils.rs                  # normalize_item_id, UUID cache
+      utils.rs                  # UUID cache, send_message_to_player, summarize helpers
     bot/
       mod.rs                    # Bot struct, event loop
       connection.rs  navigation.rs  shulker.rs

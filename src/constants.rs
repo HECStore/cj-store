@@ -187,6 +187,11 @@ pub const NODE_SPACING: i32 = 3;
 /// This is the only chest that allows mixed item types in its shulkers.
 pub const OVERFLOW_CHEST_ITEM: &str = "overflow";
 
+/// Item name for the base currency chest (node 0, chest 0).
+/// This is the item used as the store's currency for all trading pairs.
+/// All pair prices and user balances are denominated in this item.
+pub const BASE_CURRENCY_ITEM: &str = "diamond";
+
 /// Chest ID for diamond storage (node 0, chest 0)
 pub const DIAMOND_CHEST_ID: i32 = 0;
 

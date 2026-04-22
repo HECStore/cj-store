@@ -22,6 +22,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use tracing::warn;
+
 use crate::fsutil::write_atomic;
 
 // The Mojang lookup path is gated behind `#[cfg(not(test))]` so tests don't
@@ -181,7 +183,7 @@ impl User {
         let mut users = HashMap::new();
 
         if !dir_path.exists() {
-            eprintln!(
+            warn!(
                 "Users directory not found at {}. Returning an empty HashMap.",
                 dir_path.display()
             );
@@ -199,13 +201,13 @@ impl User {
                             let uuid = user.uuid.clone();
                             users.insert(uuid, user);
                         }
-                        Err(e) => eprintln!(
-                            "Warning: Could not deserialize user from {}: {}",
+                        Err(e) => warn!(
+                            "Could not deserialize user from {}: {}",
                             path.display(),
                             e
                         ),
                     },
-                    Err(e) => eprintln!("Warning: Could not read file {}: {}", path.display(), e),
+                    Err(e) => warn!("Could not read file {}: {}", path.display(), e),
                 }
             }
         }

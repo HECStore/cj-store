@@ -115,6 +115,12 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     match fs::rename(&tmp_path, path) {
         Ok(_) => {
             tracing::debug!("[File] write_atomic: Rename successful");
+            #[cfg(unix)]
+            {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
             Ok(())
         },
         Err(e) => {

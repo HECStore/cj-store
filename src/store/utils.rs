@@ -28,18 +28,6 @@ fn uuid_cache() -> &'static Mutex<UuidCache> {
     UUID_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Normalize item ID: strip "minecraft:" prefix if present.
-/// This ensures consistent item naming across the codebase (without prefix).
-/// "minecraft:diamond" -> "diamond", "diamond" -> "diamond"
-/// Returns empty string for empty input (invalid, caller should validate).
-pub fn normalize_item_id(item: &str) -> String {
-    if item.is_empty() {
-        return String::new();
-    }
-    // Strip "minecraft:" prefix if present
-    item.strip_prefix("minecraft:").unwrap_or(item).to_string()
-}
-
 /// Resolve username to UUID via Mojang API (async), with in-memory caching.
 ///
 /// Lookups are cached for `UUID_CACHE_TTL_SECS` (default 5 minutes). Repeated
@@ -252,24 +240,6 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_normalize_item_id() {
-        // Should keep items without prefix unchanged
-        assert_eq!(normalize_item_id("diamond"), "diamond");
-        assert_eq!(normalize_item_id("cobblestone"), "cobblestone");
-        assert_eq!(normalize_item_id("iron_ingot"), "iron_ingot");
-        
-        // Should strip minecraft: prefix
-        assert_eq!(normalize_item_id("minecraft:diamond"), "diamond");
-        assert_eq!(normalize_item_id("minecraft:cobblestone"), "cobblestone");
-        
-        // Should preserve custom namespaces (only strips "minecraft:" prefix)
-        assert_eq!(normalize_item_id("modid:custom_item"), "modid:custom_item");
-        
-        // Empty string returns empty string (invalid, caller should validate)
-        assert_eq!(normalize_item_id(""), "");
-    }
-    
-    #[test]
     fn test_fmt_issues() {
         // Empty issues
         assert_eq!(fmt_issues("Errors", &[], 5), "Errors");
@@ -306,7 +276,7 @@ mod tests {
         // Single transfer
         let transfers = vec![ChestTransfer {
             chest_id: 0,
-            item: crate::types::ItemId::from_normalized("diamond".to_string()),
+            item: crate::types::ItemId::new("diamond").unwrap(),
             amount: 64,
             position: Position::default(),
         }];
@@ -316,13 +286,13 @@ mod tests {
         let transfers = vec![
             ChestTransfer {
                 chest_id: 0,
-                item: crate::types::ItemId::from_normalized("diamond".to_string()),
+                item: crate::types::ItemId::new("diamond").unwrap(),
                 amount: 64,
                 position: Position::default(),
             },
             ChestTransfer {
                 chest_id: 1,
-                item: crate::types::ItemId::from_normalized("iron_ingot".to_string()),
+                item: crate::types::ItemId::new("iron_ingot").unwrap(),
                 amount: 128,
                 position: Position::default(),
             },

@@ -86,9 +86,9 @@ impl Trade {
     }
 
     // Helper function to get the file path for a single trade.
-    // The timestamp doubles as the filename, so two trades created in the
-    // same nanosecond would collide — in practice this is fine since
-    // `Utc::now()` is monotonic per process and trades are created serially.
+    // The timestamp doubles as the filename, so two trades created at the
+    // exact same nanosecond would collide — in practice this is fine since
+    // trades are created serially and sub-nanosecond collisions are not expected.
     fn get_trade_file_path(timestamp: &DateTime<Utc>) -> PathBuf {
         // Colons are reserved on Windows (NTFS) filesystems, so RFC3339
         // timestamps must have them replaced before use as a filename.
@@ -131,18 +131,28 @@ impl Trade {
             return Ok(Vec::new());
         }
 
-        // Collect .json entries in a single directory scan. Reading the
-        // directory twice (once for count, once for load) would be wasteful
-        // and could report inconsistent counts if files were added or removed
-        // between scans.
-        let json_paths: Vec<PathBuf> = fs::read_dir(dir_path)?
+        // Collect .json filenames and sort them lexicographically. Because
+        // filenames are RFC3339 timestamps with colons replaced by dashes,
+        // lexicographic order equals chronological order. Sorting before
+        // slicing lets us take only the last `max_trades` filenames and
+        // deserialize only those files, avoiding a full history read.
+        let mut json_paths: Vec<PathBuf> = fs::read_dir(dir_path)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "json"))
             .collect();
         let file_count = json_paths.len();
 
-        for path in &json_paths {
+        json_paths.sort();
+
+        // Keep only the last `max_trades` paths (the most recent ones).
+        let paths_to_load = if json_paths.len() > max_trades {
+            &json_paths[json_paths.len() - max_trades..]
+        } else {
+            &json_paths[..]
+        };
+
+        for path in paths_to_load {
             match fs::read_to_string(path) {
                 Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                     Ok(trade) => {
@@ -158,17 +168,11 @@ impl Trade {
             }
         }
 
-        // Sort trades by timestamp (oldest first)
+        // Trades are already in chronological order due to sorted filenames,
+        // but sort by timestamp field to be safe against any filename anomalies.
         trades.sort_by_key(|a| a.timestamp);
-        
-        // Limit to max_trades (keep most recent).
-        // Since trades are sorted oldest-first, skipping the first N entries
-        // discards the oldest and retains the most recent `max_trades`.
-        if trades.len() > max_trades {
-            let original_count = trades.len();
-            trades = trades.into_iter()
-                .skip(original_count - max_trades)
-                .collect();
+
+        if file_count > max_trades {
             tracing::info!(
                 "Loaded {} of {} trades into memory (limited to {})",
                 trades.len(),
@@ -189,6 +193,15 @@ impl Trade {
     /// The orphan cleanup ensures the on-disk set matches `trades` exactly,
     /// so callers can use this to synchronize after in-memory deletions.
     pub fn save_all(trades: &Vec<Self>) -> io::Result<()> {
+        // Refuse to proceed with an empty vec — writing zero expected files
+        // would cause the orphan-cleanup loop below to delete every trade on disk.
+        if trades.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "save_all called with an empty trades vec; refusing to wipe the trades directory",
+            ));
+        }
+
         let dir_path = Path::new(Self::TRADES_DIR);
 
         // Ensure the directory exists

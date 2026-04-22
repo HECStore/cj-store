@@ -91,10 +91,10 @@ recovered). The usual async discipline — never hold the guard across
   finite, buy-then-sell is strictly lossy at resulting reserves, non-positive
   quantity always returns `None`, `x*y=k` exact at `fee=0.0`, fee knob is
   monotonic.
-- **`debug_assert!`** guards in [src/store/orders.rs](src/store/orders.rs)
-  and [src/store/handlers/operator.rs](src/store/handlers/operator.rs)
-  verify non-negativity and finiteness in dev/test builds; compiled out of
-  release.
+- **`assert!`** guards in [src/store/handlers/operator.rs](src/store/handlers/operator.rs)
+  verify non-negativity and finiteness of stock values and fire in both debug
+  and release builds. **`debug_assert!`** guards in
+  [src/store/orders.rs](src/store/orders.rs) are compiled out of release.
 - **Integration tests** build a `Store` in-memory via `Store::new_for_test`
   and spawn a mock bot task; `utils::resolve_user_uuid` is cfg-gated to
   deterministic offline UUIDs under `#[cfg(test)]`.

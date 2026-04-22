@@ -3,8 +3,8 @@
 //! Pulled out of `player.rs` so the per-command handler modules can share
 //! them without cycles.
 
-use super::super::utils;
 use crate::constants::MAX_TRANSACTION_QUANTITY;
+use crate::types::ItemId;
 
 /// Validate item name format.
 /// Item names should be alphanumeric with optional underscores and colons.
@@ -17,8 +17,7 @@ pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
         return Err("Item name cannot be empty. Example: buy cobblestone 64".to_string());
     }
 
-    let normalized = utils::normalize_item_id(item);
-    if normalized.is_empty() {
+    if ItemId::new(item).is_err() {
         return Err("Invalid item name. Example items: cobblestone, iron_ingot, diamond".to_string());
     }
 

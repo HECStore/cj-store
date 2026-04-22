@@ -51,10 +51,15 @@ impl ItemId {
     }
 
     /// Build an `ItemId` from a string that is already known to be
-    /// normalized. No prefix stripping or validation is performed.
+    /// normalized (no `minecraft:` prefix). No prefix stripping is performed.
     ///
-    /// Prefer [`new`](Self::new) for user/external input.
+    /// # Panics (debug builds only)
+    ///
+    /// Panics if `s` is empty, because an empty `ItemId` is never valid outside
+    /// the [`EMPTY`](Self::EMPTY) sentinel. Use [`new`](Self::new) for
+    /// user/external input.
     pub fn from_normalized(s: String) -> Self {
+        debug_assert!(!s.is_empty(), "ItemId::from_normalized called with empty string");
         Self(s)
     }
 

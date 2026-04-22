@@ -24,15 +24,17 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                     if chest.item != "diamond" {
                         warn!("Attempted to change node 0 chest 0 item from diamond to {}, enforcing diamond", report.item);
                     }
-                    chest.item = ItemId::from_normalized("diamond".to_string());
+                    chest.item = ItemId::new("diamond").expect("diamond is a valid item ID");
                 } else if chest.id == crate::constants::OVERFLOW_CHEST_ID {
                     // Chest 1: dedicated for overflow (mixed items allowed, but keep the "overflow" item type)
                     if chest.item != crate::constants::OVERFLOW_CHEST_ITEM {
                         warn!("Attempted to change node 0 chest 1 item from overflow to {}, enforcing overflow", report.item);
                     }
-                    chest.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
+                    chest.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                 } else {
-                    chest.item = ItemId::from_normalized(report.item);
+                    // report.item comes from the bot and may include a minecraft: prefix;
+                    // use ItemId::new to normalize it. Fall back to EMPTY if invalid.
+                    chest.item = ItemId::new(&report.item).unwrap_or(ItemId::EMPTY);
                 }
                 
                 // Slot merge semantics:

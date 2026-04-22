@@ -51,16 +51,21 @@ pub struct TradeItem {
 ///
 /// Sent from Bot to Store to sync authoritative state.
 /// Contains per-slot item counts for the entire chest (54 slots).
+///
+/// `ChestSyncReport` is an in-memory-only type (no Serde derives) so the
+/// fixed-size array does not affect any on-disk format.  The persisted
+/// `Chest.amounts` field remains `Vec<i32>` and is updated slot-by-slot
+/// in `apply_chest_sync`.
 #[derive(Debug, Clone)]
 pub struct ChestSyncReport {
     /// Chest ID (calculated as `node_id * 4 + chest_index`)
     pub chest_id: i32,
     /// Item type stored in this chest
     pub item: String,
-    /// Per-slot item counts for the double chest — length 54, one entry
-    /// per chest slot (each slot may hold a shulker box whose contents
-    /// are aggregated into that entry's total).
-    pub amounts: Vec<i32>,
+    /// Per-slot item counts for the double chest — exactly 54 entries, one
+    /// per chest slot.  A value of `-1` means "bot did not inspect this slot;
+    /// preserve the existing stored value" (see `apply_chest_sync`).
+    pub amounts: [i32; crate::constants::DOUBLE_CHEST_SLOTS],
 }
 
 /// Actions that can be performed on a chest.

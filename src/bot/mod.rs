@@ -141,16 +141,17 @@ impl Bot {
     }
 
     /// Normalize item ID by stripping "minecraft:" prefix if present.
-    /// 
-    /// This is a wrapper around `crate::store::utils::normalize_item_id()` for
-    /// convenience in bot code. Used for consistent item naming in storage.
-    /// 
+    ///
+    /// Used to canonicalize raw item names returned by the Minecraft API so
+    /// they can be compared against stored `ItemId` values (which are already
+    /// prefix-free). Empty input returns an empty string; callers that need a
+    /// non-empty invariant should use `ItemId::new` instead.
+    ///
     /// # Examples
     /// - "minecraft:diamond" -> "diamond"
     /// - "diamond" -> "diamond"
-    /// - "" -> "" (invalid, caller should validate)
     pub fn normalize_item_id(item: &str) -> String {
-        crate::store::utils::normalize_item_id(item)
+        item.strip_prefix("minecraft:").unwrap_or(item).to_string()
     }
     
     pub fn chat_subscribe(&self) -> broadcast::Receiver<String> {
@@ -334,12 +335,16 @@ pub async fn bot_task(
                                     // least one slot is non-zero. An all-zero array is ambiguous - it could
                                     // mean "never scanned yet" rather than "confirmed empty", and treating
                                     // an unscanned chest as empty would skip valid destinations.
-                                    let known_counts = if target_chest.amounts.len() == crate::constants::DOUBLE_CHEST_SLOTS
-                                        && target_chest.amounts.iter().any(|&x| x > 0) {
-                                        Some(&target_chest.amounts)
-                                    } else {
-                                        None
-                                    };
+                                    let known_arr: Option<[i32; crate::constants::DOUBLE_CHEST_SLOTS]> =
+                                        if target_chest.amounts.len() == crate::constants::DOUBLE_CHEST_SLOTS
+                                            && target_chest.amounts.iter().any(|&x| x > 0)
+                                        {
+                                            let mut arr = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                                            arr.copy_from_slice(&target_chest.amounts);
+                                            Some(arr)
+                                        } else {
+                                            None
+                                        };
                                     let io_start = std::time::Instant::now();
                                     let io_result = chest_io::automated_chest_io(
                                         &bot,
@@ -349,7 +354,7 @@ pub async fn bot_task(
                                         amount,
                                         "deposit",
                                         &node_position,
-                                        known_counts,
+                                        known_arr.as_ref(),
                                         stack_size,
                                     ).await;
                                     let io_elapsed = io_start.elapsed();
@@ -379,12 +384,16 @@ pub async fn bot_task(
                                     // Same all-zero ambiguity guard as the deposit path: an unscanned chest
                                     // has a zero-filled amounts array which we must NOT treat as "all empty",
                                     // otherwise we'd refuse to pull from chests that actually have stock.
-                                    let known_counts = if target_chest.amounts.len() == crate::constants::DOUBLE_CHEST_SLOTS
-                                        && target_chest.amounts.iter().any(|&x| x > 0) {
-                                        Some(&target_chest.amounts)
-                                    } else {
-                                        None
-                                    };
+                                    let known_arr: Option<[i32; crate::constants::DOUBLE_CHEST_SLOTS]> =
+                                        if target_chest.amounts.len() == crate::constants::DOUBLE_CHEST_SLOTS
+                                            && target_chest.amounts.iter().any(|&x| x > 0)
+                                        {
+                                            let mut arr = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                                            arr.copy_from_slice(&target_chest.amounts);
+                                            Some(arr)
+                                        } else {
+                                            None
+                                        };
                                     let io_result = chest_io::automated_chest_io(
                                         &bot,
                                         chest_block_pos,
@@ -393,7 +402,7 @@ pub async fn bot_task(
                                         amount,
                                         "withdraw",
                                         &node_position,
-                                        known_counts,
+                                        known_arr.as_ref(),
                                         stack_size,
                                     ).await;
 

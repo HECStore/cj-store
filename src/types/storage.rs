@@ -219,16 +219,6 @@ impl Storage {
         None
     }
 
-    /// Convenience wrapper (reserved): withdraw and return actual amount removed.
-    pub fn withdraw_item(&mut self, item: &str, qty: i32) -> i32 {
-        self.withdraw_plan(item, qty).iter().map(|t| t.amount).sum()
-    }
-
-    /// Convenience wrapper (reserved): deposit and return actual amount added.
-    pub fn deposit_item(&mut self, item: &str, qty: i32, stack_size: i32) -> i32 {
-        self.deposit_plan(item, qty, stack_size).iter().map(|t| t.amount).sum()
-    }
-
     /// Plans withdrawal of `qty` items **without mutating** storage state.
     ///
     /// This is the read-only counterpart to `withdraw_plan`. It walks the

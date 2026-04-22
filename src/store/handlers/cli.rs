@@ -84,11 +84,11 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             // Node 0 has reserved chests (forced, cannot change)
             if node_id == 0 {
                 if let Some(chest_0) = node.chests.get_mut(0) {
-                    chest_0.item = ItemId::from_normalized("diamond".to_string());
+                    chest_0.item = ItemId::new(crate::constants::BASE_CURRENCY_ITEM).expect("BASE_CURRENCY_ITEM is a valid item ID");
                     info!("Node 0 chest 0 set to diamond (forced, cannot change)");
                 }
                 if let Some(chest_1) = node.chests.get_mut(1) {
-                    chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
+                    chest_1.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                     info!("Node 0 chest 1 set to overflow (forced, cannot change)");
                 }
             }
@@ -158,11 +158,11 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                     // Node 0 has reserved chests
                     if node_id == 0 {
                         if let Some(chest_0) = node.chests.get_mut(0) {
-                            chest_0.item = ItemId::from_normalized("diamond".to_string());
+                            chest_0.item = ItemId::new(crate::constants::BASE_CURRENCY_ITEM).expect("BASE_CURRENCY_ITEM is a valid item ID");
                             info!("Node 0 chest 0 set to diamond (forced)");
                         }
                         if let Some(chest_1) = node.chests.get_mut(1) {
-                            chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
+                            chest_1.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                             info!("Node 0 chest 1 set to overflow (forced)");
                         }
                     }
@@ -243,21 +243,23 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 let _ = respond_to.send(Err(format!("Invalid stack size: {}. Must be 1, 16, or 64", stack_size)));
                 return Ok(());
             }
-            // Normalize to the canonical item id (lowercase, strip namespace,
-            // etc.) so the pair key is consistent with how trades reference it.
-            let normalized_item = utils::normalize_item_id(&item_name);
-            // Check if normalization resulted in empty string (invalid item name)
-            if normalized_item.is_empty() {
-                let _ = respond_to.send(Err("Invalid item name".to_string()));
-                return Ok(());
-            }
+            // Normalize to the canonical item id (strip minecraft: prefix) so
+            // the pair key is consistent with how trades reference it.
+            let item_id = match ItemId::new(&item_name) {
+                Ok(id) => id,
+                Err(_) => {
+                    let _ = respond_to.send(Err("Invalid item name".to_string()));
+                    return Ok(());
+                }
+            };
+            let normalized_item = item_id.to_string();
             if store.pairs.contains_key(&normalized_item) {
                 let _ = respond_to.send(Err(format!("Pair '{}' already exists", normalized_item)));
             } else {
                 store.pairs.insert(
                     normalized_item.clone(),
                     crate::types::Pair {
-                        item: ItemId::from_normalized(normalized_item.clone()),
+                        item: item_id,
                         stack_size,
                         item_stock: 0,
                         currency_stock: 0.0,
@@ -274,11 +276,17 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 let _ = respond_to.send(Err("Item name cannot be empty".to_string()));
                 return Ok(());
             }
-            let normalized_item = utils::normalize_item_id(&item_name);
+            let normalized_item = match ItemId::new(&item_name) {
+                Ok(id) => id.to_string(),
+                Err(_) => {
+                    let _ = respond_to.send(Err("Invalid item name".to_string()));
+                    return Ok(());
+                }
+            };
 
-            // Diamond is the store's base currency; removing it would break
-            // every existing pair's pricing and user balance accounting.
-            if normalized_item == "diamond" {
+            // The base currency pair cannot be removed; it underpins every
+            // existing pair's pricing and user balance accounting.
+            if normalized_item == crate::constants::BASE_CURRENCY_ITEM {
                 let _ = respond_to.send(Err("Cannot remove diamond pair (used as currency)".to_string()));
                 return Ok(());
             }
@@ -409,10 +417,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                         // Node 0 has reserved chests
                         if node_id == 0 {
                             if let Some(chest_0) = node.chests.get_mut(0) {
-                                chest_0.item = ItemId::from_normalized("diamond".to_string());
+                                chest_0.item = ItemId::new(crate::constants::BASE_CURRENCY_ITEM).expect("BASE_CURRENCY_ITEM is a valid item ID");
                             }
                             if let Some(chest_1) = node.chests.get_mut(1) {
-                                chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
+                                chest_1.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                             }
                         }
                         

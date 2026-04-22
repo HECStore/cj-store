@@ -94,20 +94,22 @@ impl Store {
                 needs_save = true; // Will remove invalid pair file
                 continue;
             }
-            let normalized_item = utils::normalize_item_id(&pair.item);
-            // Skip pairs that normalize to empty
-            if normalized_item.is_empty() {
-                warn!("Skipping pair with invalid item name '{}' (normalized to empty)", pair.item);
-                needs_save = true; // Will remove invalid pair file
-                continue;
-            }
+            let item_id = match ItemId::new(&pair.item) {
+                Ok(id) => id,
+                Err(_) => {
+                    warn!("Skipping pair with invalid item name '{}' (normalized to empty)", pair.item);
+                    needs_save = true; // Will remove invalid pair file
+                    continue;
+                }
+            };
+            let normalized_item = item_id.to_string();
             // If the item was not normalized (e.g., had minecraft: prefix), we need to update it and save
             if old_key != normalized_item {
                 warn!("Normalizing pair item name from '{}' to '{}'", old_key, normalized_item);
                 needs_save = true;
             }
             // Update the pair's item field to normalized form (without minecraft: prefix)
-            pair.item = ItemId::from_normalized(normalized_item.clone());
+            pair.item = item_id;
             // Insert with normalized key
             normalized_pairs.insert(normalized_item, pair);
         }

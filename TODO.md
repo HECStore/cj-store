@@ -94,8 +94,8 @@
 
 **Observations:**
 
-- Atomicity is "best-effort": rename path is atomic, copy-fallback path is not. No parent-directory `fsync` after rename, so a crash immediately after rename can lose the name flip on POSIX — durability ceiling.
-- Rename-failure → copy-fallback path still isn't covered by tests (portability of simulating Windows rename failure is awkward).
+- [ ] Add parent-directory `fsync` after rename in `write_atomic` to close the POSIX durability gap: a crash between rename and fsync can lose the name flip.
+- [ ] Add a unit test for the rename-failure → copy-fallback path (inject failure via a test-only hook or `cfg`-gated wrapper so it runs portably).
 
 ### src/messages.rs
 
@@ -151,9 +151,9 @@
 
 **Observations:**
 
-- `ItemId::new` has zero production call sites — every non-test construction goes through `ItemId::from_normalized(...)` after `store::utils::normalize_item_id`. Consolidating onto `ItemId::new` would give one canonical entry point but touches dozens of files.
-- `store::utils::normalize_item_id` duplicates the prefix-strip logic from `ItemId::new`. Two normalizers maintained in parallel; the utility version becomes redundant once call sites unify.
-- Non-empty invariant only holds for values from `new`. `EMPTY` and `from_normalized` are both escape hatches — the invariant is effectively test-path-only today.
+- [ ] Consolidate all `ItemId` construction onto `ItemId::new`. Production currently goes through `ItemId::from_normalized(...)` after `store::utils::normalize_item_id`; unifying gives one canonical entry point (touches dozens of files).
+- [ ] Delete `store::utils::normalize_item_id` after the `ItemId::new` consolidation — its prefix-strip logic duplicates `ItemId::new`.
+- [ ] Strengthen `ItemId`'s non-empty invariant: validate inside `from_normalized` too, or remove the `EMPTY` / `from_normalized` escape hatches so production code cannot bypass `new`.
 
 ### src/types/node.rs
 
@@ -167,8 +167,8 @@
 
 **Observations:**
 
-- `eprintln!` at the "reserved chest save failed" branch is consistent with the rest of the types/ layer. Migrating the whole types/ layer to `tracing::warn!` would be a separate coherent change.
-- Tests round-trip `Node::new(0, ...)` but don't test `Node::load` re-enforcement of node 0's reserved chests — exercised only indirectly.
+- [ ] Migrate the whole `types/` layer from `eprintln!` to `tracing::warn!` (currently `node.rs`, `pair.rs`, `user.rs`, `trade.rs` all use `eprintln!` for non-fatal load/save warnings).
+- [ ] Add a direct test for `Node::load`'s re-enforcement of node 0's reserved chests (diamond at index 0, overflow at index 1) — currently exercised only indirectly.
 
 ### src/types/chest.rs
 
@@ -187,9 +187,9 @@
 
 **Observations:**
 
-- `load_all_with_limit` deserializes every trade before trimming to `max_trades` — a 100K-trade history with `max_trades_in_memory = 50_000` still reads and parses all 100K files before dropping the oldest 50K. Scalable design would list filenames, sort lexicographically (RFC3339 with `:` → `-` is chronological), take only the last N, then deserialize. Worth revisiting if trade volumes push startup latency over ~1s.
-- `save_all` with an empty `Vec` deletes every file in `data/trades` — documented as a sync primitive, but a real foot-gun.
-- Timestamp-as-filename collision risk: the code comment claims `Utc::now()` is "monotonic per process" which is not true (wall-clock can jump backwards from NTP). Collision requires two trades at the same nanosecond — vanishingly unlikely in practice.
+- [ ] Make `Trade::load_all_with_limit` scalable: list filenames, sort lexicographically (RFC3339-with-dashes is chronological), take only the last `max_trades`, then deserialize. Current impl reads and parses every file before trimming.
+- [ ] Guard `Trade::save_all` against empty-`Vec` input so it cannot silently wipe `data/trades`. Either return an error or require an explicit `clear_all` method for the destructive case.
+- [ ] Fix the misleading comment claiming `Utc::now()` is "monotonic per process" (NTP can jump the wall-clock backwards); document the real collision bound (two trades at the same nanosecond) instead.
 
 ### src/types/order.rs
 
@@ -248,8 +248,8 @@
 
 **Observations:**
 
-- `DEFAULT_SHULKER_CAPACITY` has no callers — all code paths use `Pair::shulker_capacity_for_stack_size(stack_size)`. Kept as a stack-size-unaware default reserved for future tooling; candidate for deletion if still unused next pass.
-- `withdraw_item` / `deposit_item` convenience wrappers have no callers either; same "reserved" rationale. Same deletion candidate.
+- [ ] Delete `Storage::DEFAULT_SHULKER_CAPACITY` if still unused. No production callers today; the stack-size-aware `Pair::shulker_capacity_for_stack_size` is the canonical path.
+- [ ] Delete the `Storage::withdraw_item` / `Storage::deposit_item` convenience wrappers if still unused. Tests exercise `deposit_plan` / `withdraw_plan` directly.
 
 ---
 
@@ -274,7 +274,7 @@
 
 **Observations:**
 
-- Timing constants `POST_RECONNECT_INIT_WAIT_MS` / `DELAY_SHUTDOWN_BUFFER_MS` were deferred — would be speculative additions without clear callers beyond the single `bot_task` site.
+- [ ] Promote the 20s post-reconnect init wait and ~2s shutdown buffer in `bot_task` to named crate constants if a second caller ever emerges. Not worth doing speculatively today.
 
 ### src/bot/connection.rs
 
@@ -302,7 +302,7 @@
 
 **Observations:**
 
-- `ensure_shulker_in_hotbar_slot_0` is ~400 lines of sequential click-then-verify logic with three nested "place shulker" paths. Extracting a `place_shulker_in_hotbar_slot_0(source)` helper would collapse the three branches; high-value refactor.
+- [ ] Refactor `ensure_shulker_in_hotbar_slot_0` (~400 lines of click-then-verify logic): extract a `place_shulker_in_hotbar_slot_0(source)` helper to collapse the three nested "place shulker" branches (cursor-empty / cursor-occupied / other-slot).
 
 ### src/bot/chest_io.rs
 
@@ -322,8 +322,8 @@
 
 **Observations:**
 
-- ~400-line logic duplication between `withdraw_shulkers` and `deposit_shulkers` sharing the same cursor-clear / take-shulker / close-chest / hotbar-slot-0 / station / open-shulker / pickup / reopen / put-back skeleton. Extracting a `ShulkerRoundTrip` helper is the high-value refactor.
-- `slot_counts: Vec<i32>` from `automated_chest_io` could be `[i32; DOUBLE_CHEST_SLOTS]` (fixed size, no alloc). The Vec propagates through `ChestSyncReport`, so changing it is a wider serialization-layer refactor than a single-file fix.
+- [ ] Extract a `ShulkerRoundTrip` helper from `withdraw_shulkers` / `deposit_shulkers` — the two paths share ~400 lines of cursor-clear / take-shulker / close-chest / hotbar-slot-0 / station / open-shulker / pickup / reopen / put-back skeleton.
+- [ ] Change `slot_counts: Vec<i32>` in `automated_chest_io` to `[i32; DOUBLE_CHEST_SLOTS]` (fixed size, no alloc, invariant-encoded). Requires updating `ChestSyncReport` and all callers — the Vec propagates through the serialization layer.
 
 ### src/bot/shulker.rs
 
@@ -435,7 +435,7 @@
 
 **Observations:**
 
-- Mock bot in `spawn_mock_bot` always returns `player_offers` regardless of direction — correct for the current test suite but future test authors who miss the comment could be confused.
+- [ ] Clarify `spawn_mock_bot`'s direction ambiguity: either rename `player_offers` to something direction-neutral or split the mock into per-direction helpers, so future test authors don't misread the echo-back logic.
 
 ### src/store/pricing.rs
 
@@ -577,8 +577,8 @@
 
 **Observations:**
 
-- Two-phase commit (trade → storage deposit/withdraw with reverse-trade rollback) is resilient, but a second failure during rollback strands items in the bot's inventory and requires manual operator intervention.
-- `debug_assert!` negative-stock guards only fire in debug builds; production integer-underflow would corrupt stocks silently. Raising to `assert!` or adding an invariant check in the save path would be a behavior change.
+- [ ] Handle rollback-during-rollback failure in the operator two-phase commit. A second failure currently strands items in the bot's inventory with no automatic remediation; at minimum, persist the stuck state and alert the operator (or the player whose trade was in flight).
+- [ ] Harden the negative-stock guards in `handlers/operator.rs`: `debug_assert!` only fires in debug builds, so production integer-underflow can silently corrupt stocks. Promote to `assert!` or add an invariant check in the save path.
 
 ### src/store/handlers/cli.rs
 
@@ -586,7 +586,7 @@
 
 **Observations:**
 
-- Hardcoded `"diamond"` string check for currency-chest protection. If the base currency ever changes (unlikely but possible via config), this fails silently.
+- [ ] Replace the hardcoded `"diamond"` string check in `handle_cli_message`'s currency-chest protection with a named constant (or config-driven value) so changing the base currency doesn't silently bypass the guard.
 
 ### src/store/handlers/info.rs
 
@@ -607,4 +607,4 @@
 
 **Observations:**
 
-- Float arithmetic on balances may accumulate rounding errors; inherent to f64.
+- [ ] Evaluate migrating user balances from `f64` to an integer representation (millidiamonds or similar) to eliminate accumulated rounding error on long histories.

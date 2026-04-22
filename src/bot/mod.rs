@@ -88,6 +88,10 @@ pub struct Bot {
 }
 
 impl Bot {
+    // Bot::new is called from exactly one place (bot_task) with a fan-out of
+    // config fields + channel handles. Wrapping them in a builder would add
+    // indirection without a second caller to benefit from it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         account_email: String,
         server_address: String,
@@ -128,7 +132,7 @@ impl Bot {
 
     pub async fn send_whisper(&self, target: &str, message: &str) -> Result<(), String> {
         if let Some(client) = self.client.read().await.as_ref() {
-            client.chat(&format!("/msg {} {}", target, message));
+            client.chat(format!("/msg {} {}", target, message));
             debug!("Sent whisper to {}: {}", target, message);
             Ok(())
         } else {
@@ -648,13 +652,11 @@ async fn validate_node_physically(
 }
 
 // Function pointer that matches the expected signature
-pub(crate) fn handle_event_fn(
+pub(crate) async fn handle_event_fn(
     client: Client,
     event: Event,
     mut state: BotState,
-) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-    async move { handle_event(client, event, &mut state).await }
-}
+) -> anyhow::Result<()> { handle_event(client, event, &mut state).await }
 
 // Your event handler that works with the state
 async fn handle_event(client: Client, event: Event, state: &mut BotState) -> anyhow::Result<()> {
@@ -683,11 +685,10 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             // Broadcast chat to the bot task for trade failure detection.
             let _ = state.chat_tx.send(message_text);
 
-            if let Some(store_tx) = &state.store_tx {
-                if let Err(e) = handle_chat_message(client, m, store_tx).await {
+            if let Some(store_tx) = &state.store_tx
+                && let Err(e) = handle_chat_message(client, m, store_tx).await {
                     error!("Error handling chat message: {}", e);
                 }
-            }
         }
         Event::Disconnect(reason) => {
             warn!("[Event] Bot disconnected from server - reason: {:?}", reason);

@@ -241,7 +241,7 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
     let is_operator: bool = with_retry("Failed to read selection", || {
         Select::new()
             .with_prompt("Set operator status")
-            .items(&["false", "true"])
+            .items(["false", "true"])
             .default(0)
             .interact()
     }) == 1;
@@ -398,7 +398,7 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     let stack_size_selection = with_retry("Failed to read stack size selection", || {
         Select::new()
             .with_prompt("Select stack size")
-            .items(&["64 (most items)", "16 (ender pearls, eggs, signs, buckets)", "1 (tools, weapons, armor)"])
+            .items(["64 (most items)", "16 (ender pearls, eggs, signs, buckets)", "1 (tools, weapons, armor)"])
             .default(0)
             .interact()
     });

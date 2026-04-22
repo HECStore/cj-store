@@ -74,11 +74,10 @@ impl Order {
         let file_path = Path::new(ORDERS_FILE);
 
         // Ensure the parent directory exists
-        if let Some(parent) = file_path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = file_path.parent()
+            && !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
-        }
 
         // Create a pruned copy if needed (don't mutate the original).
         // Skipping `len - max_orders` from the front keeps the most recent
@@ -92,7 +91,7 @@ impl Order {
         };
 
         let json_str = serde_json::to_string_pretty(&orders_to_save)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         write_atomic(file_path, &json_str)?;
         Ok(())

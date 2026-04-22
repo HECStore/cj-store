@@ -211,14 +211,13 @@ impl Journal {
 
     fn persist(&self) -> io::Result<()> {
         let path = &self.path;
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = path.parent()
+            && !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
-        }
         let entries: Vec<&JournalEntry> = self.entry.iter().collect();
         let json = serde_json::to_string_pretty(&entries)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         write_atomic(path, &json)?;
         Ok(())
     }

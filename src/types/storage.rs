@@ -148,15 +148,15 @@ impl Storage {
             let path = entry.path();
 
             // Only process JSON files
-            if path.is_file() {
-                if let Some(extension) = path.extension() {
-                    if extension == "json" {
-                        if let Some(file_name) = path.file_stem() {
-                            if let Some(file_str) = file_name.to_str() {
+            if path.is_file()
+                && let Some(extension) = path.extension()
+                    && extension == "json"
+                        && let Some(file_name) = path.file_stem()
+                            && let Some(file_str) = file_name.to_str() {
                                 // Parse filename as node ID (e.g., "0.json" -> 0)
                                 if let Ok(node_id) = file_str.parse::<i32>() {
                                     // Load the node using its ID and the storage position
-                                    match Node::load(node_id, &storage_position) {
+                                    match Node::load(node_id, storage_position) {
                                         Ok(node) => nodes.push(node),
                                         Err(e) => {
                                             // Log error but continue loading other nodes
@@ -165,10 +165,6 @@ impl Storage {
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            }
         }
 
         Ok(Storage {
@@ -317,12 +313,11 @@ impl Storage {
             amt: i32,
         ) {
             if amt <= 0 { return; }
-            if let Some(last) = plan.last_mut() {
-                if last.chest_id == chest_id {
+            if let Some(last) = plan.last_mut()
+                && last.chest_id == chest_id {
                     last.amount += amt;
                     return;
                 }
-            }
             plan.push(ChestTransfer {
                 chest_id,
                 position,
@@ -382,16 +377,14 @@ impl Storage {
 
         if remaining > 0 && !self.nodes.is_empty() {
             let node_0 = &self.nodes[0];
-            if item == "diamond" {
-                if let Some(chest) = node_0.chests.get(crate::constants::DIAMOND_CHEST_ID as usize) {
+            if item == "diamond"
+                && let Some(chest) = node_0.chests.get(crate::constants::DIAMOND_CHEST_ID as usize) {
                     try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
                 }
-            }
-            if item == crate::constants::OVERFLOW_CHEST_ITEM {
-                if let Some(chest) = node_0.chests.get(crate::constants::OVERFLOW_CHEST_ID as usize) {
+            if item == crate::constants::OVERFLOW_CHEST_ITEM
+                && let Some(chest) = node_0.chests.get(crate::constants::OVERFLOW_CHEST_ID as usize) {
                     try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
                 }
-            }
             for ci in 2..node_0.chests.len() {
                 if remaining <= 0 { break; }
                 try_claim(&mut remaining, &mut plan, &mut claimed_empty, &node_0.chests[ci]);
@@ -886,7 +879,7 @@ mod tests {
         assert_eq!(Pair::shulker_capacity_for_stack_size(16), 27 * 16);
         
         // Stack size 1: 27 * 1 = 27
-        assert_eq!(Pair::shulker_capacity_for_stack_size(1), 27 * 1);
+        assert_eq!(Pair::shulker_capacity_for_stack_size(1), 27);
     }
 
     #[test]

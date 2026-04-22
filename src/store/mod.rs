@@ -154,7 +154,7 @@ impl Store {
         
         let trades = Trade::load_all_with_limit(config.max_trades_in_memory)?;
         let mut storage = Storage::load(&config.position)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // If storage is empty, auto-create node 0
         if storage.nodes.is_empty() {

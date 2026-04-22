@@ -80,7 +80,7 @@ pub fn save(store: &Store) -> Result<(), Box<dyn std::error::Error + Send + Sync
     tracing::info!("[Save] Trades saved successfully");
     
     tracing::info!("[Save] Saving storage ({} nodes)", store.storage.nodes.len());
-    store.storage.save().map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
+    store.storage.save().map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
     tracing::info!("[Save] Storage saved successfully");
     
     tracing::info!("[Save] All store data saved successfully");

@@ -115,7 +115,7 @@ pub(super) async fn handle_queue(
 
     const ORDERS_PER_PAGE: usize = 4;
     let total_user_orders = user_orders.len();
-    let total_pages = (total_user_orders + ORDERS_PER_PAGE - 1) / ORDERS_PER_PAGE;
+    let total_pages = total_user_orders.div_ceil(ORDERS_PER_PAGE);
 
     if page > total_pages {
         return utils::send_message_to_player(
@@ -165,8 +165,8 @@ pub(super) async fn handle_cancel(
     user_uuid: &str,
     order_id: u64,
 ) -> Result<(), StoreError> {
-    if let Some(ref trade) = store.current_trade {
-        if trade.order().id == order_id {
+    if let Some(ref trade) = store.current_trade
+        && trade.order().id == order_id {
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -178,7 +178,6 @@ pub(super) async fn handle_cancel(
             )
             .await;
         }
-    }
 
     match store.order_queue.cancel(user_uuid, order_id) {
         Ok(()) => {
@@ -369,7 +368,7 @@ async fn handle_help_command(
     player_name: &str,
     command: Option<&str>,
 ) -> Result<(), StoreError> {
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await.ok();
+    let user_uuid = utils::resolve_user_uuid(player_name).await.ok();
     let is_op = user_uuid
         .as_ref()
         .map(|u| utils::is_operator(store, u))
@@ -524,7 +523,7 @@ async fn handle_help_command(
 /// Get user balance asynchronously
 async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64, String> {
     state::assert_invariants(store, "pre-balance", false)?;
-    let uuid = utils::resolve_user_uuid(store, username).await?;
+    let uuid = utils::resolve_user_uuid(username).await?;
     utils::ensure_user_exists(store, username, &uuid);
     let bal = store.users.get(&uuid).map(|u| u.balance).unwrap_or(0.0);
     if !bal.is_finite() || bal < 0.0 {
@@ -550,8 +549,8 @@ pub async fn pay_async(
         return Err(StoreError::ValidationError("Amount must be positive".to_string()));
     }
 
-    let payer_uuid = utils::resolve_user_uuid(store, payer_username).await?;
-    let payee_uuid = utils::resolve_user_uuid(store, payee_username).await?;
+    let payer_uuid = utils::resolve_user_uuid(payer_username).await?;
+    let payee_uuid = utils::resolve_user_uuid(payee_username).await?;
 
     if !store.users.contains_key(&payer_uuid) {
         return Err(StoreError::ValidationError(format!(

@@ -4,7 +4,7 @@ use azalea::inventory::operations::PickupClick;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::constants::{DOUBLE_CHEST_SLOTS, SHULKER_BOX_SLOTS};
+use crate::constants::{DELAY_CONTAINER_SYNC_MS, DOUBLE_CHEST_SLOTS, SHULKER_BOX_SLOTS};
 use crate::messages::TradeItem;
 use super::Bot;
 
@@ -56,7 +56,7 @@ pub fn trade_player_status_slots() -> Vec<usize> {
 
 pub fn trade_accept_slots() -> Vec<usize> {
     // rows 4..5 cols 0..1 are lime wool accept buttons (4 slots)
-    vec![4 * 9 + 0, 4 * 9 + 1, 5 * 9 + 0, 5 * 9 + 1]
+    vec![(4 * 9), 4 * 9 + 1, (5 * 9), 5 * 9 + 1]
 }
 
 pub fn trade_cancel_slots() -> Vec<usize> {
@@ -199,17 +199,18 @@ pub async fn place_items_from_inventory_into_trade(
         debug!("place_items_from_inventory_into_trade: Cursor cleared successfully");
     }
 
-    // CRITICAL: Wait for inventory to fully sync after trade menu opens
-    // Without this delay, the inventory state may be stale and items won't be found
-    tokio::time::sleep(tokio::time::Duration::from_millis(450)).await;
+    // CRITICAL: Wait for inventory to fully sync after trade menu opens.
+    // Without this delay, the inventory state may be stale and items won't be found.
+    // DELAY_CONTAINER_SYNC_MS (450) is shared with bot/shulker::open_shulker_at_station
+    // — same class of wait (container-open ACK from server).
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_CONTAINER_SYNC_MS)).await;
 
     // Log initial inventory state for debugging
     {
         let slots_all = inv.slots().ok_or_else(|| "Trade menu closed".to_string())?;
         let mut found_items: Vec<String> = Vec::new();
         let mut total_count = 0i32;
-        for i in contents_len..slots_all.len() {
-            let stack = &slots_all[i];
+        for (i, stack) in slots_all.iter().enumerate().skip(contents_len) {
             if stack.count() > 0 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id {
                 let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inventory" };
                 found_items.push(format!("slot {} ({}): {}x", i, slot_type, stack.count()));
@@ -236,8 +237,7 @@ pub async fn place_items_from_inventory_into_trade(
         // place the WHOLE stack in one left-click (fast path). Only fall back to a too-large stack
         // (and then partial right-click placement below) when no fitting stack exists.
         let mut best_slot: Option<(usize, i32)> = None;
-        for i in contents_len..slots_all.len() {
-            let stack = &slots_all[i];
+        for (i, stack) in slots_all.iter().enumerate().skip(contents_len) {
             if stack.count() <= 0 {
                 continue;
             }
@@ -264,8 +264,7 @@ pub async fn place_items_from_inventory_into_trade(
         let Some((inv_slot, stack_count)) = best_slot else {
             // Log what items are actually in inventory for debugging
             let mut inventory_contents = Vec::new();
-            for i in contents_len..slots_all.len() {
-                let stack = &slots_all[i];
+            for (i, stack) in slots_all.iter().enumerate().skip(contents_len) {
                 if stack.count() > 0 {
                     let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inv" };
                     inventory_contents.push(format!("slot {} ({}): {}x {}", i, slot_type, stack.count(), stack.kind()));
@@ -437,8 +436,7 @@ pub async fn place_items_from_inventory_into_trade(
             // Find an empty inventory slot to put the items back
             let slots_all = inv.slots().ok_or_else(|| "Trade menu closed".to_string())?;
             let mut found_empty = false;
-            for i in contents_len..slots_all.len() {
-                let stack = &slots_all[i];
+            for (i, stack) in slots_all.iter().enumerate().skip(contents_len) {
                 if stack.count() == 0 {
                     inv.click(PickupClick::Left {
                         slot: Some(i as u16),
@@ -482,6 +480,7 @@ pub async fn place_items_from_inventory_into_trade(
 ///   a quantity and we take whatever they drop in.
 /// - `require_exact_amount`: reject trades where the player offers MORE than expected.
 ///   Used for sell orders where the price is fixed and surplus must not be accepted.
+///
 /// Default behavior (both false): at least `amount` required, surplus is allowed and
 /// later credited to the player's balance. Under-supplying is ALWAYS an error - this
 /// is what prevents the "pay less than the price" exploit.
@@ -502,12 +501,11 @@ fn validate_player_items(
     // If no player offers expected, all slots must be empty
     if player_offers.is_empty() {
         for &slot_idx in player_slots {
-            if let Some(stack) = contents.get(slot_idx) {
-                if stack.count() > 0 {
+            if let Some(stack) = contents.get(slot_idx)
+                && stack.count() > 0 {
                     let item_id = Bot::normalize_item_id(&stack.kind().to_string());
                     validation_errors.push(format!("Unexpected item: {} (no items expected)", item_id));
                 }
-            }
         }
     } else {
         // Build normalized expected item IDs for quick lookup
@@ -518,8 +516,8 @@ fn validate_player_items(
         
         // Scan all player slots for items
         for &slot_idx in player_slots {
-            if let Some(stack) = contents.get(slot_idx) {
-                if stack.count() > 0 {
+            if let Some(stack) = contents.get(slot_idx)
+                && stack.count() > 0 {
                     let item_id = Bot::normalize_item_id(&stack.kind().to_string());
                     *found_items.entry(item_id.clone()).or_insert(0) += stack.count();
                     
@@ -528,7 +526,6 @@ fn validate_player_items(
                         validation_errors.push(format!("Unexpected item type: {} (not in expected list)", item_id));
                     }
                 }
-            }
         }
         
         // Validate expected items based on validation mode
@@ -643,12 +640,11 @@ pub async fn execute_trade_with_player(
         let mut total_offered: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
         
         for &slot_idx in &bot_slots {
-            if let Some(stack) = contents.get(slot_idx) {
-                if stack.count() > 0 {
+            if let Some(stack) = contents.get(slot_idx)
+                && stack.count() > 0 {
                     let item_id = Bot::normalize_item_id(&stack.kind().to_string());
                     *total_offered.entry(item_id).or_insert(0) += stack.count();
                 }
-            }
         }
         
         // Check each expected offer
@@ -872,7 +868,7 @@ pub async fn execute_trade_with_player(
             // items (we validate, set ever_validated=true), then swaps them out for junk
             // right before pressing accept. Without re-validation each tick we'd accept
             // the swapped state. See the RACE CONDITION NOTES above the outer loop.
-            let contents_vec: Vec<azalea::inventory::ItemStack> = contents.iter().cloned().collect();
+            let contents_vec: Vec<azalea::inventory::ItemStack> = contents.to_vec();
             let (found_items, validation_errors) = validate_player_items(
                 &contents_vec,
                 &player_slots,

@@ -162,11 +162,10 @@ impl User {
         let path = Self::get_user_file_path(&self.uuid);
 
         // Ensure the directory exists
-        if let Some(parent_dir) = path.parent() {
-            if !parent_dir.exists() {
+        if let Some(parent_dir) = path.parent()
+            && !parent_dir.exists() {
                 fs::create_dir_all(parent_dir)?;
             }
-        }
 
         let json_str = serde_json::to_string_pretty(self)?; // Serialize the single User
         write_atomic(&path, &json_str)?;
@@ -246,13 +245,11 @@ impl User {
             for entry in fs::read_dir(dir_path)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        if !expected_files.contains(filename) {
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                    && let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                        && !expected_files.contains(filename) {
                             fs::remove_file(&path)?;
                         }
-                    }
-                }
             }
         }
 

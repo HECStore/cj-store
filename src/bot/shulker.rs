@@ -8,8 +8,8 @@ use tracing::{debug, error, info, warn};
 
 use super::Bot;
 use crate::constants::{
-    DELAY_INTERACT_MS, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
-    SHULKER_OP_MAX_RETRIES, exponential_backoff_delay,
+    DELAY_CONTAINER_SYNC_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS,
+    RETRY_MAX_DELAY_MS, SHULKER_OP_MAX_RETRIES, exponential_backoff_delay,
 };
 use crate::types::Position;
 
@@ -184,7 +184,7 @@ pub async fn pickup_shulker_from_station(
                 );
                 break;
             } else {
-                if waited_ms % 1000 == 0 {
+                if waited_ms.is_multiple_of(1000) {
                     debug!(
                         "pickup_shulker_from_station: Still mining... {}ms elapsed, block: {}",
                         waited_ms, block_name
@@ -224,7 +224,7 @@ pub async fn pickup_shulker_from_station(
         // drifts or the initial start_mining packet was dropped. Every 500ms we re-aim
         // at the block center and re-issue start_mining so a transient glitch doesn't
         // stall the whole pickup until the 7s timeout.
-        if waited_ms % 500 == 0 {
+        if waited_ms.is_multiple_of(500) {
             debug!(
                 "pickup_shulker_from_station: Re-issuing mining command at {}ms",
                 waited_ms
@@ -342,10 +342,12 @@ async fn open_shulker_at_station_once(
     client.look_at(station_vec3);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
-    // Right-click to open the shulker, then get the container handle
+    // Right-click to open the shulker, then get the container handle.
+    // DELAY_CONTAINER_SYNC_MS (450) is the empirical container-open wait —
+    // shorter and the container contents read can race the server packet.
     debug!("open_shulker_at_station_once: Sending block_interact to open shulker");
     client.block_interact(station_block);
-    tokio::time::sleep(tokio::time::Duration::from_millis(450)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_CONTAINER_SYNC_MS)).await;
 
     // Get the container handle for the opened shulker
     // Use 300 ticks (15 seconds) timeout to handle server lag
@@ -360,7 +362,7 @@ async fn open_shulker_at_station_once(
                 debug!(
                     "open_shulker_at_station_once: Opened, {} slots, {} items",
                     contents.len(),
-                    contents.iter().map(|s| s.count() as i32).sum::<i32>()
+                    contents.iter().map(|s| s.count()).sum::<i32>()
                 );
             }
             Ok(container)

@@ -90,6 +90,12 @@ pub enum ChestAction {
 ///
 /// The Store multiplexes its inbox over this enum so a single channel can
 /// serve both the in-game Bot and the operator CLI.
+///
+/// `Debug` is derived so diagnostic traces (`tracing::debug!("{:?}", msg)`)
+/// can log message shape without a manual `match` at every log site;
+/// `tokio::sync::oneshot::Sender<T>` already implements `Debug`, so the
+/// nested variants below don't need hand-written impls.
+#[derive(Debug)]
 pub enum StoreMessage {
     /// Message originating from the in-game Bot task.
     FromBot(BotMessage),
@@ -104,6 +110,7 @@ pub enum StoreMessage {
 }
 
 /// Messages from Bot to Store.
+#[derive(Debug)]
 pub enum BotMessage {
     /// Player sent a command (e.g., "/msg HECStore buy cobblestone 256").
     PlayerCommand {
@@ -115,6 +122,7 @@ pub enum BotMessage {
 }
 
 /// Messages from CLI to Store.
+#[derive(Debug)]
 pub enum CliMessage {
     /// Request all user balances.
     QueryBalances {
@@ -143,6 +151,7 @@ pub enum CliMessage {
     /// Bot will navigate to the calculated position and verify:
     /// 1. All 4 chests exist and can be opened
     /// 2. Each chest slot contains a shulker box
+    ///
     /// Only adds the node if all checks pass.
     AddNodeWithValidation {
         respond_to: oneshot::Sender<Result<i32, String>>,
@@ -212,6 +221,7 @@ pub enum CliMessage {
 ///
 /// Every variant that needs a result carries a `oneshot::Sender` so the Store
 /// can `await` the Bot's outcome while remaining fully async.
+#[derive(Debug)]
 pub enum BotInstruction {
     /// Whisper a message to a player.
     Whisper {

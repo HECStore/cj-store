@@ -35,7 +35,7 @@ pub async fn handle_player_command(
     // Resolve user UUID for rate limiting (creates user if needed).
     // UUID is the canonical identity key - rate limiting and ownership
     // must not rely on usernames since players can change them.
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     // Rate limiting check - runs before command parsing so spamming any

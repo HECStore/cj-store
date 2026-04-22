@@ -46,9 +46,10 @@ pub fn normalize_item_id(item: &str) -> String {
 /// commands from the same player reuse the cached UUID instead of hitting the
 /// Mojang API on every interaction.
 ///
-/// `_store` is currently unused but retained in the signature for call-site
-/// stability.
-pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String, String> {
+/// Returns a typed `StoreError::ValidationError` on Mojang lookup failure —
+/// the text is user-safe and the handlers whisper it straight back to the
+/// player.
+pub async fn resolve_user_uuid(username: &str) -> Result<String, crate::error::StoreError> {
     #[cfg(test)]
     {
         // Offline deterministic UUID for integration tests: avoids hitting the
@@ -56,7 +57,7 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
         // zero-padded username embedded in the last UUID segment.
         let trimmed: String = username.chars().take(12).collect();
         let padded = format!("{:0>12}", trimmed);
-        return Ok(format!("00000000-0000-0000-0000-{}", padded));
+        Ok(format!("00000000-0000-0000-0000-{}", padded))
     }
     #[cfg(not(test))]
     {
@@ -66,16 +67,20 @@ pub async fn resolve_user_uuid(_store: &Store, username: &str) -> Result<String,
         // Check cache first
         {
             let cache = uuid_cache().lock();
-            if let Some((uuid, ts)) = cache.get(&key) {
-                if ts.elapsed() < ttl {
+            if let Some((uuid, ts)) = cache.get(&key)
+                && ts.elapsed() < ttl {
                     debug!("UUID cache hit for '{}' -> {}", username, uuid);
                     return Ok(uuid.clone());
                 }
-            }
         }
 
-        // Cache miss or stale — fetch from Mojang API
-        let uuid = User::get_uuid_async(username).await?;
+        // Cache miss or stale — fetch from Mojang API.
+        // Map the legacy `String` error into a typed variant explicitly so
+        // the conversion is visible at the boundary (no blanket
+        // `From<String>` impl any more).
+        let uuid = User::get_uuid_async(username)
+            .await
+            .map_err(crate::error::StoreError::ValidationError)?;
         info!("UUID cache miss for '{}', fetched {}", username, uuid);
 
         {
@@ -127,12 +132,11 @@ pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
             },
         );
         store.dirty = true;
-    } else if let Some(user) = store.users.get_mut(uuid) {
-        if user.username != username {
+    } else if let Some(user) = store.users.get_mut(uuid)
+        && user.username != username {
             user.username = username.to_string();
             store.dirty = true;
         }
-    }
 }
 
 /// Check if a user is an operator

@@ -320,7 +320,7 @@ pub const TRADE_STATE_FILE: &str = "data/current_trade.json";
 /// Write the current trade state to disk atomically.
 pub fn persist(state: &TradeState) -> io::Result<()> {
     let json = serde_json::to_string_pretty(state)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     crate::fsutil::write_atomic(TRADE_STATE_FILE, &json)
 }
 

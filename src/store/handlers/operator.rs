@@ -17,7 +17,7 @@ pub async fn handle_additem_order(
 ) -> Result<(), StoreError> {
     info!("[Additem] === STARTING ADDITEM ORDER === player={} item={} qty={}", player_name, item, quantity);
     state::assert_invariants(store, "pre-additem", false)?;
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -31,7 +31,7 @@ pub async fn handle_additem_order(
 
     let qty_i32: i32 = quantity
         .try_into()
-        .map_err(|_| "Quantity too large".to_string())?;
+        .map_err(|_| StoreError::ValidationError("Quantity too large".to_string()))?;
     if qty_i32 <= 0 {
         return utils::send_message_to_player(store, player_name, "Quantity must be positive")
             .await;
@@ -77,8 +77,8 @@ pub async fn handle_additem_order(
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
-        .map_err(|_| "Bot timed out waiting for trade completion".to_string())?
-        .map_err(|e| format!("Bot response dropped: {}", e))?;
+        .map_err(|_| StoreError::BotError("Bot timed out waiting for trade completion".to_string()))?
+        .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
     if let Err(err) = &trade_result {
         return utils::send_message_to_player(
             store,
@@ -119,7 +119,7 @@ pub async fn handle_additem_order(
                     item: item.to_string(),
                     amount: t.amount,
                     from_player: None,
-                    stack_size: stack_size,
+                    stack_size,
                 },
                 respond_to: tx,
             })
@@ -268,7 +268,7 @@ pub async fn handle_removeitem_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-removeitem", false)?;
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -282,7 +282,7 @@ pub async fn handle_removeitem_order(
 
     let qty_i32: i32 = quantity
         .try_into()
-        .map_err(|_| "Quantity too large".to_string())?;
+        .map_err(|_| StoreError::ValidationError("Quantity too large".to_string()))?;
     if qty_i32 <= 0 {
         return utils::send_message_to_player(store, player_name, "Quantity must be positive")
             .await;
@@ -349,12 +349,12 @@ pub async fn handle_removeitem_order(
                 respond_to: tx,
             })
             .await
-            .map_err(|e| format!("Failed to send chest instruction to bot: {}", e))?;
+            .map_err(|e| StoreError::BotError(format!("Failed to send chest instruction to bot: {}", e)))?;
 
         let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
             .await
-            .map_err(|_| "Bot timed out performing chest step".to_string())?
-            .map_err(|e| format!("Bot response dropped: {}", e))?;
+            .map_err(|_| StoreError::ChestOp("Bot timed out performing chest step".to_string()))?
+            .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
 
         match bot_result {
             Err(err) => {
@@ -408,8 +408,8 @@ pub async fn handle_removeitem_order(
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
-        .map_err(|_| "Bot timed out waiting for trade completion".to_string())?
-        .map_err(|e| format!("Bot response dropped: {}", e))?;
+        .map_err(|_| StoreError::BotError("Bot timed out waiting for trade completion".to_string()))?
+        .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
     
     if let Err(err) = &trade_result {
         error!("[Removeitem] Trade FAILED: {} - rolling back items to storage", err);
@@ -480,7 +480,7 @@ pub async fn handle_add_currency(
     amount: f64,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-add-currency", false)?;
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -542,7 +542,7 @@ pub async fn handle_remove_currency(
     amount: f64,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-remove-currency", false)?;
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {

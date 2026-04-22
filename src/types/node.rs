@@ -152,29 +152,26 @@ impl Node {
             let mut needs_save = false;
 
             // Chest 0: dedicated for diamonds
-            if let Some(chest_0) = node.chests.get_mut(0) {
-                if chest_0.item != "diamond" {
+            if let Some(chest_0) = node.chests.get_mut(0)
+                && chest_0.item != "diamond" {
                     chest_0.item = ItemId::from_normalized("diamond".to_string());
                     needs_save = true;
                 }
-            }
 
             // Chest 1: overflow/failsafe for unknown/leftover items
-            if let Some(chest_1) = node.chests.get_mut(1) {
-                if chest_1.item != crate::constants::OVERFLOW_CHEST_ITEM {
+            if let Some(chest_1) = node.chests.get_mut(1)
+                && chest_1.item != crate::constants::OVERFLOW_CHEST_ITEM {
                     chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                     needs_save = true;
                 }
-            }
 
-            if needs_save {
-                if let Err(e) = node.save() {
+            if needs_save
+                && let Err(e) = node.save() {
                     eprintln!(
                         "Warning: Failed to save node 0 reserved chest assignments: {}",
                         e
                     );
                 }
-            }
         }
 
         Ok(node)
@@ -189,12 +186,11 @@ impl Node {
         tracing::debug!("[Node] Saving node {} to {:?}", self.id, file_path);
 
         // Ensure the directory exists
-        if let Some(parent_dir) = Path::new(&file_path).parent() {
-            if !parent_dir.exists() {
+        if let Some(parent_dir) = Path::new(&file_path).parent()
+            && !parent_dir.exists() {
                 tracing::debug!("[Node] Creating parent directory for node {}", self.id);
                 fs::create_dir_all(parent_dir)?;
             }
-        }
 
         // Serialize node to JSON
         tracing::debug!("[Node] Serializing node {} to JSON", self.id);

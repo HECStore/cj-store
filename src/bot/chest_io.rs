@@ -47,8 +47,7 @@ pub fn find_shulker_in_inventory_view(
         .contents()
         .ok_or_else(|| "Chest closed".to_string())?
         .len();
-    for i in chest_size..all_slots.len() {
-        let slot_item = &all_slots[i];
+    for (i, slot_item) in all_slots.iter().enumerate().skip(chest_size) {
         if slot_item.count() > 0
             && super::shulker::is_shulker_box(&slot_item.kind().to_string())
         {
@@ -184,14 +183,13 @@ pub async fn place_shulker_in_chest_slot_verified(
             .slots()
             .ok_or_else(|| "Container closed while verifying shulker placement".to_string())?;
 
-        if let Some(chest_item) = updated_slots.get(chest_slot) {
-            if chest_item.count() > 0
+        if let Some(chest_item) = updated_slots.get(chest_slot)
+            && chest_item.count() > 0
                 && super::shulker::is_shulker_box(&chest_item.kind().to_string())
             {
                 verified = true;
                 break;
             }
-        }
 
         if attempt < MAX_VERIFICATION_ATTEMPTS - 1 {
             debug!(
@@ -656,8 +654,8 @@ async fn transfer_withdraw_from_shulker(
             let inv_end = inv_start + SHULKER_BOX_SLOTS; // inventory slots 9-35
 
             let mut target_slot: Option<usize> = None;
-            for i in inv_start..inv_end.min(all_slots.len()) {
-                if all_slots[i].count() == 0 {
+            for (i, stack) in all_slots.iter().enumerate().take(inv_end).skip(inv_start) {
+                if stack.count() == 0 {
                     target_slot = Some(i);
                     break;
                 }
@@ -754,8 +752,7 @@ async fn transfer_deposit_into_shulker(
         let mut found: Option<(usize, i32)> = None;
         // Search in BOTH inventory (27-53) AND hotbar (54-62) slots
         // Limit to actual container size
-        for i in inv_start..inventory_end.min(inv_end) {
-            let stack = &all_slots[i];
+        for (i, stack) in all_slots.iter().enumerate().take(inventory_end.min(inv_end)).skip(inv_start) {
             if stack.count() > 0
                 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id
             {
@@ -836,8 +833,7 @@ async fn transfer_deposit_into_shulker(
             // Build list of target slots with their available space
             let mut target_slots: Vec<(usize, i32)> = Vec::new(); // (slot_index, space_available)
 
-            for i in 0..shulker_size {
-                let slot_item = &all_slots[i];
+            for (i, slot_item) in all_slots.iter().enumerate().take(shulker_size) {
                 if slot_item.count() == 0 {
                     // Empty slot - can hold up to one stack
                     target_slots.push((i, stack_size));
@@ -1098,7 +1094,7 @@ async fn withdraw_shulkers(
     node_position: &Position,
     station_pos: &Position,
     mut container: azalea::container::ContainerHandle,
-    slot_counts: &mut Vec<i32>,
+    slot_counts: &mut [i32],
     stack_size: i32,
 ) -> Result<i32, String> {
     use crate::store::journal::{JournalOp, JournalState};
@@ -1258,7 +1254,7 @@ async fn withdraw_shulkers(
 
                     // Open shulker
                     let shulker_container =
-                        super::shulker::open_shulker_at_station(bot, &station_pos).await?;
+                        super::shulker::open_shulker_at_station(bot, station_pos).await?;
 
                     // Check if shulker contains target item and count how much
                     let shulker_contents = shulker_container
@@ -1326,7 +1322,7 @@ async fn withdraw_shulkers(
                     }
 
                     // Pick up shulker
-                    super::shulker::pickup_shulker_from_station(bot, &station_pos, node_position)
+                    super::shulker::pickup_shulker_from_station(bot, station_pos, node_position)
                         .await?;
 
                     // Journal: shulker is back in bot inventory (station is empty).
@@ -1412,7 +1408,7 @@ async fn deposit_shulkers(
     node_position: &Position,
     station_pos: &Position,
     mut container: azalea::container::ContainerHandle,
-    slot_counts: &mut Vec<i32>,
+    slot_counts: &mut [i32],
     stack_size: i32,
     known_counts: Option<&Vec<i32>>,
 ) -> Result<i32, String> {
@@ -1432,9 +1428,8 @@ async fn deposit_shulkers(
                 .contents()
                 .ok_or_else(|| "Chest closed after reopen attempt".to_string())?;
             let mut has_any_shulker = false;
-            for slot_idx in 0..contents.len().min(DOUBLE_CHEST_SLOTS) {
-                let stack = &contents[slot_idx];
-                if stack.count() > 0 && super::shulker::is_shulker_box(&stack.kind().to_string()) {
+            for (_slot_idx, entry) in contents.iter().enumerate().take(DOUBLE_CHEST_SLOTS) {
+                if entry.count() > 0 && super::shulker::is_shulker_box(&entry.kind().to_string()) {
                     has_any_shulker = true;
                     break;
                 }
@@ -1469,9 +1464,9 @@ async fn deposit_shulkers(
                 // unambiguous: the shulker physically cannot hold more. Skipping here
                 // avoids the huge cost of taking the shulker out, placing, opening,
                 // discovering it's full, and putting it back.
-                if let Some(known) = known_counts {
-                    if let Some(&count) = known.get(slot_idx) {
-                        if count >= shulker_capacity {
+                if let Some(known) = known_counts
+                    && let Some(&count) = known.get(slot_idx)
+                        && count >= shulker_capacity {
                             debug!(
                                 "Skipping slot {}: known full with {} items (max {})",
                                 slot_idx, count, shulker_capacity
@@ -1479,8 +1474,6 @@ async fn deposit_shulkers(
                             confirmed_full.insert(slot_idx);
                             continue;
                         }
-                    }
-                }
 
                 // Ensure chest is open (it might have been closed by a server restart,
                 // chunk unload, or previous shulker iteration). Reopen uses the
@@ -1604,7 +1597,7 @@ async fn deposit_shulkers(
 
                 // Open shulker (don't reopen chest yet - we'll do that after closing shulker if needed)
                 let shulker_container =
-                    super::shulker::open_shulker_at_station(bot, &station_pos).await?;
+                    super::shulker::open_shulker_at_station(bot, station_pos).await?;
 
                 // Check if shulker has space (can hold target item) and count existing items
                 // Use the correct stack size for calculating available space
@@ -1635,8 +1628,7 @@ async fn deposit_shulkers(
                 // Search BOTH inventory (27-53) AND hotbar (54-62) - items can be anywhere after a trade
                 let inventory_and_hotbar_end = inv_start + SHULKER_BOX_SLOTS + 9; // 27 inventory + 9 hotbar = 36 slots
                 let mut bot_item_count = 0i32;
-                for i in inv_start..inventory_and_hotbar_end.min(all_slots.len()) {
-                    let stack = &all_slots[i];
+                for (_i, stack) in all_slots.iter().enumerate().take(inventory_and_hotbar_end).skip(inv_start) {
                     if stack.count() > 0
                         && Bot::normalize_item_id(&stack.kind().to_string()) == target_id
                     {
@@ -1716,7 +1708,7 @@ async fn deposit_shulkers(
                         // Pick up shulker and put it back
                         super::shulker::pickup_shulker_from_station(
                             bot,
-                            &station_pos,
+                            station_pos,
                             node_position,
                         )
                         .await?;
@@ -1779,7 +1771,7 @@ async fn deposit_shulkers(
                 }
 
                 // Pick up shulker
-                super::shulker::pickup_shulker_from_station(bot, &station_pos, node_position)
+                super::shulker::pickup_shulker_from_station(bot, station_pos, node_position)
                     .await?;
 
                 // Journal: shulker picked up from station.

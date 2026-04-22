@@ -38,8 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Supported:
     //   --validate-only / --dry-run : load + validate config, then exit.
     //   --help / -h                 : usage and exit.
+    // Only the first non-program arg is considered — if future flags combine
+    // (e.g. `--validate-only --quiet`) this scan will need to change, but the
+    // current set are all mutually-exclusive "do one thing then exit" actions.
     let args: Vec<String> = std::env::args().collect();
-    for a in args.iter().skip(1) {
+    if let Some(a) = args.get(1) {
         match a.as_str() {
             "--validate-only" | "--dry-run" => return run_validate_only(),
             "--help" | "-h" => {

@@ -26,7 +26,10 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     let path = path.as_ref();
     tracing::debug!("[File] write_atomic: Starting write operation for {:?}", path);
     
-    // Ensure we have a valid file name
+    // Ensure we have a valid file name.
+    // `file_name()` returns None for `.` and `..`, and the inner `to_str()` can
+    // reject non-UTF-8 names on Unix; both cases produce `InvalidInput` so the
+    // caller sees the real reason rather than a confusing later error.
     let file_name = path.file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::new(
@@ -68,8 +71,7 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     
     // Verify temp file was created successfully
     if !tmp_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("Temp file was not created: {:?}", tmp_path)
         ));
     }
@@ -140,8 +142,7 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
                             tracing::error!("[File] write_atomic: Failed to remove existing file: {}", remove_err);
                             // If remove failed, clean up temp file and return error
                             let _ = fs::remove_file(&tmp_path);
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
+                            return Err(io::Error::other(
                                 format!("Failed to save file: rename error: {}, copy error: {}, remove error: {} (path: {:?})", e, copy_err, remove_err, path)
                             ));
                         }
@@ -157,8 +158,7 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
                                 tracing::error!("[File] write_atomic: Final copy attempt failed: {}", final_copy_err);
                                 // Clean up temp file on final failure
                                 let _ = fs::remove_file(&tmp_path);
-                                Err(io::Error::new(
-                                    io::ErrorKind::Other,
+                                Err(io::Error::other(
                                     format!("Failed to save file after removing existing: rename error: {}, copy error: {}, final copy error: {} (path: {:?}, tmp_path: {:?})", e, copy_err, final_copy_err, path, tmp_path)
                                 ))
                             }
@@ -167,8 +167,7 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
                         tracing::error!("[File] write_atomic: Destination doesn't exist but both rename and copy failed");
                         // Path doesn't exist, but both rename and copy failed
                         let _ = fs::remove_file(&tmp_path);
-                        Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        Err(io::Error::other(
                             format!("Failed to save file (destination doesn't exist): rename error: {}, copy error: {} (path: {:?}, tmp_path: {:?})", e, copy_err, path, tmp_path)
                         ))
                     }
@@ -178,3 +177,120 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     }
 }
 
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Scratch directory under the system temp dir, uniquely named so tests
+    /// can't clobber each other or stale runs. Cleaned up in each test's
+    /// Drop via the returned guard.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cj-store-fsutil-{}-{}",
+                name,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            Self(base)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn read_to_string(p: &Path) -> String {
+        let mut f = fs::File::open(p).unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn creates_file_when_destination_missing() {
+        let dir = TmpDir::new("create-missing");
+        let target = dir.path("new.json");
+        assert!(!target.exists());
+        write_atomic(&target, "hello").unwrap();
+        assert_eq!(read_to_string(&target), "hello");
+        // .tmp must not survive a successful write.
+        assert!(!dir.path("new.json.tmp").exists());
+    }
+
+    #[test]
+    fn overwrites_existing_file() {
+        let dir = TmpDir::new("overwrite");
+        let target = dir.path("data.json");
+        fs::write(&target, "old contents").unwrap();
+        write_atomic(&target, "new contents").unwrap();
+        assert_eq!(read_to_string(&target), "new contents");
+        assert!(!dir.path("data.json.tmp").exists());
+    }
+
+    #[test]
+    fn creates_parent_directory_if_missing() {
+        let dir = TmpDir::new("mkdirs");
+        let target = dir.path("nested/sub/file.json");
+        write_atomic(&target, "x").unwrap();
+        assert_eq!(read_to_string(&target), "x");
+    }
+
+    #[test]
+    fn empty_string_is_valid_content() {
+        let dir = TmpDir::new("empty");
+        let target = dir.path("empty.json");
+        write_atomic(&target, "").unwrap();
+        assert_eq!(read_to_string(&target), "");
+    }
+
+    #[test]
+    fn rejects_path_without_file_name() {
+        // A path ending in "/" (or "\\") has no file_name component — the
+        // validator should refuse with InvalidInput rather than producing a
+        // confusing downstream error from the create/rename step.
+        let dir = TmpDir::new("reject-dir");
+        // Target the directory itself, which has a file_name, but use ".." which
+        // does not. "." also has no file_name component on Unix.
+        let bad: std::path::PathBuf = dir.path("..").components()
+            .take_while(|c| !matches!(c, std::path::Component::ParentDir))
+            .collect();
+        // If the above didn't produce a bad path for this platform, fall back to
+        // an empty path which is explicitly rejected.
+        let bad = if bad.file_name().is_none() { bad } else { std::path::PathBuf::from("") };
+        let err = write_atomic(&bad, "x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn temp_file_cleaned_up_on_success() {
+        // Regression guard: a successful write must not leave a .tmp sibling.
+        // Before the rename the .tmp exists; after, it must be gone (either
+        // via rename consuming it, or via explicit cleanup in the copy fallback).
+        let dir = TmpDir::new("cleanup");
+        let target = dir.path("foo.json");
+        write_atomic(&target, "data").unwrap();
+        let mut found_tmp = false;
+        for entry in fs::read_dir(&dir.0).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            if name.ends_with(".tmp") {
+                found_tmp = true;
+            }
+        }
+        assert!(!found_tmp, "unexpected leftover .tmp file in {:?}", dir.0);
+    }
+}

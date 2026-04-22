@@ -45,7 +45,7 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 username_or_uuid.clone()
             } else {
                 // Assume it's a username, resolve UUID
-                utils::resolve_user_uuid(store, &username_or_uuid).await?
+                utils::resolve_user_uuid(&username_or_uuid).await?
             };
             // Auto-create the user record if missing so operators can be
             // granted to players who have never interacted with the store.
@@ -131,7 +131,7 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             let (validation_tx, validation_rx) = oneshot::channel();
             if let Err(e) = store.bot_tx.send(BotInstruction::ValidateNode {
                 node_id: next_node_id,
-                node_position: node_position.clone(),
+                node_position,
                 respond_to: validation_tx,
             }).await {
                 let _ = respond_to.send(Err(format!("Failed to send validation request to bot: {}", e)));
@@ -285,12 +285,11 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             
             if store.pairs.contains_key(&normalized_item) {
                 // Check if pair has any stock (warn but still allow removal)
-                if let Some(pair) = store.pairs.get(&normalized_item) {
-                    if pair.item_stock > 0 || pair.currency_stock > 0.0 {
+                if let Some(pair) = store.pairs.get(&normalized_item)
+                    && (pair.item_stock > 0 || pair.currency_stock > 0.0) {
                         warn!("[CLI] Removing pair '{}' which has stock: {} items, {:.2} currency", 
                               normalized_item, pair.item_stock, pair.currency_stock);
                     }
-                }
                 
                 store.pairs.remove(&normalized_item);
                 
@@ -387,7 +386,7 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 let (validation_tx, validation_rx) = oneshot::channel();
                 if let Err(e) = store.bot_tx.send(BotInstruction::ValidateNode {
                     node_id: next_node_id,
-                    node_position: node_position.clone(),
+                    node_position,
                     respond_to: validation_tx,
                 }).await {
                     let _ = respond_to.send(Err(format!("Failed to send validation request: {}", e)));

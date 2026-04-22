@@ -136,11 +136,11 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
         .ok_or_else(|| "Buffer chest closed".to_string())?;
     
     let mut items_moved = 0;
-    for i in contents_len..all.len() {
-        if all[i].count() > 0 {
+    for (i, stack) in all.iter().enumerate().skip(contents_len) {
+        if stack.count() > 0 {
             debug!(
-                "ensure_inventory_empty: Shift-clicking slot {} ({} x{})", 
-                i, all[i].kind(), all[i].count()
+                "ensure_inventory_empty: Shift-clicking slot {} ({} x{})",
+                i, stack.kind(), stack.count()
             );
             chest.shift_click(i);
             items_moved += 1;
@@ -189,11 +189,10 @@ pub async fn move_hotbar_to_inventory(bot: &Bot) -> Result<(), String> {
     // Log current hotbar state
     debug!("move_hotbar_to_inventory: Current hotbar state:");
     for hotbar_idx in 36..45 {
-        if let Some(stack) = all_slots.get(hotbar_idx) {
-            if stack.count() > 0 {
+        if let Some(stack) = all_slots.get(hotbar_idx)
+            && stack.count() > 0 {
                 debug!("  Hotbar slot {} (idx {}): {} x{}", hotbar_idx - 36, hotbar_idx, stack.kind(), stack.count());
             }
-        }
     }
 
     // Hotbar slots are 36-44 (inventory indices)
@@ -378,22 +377,25 @@ pub fn carried_item(client: &azalea::Client) -> azalea::inventory::ItemStack {
 /// Returns Ok(()) if shulker is now in hotbar slot 0, Err if it couldn't be moved.
 ///
 /// Flow overview (this function is the trickiest piece of state-wrangling in the bot):
-///   1. Fast path: shulker already sits in container slot 36 (hotbar slot 0) -> done.
-///   2. Cursor path: shulker is currently held on the cursor.
-///        a. If slot 36 is empty, just left-click slot 36 to deposit.
-///        b. If slot 36 is occupied, we CANNOT use a pick-up/put-down dance because
-///           the cursor already holds the shulker - left-clicking would swap the
-///           shulker for whatever was in slot 36, then we'd be holding junk. Instead
-///           we shift-click slot 36 to evacuate its contents into the main inventory
-///           (slots 9-35) without touching the cursor, verify the shulker is still
-///           on the cursor (rarely, the shift-click can race and displace it), and
-///           then left-click slot 36 to place the shulker.
-///        c. If any verification fails, hand off to `recover_shulker_to_slot_0`,
-///           which retries from a clean state.
-///   3. Slot path: shulker lives in some other inventory/hotbar slot.
-///        a. Evacuate slot 36 into an empty inventory slot if needed (pick-up/put-down).
-///        b. Pick up the shulker, place it into slot 36, then verify with a short
-///           retry loop because server inventory updates lag behind click packets.
+///
+/// **1. Fast path** — shulker already sits in container slot 36 (hotbar slot 0) -> done.
+///
+/// **2. Cursor path** — shulker is currently held on the cursor.
+///    - If slot 36 is empty, just left-click slot 36 to deposit.
+///    - If slot 36 is occupied, we CANNOT use a pick-up/put-down dance because the
+///      cursor already holds the shulker - left-clicking would swap the shulker for
+///      whatever was in slot 36, then we'd be holding junk. Instead we shift-click
+///      slot 36 to evacuate its contents into the main inventory (slots 9-35) without
+///      touching the cursor, verify the shulker is still on the cursor (rarely, the
+///      shift-click can race and displace it), and then left-click slot 36 to place
+///      the shulker.
+///    - If any verification fails, hand off to `recover_shulker_to_slot_0`, which
+///      retries from a clean state.
+///
+/// **3. Slot path** — shulker lives in some other inventory/hotbar slot.
+///    - Evacuate slot 36 into an empty inventory slot if needed (pick-up/put-down).
+///    - Pick up the shulker, place it into slot 36, then verify with a short retry
+///      loop because server inventory updates lag behind click packets.
 ///
 /// Why slot 0 specifically: the "place shulker" path later uses the hotbar-select
 /// packet to hold the shulker for a block_interact, and the rest of the bot assumes
@@ -464,13 +466,12 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
     }
 
     // Check if shulker is already in hotbar slot 0
-    if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0) {
-        if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+    if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0)
+        && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
             debug!("ensure_shulker_in_hotbar_slot_0: Shulker ALREADY in hotbar slot 0 - no action needed");
             drop(inv_handle);
             return Ok(());
         }
-    }
 
     // Check if shulker is in cursor
     let carried = carried_item(&client);
@@ -572,13 +573,12 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
                             
                             // Verify it's now in hotbar slot 0
                             let updated_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
-                            if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0) {
-                                if slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
+                            if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
+                                && slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
                                     debug!("ensure_shulker_in_hotbar_slot_0: SUCCESS - Shulker recovered to hotbar slot 0");
                                     drop(inv_handle);
                                     return Ok(());
                                 }
-                            }
                             error!("ensure_shulker_in_hotbar_slot_0: Failed to move recovered shulker to hotbar slot 0");
                             drop(inv_handle);
                             return Err("Failed to move shulker to hotbar slot 0 after recovery".to_string());
@@ -608,13 +608,12 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
                         final_cursor.count()
                     );
                     
-                    if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0) {
-                        if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+                    if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
+                        && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
                             debug!("ensure_shulker_in_hotbar_slot_0: SUCCESS - Shulker placed in hotbar slot 0");
                             drop(inv_handle);
                             return Ok(());
                         }
-                    }
                     
                     // Shulker placement failed - search for it in inventory and retry
                     warn!("ensure_shulker_in_hotbar_slot_0: Shulker placement from cursor FAILED, attempting recovery");
@@ -647,13 +646,12 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
                     final_cursor.count()
                 );
                 
-                if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0) {
-                    if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+                if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
+                    && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
                         debug!("ensure_shulker_in_hotbar_slot_0: SUCCESS - Shulker placed in hotbar slot 0");
                         drop(inv_handle);
                         return Ok(());
                     }
-                }
                 
                 // Shulker placement failed - search for it in inventory and retry
                 warn!("ensure_shulker_in_hotbar_slot_0: Shulker placement to empty slot 0 FAILED, attempting recovery");
@@ -686,8 +684,8 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
         );
         
         // Clear hotbar slot 0 first if needed
-        if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0) {
-            if slot_item.count() > 0 {
+        if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0)
+            && slot_item.count() > 0 {
                 debug!(
                     "ensure_shulker_in_hotbar_slot_0: Clearing hotbar slot 0 (has {} x{})", 
                     slot_item.kind(), slot_item.count()
@@ -714,7 +712,6 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
                     warn!("ensure_shulker_in_hotbar_slot_0: No empty slot to move hotbar item, will attempt swap");
                 }
             }
-        }
         
         // Pick up shulker from its current slot
         debug!("ensure_shulker_in_hotbar_slot_0: Picking up shulker from slot {}", shulker_idx);
@@ -743,13 +740,12 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
         let mut verified = false;
         for verify_attempt in 0..5 {
             let updated_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
-            if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0) {
-                if slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
+            if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
+                && slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
                     debug!("ensure_shulker_in_hotbar_slot_0: SUCCESS - Shulker now in hotbar slot 0 (verified on attempt {})", verify_attempt + 1);
                     verified = true;
                     break;
                 }
-            }
             if verify_attempt < 4 {
                 debug!(
                     "ensure_shulker_in_hotbar_slot_0: Verification attempt {} - shulker not in hotbar slot 0 yet, waiting...", 
@@ -827,21 +823,20 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
         );
         
         // First check if shulker is already in slot 0 (maybe it arrived late)
-        if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0) {
-            if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+        if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0)
+            && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
                 debug!("recover_shulker_to_slot_0: SUCCESS - Shulker already in hotbar slot 0 (delayed sync?)");
                 drop(inv_handle);
                 return Ok(());
             }
-        }
         
         // Check if shulker is still in cursor
         if carried.count() > 0 && shulker::is_shulker_box(&carried.kind().to_string()) {
             debug!("recover_shulker_to_slot_0: Shulker found in CURSOR, attempting to place in hotbar slot 0");
             
             // Clear hotbar slot 0 first if needed
-            if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0) {
-                if slot_item.count() > 0 {
+            if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0)
+                && slot_item.count() > 0 {
                     debug!(
                         "recover_shulker_to_slot_0: Clearing hotbar slot 0 (has {} x{})", 
                         slot_item.kind(), slot_item.count()
@@ -849,7 +844,6 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
                     inv_handle.shift_click(HOTBAR_SLOT_0);
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 }
-            }
             
             debug!("recover_shulker_to_slot_0: Left-clicking hotbar slot 0 to place shulker from cursor");
             inv_handle.click(PickupClick::Left {
@@ -868,13 +862,12 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
                 final_cursor.count()
             );
             
-            if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0) {
-                if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+            if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
+                && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
                     debug!("recover_shulker_to_slot_0: SUCCESS - Shulker placed in hotbar slot 0 from cursor");
                     drop(inv_handle);
                     return Ok(());
                 }
-            }
             warn!("recover_shulker_to_slot_0: Placement from cursor failed, will retry");
             drop(inv_handle);
             continue; // Retry
@@ -913,8 +906,8 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
             debug!("recover_shulker_to_slot_0: Moving shulker from slot {} to hotbar slot 0", shulker_idx);
             
             // Clear hotbar slot 0 first if needed
-            if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0) {
-                if slot_item.count() > 0 {
+            if let Some(slot_item) = all_slots.get(HOTBAR_SLOT_0)
+                && slot_item.count() > 0 {
                     debug!(
                         "recover_shulker_to_slot_0: Clearing hotbar slot 0 first (has {} x{})", 
                         slot_item.kind(), slot_item.count()
@@ -922,7 +915,6 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
                     inv_handle.shift_click(HOTBAR_SLOT_0);
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 }
-            }
             
             // Pick up shulker from its current slot
             debug!("recover_shulker_to_slot_0: Picking up shulker from slot {}", shulker_idx);
@@ -948,8 +940,8 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
             // Verify placement (with retries for timing)
             for verify_attempt in 0..5 {
                 let updated_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
-                if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0) {
-                    if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+                if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
+                    && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
                         info!(
                             "recover_shulker_to_slot_0: SUCCESS - Shulker moved to hotbar slot 0 (verified on attempt {})", 
                             verify_attempt + 1
@@ -957,7 +949,6 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
                         drop(inv_handle);
                         return Ok(());
                     }
-                }
                 if verify_attempt < 4 {
                     debug!(
                         "recover_shulker_to_slot_0: Verification attempt {} - shulker not in slot 0 yet", 

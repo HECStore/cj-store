@@ -71,7 +71,7 @@ pub async fn handle_withdraw_balance_queued(
     // layout, not from any arbitrary policy.
     const MAX_TRADE_DIAMONDS: i32 = 12 * 64; // 768
 
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     let user_balance = store.expect_user(&user_uuid, "withdraw-balance/pre-check")?.balance;

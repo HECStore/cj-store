@@ -192,7 +192,7 @@ async fn validate_and_plan_buy(
     item: &str,
     quantity: u32,
 ) -> Result<Option<BuyPlan>, StoreError> {
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -602,7 +602,7 @@ async fn validate_and_plan_sell(
     item: &str,
     quantity: u32,
 ) -> Result<Option<SellPlan>, StoreError> {
-    let user_uuid = utils::resolve_user_uuid(store, player_name).await?;
+    let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -1164,7 +1164,7 @@ mod tests {
                         };
                         let mut amounts = vec![-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
                         // Compute new value for slot 0 based on the prior state
-                        let prior = target_chest.amounts.get(0).copied().unwrap_or(0);
+                        let prior = target_chest.amounts.first().copied().unwrap_or(0);
                         amounts[0] = (prior + delta).max(0);
                         let _ = respond_to.send(Ok(ChestSyncReport {
                             chest_id: target_chest.id,
@@ -1241,7 +1241,7 @@ mod tests {
         let result = handle_buy_order(&mut store, "Bob", "gunpowder", 10).await;
         assert!(result.is_ok());
         // No pair created, no user balance change.
-        assert!(store.pairs.get("gunpowder").is_none());
+        assert!(!store.pairs.contains_key("gunpowder"));
     }
 
     #[tokio::test]
@@ -1318,7 +1318,7 @@ mod tests {
         let result = handle_sell_order(&mut store, "Seller", "gunpowder", 10).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
-        assert!(store.pairs.get("gunpowder").is_none());
+        assert!(!store.pairs.contains_key("gunpowder"));
     }
 
     #[tokio::test]

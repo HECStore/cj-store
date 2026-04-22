@@ -34,6 +34,7 @@ pub const TRADE_TIMEOUT_MS: u64 = 45_000;
 /// - Breaking and picking up shulkers
 /// - Walking to collect dropped items
 /// - Waiting for item drop settle time (4s per shulker)
+///
 /// 90 seconds should handle even complex multi-shulker operations.
 pub const CHEST_OP_TIMEOUT_SECS: u64 = 90;
 
@@ -79,6 +80,14 @@ pub const DELAY_VALIDATION_BETWEEN_CHESTS_MS: u64 = 750;
 
 /// Delay after placing shulker on station
 pub const DELAY_SHULKER_PLACE_MS: u64 = 750;
+
+/// Delay after block-interact / trade-menu open events where the container
+/// content packet is in flight. Sits between `DELAY_BLOCK_OP_MS` (350) and
+/// `DELAY_SETTLE_MS` (500) — empirically the shortest wait that reliably
+/// produces a sync'd shulker-open or trade-menu inventory read. Shared by
+/// `bot/shulker::open_shulker_at_station_once` (after `block_interact`) and
+/// `bot/trade::place_items_from_inventory_into_trade` (after trade GUI open).
+pub const DELAY_CONTAINER_SYNC_MS: u64 = 450;
 
 /// Delay for disconnect operations (2 seconds)
 pub const DELAY_DISCONNECT_MS: u64 = 2_000;

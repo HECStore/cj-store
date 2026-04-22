@@ -196,14 +196,13 @@ impl Config {
         }
         
         // Validate buffer_chest_position if present
-        if let Some(ref buffer_pos) = self.buffer_chest_position {
-            if buffer_pos.x.abs() > COORD_LIMIT || buffer_pos.z.abs() > COORD_LIMIT {
+        if let Some(ref buffer_pos) = self.buffer_chest_position
+            && (buffer_pos.x.abs() > COORD_LIMIT || buffer_pos.z.abs() > COORD_LIMIT) {
                 errors.push(format!(
                     "buffer_chest_position coordinates exceed limits: ({}, {}, {})",
                     buffer_pos.x, buffer_pos.y, buffer_pos.z
                 ));
             }
-        }
         
         // Validate timeout values
         if self.trade_timeout_ms == 0 {
@@ -265,11 +264,10 @@ impl Config {
             };
 
             // Ensure the directory exists
-            if let Some(parent_dir) = config_path.parent() {
-                if !parent_dir.exists() {
+            if let Some(parent_dir) = config_path.parent()
+                && !parent_dir.exists() {
                     fs::create_dir_all(parent_dir)?;
                 }
-            }
 
             // Serialize the default config to a pretty JSON string
             let json_str = serde_json::to_string_pretty(&default_config)?;

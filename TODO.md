@@ -106,8 +106,8 @@
 
 **Observations:**
 
-- 5 of 14 `StoreError` variants are unconstructed (`ItemNotFound`, `InsufficientFunds`, `InsufficientStock`, `PlanInfeasible`, `QueueFull`). Documented as aspirational migration targets; no compiler warnings because pub enum variants in a binary crate are reachable-by-construction.
-- `From<String> for StoreError` maps every legacy string to `ValidationError` — a caller matching on `ValidationError` will over-match legacy errors of other true categories. Revisit and remove this impl once the migration is complete.
+- Removed the 5 unconstructed variants (`ItemNotFound`, `InsufficientFunds`, `InsufficientStock`, `PlanInfeasible`, `QueueFull`). The typed hierarchy now matches what the code actually uses; if one of those cases reappears, add the variant back with its real construction site. ✓
+- Removed `From<String> for StoreError`. Operator/CLI error paths that previously round-tripped through the blanket impl now convert at the boundary with explicit `.map_err(StoreError::BotError)` / `.map_err(StoreError::ValidationError)` / `.map_err(StoreError::ChestOp)` so the error category is chosen deliberately, not collapsed to `ValidationError` by default. `resolve_user_uuid` was retyped to `Result<String, StoreError>` at the same time (and dropped its unused `_store: &Store` param). ✓
 - `InvariantViolation(String)` renders with no prefix; relies on callers to write the full sentence. A "Invariant: " prefix would help log-grep but is only constructed once.
 
 ### src/fsutil.rs
@@ -118,8 +118,8 @@
 
 - Atomicity is "best-effort": rename path is atomic, copy-fallback path is not. No parent-directory `fsync` after rename, so a crash immediately after rename can lose the name flip on POSIX — durability ceiling worth knowing.
 - Temp filename is `{file}.tmp`, not unique — safe only because every call for a given path is serialized through the single-owner actor that writes it.
-- All synthesized errors use `io::ErrorKind::Other`; detail is in message strings, and no call site matches on `ErrorKind`.
-- No unit tests — the fallback cascade (rename → copy → remove+copy → error) would benefit from coverage but simulating Windows rename failure portably is awkward.
+- All synthesized errors use `io::ErrorKind::Other` (via the shorter `io::Error::other(..)` helper). Detail is in message strings, and no call site matches on `ErrorKind`.
+- Added 6 happy-path unit tests: create-when-missing, overwrite-existing, auto-mkdir parents, empty content, invalid path rejection, and a regression guard that no `.tmp` sibling is left after a successful write. The rename-failure → copy-fallback path still isn't covered portably; documenting deferral here rather than skipping a test that would only run on Windows. ✓
 
 ### src/messages.rs
 
@@ -134,7 +134,7 @@
 
 **Observations:**
 
-- None of `StoreMessage` / `BotMessage` / `CliMessage` / `BotInstruction` derive Debug — would need a manual impl skipping the `oneshot::Sender<T>`. Would unlock `{:?}` logging for diagnostic traces.
+- `StoreMessage` / `BotMessage` / `CliMessage` / `BotInstruction` now derive `Debug`. `tokio::sync::oneshot::Sender<T>` already implements `Debug`, so no manual impls were needed — diagnostic `tracing::debug!("{:?}", msg)` now works at any log site. ✓
 - Wire types use `String` for item identifiers rather than `ItemId` — deliberate: these cross task boundaries and `ItemId` adds no value at the wire level.
 - `BotInstruction::Restart` is fire-and-forget (no `respond_to`) because the original sender no longer exists after the bot task is torn down and respawned.
 

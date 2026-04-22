@@ -27,7 +27,7 @@ use crate::constants::{FEE_MIN, FEE_MAX, MIN_RESERVE_FOR_PRICE};
 /// * `true` if fee is valid (between FEE_MIN and FEE_MAX)
 /// * `false` otherwise
 pub fn validate_fee(fee: f64) -> bool {
-    fee >= FEE_MIN && fee <= FEE_MAX && fee.is_finite()
+    (FEE_MIN..=FEE_MAX).contains(&fee) && fee.is_finite()
 }
 
 /// Check if reserves are sufficient for reliable price calculation.

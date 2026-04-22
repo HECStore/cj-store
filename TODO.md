@@ -1,3 +1,191 @@
+# Mission
+
+This is a systematic quality pass over the entire codebase, function by function. The goal is not to add things — it is to reach the right state: every comment that remains earns its place, every meaningful behavior has a test that would catch a regression, and every log line gives an operator exactly what they need to understand what the system is doing or what went wrong. Proceed file by file: batch-read all functions in a file in parallel, apply all three reviews, then move to the next. When this pass is complete, the codebase should be in a state where no comment is noise, no test is misleading, and no operator is flying blind.
+
+## Subagent strategy
+
+Subagents must be used to the maximum extent possible throughout this pass. The main agent's job is coordination and final judgment — not raw reading and searching.
+
+**Parallelize aggressively.** When starting a file, spawn one subagent per function simultaneously — do not read functions one at a time. Each subagent reads whatever it needs for its function (source, test file, call sites) and reports back. Never wait for one subagent to finish before starting another whose inputs are already known. Collect all subagent results first, then synthesize and make decisions.
+
+**Delegate all exploration.** Use `Explore` subagents for any codebase search: finding where a function is tested, locating all call sites, checking whether a log field is used consistently across files. Do not run these searches in the main context.
+
+**Delegate research.** When evaluating whether a comment, test, or log line is correct, a subagent can read the referenced code, check whether a struct's `Debug` impl exposes sensitive fields, or verify a constant's derivation — while the main agent waits for the full batch to complete before touching any file.
+
+**Subagents are read-only and flat.** A subagent must never write to, edit, or delete any file, and must never spawn child subagents. Its only job is to read, analyze, and report findings back to the main agent. All writes and all subagent spawning are performed by the main agent only, after every subagent in the current batch has returned.
+
+**Edit in a dedicated phase.** A batch is all subagents spawned for a single source file. Once every subagent in the batch has returned, apply all edits to that file in one sequential pass before starting the next batch. Never interleave subagent dispatches and file edits for the same file — a subagent reading a file while the main agent is editing it will report stale findings.
+
+**Flag cross-file dependencies.** If a subagent finds that a function's behavior is defined, constrained, or called from another file not yet reviewed, do not act on the finding immediately. Note the dependency and resolve it once both files have been fully reviewed, so decisions are made against consistent state.
+
+**Main agent responsibilities only:** synthesizing subagent findings into concrete edits, resolving ambiguity that requires cross-function or cross-file context, and making the final call on borderline cases. Everything that is pure information-gathering or parallel-safe work goes to a subagent.
+
+---
+
+# TODO — Review Pass
+
+Each item below is tagged with one of three review types. Read this section
+before starting any pass so every decision is made against the same standard.
+
+**Subagents report; the main agent acts.** The criteria below ("Remove it if", "Add one if", etc.) are evaluation standards, not edit commands. When a subagent works through a function it identifies which criteria are met and reports those findings. The main agent reads all findings and applies the edits. A subagent that makes a direct edit violates the read-only rule.
+
+**Shared test files are edited last.** Integration test files shared across multiple source files must not be edited during any individual source file's edit phase. Queue all pending edits to shared test files and apply them in a single pass after every source file batch has completed, so no subagent ever reads a partially-edited shared test file.
+
+---
+
+## Do comments
+
+**Goal:** every comment in the item earns its place by explaining something
+the code cannot express on its own. No comment exists because it seemed like
+a good idea at the time — each one is load-bearing.
+
+Work through the item's source. For each comment you find — or for the
+absence of one — ask:
+
+**Remove it if:**
+- It restates what the identifier or signature already says.
+  (`// returns the length` above `fn len() -> usize` adds nothing.)
+- It describes *what* the code does rather than *why* it does it that way.
+- It's a leftover from a refactor, references a ticket, names a caller, or
+  describes the "old" behavior.
+- It's a section divider, spacer, or `// ===` banner with no information.
+
+**Rephrase or correct it if:**
+- It's accurate but wordy — cut to the minimum that preserves meaning.
+- It uses vague language ("handle", "process", "deal with") where a precise
+  verb exists.
+- It refers to a type, function, or constant that has since been renamed.
+- It describes a constraint or invariant imprecisely (e.g. says "non-negative"
+  when the real bound is "strictly positive").
+- The tone is a note-to-self or apology rather than a statement of fact.
+
+**Add one if:**
+- There is a non-obvious invariant the caller must respect (e.g. "must be
+  called with the journal lock held", "input must be pre-normalized").
+- The implementation chose a surprising approach for a non-obvious reason
+  (e.g. a workaround for an Azalea bug, a deliberate performance trade-off).
+- A value or formula is not derivable from the surrounding context (e.g. a
+  magic timeout chosen to match a specific server tick rate).
+- The function has a subtle failure mode or edge case that would bite a future
+  reader who skims the signature.
+
+**Keep it as-is only if** none of the above criteria apply.
+
+The bar: after this pass, every comment left in the file should be one that a
+future maintainer would be glad exists. If you're unsure whether to add one,
+don't — silence is better than noise.
+
+---
+
+## Do testing
+
+**Goal:** the test suite covers every meaningful behavior and failure mode,
+names tests so their intent is clear without reading the body, and contains
+no dead, redundant, or misleading tests.
+
+Work through the item's source and its existing tests. For each behavior,
+branch, and invariant, ask:
+
+**Add a test if:**
+- A non-trivial code path has no coverage (happy path, error path, edge case).
+- An invariant is asserted in production code (`assert!`, bounds check,
+  state-machine guard) but no test deliberately exercises the violation.
+- A bug was fixed here and no regression test was added at the time.
+- The function has a documented constraint (e.g. "input must be sorted") that
+  is never verified by a test.
+- Behavior depends on ordering, timing, or size thresholds — test at the
+  boundary, not just safely inside it.
+
+**Change a test if:**
+- It passes for the wrong reason (tests the mock rather than the code,
+  or asserts on an intermediate state that doesn't reflect the public contract).
+- It is fragile — tightly coupled to implementation details that change
+  without the behavior changing.
+- The setup is so verbose it obscures what scenario is actually being tested —
+  collapse repetitive construction into a builder or fixture helper.
+- A `#[should_panic]` test doesn't assert the message, making it pass on any
+  panic for any reason.
+
+**Remove a test if:**
+- It is dead — never runs because of a `#[cfg]` gate, `#[ignore]`, or wrong
+  module placement.
+- It tests a private helper that no longer exists or was inlined.
+- It covers the same scenario as another test — same inputs and assertions,
+  regardless of name.
+
+**Rename a test if:**
+- The name describes the mechanism rather than the behavior
+  (`test_parse_ok` → `buy_command_accepts_lowercase_item_name`).
+- The name is generic (`test1`, `test_basic`, `test_edge_case`).
+- The name says what the function does but not what the test verifies.
+
+**Structure to aim for:** each test should read as a three-part sentence —
+given (setup), when (action), then (assertion) — even if it's not literally
+split that way. A reader should understand what scenario is being tested and
+what correct behavior looks like without reading the production code.
+
+---
+
+## Do logging
+
+**Goal:** the log output tells an operator exactly what the system is doing
+and what went wrong, with no noise that drowns the signal and no silence that
+hides a problem.
+
+Work through the item's source. For each `tracing` call — or for its absence
+— ask:
+
+**Remove it if:**
+- It is `trace!` and not genuinely needed for a specific deep-debugging
+  session — `trace!` should not survive in production code by default.
+- It fires on every iteration of a hot loop and produces volume with no
+  diagnostic value.
+- It duplicates information already present in a nearby call at the same or
+  higher level.
+- It logs internal implementation steps that an operator cannot act on and a
+  developer can get from a debugger.
+- The message is always the same string with no variables — it tells you
+  *that* something happened but not *what* or *which*.
+
+**Change the level if:**
+- `error!` is used for a recoverable condition the system handles itself
+  → downgrade to `warn!`.
+- `warn!` is used for a condition that always requires operator intervention
+  → upgrade to `error!`.
+- `info!` is used for per-item or per-request events in a tight loop
+  → downgrade to `debug!`.
+- `debug!` is used for the top-level lifecycle events an operator would want
+  to see in a tailed log → upgrade to `info!`.
+
+**Change the message or fields if:**
+- The message uses vague language ("failed", "error", "problem") without
+  naming what failed and why.
+- Key identifiers (item name, user UUID, chest ID, order ID) are missing
+  from a message that fires in a context where multiple instances are
+  possible — the operator cannot tell *which* one without them.
+- The message is a sentence fragment rather than a complete, human-readable
+  description of what happened.
+- The error value is dumped raw (`format!("{:?}", e)`) instead of extracting
+  the relevant detail — `{e}` or a targeted field is almost always cleaner.
+- Units are missing from numeric values (log `"timeout after 45s"` not
+  `"timeout after 45000"`).
+
+**Add a call if:**
+- A branch is taken that permanently changes system state (pair deleted,
+  node added, config reloaded) and no log records it.
+- An error is swallowed with `let _ = ...` or `.ok()` and the failure is
+  non-trivial (i.e. not "this is expected to fail sometimes").
+- A recovery path is entered (retry, rollback, fallback) — the operator
+  needs to know the system deviated from the happy path.
+- Startup loads or skips a resource (pair file, user file, storage node)
+  and the count or skipped item is not recorded.
+
+**Keep it as-is only if** the level, message, and fields are all correct and
+sufficient. The test: could an operator, reading only the log line, understand
+what happened and decide whether action is needed?
+
+---
+
 ### src/main.rs
 
 - fn `main`
@@ -7,20 +195,20 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `main`
-- [ ] Review comments: fn `print_usage`
-- [ ] Review comments: fn `run_validate_only`
-- [ ] Review comments: fn `spawn_config_watcher`
+- [ ] Do comments: fn `main`
+- [ ] Do comments: fn `print_usage`
+- [ ] Do comments: fn `run_validate_only`
+- [ ] Do comments: fn `spawn_config_watcher`
 
-- [ ] Review testability: fn `main`
-- [ ] Review testability: fn `print_usage`
-- [ ] Review testability: fn `run_validate_only`
-- [ ] Review testability: fn `spawn_config_watcher`
+- [ ] Do testing: fn `main`
+- [ ] Do testing: fn `print_usage`
+- [ ] Do testing: fn `run_validate_only`
+- [ ] Do testing: fn `spawn_config_watcher`
 
-- [ ] Review logging: fn `main`
-- [ ] Review logging: fn `print_usage`
-- [ ] Review logging: fn `run_validate_only`
-- [ ] Review logging: fn `spawn_config_watcher`
+- [ ] Do logging: fn `main`
+- [ ] Do logging: fn `print_usage`
+- [ ] Do logging: fn `run_validate_only`
+- [ ] Do logging: fn `spawn_config_watcher`
 
 ### src/cli.rs
 
@@ -43,56 +231,56 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `with_retry`
-- [ ] Review comments: fn `cli_task`
-- [ ] Review comments: fn `get_balances`
-- [ ] Review comments: fn `get_pairs`
-- [ ] Review comments: fn `set_operator`
-- [ ] Review comments: fn `add_node`
-- [ ] Review comments: fn `add_node_with_validation`
-- [ ] Review comments: fn `discover_storage`
-- [ ] Review comments: fn `remove_node`
-- [ ] Review comments: fn `add_pair`
-- [ ] Review comments: fn `remove_pair`
-- [ ] Review comments: fn `view_storage`
-- [ ] Review comments: fn `view_trades`
-- [ ] Review comments: fn `restart_bot`
-- [ ] Review comments: fn `clear_stuck_order`
-- [ ] Review comments: fn `audit_state`
+- [ ] Do comments: fn `with_retry`
+- [ ] Do comments: fn `cli_task`
+- [ ] Do comments: fn `get_balances`
+- [ ] Do comments: fn `get_pairs`
+- [ ] Do comments: fn `set_operator`
+- [ ] Do comments: fn `add_node`
+- [ ] Do comments: fn `add_node_with_validation`
+- [ ] Do comments: fn `discover_storage`
+- [ ] Do comments: fn `remove_node`
+- [ ] Do comments: fn `add_pair`
+- [ ] Do comments: fn `remove_pair`
+- [ ] Do comments: fn `view_storage`
+- [ ] Do comments: fn `view_trades`
+- [ ] Do comments: fn `restart_bot`
+- [ ] Do comments: fn `clear_stuck_order`
+- [ ] Do comments: fn `audit_state`
 
-- [ ] Review testability: fn `with_retry`
-- [ ] Review testability: fn `cli_task`
-- [ ] Review testability: fn `get_balances`
-- [ ] Review testability: fn `get_pairs`
-- [ ] Review testability: fn `set_operator`
-- [ ] Review testability: fn `add_node`
-- [ ] Review testability: fn `add_node_with_validation`
-- [ ] Review testability: fn `discover_storage`
-- [ ] Review testability: fn `remove_node`
-- [ ] Review testability: fn `add_pair`
-- [ ] Review testability: fn `remove_pair`
-- [ ] Review testability: fn `view_storage`
-- [ ] Review testability: fn `view_trades`
-- [ ] Review testability: fn `restart_bot`
-- [ ] Review testability: fn `clear_stuck_order`
-- [ ] Review testability: fn `audit_state`
+- [ ] Do testing: fn `with_retry`
+- [ ] Do testing: fn `cli_task`
+- [ ] Do testing: fn `get_balances`
+- [ ] Do testing: fn `get_pairs`
+- [ ] Do testing: fn `set_operator`
+- [ ] Do testing: fn `add_node`
+- [ ] Do testing: fn `add_node_with_validation`
+- [ ] Do testing: fn `discover_storage`
+- [ ] Do testing: fn `remove_node`
+- [ ] Do testing: fn `add_pair`
+- [ ] Do testing: fn `remove_pair`
+- [ ] Do testing: fn `view_storage`
+- [ ] Do testing: fn `view_trades`
+- [ ] Do testing: fn `restart_bot`
+- [ ] Do testing: fn `clear_stuck_order`
+- [ ] Do testing: fn `audit_state`
 
-- [ ] Review logging: fn `with_retry`
-- [ ] Review logging: fn `cli_task`
-- [ ] Review logging: fn `get_balances`
-- [ ] Review logging: fn `get_pairs`
-- [ ] Review logging: fn `set_operator`
-- [ ] Review logging: fn `add_node`
-- [ ] Review logging: fn `add_node_with_validation`
-- [ ] Review logging: fn `discover_storage`
-- [ ] Review logging: fn `remove_node`
-- [ ] Review logging: fn `add_pair`
-- [ ] Review logging: fn `remove_pair`
-- [ ] Review logging: fn `view_storage`
-- [ ] Review logging: fn `view_trades`
-- [ ] Review logging: fn `restart_bot`
-- [ ] Review logging: fn `clear_stuck_order`
-- [ ] Review logging: fn `audit_state`
+- [ ] Do logging: fn `with_retry`
+- [ ] Do logging: fn `cli_task`
+- [ ] Do logging: fn `get_balances`
+- [ ] Do logging: fn `get_pairs`
+- [ ] Do logging: fn `set_operator`
+- [ ] Do logging: fn `add_node`
+- [ ] Do logging: fn `add_node_with_validation`
+- [ ] Do logging: fn `discover_storage`
+- [ ] Do logging: fn `remove_node`
+- [ ] Do logging: fn `add_pair`
+- [ ] Do logging: fn `remove_pair`
+- [ ] Do logging: fn `view_storage`
+- [ ] Do logging: fn `view_trades`
+- [ ] Do logging: fn `restart_bot`
+- [ ] Do logging: fn `clear_stuck_order`
+- [ ] Do logging: fn `audit_state`
 
 ### src/config.rs
 
@@ -107,32 +295,32 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Config`
-- [ ] Review comments: fn `default_trade_timeout_ms`
-- [ ] Review comments: fn `default_pathfinding_timeout_ms`
-- [ ] Review comments: fn `default_max_orders`
-- [ ] Review comments: fn `default_max_trades_in_memory`
-- [ ] Review comments: fn `default_autosave_interval_secs`
-- [ ] Review comments: impl Config :: fn `validate`
-- [ ] Review comments: impl Config :: fn `load`
+- [ ] Do comments: struct `Config`
+- [ ] Do comments: fn `default_trade_timeout_ms`
+- [ ] Do comments: fn `default_pathfinding_timeout_ms`
+- [ ] Do comments: fn `default_max_orders`
+- [ ] Do comments: fn `default_max_trades_in_memory`
+- [ ] Do comments: fn `default_autosave_interval_secs`
+- [ ] Do comments: impl Config :: fn `validate`
+- [ ] Do comments: impl Config :: fn `load`
 
-- [ ] Review testability: struct `Config`
-- [ ] Review testability: fn `default_trade_timeout_ms`
-- [ ] Review testability: fn `default_pathfinding_timeout_ms`
-- [ ] Review testability: fn `default_max_orders`
-- [ ] Review testability: fn `default_max_trades_in_memory`
-- [ ] Review testability: fn `default_autosave_interval_secs`
-- [ ] Review testability: impl Config :: fn `validate`
-- [ ] Review testability: impl Config :: fn `load`
+- [ ] Do testing: struct `Config`
+- [ ] Do testing: fn `default_trade_timeout_ms`
+- [ ] Do testing: fn `default_pathfinding_timeout_ms`
+- [ ] Do testing: fn `default_max_orders`
+- [ ] Do testing: fn `default_max_trades_in_memory`
+- [ ] Do testing: fn `default_autosave_interval_secs`
+- [ ] Do testing: impl Config :: fn `validate`
+- [ ] Do testing: impl Config :: fn `load`
 
-- [ ] Review logging: struct `Config`
-- [ ] Review logging: fn `default_trade_timeout_ms`
-- [ ] Review logging: fn `default_pathfinding_timeout_ms`
-- [ ] Review logging: fn `default_max_orders`
-- [ ] Review logging: fn `default_max_trades_in_memory`
-- [ ] Review logging: fn `default_autosave_interval_secs`
-- [ ] Review logging: impl Config :: fn `validate`
-- [ ] Review logging: impl Config :: fn `load`
+- [ ] Do logging: struct `Config`
+- [ ] Do logging: fn `default_trade_timeout_ms`
+- [ ] Do logging: fn `default_pathfinding_timeout_ms`
+- [ ] Do logging: fn `default_max_orders`
+- [ ] Do logging: fn `default_max_trades_in_memory`
+- [ ] Do logging: fn `default_autosave_interval_secs`
+- [ ] Do logging: impl Config :: fn `validate`
+- [ ] Do logging: impl Config :: fn `load`
 
 ### src/constants.rs
 
@@ -183,140 +371,140 @@
 
 **TODO:**
 
-- [ ] Review comments: const `DOUBLE_CHEST_SLOTS`
-- [ ] Review comments: const `SHULKER_BOX_SLOTS`
-- [ ] Review comments: const `HOTBAR_SLOT_0`
-- [ ] Review comments: const `TRADE_TIMEOUT_MS`
-- [ ] Review comments: const `CHEST_OP_TIMEOUT_SECS`
-- [ ] Review comments: const `PATHFINDING_TIMEOUT_MS`
-- [ ] Review comments: const `DELAY_SHORT_MS`
-- [ ] Review comments: const `PATHFINDING_CHECK_INTERVAL_MS`
-- [ ] Review comments: const `DELAY_MEDIUM_MS`
-- [ ] Review comments: const `DELAY_INTERACT_MS`
-- [ ] Review comments: const `DELAY_BLOCK_OP_MS`
-- [ ] Review comments: const `DELAY_LOOK_AT_MS`
-- [ ] Review comments: const `DELAY_SETTLE_MS`
-- [ ] Review comments: const `DELAY_VALIDATION_BETWEEN_CHESTS_MS`
-- [ ] Review comments: const `DELAY_SHULKER_PLACE_MS`
-- [ ] Review comments: const `DELAY_DISCONNECT_MS`
-- [ ] Review comments: const `DELAY_CONFIG_DEBOUNCE_MS`
-- [ ] Review comments: const `CHEST_OP_MAX_RETRIES`
-- [ ] Review comments: const `CHUNK_RELOAD_EXTRA_RETRIES`
-- [ ] Review comments: const `CHUNK_RELOAD_BASE_DELAY_MS`
-- [ ] Review comments: const `CHUNK_RELOAD_MAX_DELAY_MS`
-- [ ] Review comments: const `SHULKER_OP_MAX_RETRIES`
-- [ ] Review comments: const `NAVIGATION_MAX_RETRIES`
-- [ ] Review comments: const `RETRY_BASE_DELAY_MS`
-- [ ] Review comments: const `RETRY_MAX_DELAY_MS`
-- [ ] Review comments: const `FEE_MIN`
-- [ ] Review comments: const `FEE_MAX`
-- [ ] Review comments: const `MAX_TRANSACTION_QUANTITY`
-- [ ] Review comments: const `MIN_RESERVE_FOR_PRICE`
-- [ ] Review comments: const `CHESTS_PER_NODE`
-- [ ] Review comments: const `NODE_SPACING`
-- [ ] Review comments: const `OVERFLOW_CHEST_ITEM`
-- [ ] Review comments: const `DIAMOND_CHEST_ID`
-- [ ] Review comments: const `OVERFLOW_CHEST_ID`
-- [ ] Review comments: const `MAX_ORDERS_PER_USER`
-- [ ] Review comments: const `MAX_QUEUE_SIZE`
-- [ ] Review comments: const `QUEUE_FILE`
-- [ ] Review comments: const `RATE_LIMIT_BASE_COOLDOWN_MS`
-- [ ] Review comments: const `UUID_CACHE_TTL_SECS`
-- [ ] Review comments: const `RATE_LIMIT_MAX_COOLDOWN_MS`
-- [ ] Review comments: const `RATE_LIMIT_RESET_AFTER_MS`
-- [ ] Review comments: const `CLEANUP_INTERVAL_SECS`
-- [ ] Review comments: const `RATE_LIMIT_STALE_AFTER_SECS`
-- [ ] Review comments: fn `exponential_backoff_delay`
+- [ ] Do comments: const `DOUBLE_CHEST_SLOTS`
+- [ ] Do comments: const `SHULKER_BOX_SLOTS`
+- [ ] Do comments: const `HOTBAR_SLOT_0`
+- [ ] Do comments: const `TRADE_TIMEOUT_MS`
+- [ ] Do comments: const `CHEST_OP_TIMEOUT_SECS`
+- [ ] Do comments: const `PATHFINDING_TIMEOUT_MS`
+- [ ] Do comments: const `DELAY_SHORT_MS`
+- [ ] Do comments: const `PATHFINDING_CHECK_INTERVAL_MS`
+- [ ] Do comments: const `DELAY_MEDIUM_MS`
+- [ ] Do comments: const `DELAY_INTERACT_MS`
+- [ ] Do comments: const `DELAY_BLOCK_OP_MS`
+- [ ] Do comments: const `DELAY_LOOK_AT_MS`
+- [ ] Do comments: const `DELAY_SETTLE_MS`
+- [ ] Do comments: const `DELAY_VALIDATION_BETWEEN_CHESTS_MS`
+- [ ] Do comments: const `DELAY_SHULKER_PLACE_MS`
+- [ ] Do comments: const `DELAY_DISCONNECT_MS`
+- [ ] Do comments: const `DELAY_CONFIG_DEBOUNCE_MS`
+- [ ] Do comments: const `CHEST_OP_MAX_RETRIES`
+- [ ] Do comments: const `CHUNK_RELOAD_EXTRA_RETRIES`
+- [ ] Do comments: const `CHUNK_RELOAD_BASE_DELAY_MS`
+- [ ] Do comments: const `CHUNK_RELOAD_MAX_DELAY_MS`
+- [ ] Do comments: const `SHULKER_OP_MAX_RETRIES`
+- [ ] Do comments: const `NAVIGATION_MAX_RETRIES`
+- [ ] Do comments: const `RETRY_BASE_DELAY_MS`
+- [ ] Do comments: const `RETRY_MAX_DELAY_MS`
+- [ ] Do comments: const `FEE_MIN`
+- [ ] Do comments: const `FEE_MAX`
+- [ ] Do comments: const `MAX_TRANSACTION_QUANTITY`
+- [ ] Do comments: const `MIN_RESERVE_FOR_PRICE`
+- [ ] Do comments: const `CHESTS_PER_NODE`
+- [ ] Do comments: const `NODE_SPACING`
+- [ ] Do comments: const `OVERFLOW_CHEST_ITEM`
+- [ ] Do comments: const `DIAMOND_CHEST_ID`
+- [ ] Do comments: const `OVERFLOW_CHEST_ID`
+- [ ] Do comments: const `MAX_ORDERS_PER_USER`
+- [ ] Do comments: const `MAX_QUEUE_SIZE`
+- [ ] Do comments: const `QUEUE_FILE`
+- [ ] Do comments: const `RATE_LIMIT_BASE_COOLDOWN_MS`
+- [ ] Do comments: const `UUID_CACHE_TTL_SECS`
+- [ ] Do comments: const `RATE_LIMIT_MAX_COOLDOWN_MS`
+- [ ] Do comments: const `RATE_LIMIT_RESET_AFTER_MS`
+- [ ] Do comments: const `CLEANUP_INTERVAL_SECS`
+- [ ] Do comments: const `RATE_LIMIT_STALE_AFTER_SECS`
+- [ ] Do comments: fn `exponential_backoff_delay`
 
-- [ ] Review testability: const `DOUBLE_CHEST_SLOTS`
-- [ ] Review testability: const `SHULKER_BOX_SLOTS`
-- [ ] Review testability: const `HOTBAR_SLOT_0`
-- [ ] Review testability: const `TRADE_TIMEOUT_MS`
-- [ ] Review testability: const `CHEST_OP_TIMEOUT_SECS`
-- [ ] Review testability: const `PATHFINDING_TIMEOUT_MS`
-- [ ] Review testability: const `DELAY_SHORT_MS`
-- [ ] Review testability: const `PATHFINDING_CHECK_INTERVAL_MS`
-- [ ] Review testability: const `DELAY_MEDIUM_MS`
-- [ ] Review testability: const `DELAY_INTERACT_MS`
-- [ ] Review testability: const `DELAY_BLOCK_OP_MS`
-- [ ] Review testability: const `DELAY_LOOK_AT_MS`
-- [ ] Review testability: const `DELAY_SETTLE_MS`
-- [ ] Review testability: const `DELAY_VALIDATION_BETWEEN_CHESTS_MS`
-- [ ] Review testability: const `DELAY_SHULKER_PLACE_MS`
-- [ ] Review testability: const `DELAY_DISCONNECT_MS`
-- [ ] Review testability: const `DELAY_CONFIG_DEBOUNCE_MS`
-- [ ] Review testability: const `CHEST_OP_MAX_RETRIES`
-- [ ] Review testability: const `CHUNK_RELOAD_EXTRA_RETRIES`
-- [ ] Review testability: const `CHUNK_RELOAD_BASE_DELAY_MS`
-- [ ] Review testability: const `CHUNK_RELOAD_MAX_DELAY_MS`
-- [ ] Review testability: const `SHULKER_OP_MAX_RETRIES`
-- [ ] Review testability: const `NAVIGATION_MAX_RETRIES`
-- [ ] Review testability: const `RETRY_BASE_DELAY_MS`
-- [ ] Review testability: const `RETRY_MAX_DELAY_MS`
-- [ ] Review testability: const `FEE_MIN`
-- [ ] Review testability: const `FEE_MAX`
-- [ ] Review testability: const `MAX_TRANSACTION_QUANTITY`
-- [ ] Review testability: const `MIN_RESERVE_FOR_PRICE`
-- [ ] Review testability: const `CHESTS_PER_NODE`
-- [ ] Review testability: const `NODE_SPACING`
-- [ ] Review testability: const `OVERFLOW_CHEST_ITEM`
-- [ ] Review testability: const `DIAMOND_CHEST_ID`
-- [ ] Review testability: const `OVERFLOW_CHEST_ID`
-- [ ] Review testability: const `MAX_ORDERS_PER_USER`
-- [ ] Review testability: const `MAX_QUEUE_SIZE`
-- [ ] Review testability: const `QUEUE_FILE`
-- [ ] Review testability: const `RATE_LIMIT_BASE_COOLDOWN_MS`
-- [ ] Review testability: const `UUID_CACHE_TTL_SECS`
-- [ ] Review testability: const `RATE_LIMIT_MAX_COOLDOWN_MS`
-- [ ] Review testability: const `RATE_LIMIT_RESET_AFTER_MS`
-- [ ] Review testability: const `CLEANUP_INTERVAL_SECS`
-- [ ] Review testability: const `RATE_LIMIT_STALE_AFTER_SECS`
-- [ ] Review testability: fn `exponential_backoff_delay`
+- [ ] Do testing: const `DOUBLE_CHEST_SLOTS`
+- [ ] Do testing: const `SHULKER_BOX_SLOTS`
+- [ ] Do testing: const `HOTBAR_SLOT_0`
+- [ ] Do testing: const `TRADE_TIMEOUT_MS`
+- [ ] Do testing: const `CHEST_OP_TIMEOUT_SECS`
+- [ ] Do testing: const `PATHFINDING_TIMEOUT_MS`
+- [ ] Do testing: const `DELAY_SHORT_MS`
+- [ ] Do testing: const `PATHFINDING_CHECK_INTERVAL_MS`
+- [ ] Do testing: const `DELAY_MEDIUM_MS`
+- [ ] Do testing: const `DELAY_INTERACT_MS`
+- [ ] Do testing: const `DELAY_BLOCK_OP_MS`
+- [ ] Do testing: const `DELAY_LOOK_AT_MS`
+- [ ] Do testing: const `DELAY_SETTLE_MS`
+- [ ] Do testing: const `DELAY_VALIDATION_BETWEEN_CHESTS_MS`
+- [ ] Do testing: const `DELAY_SHULKER_PLACE_MS`
+- [ ] Do testing: const `DELAY_DISCONNECT_MS`
+- [ ] Do testing: const `DELAY_CONFIG_DEBOUNCE_MS`
+- [ ] Do testing: const `CHEST_OP_MAX_RETRIES`
+- [ ] Do testing: const `CHUNK_RELOAD_EXTRA_RETRIES`
+- [ ] Do testing: const `CHUNK_RELOAD_BASE_DELAY_MS`
+- [ ] Do testing: const `CHUNK_RELOAD_MAX_DELAY_MS`
+- [ ] Do testing: const `SHULKER_OP_MAX_RETRIES`
+- [ ] Do testing: const `NAVIGATION_MAX_RETRIES`
+- [ ] Do testing: const `RETRY_BASE_DELAY_MS`
+- [ ] Do testing: const `RETRY_MAX_DELAY_MS`
+- [ ] Do testing: const `FEE_MIN`
+- [ ] Do testing: const `FEE_MAX`
+- [ ] Do testing: const `MAX_TRANSACTION_QUANTITY`
+- [ ] Do testing: const `MIN_RESERVE_FOR_PRICE`
+- [ ] Do testing: const `CHESTS_PER_NODE`
+- [ ] Do testing: const `NODE_SPACING`
+- [ ] Do testing: const `OVERFLOW_CHEST_ITEM`
+- [ ] Do testing: const `DIAMOND_CHEST_ID`
+- [ ] Do testing: const `OVERFLOW_CHEST_ID`
+- [ ] Do testing: const `MAX_ORDERS_PER_USER`
+- [ ] Do testing: const `MAX_QUEUE_SIZE`
+- [ ] Do testing: const `QUEUE_FILE`
+- [ ] Do testing: const `RATE_LIMIT_BASE_COOLDOWN_MS`
+- [ ] Do testing: const `UUID_CACHE_TTL_SECS`
+- [ ] Do testing: const `RATE_LIMIT_MAX_COOLDOWN_MS`
+- [ ] Do testing: const `RATE_LIMIT_RESET_AFTER_MS`
+- [ ] Do testing: const `CLEANUP_INTERVAL_SECS`
+- [ ] Do testing: const `RATE_LIMIT_STALE_AFTER_SECS`
+- [ ] Do testing: fn `exponential_backoff_delay`
 
-- [ ] Review logging: const `DOUBLE_CHEST_SLOTS`
-- [ ] Review logging: const `SHULKER_BOX_SLOTS`
-- [ ] Review logging: const `HOTBAR_SLOT_0`
-- [ ] Review logging: const `TRADE_TIMEOUT_MS`
-- [ ] Review logging: const `CHEST_OP_TIMEOUT_SECS`
-- [ ] Review logging: const `PATHFINDING_TIMEOUT_MS`
-- [ ] Review logging: const `DELAY_SHORT_MS`
-- [ ] Review logging: const `PATHFINDING_CHECK_INTERVAL_MS`
-- [ ] Review logging: const `DELAY_MEDIUM_MS`
-- [ ] Review logging: const `DELAY_INTERACT_MS`
-- [ ] Review logging: const `DELAY_BLOCK_OP_MS`
-- [ ] Review logging: const `DELAY_LOOK_AT_MS`
-- [ ] Review logging: const `DELAY_SETTLE_MS`
-- [ ] Review logging: const `DELAY_VALIDATION_BETWEEN_CHESTS_MS`
-- [ ] Review logging: const `DELAY_SHULKER_PLACE_MS`
-- [ ] Review logging: const `DELAY_DISCONNECT_MS`
-- [ ] Review logging: const `DELAY_CONFIG_DEBOUNCE_MS`
-- [ ] Review logging: const `CHEST_OP_MAX_RETRIES`
-- [ ] Review logging: const `CHUNK_RELOAD_EXTRA_RETRIES`
-- [ ] Review logging: const `CHUNK_RELOAD_BASE_DELAY_MS`
-- [ ] Review logging: const `CHUNK_RELOAD_MAX_DELAY_MS`
-- [ ] Review logging: const `SHULKER_OP_MAX_RETRIES`
-- [ ] Review logging: const `NAVIGATION_MAX_RETRIES`
-- [ ] Review logging: const `RETRY_BASE_DELAY_MS`
-- [ ] Review logging: const `RETRY_MAX_DELAY_MS`
-- [ ] Review logging: const `FEE_MIN`
-- [ ] Review logging: const `FEE_MAX`
-- [ ] Review logging: const `MAX_TRANSACTION_QUANTITY`
-- [ ] Review logging: const `MIN_RESERVE_FOR_PRICE`
-- [ ] Review logging: const `CHESTS_PER_NODE`
-- [ ] Review logging: const `NODE_SPACING`
-- [ ] Review logging: const `OVERFLOW_CHEST_ITEM`
-- [ ] Review logging: const `DIAMOND_CHEST_ID`
-- [ ] Review logging: const `OVERFLOW_CHEST_ID`
-- [ ] Review logging: const `MAX_ORDERS_PER_USER`
-- [ ] Review logging: const `MAX_QUEUE_SIZE`
-- [ ] Review logging: const `QUEUE_FILE`
-- [ ] Review logging: const `RATE_LIMIT_BASE_COOLDOWN_MS`
-- [ ] Review logging: const `UUID_CACHE_TTL_SECS`
-- [ ] Review logging: const `RATE_LIMIT_MAX_COOLDOWN_MS`
-- [ ] Review logging: const `RATE_LIMIT_RESET_AFTER_MS`
-- [ ] Review logging: const `CLEANUP_INTERVAL_SECS`
-- [ ] Review logging: const `RATE_LIMIT_STALE_AFTER_SECS`
-- [ ] Review logging: fn `exponential_backoff_delay`
+- [ ] Do logging: const `DOUBLE_CHEST_SLOTS`
+- [ ] Do logging: const `SHULKER_BOX_SLOTS`
+- [ ] Do logging: const `HOTBAR_SLOT_0`
+- [ ] Do logging: const `TRADE_TIMEOUT_MS`
+- [ ] Do logging: const `CHEST_OP_TIMEOUT_SECS`
+- [ ] Do logging: const `PATHFINDING_TIMEOUT_MS`
+- [ ] Do logging: const `DELAY_SHORT_MS`
+- [ ] Do logging: const `PATHFINDING_CHECK_INTERVAL_MS`
+- [ ] Do logging: const `DELAY_MEDIUM_MS`
+- [ ] Do logging: const `DELAY_INTERACT_MS`
+- [ ] Do logging: const `DELAY_BLOCK_OP_MS`
+- [ ] Do logging: const `DELAY_LOOK_AT_MS`
+- [ ] Do logging: const `DELAY_SETTLE_MS`
+- [ ] Do logging: const `DELAY_VALIDATION_BETWEEN_CHESTS_MS`
+- [ ] Do logging: const `DELAY_SHULKER_PLACE_MS`
+- [ ] Do logging: const `DELAY_DISCONNECT_MS`
+- [ ] Do logging: const `DELAY_CONFIG_DEBOUNCE_MS`
+- [ ] Do logging: const `CHEST_OP_MAX_RETRIES`
+- [ ] Do logging: const `CHUNK_RELOAD_EXTRA_RETRIES`
+- [ ] Do logging: const `CHUNK_RELOAD_BASE_DELAY_MS`
+- [ ] Do logging: const `CHUNK_RELOAD_MAX_DELAY_MS`
+- [ ] Do logging: const `SHULKER_OP_MAX_RETRIES`
+- [ ] Do logging: const `NAVIGATION_MAX_RETRIES`
+- [ ] Do logging: const `RETRY_BASE_DELAY_MS`
+- [ ] Do logging: const `RETRY_MAX_DELAY_MS`
+- [ ] Do logging: const `FEE_MIN`
+- [ ] Do logging: const `FEE_MAX`
+- [ ] Do logging: const `MAX_TRANSACTION_QUANTITY`
+- [ ] Do logging: const `MIN_RESERVE_FOR_PRICE`
+- [ ] Do logging: const `CHESTS_PER_NODE`
+- [ ] Do logging: const `NODE_SPACING`
+- [ ] Do logging: const `OVERFLOW_CHEST_ITEM`
+- [ ] Do logging: const `DIAMOND_CHEST_ID`
+- [ ] Do logging: const `OVERFLOW_CHEST_ID`
+- [ ] Do logging: const `MAX_ORDERS_PER_USER`
+- [ ] Do logging: const `MAX_QUEUE_SIZE`
+- [ ] Do logging: const `QUEUE_FILE`
+- [ ] Do logging: const `RATE_LIMIT_BASE_COOLDOWN_MS`
+- [ ] Do logging: const `UUID_CACHE_TTL_SECS`
+- [ ] Do logging: const `RATE_LIMIT_MAX_COOLDOWN_MS`
+- [ ] Do logging: const `RATE_LIMIT_RESET_AFTER_MS`
+- [ ] Do logging: const `CLEANUP_INTERVAL_SECS`
+- [ ] Do logging: const `RATE_LIMIT_STALE_AFTER_SECS`
+- [ ] Do logging: fn `exponential_backoff_delay`
 
 ### src/error.rs
 
@@ -326,17 +514,17 @@
 
 **TODO:**
 
-- [ ] Review comments: enum `StoreError`
-- [ ] Review comments: impl `From<StoreError> for String` :: fn `from`
-- [ ] Review comments: impl `From<String> for StoreError` :: fn `from`
+- [ ] Do comments: enum `StoreError`
+- [ ] Do comments: impl `From<StoreError> for String` :: fn `from`
+- [ ] Do comments: impl `From<String> for StoreError` :: fn `from`
 
-- [ ] Review testability: enum `StoreError`
-- [ ] Review testability: impl `From<StoreError> for String` :: fn `from`
-- [ ] Review testability: impl `From<String> for StoreError` :: fn `from`
+- [ ] Do testing: enum `StoreError`
+- [ ] Do testing: impl `From<StoreError> for String` :: fn `from`
+- [ ] Do testing: impl `From<String> for StoreError` :: fn `from`
 
-- [ ] Review logging: enum `StoreError`
-- [ ] Review logging: impl `From<StoreError> for String` :: fn `from`
-- [ ] Review logging: impl `From<String> for StoreError` :: fn `from`
+- [ ] Do logging: enum `StoreError`
+- [ ] Do logging: impl `From<StoreError> for String` :: fn `from`
+- [ ] Do logging: impl `From<String> for StoreError` :: fn `from`
 
 ### src/fsutil.rs
 
@@ -344,13 +532,11 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `write_atomic`
+- [ ] Do comments: fn `write_atomic`
 
-- [ ] Review testability: fn `write_atomic`
+- [ ] Do testing: fn `write_atomic`
 
-- [ ] Review logging: fn `write_atomic`
-
-- [ ] Add a unit test for the rename-failure → copy-fallback path (inject failure via a test-only hook or `cfg`-gated wrapper so it runs portably).
+- [ ] Do logging: fn `write_atomic`
 
 ### src/messages.rs
 
@@ -365,32 +551,32 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `TradeItem`
-- [ ] Review comments: struct `ChestSyncReport`
-- [ ] Review comments: enum `QueuedOrderType`
-- [ ] Review comments: enum `ChestAction`
-- [ ] Review comments: enum `StoreMessage`
-- [ ] Review comments: enum `BotMessage`
-- [ ] Review comments: enum `CliMessage`
-- [ ] Review comments: enum `BotInstruction`
+- [ ] Do comments: struct `TradeItem`
+- [ ] Do comments: struct `ChestSyncReport`
+- [ ] Do comments: enum `QueuedOrderType`
+- [ ] Do comments: enum `ChestAction`
+- [ ] Do comments: enum `StoreMessage`
+- [ ] Do comments: enum `BotMessage`
+- [ ] Do comments: enum `CliMessage`
+- [ ] Do comments: enum `BotInstruction`
 
-- [ ] Review testability: struct `TradeItem`
-- [ ] Review testability: struct `ChestSyncReport`
-- [ ] Review testability: enum `QueuedOrderType`
-- [ ] Review testability: enum `ChestAction`
-- [ ] Review testability: enum `StoreMessage`
-- [ ] Review testability: enum `BotMessage`
-- [ ] Review testability: enum `CliMessage`
-- [ ] Review testability: enum `BotInstruction`
+- [ ] Do testing: struct `TradeItem`
+- [ ] Do testing: struct `ChestSyncReport`
+- [ ] Do testing: enum `QueuedOrderType`
+- [ ] Do testing: enum `ChestAction`
+- [ ] Do testing: enum `StoreMessage`
+- [ ] Do testing: enum `BotMessage`
+- [ ] Do testing: enum `CliMessage`
+- [ ] Do testing: enum `BotInstruction`
 
-- [ ] Review logging: struct `TradeItem`
-- [ ] Review logging: struct `ChestSyncReport`
-- [ ] Review logging: enum `QueuedOrderType`
-- [ ] Review logging: enum `ChestAction`
-- [ ] Review logging: enum `StoreMessage`
-- [ ] Review logging: enum `BotMessage`
-- [ ] Review logging: enum `CliMessage`
-- [ ] Review logging: enum `BotInstruction`
+- [ ] Do logging: struct `TradeItem`
+- [ ] Do logging: struct `ChestSyncReport`
+- [ ] Do logging: enum `QueuedOrderType`
+- [ ] Do logging: enum `ChestAction`
+- [ ] Do logging: enum `StoreMessage`
+- [ ] Do logging: enum `BotMessage`
+- [ ] Do logging: enum `CliMessage`
+- [ ] Do logging: enum `BotInstruction`
 
 ### src/types.rs
 
@@ -407,38 +593,38 @@
 
 **TODO:**
 
-- [ ] Review comments: pub mod `chest`
-- [ ] Review comments: pub mod `item_id`
-- [ ] Review comments: pub mod `node`
-- [ ] Review comments: pub mod `order`
-- [ ] Review comments: pub mod `pair`
-- [ ] Review comments: pub mod `position`
-- [ ] Review comments: pub mod `storage`
-- [ ] Review comments: pub mod `trade`
-- [ ] Review comments: pub mod `user`
-- [ ] Review comments: re-export surface (`Chest`, `ItemId`, `Node`, `Order`, `Pair`, `Position`, `Storage`, `Trade`, `TradeType`, `User`)
+- [ ] Do comments: pub mod `chest`
+- [ ] Do comments: pub mod `item_id`
+- [ ] Do comments: pub mod `node`
+- [ ] Do comments: pub mod `order`
+- [ ] Do comments: pub mod `pair`
+- [ ] Do comments: pub mod `position`
+- [ ] Do comments: pub mod `storage`
+- [ ] Do comments: pub mod `trade`
+- [ ] Do comments: pub mod `user`
+- [ ] Do comments: re-export surface (`Chest`, `ItemId`, `Node`, `Order`, `Pair`, `Position`, `Storage`, `Trade`, `TradeType`, `User`)
 
-- [ ] Review testability: pub mod `chest`
-- [ ] Review testability: pub mod `item_id`
-- [ ] Review testability: pub mod `node`
-- [ ] Review testability: pub mod `order`
-- [ ] Review testability: pub mod `pair`
-- [ ] Review testability: pub mod `position`
-- [ ] Review testability: pub mod `storage`
-- [ ] Review testability: pub mod `trade`
-- [ ] Review testability: pub mod `user`
-- [ ] Review testability: re-export surface (`Chest`, `ItemId`, `Node`, `Order`, `Pair`, `Position`, `Storage`, `Trade`, `TradeType`, `User`)
+- [ ] Do testing: pub mod `chest`
+- [ ] Do testing: pub mod `item_id`
+- [ ] Do testing: pub mod `node`
+- [ ] Do testing: pub mod `order`
+- [ ] Do testing: pub mod `pair`
+- [ ] Do testing: pub mod `position`
+- [ ] Do testing: pub mod `storage`
+- [ ] Do testing: pub mod `trade`
+- [ ] Do testing: pub mod `user`
+- [ ] Do testing: re-export surface (`Chest`, `ItemId`, `Node`, `Order`, `Pair`, `Position`, `Storage`, `Trade`, `TradeType`, `User`)
 
-- [ ] Review logging: pub mod `chest`
-- [ ] Review logging: pub mod `item_id`
-- [ ] Review logging: pub mod `node`
-- [ ] Review logging: pub mod `order`
-- [ ] Review logging: pub mod `pair`
-- [ ] Review logging: pub mod `position`
-- [ ] Review logging: pub mod `storage`
-- [ ] Review logging: pub mod `trade`
-- [ ] Review logging: pub mod `user`
-- [ ] Review logging: re-export surface (`Chest`, `ItemId`, `Node`, `Order`, `Pair`, `Position`, `Storage`, `Trade`, `TradeType`, `User`)
+- [ ] Do logging: pub mod `chest`
+- [ ] Do logging: pub mod `item_id`
+- [ ] Do logging: pub mod `node`
+- [ ] Do logging: pub mod `order`
+- [ ] Do logging: pub mod `pair`
+- [ ] Do logging: pub mod `position`
+- [ ] Do logging: pub mod `storage`
+- [ ] Do logging: pub mod `trade`
+- [ ] Do logging: pub mod `user`
+- [ ] Do logging: re-export surface (`Chest`, `ItemId`, `Node`, `Order`, `Pair`, `Position`, `Storage`, `Trade`, `TradeType`, `User`)
 
 ---
 
@@ -450,11 +636,11 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Position`
+- [ ] Do comments: struct `Position`
 
-- [ ] Review testability: struct `Position`
+- [ ] Do testing: struct `Position`
 
-- [ ] Review logging: struct `Position`
+- [ ] Do logging: struct `Position`
 
 ### src/types/item_id.rs
 
@@ -478,59 +664,59 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `ItemId`
-- [ ] Review comments: impl ItemId :: const `EMPTY`
-- [ ] Review comments: impl ItemId :: fn `new`
-- [ ] Review comments: impl ItemId :: fn `from_normalized`
-- [ ] Review comments: impl ItemId :: fn `as_str`
-- [ ] Review comments: impl ItemId :: fn `with_minecraft_prefix`
-- [ ] Review comments: impl ItemId :: fn `is_empty`
-- [ ] Review comments: impl `Deref for ItemId` :: fn `deref`
-- [ ] Review comments: impl `Borrow<str> for ItemId` :: fn `borrow`
-- [ ] Review comments: impl `AsRef<str> for ItemId` :: fn `as_ref`
-- [ ] Review comments: impl `Display for ItemId` :: fn `fmt`
-- [ ] Review comments: impl `PartialEq<str> for ItemId` :: fn `eq`
-- [ ] Review comments: impl `PartialEq<&str> for ItemId` :: fn `eq`
-- [ ] Review comments: impl `PartialEq<String> for ItemId` :: fn `eq`
-- [ ] Review comments: impl `From<ItemId> for String` :: fn `from`
-- [ ] Review comments: impl `Default for ItemId` :: fn `default`
-- [ ] Review comments: tests module
+- [ ] Do comments: struct `ItemId`
+- [ ] Do comments: impl ItemId :: const `EMPTY`
+- [ ] Do comments: impl ItemId :: fn `new`
+- [ ] Do comments: impl ItemId :: fn `from_normalized`
+- [ ] Do comments: impl ItemId :: fn `as_str`
+- [ ] Do comments: impl ItemId :: fn `with_minecraft_prefix`
+- [ ] Do comments: impl ItemId :: fn `is_empty`
+- [ ] Do comments: impl `Deref for ItemId` :: fn `deref`
+- [ ] Do comments: impl `Borrow<str> for ItemId` :: fn `borrow`
+- [ ] Do comments: impl `AsRef<str> for ItemId` :: fn `as_ref`
+- [ ] Do comments: impl `Display for ItemId` :: fn `fmt`
+- [ ] Do comments: impl `PartialEq<str> for ItemId` :: fn `eq`
+- [ ] Do comments: impl `PartialEq<&str> for ItemId` :: fn `eq`
+- [ ] Do comments: impl `PartialEq<String> for ItemId` :: fn `eq`
+- [ ] Do comments: impl `From<ItemId> for String` :: fn `from`
+- [ ] Do comments: impl `Default for ItemId` :: fn `default`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: struct `ItemId`
-- [ ] Review testability: impl ItemId :: const `EMPTY`
-- [ ] Review testability: impl ItemId :: fn `new`
-- [ ] Review testability: impl ItemId :: fn `from_normalized`
-- [ ] Review testability: impl ItemId :: fn `as_str`
-- [ ] Review testability: impl ItemId :: fn `with_minecraft_prefix`
-- [ ] Review testability: impl ItemId :: fn `is_empty`
-- [ ] Review testability: impl `Deref for ItemId` :: fn `deref`
-- [ ] Review testability: impl `Borrow<str> for ItemId` :: fn `borrow`
-- [ ] Review testability: impl `AsRef<str> for ItemId` :: fn `as_ref`
-- [ ] Review testability: impl `Display for ItemId` :: fn `fmt`
-- [ ] Review testability: impl `PartialEq<str> for ItemId` :: fn `eq`
-- [ ] Review testability: impl `PartialEq<&str> for ItemId` :: fn `eq`
-- [ ] Review testability: impl `PartialEq<String> for ItemId` :: fn `eq`
-- [ ] Review testability: impl `From<ItemId> for String` :: fn `from`
-- [ ] Review testability: impl `Default for ItemId` :: fn `default`
-- [ ] Review testability: tests module
+- [ ] Do testing: struct `ItemId`
+- [ ] Do testing: impl ItemId :: const `EMPTY`
+- [ ] Do testing: impl ItemId :: fn `new`
+- [ ] Do testing: impl ItemId :: fn `from_normalized`
+- [ ] Do testing: impl ItemId :: fn `as_str`
+- [ ] Do testing: impl ItemId :: fn `with_minecraft_prefix`
+- [ ] Do testing: impl ItemId :: fn `is_empty`
+- [ ] Do testing: impl `Deref for ItemId` :: fn `deref`
+- [ ] Do testing: impl `Borrow<str> for ItemId` :: fn `borrow`
+- [ ] Do testing: impl `AsRef<str> for ItemId` :: fn `as_ref`
+- [ ] Do testing: impl `Display for ItemId` :: fn `fmt`
+- [ ] Do testing: impl `PartialEq<str> for ItemId` :: fn `eq`
+- [ ] Do testing: impl `PartialEq<&str> for ItemId` :: fn `eq`
+- [ ] Do testing: impl `PartialEq<String> for ItemId` :: fn `eq`
+- [ ] Do testing: impl `From<ItemId> for String` :: fn `from`
+- [ ] Do testing: impl `Default for ItemId` :: fn `default`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: struct `ItemId`
-- [ ] Review logging: impl ItemId :: const `EMPTY`
-- [ ] Review logging: impl ItemId :: fn `new`
-- [ ] Review logging: impl ItemId :: fn `from_normalized`
-- [ ] Review logging: impl ItemId :: fn `as_str`
-- [ ] Review logging: impl ItemId :: fn `with_minecraft_prefix`
-- [ ] Review logging: impl ItemId :: fn `is_empty`
-- [ ] Review logging: impl `Deref for ItemId` :: fn `deref`
-- [ ] Review logging: impl `Borrow<str> for ItemId` :: fn `borrow`
-- [ ] Review logging: impl `AsRef<str> for ItemId` :: fn `as_ref`
-- [ ] Review logging: impl `Display for ItemId` :: fn `fmt`
-- [ ] Review logging: impl `PartialEq<str> for ItemId` :: fn `eq`
-- [ ] Review logging: impl `PartialEq<&str> for ItemId` :: fn `eq`
-- [ ] Review logging: impl `PartialEq<String> for ItemId` :: fn `eq`
-- [ ] Review logging: impl `From<ItemId> for String` :: fn `from`
-- [ ] Review logging: impl `Default for ItemId` :: fn `default`
-- [ ] Review logging: tests module
+- [ ] Do logging: struct `ItemId`
+- [ ] Do logging: impl ItemId :: const `EMPTY`
+- [ ] Do logging: impl ItemId :: fn `new`
+- [ ] Do logging: impl ItemId :: fn `from_normalized`
+- [ ] Do logging: impl ItemId :: fn `as_str`
+- [ ] Do logging: impl ItemId :: fn `with_minecraft_prefix`
+- [ ] Do logging: impl ItemId :: fn `is_empty`
+- [ ] Do logging: impl `Deref for ItemId` :: fn `deref`
+- [ ] Do logging: impl `Borrow<str> for ItemId` :: fn `borrow`
+- [ ] Do logging: impl `AsRef<str> for ItemId` :: fn `as_ref`
+- [ ] Do logging: impl `Display for ItemId` :: fn `fmt`
+- [ ] Do logging: impl `PartialEq<str> for ItemId` :: fn `eq`
+- [ ] Do logging: impl `PartialEq<&str> for ItemId` :: fn `eq`
+- [ ] Do logging: impl `PartialEq<String> for ItemId` :: fn `eq`
+- [ ] Do logging: impl `From<ItemId> for String` :: fn `from`
+- [ ] Do logging: impl `Default for ItemId` :: fn `default`
+- [ ] Do logging: tests module
 
 ### src/types/node.rs
 
@@ -544,31 +730,29 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Node`
-- [ ] Review comments: impl Node :: fn `new`
-- [ ] Review comments: impl Node :: fn `load`
-- [ ] Review comments: impl Node :: fn `save`
-- [ ] Review comments: impl Node :: fn `calc_position`
-- [ ] Review comments: impl Node :: fn `calc_chest_position`
-- [ ] Review comments: tests module
+- [ ] Do comments: struct `Node`
+- [ ] Do comments: impl Node :: fn `new`
+- [ ] Do comments: impl Node :: fn `load`
+- [ ] Do comments: impl Node :: fn `save`
+- [ ] Do comments: impl Node :: fn `calc_position`
+- [ ] Do comments: impl Node :: fn `calc_chest_position`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: struct `Node`
-- [ ] Review testability: impl Node :: fn `new`
-- [ ] Review testability: impl Node :: fn `load`
-- [ ] Review testability: impl Node :: fn `save`
-- [ ] Review testability: impl Node :: fn `calc_position`
-- [ ] Review testability: impl Node :: fn `calc_chest_position`
-- [ ] Review testability: tests module
+- [ ] Do testing: struct `Node`
+- [ ] Do testing: impl Node :: fn `new`
+- [ ] Do testing: impl Node :: fn `load`
+- [ ] Do testing: impl Node :: fn `save`
+- [ ] Do testing: impl Node :: fn `calc_position`
+- [ ] Do testing: impl Node :: fn `calc_chest_position`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: struct `Node`
-- [ ] Review logging: impl Node :: fn `new`
-- [ ] Review logging: impl Node :: fn `load`
-- [ ] Review logging: impl Node :: fn `save`
-- [ ] Review logging: impl Node :: fn `calc_position`
-- [ ] Review logging: impl Node :: fn `calc_chest_position`
-- [ ] Review logging: tests module
-
-- [ ] Add a direct test for `Node::load`'s re-enforcement of node 0's reserved chests (diamond at index 0, overflow at index 1) — currently exercised only indirectly.
+- [ ] Do logging: struct `Node`
+- [ ] Do logging: impl Node :: fn `new`
+- [ ] Do logging: impl Node :: fn `load`
+- [ ] Do logging: impl Node :: fn `save`
+- [ ] Do logging: impl Node :: fn `calc_position`
+- [ ] Do logging: impl Node :: fn `calc_chest_position`
+- [ ] Do logging: tests module
 
 ### src/types/chest.rs
 
@@ -578,17 +762,17 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Chest`
-- [ ] Review comments: impl Chest :: fn `new`
-- [ ] Review comments: impl Chest :: fn `calc_position`
+- [ ] Do comments: struct `Chest`
+- [ ] Do comments: impl Chest :: fn `new`
+- [ ] Do comments: impl Chest :: fn `calc_position`
 
-- [ ] Review testability: struct `Chest`
-- [ ] Review testability: impl Chest :: fn `new`
-- [ ] Review testability: impl Chest :: fn `calc_position`
+- [ ] Do testing: struct `Chest`
+- [ ] Do testing: impl Chest :: fn `new`
+- [ ] Do testing: impl Chest :: fn `calc_position`
 
-- [ ] Review logging: struct `Chest`
-- [ ] Review logging: impl Chest :: fn `new`
-- [ ] Review logging: impl Chest :: fn `calc_position`
+- [ ] Do logging: struct `Chest`
+- [ ] Do logging: impl Chest :: fn `new`
+- [ ] Do logging: impl Chest :: fn `calc_position`
 
 ### src/types/trade.rs
 
@@ -601,26 +785,26 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Trade`
-- [ ] Review comments: enum `TradeType`
-- [ ] Review comments: impl Trade :: fn `new`
-- [ ] Review comments: impl Trade :: fn `save`
-- [ ] Review comments: impl Trade :: fn `load_all_with_limit`
-- [ ] Review comments: impl Trade :: fn `save_all`
+- [ ] Do comments: struct `Trade`
+- [ ] Do comments: enum `TradeType`
+- [ ] Do comments: impl Trade :: fn `new`
+- [ ] Do comments: impl Trade :: fn `save`
+- [ ] Do comments: impl Trade :: fn `load_all_with_limit`
+- [ ] Do comments: impl Trade :: fn `save_all`
 
-- [ ] Review testability: struct `Trade`
-- [ ] Review testability: enum `TradeType`
-- [ ] Review testability: impl Trade :: fn `new`
-- [ ] Review testability: impl Trade :: fn `save`
-- [ ] Review testability: impl Trade :: fn `load_all_with_limit`
-- [ ] Review testability: impl Trade :: fn `save_all`
+- [ ] Do testing: struct `Trade`
+- [ ] Do testing: enum `TradeType`
+- [ ] Do testing: impl Trade :: fn `new`
+- [ ] Do testing: impl Trade :: fn `save`
+- [ ] Do testing: impl Trade :: fn `load_all_with_limit`
+- [ ] Do testing: impl Trade :: fn `save_all`
 
-- [ ] Review logging: struct `Trade`
-- [ ] Review logging: enum `TradeType`
-- [ ] Review logging: impl Trade :: fn `new`
-- [ ] Review logging: impl Trade :: fn `save`
-- [ ] Review logging: impl Trade :: fn `load_all_with_limit`
-- [ ] Review logging: impl Trade :: fn `save_all`
+- [ ] Do logging: struct `Trade`
+- [ ] Do logging: enum `TradeType`
+- [ ] Do logging: impl Trade :: fn `new`
+- [ ] Do logging: impl Trade :: fn `save`
+- [ ] Do logging: impl Trade :: fn `load_all_with_limit`
+- [ ] Do logging: impl Trade :: fn `save_all`
 
 ### src/types/order.rs
 
@@ -630,17 +814,17 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Order`
-- [ ] Review comments: enum `OrderType`
-- [ ] Review comments: impl Order :: fn `save_all_with_limit`
+- [ ] Do comments: struct `Order`
+- [ ] Do comments: enum `OrderType`
+- [ ] Do comments: impl Order :: fn `save_all_with_limit`
 
-- [ ] Review testability: struct `Order`
-- [ ] Review testability: enum `OrderType`
-- [ ] Review testability: impl Order :: fn `save_all_with_limit`
+- [ ] Do testing: struct `Order`
+- [ ] Do testing: enum `OrderType`
+- [ ] Do testing: impl Order :: fn `save_all_with_limit`
 
-- [ ] Review logging: struct `Order`
-- [ ] Review logging: enum `OrderType`
-- [ ] Review logging: impl Order :: fn `save_all_with_limit`
+- [ ] Do logging: struct `Order`
+- [ ] Do logging: enum `OrderType`
+- [ ] Do logging: impl Order :: fn `save_all_with_limit`
 
 ### src/types/pair.rs
 
@@ -654,29 +838,29 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `Pair`
-- [ ] Review comments: impl Pair :: fn `shulker_capacity_for_stack_size`
-- [ ] Review comments: impl Pair :: fn `sanitize_item_name_for_filename`
-- [ ] Review comments: impl Pair :: fn `get_pair_file_path`
-- [ ] Review comments: impl Pair :: fn `save`
-- [ ] Review comments: impl Pair :: fn `load_all`
-- [ ] Review comments: impl Pair :: fn `save_all`
+- [ ] Do comments: struct `Pair`
+- [ ] Do comments: impl Pair :: fn `shulker_capacity_for_stack_size`
+- [ ] Do comments: impl Pair :: fn `sanitize_item_name_for_filename`
+- [ ] Do comments: impl Pair :: fn `get_pair_file_path`
+- [ ] Do comments: impl Pair :: fn `save`
+- [ ] Do comments: impl Pair :: fn `load_all`
+- [ ] Do comments: impl Pair :: fn `save_all`
 
-- [ ] Review testability: struct `Pair`
-- [ ] Review testability: impl Pair :: fn `shulker_capacity_for_stack_size`
-- [ ] Review testability: impl Pair :: fn `sanitize_item_name_for_filename`
-- [ ] Review testability: impl Pair :: fn `get_pair_file_path`
-- [ ] Review testability: impl Pair :: fn `save`
-- [ ] Review testability: impl Pair :: fn `load_all`
-- [ ] Review testability: impl Pair :: fn `save_all`
+- [ ] Do testing: struct `Pair`
+- [ ] Do testing: impl Pair :: fn `shulker_capacity_for_stack_size`
+- [ ] Do testing: impl Pair :: fn `sanitize_item_name_for_filename`
+- [ ] Do testing: impl Pair :: fn `get_pair_file_path`
+- [ ] Do testing: impl Pair :: fn `save`
+- [ ] Do testing: impl Pair :: fn `load_all`
+- [ ] Do testing: impl Pair :: fn `save_all`
 
-- [ ] Review logging: struct `Pair`
-- [ ] Review logging: impl Pair :: fn `shulker_capacity_for_stack_size`
-- [ ] Review logging: impl Pair :: fn `sanitize_item_name_for_filename`
-- [ ] Review logging: impl Pair :: fn `get_pair_file_path`
-- [ ] Review logging: impl Pair :: fn `save`
-- [ ] Review logging: impl Pair :: fn `load_all`
-- [ ] Review logging: impl Pair :: fn `save_all`
+- [ ] Do logging: struct `Pair`
+- [ ] Do logging: impl Pair :: fn `shulker_capacity_for_stack_size`
+- [ ] Do logging: impl Pair :: fn `sanitize_item_name_for_filename`
+- [ ] Do logging: impl Pair :: fn `get_pair_file_path`
+- [ ] Do logging: impl Pair :: fn `save`
+- [ ] Do logging: impl Pair :: fn `load_all`
+- [ ] Do logging: impl Pair :: fn `save_all`
 
 ### src/types/user.rs
 
@@ -692,35 +876,35 @@
 
 **TODO:**
 
-- [ ] Review comments: static `HTTP_CLIENT`
-- [ ] Review comments: struct `User`
-- [ ] Review comments: struct `MojangResponse`
-- [ ] Review comments: fn `get_http_client`
-- [ ] Review comments: impl User :: async fn `get_uuid_async`
-- [ ] Review comments: impl User :: fn `get_user_file_path`
-- [ ] Review comments: impl User :: fn `save`
-- [ ] Review comments: impl User :: fn `load_all`
-- [ ] Review comments: impl User :: fn `save_all`
+- [ ] Do comments: static `HTTP_CLIENT`
+- [ ] Do comments: struct `User`
+- [ ] Do comments: struct `MojangResponse`
+- [ ] Do comments: fn `get_http_client`
+- [ ] Do comments: impl User :: async fn `get_uuid_async`
+- [ ] Do comments: impl User :: fn `get_user_file_path`
+- [ ] Do comments: impl User :: fn `save`
+- [ ] Do comments: impl User :: fn `load_all`
+- [ ] Do comments: impl User :: fn `save_all`
 
-- [ ] Review testability: static `HTTP_CLIENT`
-- [ ] Review testability: struct `User`
-- [ ] Review testability: struct `MojangResponse`
-- [ ] Review testability: fn `get_http_client`
-- [ ] Review testability: impl User :: async fn `get_uuid_async`
-- [ ] Review testability: impl User :: fn `get_user_file_path`
-- [ ] Review testability: impl User :: fn `save`
-- [ ] Review testability: impl User :: fn `load_all`
-- [ ] Review testability: impl User :: fn `save_all`
+- [ ] Do testing: static `HTTP_CLIENT`
+- [ ] Do testing: struct `User`
+- [ ] Do testing: struct `MojangResponse`
+- [ ] Do testing: fn `get_http_client`
+- [ ] Do testing: impl User :: async fn `get_uuid_async`
+- [ ] Do testing: impl User :: fn `get_user_file_path`
+- [ ] Do testing: impl User :: fn `save`
+- [ ] Do testing: impl User :: fn `load_all`
+- [ ] Do testing: impl User :: fn `save_all`
 
-- [ ] Review logging: static `HTTP_CLIENT`
-- [ ] Review logging: struct `User`
-- [ ] Review logging: struct `MojangResponse`
-- [ ] Review logging: fn `get_http_client`
-- [ ] Review logging: impl User :: async fn `get_uuid_async`
-- [ ] Review logging: impl User :: fn `get_user_file_path`
-- [ ] Review logging: impl User :: fn `save`
-- [ ] Review logging: impl User :: fn `load_all`
-- [ ] Review logging: impl User :: fn `save_all`
+- [ ] Do logging: static `HTTP_CLIENT`
+- [ ] Do logging: struct `User`
+- [ ] Do logging: struct `MojangResponse`
+- [ ] Do logging: fn `get_http_client`
+- [ ] Do logging: impl User :: async fn `get_uuid_async`
+- [ ] Do logging: impl User :: fn `get_user_file_path`
+- [ ] Do logging: impl User :: fn `save`
+- [ ] Do logging: impl User :: fn `load_all`
+- [ ] Do logging: impl User :: fn `save_all`
 
 ### src/types/storage.rs
 
@@ -751,80 +935,80 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `ChestTransfer`
-- [ ] Review comments: struct `Storage`
-- [ ] Review comments: impl Storage :: const `SLOTS_PER_CHEST`
-- [ ] Review comments: impl Storage :: const `DEFAULT_SHULKER_CAPACITY`
-- [ ] Review comments: impl Storage :: fn `save`
-- [ ] Review comments: impl Storage :: fn `new`
-- [ ] Review comments: impl Storage :: fn `load`
-- [ ] Review comments: impl Storage :: fn `add_node`
-- [ ] Review comments: impl Storage :: fn `total_item_amount`
-- [ ] Review comments: impl Storage :: fn `get_chest_mut`
-- [ ] Review comments: impl Storage :: fn `withdraw_item`
-- [ ] Review comments: impl Storage :: fn `deposit_item`
-- [ ] Review comments: impl Storage :: fn `simulate_withdraw_plan`
-- [ ] Review comments: impl Storage :: fn `simulate_deposit_plan`
-- [ ] Review comments: impl Storage :: fn `withdraw_plan`
-- [ ] Review comments: impl Storage :: fn `deposit_plan`
-- [ ] Review comments: impl Storage :: fn `normalize_amounts_len`
-- [ ] Review comments: impl Storage :: fn `deposit_into_chest`
-- [ ] Review comments: impl Storage :: fn `find_empty_chest_index`
-- [ ] Review comments: impl Storage :: fn `get_overflow_chest`
-- [ ] Review comments: impl Storage :: fn `get_overflow_chest_mut`
-- [ ] Review comments: impl Storage :: fn `get_overflow_chest_position`
-- [ ] Review comments: impl Storage :: const fn `overflow_chest_id`
-- [ ] Review comments: tests module
+- [ ] Do comments: struct `ChestTransfer`
+- [ ] Do comments: struct `Storage`
+- [ ] Do comments: impl Storage :: const `SLOTS_PER_CHEST`
+- [ ] Do comments: impl Storage :: const `DEFAULT_SHULKER_CAPACITY`
+- [ ] Do comments: impl Storage :: fn `save`
+- [ ] Do comments: impl Storage :: fn `new`
+- [ ] Do comments: impl Storage :: fn `load`
+- [ ] Do comments: impl Storage :: fn `add_node`
+- [ ] Do comments: impl Storage :: fn `total_item_amount`
+- [ ] Do comments: impl Storage :: fn `get_chest_mut`
+- [ ] Do comments: impl Storage :: fn `withdraw_item`
+- [ ] Do comments: impl Storage :: fn `deposit_item`
+- [ ] Do comments: impl Storage :: fn `simulate_withdraw_plan`
+- [ ] Do comments: impl Storage :: fn `simulate_deposit_plan`
+- [ ] Do comments: impl Storage :: fn `withdraw_plan`
+- [ ] Do comments: impl Storage :: fn `deposit_plan`
+- [ ] Do comments: impl Storage :: fn `normalize_amounts_len`
+- [ ] Do comments: impl Storage :: fn `deposit_into_chest`
+- [ ] Do comments: impl Storage :: fn `find_empty_chest_index`
+- [ ] Do comments: impl Storage :: fn `get_overflow_chest`
+- [ ] Do comments: impl Storage :: fn `get_overflow_chest_mut`
+- [ ] Do comments: impl Storage :: fn `get_overflow_chest_position`
+- [ ] Do comments: impl Storage :: const fn `overflow_chest_id`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: struct `ChestTransfer`
-- [ ] Review testability: struct `Storage`
-- [ ] Review testability: impl Storage :: const `SLOTS_PER_CHEST`
-- [ ] Review testability: impl Storage :: const `DEFAULT_SHULKER_CAPACITY`
-- [ ] Review testability: impl Storage :: fn `save`
-- [ ] Review testability: impl Storage :: fn `new`
-- [ ] Review testability: impl Storage :: fn `load`
-- [ ] Review testability: impl Storage :: fn `add_node`
-- [ ] Review testability: impl Storage :: fn `total_item_amount`
-- [ ] Review testability: impl Storage :: fn `get_chest_mut`
-- [ ] Review testability: impl Storage :: fn `withdraw_item`
-- [ ] Review testability: impl Storage :: fn `deposit_item`
-- [ ] Review testability: impl Storage :: fn `simulate_withdraw_plan`
-- [ ] Review testability: impl Storage :: fn `simulate_deposit_plan`
-- [ ] Review testability: impl Storage :: fn `withdraw_plan`
-- [ ] Review testability: impl Storage :: fn `deposit_plan`
-- [ ] Review testability: impl Storage :: fn `normalize_amounts_len`
-- [ ] Review testability: impl Storage :: fn `deposit_into_chest`
-- [ ] Review testability: impl Storage :: fn `find_empty_chest_index`
-- [ ] Review testability: impl Storage :: fn `get_overflow_chest`
-- [ ] Review testability: impl Storage :: fn `get_overflow_chest_mut`
-- [ ] Review testability: impl Storage :: fn `get_overflow_chest_position`
-- [ ] Review testability: impl Storage :: const fn `overflow_chest_id`
-- [ ] Review testability: tests module
+- [ ] Do testing: struct `ChestTransfer`
+- [ ] Do testing: struct `Storage`
+- [ ] Do testing: impl Storage :: const `SLOTS_PER_CHEST`
+- [ ] Do testing: impl Storage :: const `DEFAULT_SHULKER_CAPACITY`
+- [ ] Do testing: impl Storage :: fn `save`
+- [ ] Do testing: impl Storage :: fn `new`
+- [ ] Do testing: impl Storage :: fn `load`
+- [ ] Do testing: impl Storage :: fn `add_node`
+- [ ] Do testing: impl Storage :: fn `total_item_amount`
+- [ ] Do testing: impl Storage :: fn `get_chest_mut`
+- [ ] Do testing: impl Storage :: fn `withdraw_item`
+- [ ] Do testing: impl Storage :: fn `deposit_item`
+- [ ] Do testing: impl Storage :: fn `simulate_withdraw_plan`
+- [ ] Do testing: impl Storage :: fn `simulate_deposit_plan`
+- [ ] Do testing: impl Storage :: fn `withdraw_plan`
+- [ ] Do testing: impl Storage :: fn `deposit_plan`
+- [ ] Do testing: impl Storage :: fn `normalize_amounts_len`
+- [ ] Do testing: impl Storage :: fn `deposit_into_chest`
+- [ ] Do testing: impl Storage :: fn `find_empty_chest_index`
+- [ ] Do testing: impl Storage :: fn `get_overflow_chest`
+- [ ] Do testing: impl Storage :: fn `get_overflow_chest_mut`
+- [ ] Do testing: impl Storage :: fn `get_overflow_chest_position`
+- [ ] Do testing: impl Storage :: const fn `overflow_chest_id`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: struct `ChestTransfer`
-- [ ] Review logging: struct `Storage`
-- [ ] Review logging: impl Storage :: const `SLOTS_PER_CHEST`
-- [ ] Review logging: impl Storage :: const `DEFAULT_SHULKER_CAPACITY`
-- [ ] Review logging: impl Storage :: fn `save`
-- [ ] Review logging: impl Storage :: fn `new`
-- [ ] Review logging: impl Storage :: fn `load`
-- [ ] Review logging: impl Storage :: fn `add_node`
-- [ ] Review logging: impl Storage :: fn `total_item_amount`
-- [ ] Review logging: impl Storage :: fn `get_chest_mut`
-- [ ] Review logging: impl Storage :: fn `withdraw_item`
-- [ ] Review logging: impl Storage :: fn `deposit_item`
-- [ ] Review logging: impl Storage :: fn `simulate_withdraw_plan`
-- [ ] Review logging: impl Storage :: fn `simulate_deposit_plan`
-- [ ] Review logging: impl Storage :: fn `withdraw_plan`
-- [ ] Review logging: impl Storage :: fn `deposit_plan`
-- [ ] Review logging: impl Storage :: fn `normalize_amounts_len`
-- [ ] Review logging: impl Storage :: fn `deposit_into_chest`
-- [ ] Review logging: impl Storage :: fn `find_empty_chest_index`
-- [ ] Review logging: impl Storage :: fn `get_overflow_chest`
-- [ ] Review logging: impl Storage :: fn `get_overflow_chest_mut`
-- [ ] Review logging: impl Storage :: fn `get_overflow_chest_position`
-- [ ] Review logging: impl Storage :: const fn `overflow_chest_id`
-- [ ] Review logging: tests module
+- [ ] Do logging: struct `ChestTransfer`
+- [ ] Do logging: struct `Storage`
+- [ ] Do logging: impl Storage :: const `SLOTS_PER_CHEST`
+- [ ] Do logging: impl Storage :: const `DEFAULT_SHULKER_CAPACITY`
+- [ ] Do logging: impl Storage :: fn `save`
+- [ ] Do logging: impl Storage :: fn `new`
+- [ ] Do logging: impl Storage :: fn `load`
+- [ ] Do logging: impl Storage :: fn `add_node`
+- [ ] Do logging: impl Storage :: fn `total_item_amount`
+- [ ] Do logging: impl Storage :: fn `get_chest_mut`
+- [ ] Do logging: impl Storage :: fn `withdraw_item`
+- [ ] Do logging: impl Storage :: fn `deposit_item`
+- [ ] Do logging: impl Storage :: fn `simulate_withdraw_plan`
+- [ ] Do logging: impl Storage :: fn `simulate_deposit_plan`
+- [ ] Do logging: impl Storage :: fn `withdraw_plan`
+- [ ] Do logging: impl Storage :: fn `deposit_plan`
+- [ ] Do logging: impl Storage :: fn `normalize_amounts_len`
+- [ ] Do logging: impl Storage :: fn `deposit_into_chest`
+- [ ] Do logging: impl Storage :: fn `find_empty_chest_index`
+- [ ] Do logging: impl Storage :: fn `get_overflow_chest`
+- [ ] Do logging: impl Storage :: fn `get_overflow_chest_mut`
+- [ ] Do logging: impl Storage :: fn `get_overflow_chest_position`
+- [ ] Do logging: impl Storage :: const fn `overflow_chest_id`
+- [ ] Do logging: tests module
 
 ---
 
@@ -849,52 +1033,50 @@
 
 **TODO:**
 
-- [ ] Review comments: pub mod declarations (`connection`, `navigation`, `trade`, `chest_io`, `shulker`, `inventory`)
-- [ ] Review comments: struct `BotState`
-- [ ] Review comments: struct `Bot`
-- [ ] Review comments: impl `Default for BotState` :: fn `default`
-- [ ] Review comments: impl Bot :: async fn `new`
-- [ ] Review comments: impl Bot :: async fn `send_chat_message`
-- [ ] Review comments: impl Bot :: async fn `send_whisper`
-- [ ] Review comments: impl Bot :: fn `normalize_item_id`
-- [ ] Review comments: impl Bot :: fn `chat_subscribe`
-- [ ] Review comments: async fn `bot_task`
-- [ ] Review comments: async fn `validate_node_physically`
-- [ ] Review comments: fn `handle_event_fn`
-- [ ] Review comments: async fn `handle_event`
-- [ ] Review comments: async fn `handle_chat_message`
+- [ ] Do comments: pub mod declarations (`connection`, `navigation`, `trade`, `chest_io`, `shulker`, `inventory`)
+- [ ] Do comments: struct `BotState`
+- [ ] Do comments: struct `Bot`
+- [ ] Do comments: impl `Default for BotState` :: fn `default`
+- [ ] Do comments: impl Bot :: async fn `new`
+- [ ] Do comments: impl Bot :: async fn `send_chat_message`
+- [ ] Do comments: impl Bot :: async fn `send_whisper`
+- [ ] Do comments: impl Bot :: fn `normalize_item_id`
+- [ ] Do comments: impl Bot :: fn `chat_subscribe`
+- [ ] Do comments: async fn `bot_task`
+- [ ] Do comments: async fn `validate_node_physically`
+- [ ] Do comments: fn `handle_event_fn`
+- [ ] Do comments: async fn `handle_event`
+- [ ] Do comments: async fn `handle_chat_message`
 
-- [ ] Review testability: pub mod declarations (`connection`, `navigation`, `trade`, `chest_io`, `shulker`, `inventory`)
-- [ ] Review testability: struct `BotState`
-- [ ] Review testability: struct `Bot`
-- [ ] Review testability: impl `Default for BotState` :: fn `default`
-- [ ] Review testability: impl Bot :: async fn `new`
-- [ ] Review testability: impl Bot :: async fn `send_chat_message`
-- [ ] Review testability: impl Bot :: async fn `send_whisper`
-- [ ] Review testability: impl Bot :: fn `normalize_item_id`
-- [ ] Review testability: impl Bot :: fn `chat_subscribe`
-- [ ] Review testability: async fn `bot_task`
-- [ ] Review testability: async fn `validate_node_physically`
-- [ ] Review testability: fn `handle_event_fn`
-- [ ] Review testability: async fn `handle_event`
-- [ ] Review testability: async fn `handle_chat_message`
+- [ ] Do testing: pub mod declarations (`connection`, `navigation`, `trade`, `chest_io`, `shulker`, `inventory`)
+- [ ] Do testing: struct `BotState`
+- [ ] Do testing: struct `Bot`
+- [ ] Do testing: impl `Default for BotState` :: fn `default`
+- [ ] Do testing: impl Bot :: async fn `new`
+- [ ] Do testing: impl Bot :: async fn `send_chat_message`
+- [ ] Do testing: impl Bot :: async fn `send_whisper`
+- [ ] Do testing: impl Bot :: fn `normalize_item_id`
+- [ ] Do testing: impl Bot :: fn `chat_subscribe`
+- [ ] Do testing: async fn `bot_task`
+- [ ] Do testing: async fn `validate_node_physically`
+- [ ] Do testing: fn `handle_event_fn`
+- [ ] Do testing: async fn `handle_event`
+- [ ] Do testing: async fn `handle_chat_message`
 
-- [ ] Review logging: pub mod declarations (`connection`, `navigation`, `trade`, `chest_io`, `shulker`, `inventory`)
-- [ ] Review logging: struct `BotState`
-- [ ] Review logging: struct `Bot`
-- [ ] Review logging: impl `Default for BotState` :: fn `default`
-- [ ] Review logging: impl Bot :: async fn `new`
-- [ ] Review logging: impl Bot :: async fn `send_chat_message`
-- [ ] Review logging: impl Bot :: async fn `send_whisper`
-- [ ] Review logging: impl Bot :: fn `normalize_item_id`
-- [ ] Review logging: impl Bot :: fn `chat_subscribe`
-- [ ] Review logging: async fn `bot_task`
-- [ ] Review logging: async fn `validate_node_physically`
-- [ ] Review logging: fn `handle_event_fn`
-- [ ] Review logging: async fn `handle_event`
-- [ ] Review logging: async fn `handle_chat_message`
-
-- [ ] Promote the 20s post-reconnect init wait and ~2s shutdown buffer in `bot_task` to named crate constants if a second caller ever emerges. Not worth doing speculatively today.
+- [ ] Do logging: pub mod declarations (`connection`, `navigation`, `trade`, `chest_io`, `shulker`, `inventory`)
+- [ ] Do logging: struct `BotState`
+- [ ] Do logging: struct `Bot`
+- [ ] Do logging: impl `Default for BotState` :: fn `default`
+- [ ] Do logging: impl Bot :: async fn `new`
+- [ ] Do logging: impl Bot :: async fn `send_chat_message`
+- [ ] Do logging: impl Bot :: async fn `send_whisper`
+- [ ] Do logging: impl Bot :: fn `normalize_item_id`
+- [ ] Do logging: impl Bot :: fn `chat_subscribe`
+- [ ] Do logging: async fn `bot_task`
+- [ ] Do logging: async fn `validate_node_physically`
+- [ ] Do logging: fn `handle_event_fn`
+- [ ] Do logging: async fn `handle_event`
+- [ ] Do logging: async fn `handle_chat_message`
 
 ### src/bot/connection.rs
 
@@ -903,14 +1085,14 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `connect`
-- [ ] Review comments: async fn `disconnect`
+- [ ] Do comments: async fn `connect`
+- [ ] Do comments: async fn `disconnect`
 
-- [ ] Review testability: async fn `connect`
-- [ ] Review testability: async fn `disconnect`
+- [ ] Do testing: async fn `connect`
+- [ ] Do testing: async fn `disconnect`
 
-- [ ] Review logging: async fn `connect`
-- [ ] Review logging: async fn `disconnect`
+- [ ] Do logging: async fn `connect`
+- [ ] Do logging: async fn `disconnect`
 
 ### src/bot/navigation.rs
 
@@ -921,20 +1103,20 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `navigate_to_position_once`
-- [ ] Review comments: async fn `navigate_to_position`
-- [ ] Review comments: async fn `go_to_node`
-- [ ] Review comments: async fn `go_to_chest`
+- [ ] Do comments: async fn `navigate_to_position_once`
+- [ ] Do comments: async fn `navigate_to_position`
+- [ ] Do comments: async fn `go_to_node`
+- [ ] Do comments: async fn `go_to_chest`
 
-- [ ] Review testability: async fn `navigate_to_position_once`
-- [ ] Review testability: async fn `navigate_to_position`
-- [ ] Review testability: async fn `go_to_node`
-- [ ] Review testability: async fn `go_to_chest`
+- [ ] Do testing: async fn `navigate_to_position_once`
+- [ ] Do testing: async fn `navigate_to_position`
+- [ ] Do testing: async fn `go_to_node`
+- [ ] Do testing: async fn `go_to_chest`
 
-- [ ] Review logging: async fn `navigate_to_position_once`
-- [ ] Review logging: async fn `navigate_to_position`
-- [ ] Review logging: async fn `go_to_node`
-- [ ] Review logging: async fn `go_to_chest`
+- [ ] Do logging: async fn `navigate_to_position_once`
+- [ ] Do logging: async fn `navigate_to_position`
+- [ ] Do logging: async fn `go_to_node`
+- [ ] Do logging: async fn `go_to_chest`
 
 ### src/bot/inventory.rs
 
@@ -950,35 +1132,35 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `ensure_inventory_empty`
-- [ ] Review comments: async fn `move_hotbar_to_inventory`
-- [ ] Review comments: async fn `quick_move_from_container`
-- [ ] Review comments: fn `verify_holding_shulker`
-- [ ] Review comments: fn `is_entity_ready`
-- [ ] Review comments: async fn `wait_for_entity_ready`
-- [ ] Review comments: fn `carried_item`
-- [ ] Review comments: async fn `ensure_shulker_in_hotbar_slot_0`
-- [ ] Review comments: async fn `recover_shulker_to_slot_0`
+- [ ] Do comments: async fn `ensure_inventory_empty`
+- [ ] Do comments: async fn `move_hotbar_to_inventory`
+- [ ] Do comments: async fn `quick_move_from_container`
+- [ ] Do comments: fn `verify_holding_shulker`
+- [ ] Do comments: fn `is_entity_ready`
+- [ ] Do comments: async fn `wait_for_entity_ready`
+- [ ] Do comments: fn `carried_item`
+- [ ] Do comments: async fn `ensure_shulker_in_hotbar_slot_0`
+- [ ] Do comments: async fn `recover_shulker_to_slot_0`
 
-- [ ] Review testability: async fn `ensure_inventory_empty`
-- [ ] Review testability: async fn `move_hotbar_to_inventory`
-- [ ] Review testability: async fn `quick_move_from_container`
-- [ ] Review testability: fn `verify_holding_shulker`
-- [ ] Review testability: fn `is_entity_ready`
-- [ ] Review testability: async fn `wait_for_entity_ready`
-- [ ] Review testability: fn `carried_item`
-- [ ] Review testability: async fn `ensure_shulker_in_hotbar_slot_0`
-- [ ] Review testability: async fn `recover_shulker_to_slot_0`
+- [ ] Do testing: async fn `ensure_inventory_empty`
+- [ ] Do testing: async fn `move_hotbar_to_inventory`
+- [ ] Do testing: async fn `quick_move_from_container`
+- [ ] Do testing: fn `verify_holding_shulker`
+- [ ] Do testing: fn `is_entity_ready`
+- [ ] Do testing: async fn `wait_for_entity_ready`
+- [ ] Do testing: fn `carried_item`
+- [ ] Do testing: async fn `ensure_shulker_in_hotbar_slot_0`
+- [ ] Do testing: async fn `recover_shulker_to_slot_0`
 
-- [ ] Review logging: async fn `ensure_inventory_empty`
-- [ ] Review logging: async fn `move_hotbar_to_inventory`
-- [ ] Review logging: async fn `quick_move_from_container`
-- [ ] Review logging: fn `verify_holding_shulker`
-- [ ] Review logging: fn `is_entity_ready`
-- [ ] Review logging: async fn `wait_for_entity_ready`
-- [ ] Review logging: fn `carried_item`
-- [ ] Review logging: async fn `ensure_shulker_in_hotbar_slot_0`
-- [ ] Review logging: async fn `recover_shulker_to_slot_0`
+- [ ] Do logging: async fn `ensure_inventory_empty`
+- [ ] Do logging: async fn `move_hotbar_to_inventory`
+- [ ] Do logging: async fn `quick_move_from_container`
+- [ ] Do logging: fn `verify_holding_shulker`
+- [ ] Do logging: fn `is_entity_ready`
+- [ ] Do logging: async fn `wait_for_entity_ready`
+- [ ] Do logging: fn `carried_item`
+- [ ] Do logging: async fn `ensure_shulker_in_hotbar_slot_0`
+- [ ] Do logging: async fn `recover_shulker_to_slot_0`
 
 ### src/bot/chest_io.rs
 
@@ -998,47 +1180,47 @@
 
 **TODO:**
 
-- [ ] Review comments: const `CHUNK_NOT_LOADED_PREFIX`
-- [ ] Review comments: fn `find_shulker_in_inventory_view`
-- [ ] Review comments: async fn `place_shulker_in_chest_slot_verified`
-- [ ] Review comments: async fn `open_chest_container_once`
-- [ ] Review comments: async fn `open_chest_container_for_validation`
-- [ ] Review comments: async fn `open_chest_container`
-- [ ] Review comments: async fn `transfer_items_with_shulker`
-- [ ] Review comments: async fn `transfer_withdraw_from_shulker`
-- [ ] Review comments: async fn `transfer_deposit_into_shulker`
-- [ ] Review comments: async fn `prepare_for_chest_io`
-- [ ] Review comments: async fn `automated_chest_io`
-- [ ] Review comments: async fn `withdraw_shulkers`
-- [ ] Review comments: async fn `deposit_shulkers`
+- [ ] Do comments: const `CHUNK_NOT_LOADED_PREFIX`
+- [ ] Do comments: fn `find_shulker_in_inventory_view`
+- [ ] Do comments: async fn `place_shulker_in_chest_slot_verified`
+- [ ] Do comments: async fn `open_chest_container_once`
+- [ ] Do comments: async fn `open_chest_container_for_validation`
+- [ ] Do comments: async fn `open_chest_container`
+- [ ] Do comments: async fn `transfer_items_with_shulker`
+- [ ] Do comments: async fn `transfer_withdraw_from_shulker`
+- [ ] Do comments: async fn `transfer_deposit_into_shulker`
+- [ ] Do comments: async fn `prepare_for_chest_io`
+- [ ] Do comments: async fn `automated_chest_io`
+- [ ] Do comments: async fn `withdraw_shulkers`
+- [ ] Do comments: async fn `deposit_shulkers`
 
-- [ ] Review testability: const `CHUNK_NOT_LOADED_PREFIX`
-- [ ] Review testability: fn `find_shulker_in_inventory_view`
-- [ ] Review testability: async fn `place_shulker_in_chest_slot_verified`
-- [ ] Review testability: async fn `open_chest_container_once`
-- [ ] Review testability: async fn `open_chest_container_for_validation`
-- [ ] Review testability: async fn `open_chest_container`
-- [ ] Review testability: async fn `transfer_items_with_shulker`
-- [ ] Review testability: async fn `transfer_withdraw_from_shulker`
-- [ ] Review testability: async fn `transfer_deposit_into_shulker`
-- [ ] Review testability: async fn `prepare_for_chest_io`
-- [ ] Review testability: async fn `automated_chest_io`
-- [ ] Review testability: async fn `withdraw_shulkers`
-- [ ] Review testability: async fn `deposit_shulkers`
+- [ ] Do testing: const `CHUNK_NOT_LOADED_PREFIX`
+- [ ] Do testing: fn `find_shulker_in_inventory_view`
+- [ ] Do testing: async fn `place_shulker_in_chest_slot_verified`
+- [ ] Do testing: async fn `open_chest_container_once`
+- [ ] Do testing: async fn `open_chest_container_for_validation`
+- [ ] Do testing: async fn `open_chest_container`
+- [ ] Do testing: async fn `transfer_items_with_shulker`
+- [ ] Do testing: async fn `transfer_withdraw_from_shulker`
+- [ ] Do testing: async fn `transfer_deposit_into_shulker`
+- [ ] Do testing: async fn `prepare_for_chest_io`
+- [ ] Do testing: async fn `automated_chest_io`
+- [ ] Do testing: async fn `withdraw_shulkers`
+- [ ] Do testing: async fn `deposit_shulkers`
 
-- [ ] Review logging: const `CHUNK_NOT_LOADED_PREFIX`
-- [ ] Review logging: fn `find_shulker_in_inventory_view`
-- [ ] Review logging: async fn `place_shulker_in_chest_slot_verified`
-- [ ] Review logging: async fn `open_chest_container_once`
-- [ ] Review logging: async fn `open_chest_container_for_validation`
-- [ ] Review logging: async fn `open_chest_container`
-- [ ] Review logging: async fn `transfer_items_with_shulker`
-- [ ] Review logging: async fn `transfer_withdraw_from_shulker`
-- [ ] Review logging: async fn `transfer_deposit_into_shulker`
-- [ ] Review logging: async fn `prepare_for_chest_io`
-- [ ] Review logging: async fn `automated_chest_io`
-- [ ] Review logging: async fn `withdraw_shulkers`
-- [ ] Review logging: async fn `deposit_shulkers`
+- [ ] Do logging: const `CHUNK_NOT_LOADED_PREFIX`
+- [ ] Do logging: fn `find_shulker_in_inventory_view`
+- [ ] Do logging: async fn `place_shulker_in_chest_slot_verified`
+- [ ] Do logging: async fn `open_chest_container_once`
+- [ ] Do logging: async fn `open_chest_container_for_validation`
+- [ ] Do logging: async fn `open_chest_container`
+- [ ] Do logging: async fn `transfer_items_with_shulker`
+- [ ] Do logging: async fn `transfer_withdraw_from_shulker`
+- [ ] Do logging: async fn `transfer_deposit_into_shulker`
+- [ ] Do logging: async fn `prepare_for_chest_io`
+- [ ] Do logging: async fn `automated_chest_io`
+- [ ] Do logging: async fn `withdraw_shulkers`
+- [ ] Do logging: async fn `deposit_shulkers`
 
 ### src/bot/shulker.rs
 
@@ -1055,38 +1237,38 @@
 
 **TODO:**
 
-- [ ] Review comments: const `SHULKER_BOX_IDS`
-- [ ] Review comments: fn `shulker_station_position`
-- [ ] Review comments: fn `is_shulker_box`
-- [ ] Review comments: fn `validate_chest_slot_is_shulker` (cfg(test))
-- [ ] Review comments: async fn `pickup_shulker_from_station`
-- [ ] Review comments: async fn `open_shulker_at_station_once`
-- [ ] Review comments: async fn `open_shulker_at_station`
-- [ ] Review comments: test `test_is_shulker_box`
-- [ ] Review comments: test `test_validate_chest_slot_is_shulker`
-- [ ] Review comments: test `test_shulker_station_position`
+- [ ] Do comments: const `SHULKER_BOX_IDS`
+- [ ] Do comments: fn `shulker_station_position`
+- [ ] Do comments: fn `is_shulker_box`
+- [ ] Do comments: fn `validate_chest_slot_is_shulker` (cfg(test))
+- [ ] Do comments: async fn `pickup_shulker_from_station`
+- [ ] Do comments: async fn `open_shulker_at_station_once`
+- [ ] Do comments: async fn `open_shulker_at_station`
+- [ ] Do comments: test `test_is_shulker_box`
+- [ ] Do comments: test `test_validate_chest_slot_is_shulker`
+- [ ] Do comments: test `test_shulker_station_position`
 
-- [ ] Review testability: const `SHULKER_BOX_IDS`
-- [ ] Review testability: fn `shulker_station_position`
-- [ ] Review testability: fn `is_shulker_box`
-- [ ] Review testability: fn `validate_chest_slot_is_shulker` (cfg(test))
-- [ ] Review testability: async fn `pickup_shulker_from_station`
-- [ ] Review testability: async fn `open_shulker_at_station_once`
-- [ ] Review testability: async fn `open_shulker_at_station`
-- [ ] Review testability: test `test_is_shulker_box`
-- [ ] Review testability: test `test_validate_chest_slot_is_shulker`
-- [ ] Review testability: test `test_shulker_station_position`
+- [ ] Do testing: const `SHULKER_BOX_IDS`
+- [ ] Do testing: fn `shulker_station_position`
+- [ ] Do testing: fn `is_shulker_box`
+- [ ] Do testing: fn `validate_chest_slot_is_shulker` (cfg(test))
+- [ ] Do testing: async fn `pickup_shulker_from_station`
+- [ ] Do testing: async fn `open_shulker_at_station_once`
+- [ ] Do testing: async fn `open_shulker_at_station`
+- [ ] Do testing: test `test_is_shulker_box`
+- [ ] Do testing: test `test_validate_chest_slot_is_shulker`
+- [ ] Do testing: test `test_shulker_station_position`
 
-- [ ] Review logging: const `SHULKER_BOX_IDS`
-- [ ] Review logging: fn `shulker_station_position`
-- [ ] Review logging: fn `is_shulker_box`
-- [ ] Review logging: fn `validate_chest_slot_is_shulker` (cfg(test))
-- [ ] Review logging: async fn `pickup_shulker_from_station`
-- [ ] Review logging: async fn `open_shulker_at_station_once`
-- [ ] Review logging: async fn `open_shulker_at_station`
-- [ ] Review logging: test `test_is_shulker_box`
-- [ ] Review logging: test `test_validate_chest_slot_is_shulker`
-- [ ] Review logging: test `test_shulker_station_position`
+- [ ] Do logging: const `SHULKER_BOX_IDS`
+- [ ] Do logging: fn `shulker_station_position`
+- [ ] Do logging: fn `is_shulker_box`
+- [ ] Do logging: fn `validate_chest_slot_is_shulker` (cfg(test))
+- [ ] Do logging: async fn `pickup_shulker_from_station`
+- [ ] Do logging: async fn `open_shulker_at_station_once`
+- [ ] Do logging: async fn `open_shulker_at_station`
+- [ ] Do logging: test `test_is_shulker_box`
+- [ ] Do logging: test `test_validate_chest_slot_is_shulker`
+- [ ] Do logging: test `test_shulker_station_position`
 
 ### src/bot/trade.rs
 
@@ -1108,53 +1290,53 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `trade_bot_offer_slots`
-- [ ] Review comments: fn `trade_player_offer_slots`
-- [ ] Review comments: fn `trade_player_status_slots`
-- [ ] Review comments: fn `trade_accept_slots`
-- [ ] Review comments: fn `trade_cancel_slots`
-- [ ] Review comments: async fn `wait_for_trade_menu_or_failure`
-- [ ] Review comments: async fn `place_items_from_inventory_into_trade`
-- [ ] Review comments: fn `validate_player_items`
-- [ ] Review comments: async fn `execute_trade_with_player`
-- [ ] Review comments: test `test_trade_bot_offer_slots`
-- [ ] Review comments: test `test_trade_player_offer_slots`
-- [ ] Review comments: test `test_trade_player_status_slots`
-- [ ] Review comments: test `test_trade_accept_slots`
-- [ ] Review comments: test `test_trade_cancel_slots`
-- [ ] Review comments: test `test_trade_slot_sets_disjoint`
+- [ ] Do comments: fn `trade_bot_offer_slots`
+- [ ] Do comments: fn `trade_player_offer_slots`
+- [ ] Do comments: fn `trade_player_status_slots`
+- [ ] Do comments: fn `trade_accept_slots`
+- [ ] Do comments: fn `trade_cancel_slots`
+- [ ] Do comments: async fn `wait_for_trade_menu_or_failure`
+- [ ] Do comments: async fn `place_items_from_inventory_into_trade`
+- [ ] Do comments: fn `validate_player_items`
+- [ ] Do comments: async fn `execute_trade_with_player`
+- [ ] Do comments: test `test_trade_bot_offer_slots`
+- [ ] Do comments: test `test_trade_player_offer_slots`
+- [ ] Do comments: test `test_trade_player_status_slots`
+- [ ] Do comments: test `test_trade_accept_slots`
+- [ ] Do comments: test `test_trade_cancel_slots`
+- [ ] Do comments: test `test_trade_slot_sets_disjoint`
 
-- [ ] Review testability: fn `trade_bot_offer_slots`
-- [ ] Review testability: fn `trade_player_offer_slots`
-- [ ] Review testability: fn `trade_player_status_slots`
-- [ ] Review testability: fn `trade_accept_slots`
-- [ ] Review testability: fn `trade_cancel_slots`
-- [ ] Review testability: async fn `wait_for_trade_menu_or_failure`
-- [ ] Review testability: async fn `place_items_from_inventory_into_trade`
-- [ ] Review testability: fn `validate_player_items`
-- [ ] Review testability: async fn `execute_trade_with_player`
-- [ ] Review testability: test `test_trade_bot_offer_slots`
-- [ ] Review testability: test `test_trade_player_offer_slots`
-- [ ] Review testability: test `test_trade_player_status_slots`
-- [ ] Review testability: test `test_trade_accept_slots`
-- [ ] Review testability: test `test_trade_cancel_slots`
-- [ ] Review testability: test `test_trade_slot_sets_disjoint`
+- [ ] Do testing: fn `trade_bot_offer_slots`
+- [ ] Do testing: fn `trade_player_offer_slots`
+- [ ] Do testing: fn `trade_player_status_slots`
+- [ ] Do testing: fn `trade_accept_slots`
+- [ ] Do testing: fn `trade_cancel_slots`
+- [ ] Do testing: async fn `wait_for_trade_menu_or_failure`
+- [ ] Do testing: async fn `place_items_from_inventory_into_trade`
+- [ ] Do testing: fn `validate_player_items`
+- [ ] Do testing: async fn `execute_trade_with_player`
+- [ ] Do testing: test `test_trade_bot_offer_slots`
+- [ ] Do testing: test `test_trade_player_offer_slots`
+- [ ] Do testing: test `test_trade_player_status_slots`
+- [ ] Do testing: test `test_trade_accept_slots`
+- [ ] Do testing: test `test_trade_cancel_slots`
+- [ ] Do testing: test `test_trade_slot_sets_disjoint`
 
-- [ ] Review logging: fn `trade_bot_offer_slots`
-- [ ] Review logging: fn `trade_player_offer_slots`
-- [ ] Review logging: fn `trade_player_status_slots`
-- [ ] Review logging: fn `trade_accept_slots`
-- [ ] Review logging: fn `trade_cancel_slots`
-- [ ] Review logging: async fn `wait_for_trade_menu_or_failure`
-- [ ] Review logging: async fn `place_items_from_inventory_into_trade`
-- [ ] Review logging: fn `validate_player_items`
-- [ ] Review logging: async fn `execute_trade_with_player`
-- [ ] Review logging: test `test_trade_bot_offer_slots`
-- [ ] Review logging: test `test_trade_player_offer_slots`
-- [ ] Review logging: test `test_trade_player_status_slots`
-- [ ] Review logging: test `test_trade_accept_slots`
-- [ ] Review logging: test `test_trade_cancel_slots`
-- [ ] Review logging: test `test_trade_slot_sets_disjoint`
+- [ ] Do logging: fn `trade_bot_offer_slots`
+- [ ] Do logging: fn `trade_player_offer_slots`
+- [ ] Do logging: fn `trade_player_status_slots`
+- [ ] Do logging: fn `trade_accept_slots`
+- [ ] Do logging: fn `trade_cancel_slots`
+- [ ] Do logging: async fn `wait_for_trade_menu_or_failure`
+- [ ] Do logging: async fn `place_items_from_inventory_into_trade`
+- [ ] Do logging: fn `validate_player_items`
+- [ ] Do logging: async fn `execute_trade_with_player`
+- [ ] Do logging: test `test_trade_bot_offer_slots`
+- [ ] Do logging: test `test_trade_player_offer_slots`
+- [ ] Do logging: test `test_trade_player_status_slots`
+- [ ] Do logging: test `test_trade_accept_slots`
+- [ ] Do logging: test `test_trade_cancel_slots`
+- [ ] Do logging: test `test_trade_slot_sets_disjoint`
 
 ---
 
@@ -1180,53 +1362,53 @@
 
 **TODO:**
 
-- [ ] Review comments: pub mod declarations (`command`, `handlers`, `journal`, `orders`, `pricing`, `queue`, `rate_limit`, `rollback`, `state`, `trade_state`, `utils`)
-- [ ] Review comments: struct `Store`
-- [ ] Review comments: impl Store :: async fn `new`
-- [ ] Review comments: impl Store :: async fn `run`
-- [ ] Review comments: impl Store :: async fn `process_next_order`
-- [ ] Review comments: impl Store :: fn `reload_config`
-- [ ] Review comments: impl Store :: fn `advance_trade`
-- [ ] Review comments: impl Store :: async fn `handle_bot_message`
-- [ ] Review comments: impl Store :: fn `expect_pair`
-- [ ] Review comments: impl Store :: fn `expect_pair_mut`
-- [ ] Review comments: impl Store :: fn `expect_user`
-- [ ] Review comments: impl Store :: fn `expect_user_mut`
-- [ ] Review comments: impl Store :: fn `apply_chest_sync`
-- [ ] Review comments: impl Store :: fn `get_node_position`
-- [ ] Review comments: impl Store :: fn `new_for_test`
+- [ ] Do comments: pub mod declarations (`command`, `handlers`, `journal`, `orders`, `pricing`, `queue`, `rate_limit`, `rollback`, `state`, `trade_state`, `utils`)
+- [ ] Do comments: struct `Store`
+- [ ] Do comments: impl Store :: async fn `new`
+- [ ] Do comments: impl Store :: async fn `run`
+- [ ] Do comments: impl Store :: async fn `process_next_order`
+- [ ] Do comments: impl Store :: fn `reload_config`
+- [ ] Do comments: impl Store :: fn `advance_trade`
+- [ ] Do comments: impl Store :: async fn `handle_bot_message`
+- [ ] Do comments: impl Store :: fn `expect_pair`
+- [ ] Do comments: impl Store :: fn `expect_pair_mut`
+- [ ] Do comments: impl Store :: fn `expect_user`
+- [ ] Do comments: impl Store :: fn `expect_user_mut`
+- [ ] Do comments: impl Store :: fn `apply_chest_sync`
+- [ ] Do comments: impl Store :: fn `get_node_position`
+- [ ] Do comments: impl Store :: fn `new_for_test`
 
-- [ ] Review testability: pub mod declarations (`command`, `handlers`, `journal`, `orders`, `pricing`, `queue`, `rate_limit`, `rollback`, `state`, `trade_state`, `utils`)
-- [ ] Review testability: struct `Store`
-- [ ] Review testability: impl Store :: async fn `new`
-- [ ] Review testability: impl Store :: async fn `run`
-- [ ] Review testability: impl Store :: async fn `process_next_order`
-- [ ] Review testability: impl Store :: fn `reload_config`
-- [ ] Review testability: impl Store :: fn `advance_trade`
-- [ ] Review testability: impl Store :: async fn `handle_bot_message`
-- [ ] Review testability: impl Store :: fn `expect_pair`
-- [ ] Review testability: impl Store :: fn `expect_pair_mut`
-- [ ] Review testability: impl Store :: fn `expect_user`
-- [ ] Review testability: impl Store :: fn `expect_user_mut`
-- [ ] Review testability: impl Store :: fn `apply_chest_sync`
-- [ ] Review testability: impl Store :: fn `get_node_position`
-- [ ] Review testability: impl Store :: fn `new_for_test`
+- [ ] Do testing: pub mod declarations (`command`, `handlers`, `journal`, `orders`, `pricing`, `queue`, `rate_limit`, `rollback`, `state`, `trade_state`, `utils`)
+- [ ] Do testing: struct `Store`
+- [ ] Do testing: impl Store :: async fn `new`
+- [ ] Do testing: impl Store :: async fn `run`
+- [ ] Do testing: impl Store :: async fn `process_next_order`
+- [ ] Do testing: impl Store :: fn `reload_config`
+- [ ] Do testing: impl Store :: fn `advance_trade`
+- [ ] Do testing: impl Store :: async fn `handle_bot_message`
+- [ ] Do testing: impl Store :: fn `expect_pair`
+- [ ] Do testing: impl Store :: fn `expect_pair_mut`
+- [ ] Do testing: impl Store :: fn `expect_user`
+- [ ] Do testing: impl Store :: fn `expect_user_mut`
+- [ ] Do testing: impl Store :: fn `apply_chest_sync`
+- [ ] Do testing: impl Store :: fn `get_node_position`
+- [ ] Do testing: impl Store :: fn `new_for_test`
 
-- [ ] Review logging: pub mod declarations (`command`, `handlers`, `journal`, `orders`, `pricing`, `queue`, `rate_limit`, `rollback`, `state`, `trade_state`, `utils`)
-- [ ] Review logging: struct `Store`
-- [ ] Review logging: impl Store :: async fn `new`
-- [ ] Review logging: impl Store :: async fn `run`
-- [ ] Review logging: impl Store :: async fn `process_next_order`
-- [ ] Review logging: impl Store :: fn `reload_config`
-- [ ] Review logging: impl Store :: fn `advance_trade`
-- [ ] Review logging: impl Store :: async fn `handle_bot_message`
-- [ ] Review logging: impl Store :: fn `expect_pair`
-- [ ] Review logging: impl Store :: fn `expect_pair_mut`
-- [ ] Review logging: impl Store :: fn `expect_user`
-- [ ] Review logging: impl Store :: fn `expect_user_mut`
-- [ ] Review logging: impl Store :: fn `apply_chest_sync`
-- [ ] Review logging: impl Store :: fn `get_node_position`
-- [ ] Review logging: impl Store :: fn `new_for_test`
+- [ ] Do logging: pub mod declarations (`command`, `handlers`, `journal`, `orders`, `pricing`, `queue`, `rate_limit`, `rollback`, `state`, `trade_state`, `utils`)
+- [ ] Do logging: struct `Store`
+- [ ] Do logging: impl Store :: async fn `new`
+- [ ] Do logging: impl Store :: async fn `run`
+- [ ] Do logging: impl Store :: async fn `process_next_order`
+- [ ] Do logging: impl Store :: fn `reload_config`
+- [ ] Do logging: impl Store :: fn `advance_trade`
+- [ ] Do logging: impl Store :: async fn `handle_bot_message`
+- [ ] Do logging: impl Store :: fn `expect_pair`
+- [ ] Do logging: impl Store :: fn `expect_pair_mut`
+- [ ] Do logging: impl Store :: fn `expect_user`
+- [ ] Do logging: impl Store :: fn `expect_user_mut`
+- [ ] Do logging: impl Store :: fn `apply_chest_sync`
+- [ ] Do logging: impl Store :: fn `get_node_position`
+- [ ] Do logging: impl Store :: fn `new_for_test`
 
 ### src/store/state.rs
 
@@ -1237,20 +1419,20 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `apply_chest_sync`
-- [ ] Review comments: fn `save`
-- [ ] Review comments: fn `audit_state`
-- [ ] Review comments: fn `assert_invariants`
+- [ ] Do comments: fn `apply_chest_sync`
+- [ ] Do comments: fn `save`
+- [ ] Do comments: fn `audit_state`
+- [ ] Do comments: fn `assert_invariants`
 
-- [ ] Review testability: fn `apply_chest_sync`
-- [ ] Review testability: fn `save`
-- [ ] Review testability: fn `audit_state`
-- [ ] Review testability: fn `assert_invariants`
+- [ ] Do testing: fn `apply_chest_sync`
+- [ ] Do testing: fn `save`
+- [ ] Do testing: fn `audit_state`
+- [ ] Do testing: fn `assert_invariants`
 
-- [ ] Review logging: fn `apply_chest_sync`
-- [ ] Review logging: fn `save`
-- [ ] Review logging: fn `audit_state`
-- [ ] Review logging: fn `assert_invariants`
+- [ ] Do logging: fn `apply_chest_sync`
+- [ ] Do logging: fn `save`
+- [ ] Do logging: fn `audit_state`
+- [ ] Do logging: fn `assert_invariants`
 
 ### src/store/command.rs
 
@@ -1268,41 +1450,41 @@
 
 **TODO:**
 
-- [ ] Review comments: enum `Command`
-- [ ] Review comments: fn `parse_command`
-- [ ] Review comments: fn `parse_item_quantity`
-- [ ] Review comments: fn `parse_item_amount`
-- [ ] Review comments: fn `parse_optional_amount`
-- [ ] Review comments: fn `parse_price`
-- [ ] Review comments: fn `parse_balance`
-- [ ] Review comments: fn `parse_pay`
-- [ ] Review comments: fn `parse_page`
-- [ ] Review comments: fn `parse_cancel`
-- [ ] Review comments: tests module
+- [ ] Do comments: enum `Command`
+- [ ] Do comments: fn `parse_command`
+- [ ] Do comments: fn `parse_item_quantity`
+- [ ] Do comments: fn `parse_item_amount`
+- [ ] Do comments: fn `parse_optional_amount`
+- [ ] Do comments: fn `parse_price`
+- [ ] Do comments: fn `parse_balance`
+- [ ] Do comments: fn `parse_pay`
+- [ ] Do comments: fn `parse_page`
+- [ ] Do comments: fn `parse_cancel`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: enum `Command`
-- [ ] Review testability: fn `parse_command`
-- [ ] Review testability: fn `parse_item_quantity`
-- [ ] Review testability: fn `parse_item_amount`
-- [ ] Review testability: fn `parse_optional_amount`
-- [ ] Review testability: fn `parse_price`
-- [ ] Review testability: fn `parse_balance`
-- [ ] Review testability: fn `parse_pay`
-- [ ] Review testability: fn `parse_page`
-- [ ] Review testability: fn `parse_cancel`
-- [ ] Review testability: tests module
+- [ ] Do testing: enum `Command`
+- [ ] Do testing: fn `parse_command`
+- [ ] Do testing: fn `parse_item_quantity`
+- [ ] Do testing: fn `parse_item_amount`
+- [ ] Do testing: fn `parse_optional_amount`
+- [ ] Do testing: fn `parse_price`
+- [ ] Do testing: fn `parse_balance`
+- [ ] Do testing: fn `parse_pay`
+- [ ] Do testing: fn `parse_page`
+- [ ] Do testing: fn `parse_cancel`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: enum `Command`
-- [ ] Review logging: fn `parse_command`
-- [ ] Review logging: fn `parse_item_quantity`
-- [ ] Review logging: fn `parse_item_amount`
-- [ ] Review logging: fn `parse_optional_amount`
-- [ ] Review logging: fn `parse_price`
-- [ ] Review logging: fn `parse_balance`
-- [ ] Review logging: fn `parse_pay`
-- [ ] Review logging: fn `parse_page`
-- [ ] Review logging: fn `parse_cancel`
-- [ ] Review logging: tests module
+- [ ] Do logging: enum `Command`
+- [ ] Do logging: fn `parse_command`
+- [ ] Do logging: fn `parse_item_quantity`
+- [ ] Do logging: fn `parse_item_amount`
+- [ ] Do logging: fn `parse_optional_amount`
+- [ ] Do logging: fn `parse_price`
+- [ ] Do logging: fn `parse_balance`
+- [ ] Do logging: fn `parse_pay`
+- [ ] Do logging: fn `parse_page`
+- [ ] Do logging: fn `parse_cancel`
+- [ ] Do logging: tests module
 
 ### src/store/journal.rs
 
@@ -1326,59 +1508,59 @@
 
 **TODO:**
 
-- [ ] Review comments: const `JOURNAL_FILE`
-- [ ] Review comments: static `NEXT_OPERATION_ID`
-- [ ] Review comments: type alias `SharedJournal`
-- [ ] Review comments: struct `JournalEntry`
-- [ ] Review comments: struct `Journal`
-- [ ] Review comments: enum `JournalOp`
-- [ ] Review comments: enum `JournalState`
-- [ ] Review comments: impl `Default for Journal` :: fn `default`
-- [ ] Review comments: impl Journal :: fn `load`
-- [ ] Review comments: impl Journal :: fn `load_from`
-- [ ] Review comments: impl Journal :: fn `clear_leftover`
-- [ ] Review comments: impl Journal :: fn `begin`
-- [ ] Review comments: impl Journal :: fn `advance`
-- [ ] Review comments: impl Journal :: fn `complete`
-- [ ] Review comments: impl Journal :: fn `current`
-- [ ] Review comments: impl Journal :: fn `persist`
-- [ ] Review comments: tests module
+- [ ] Do comments: const `JOURNAL_FILE`
+- [ ] Do comments: static `NEXT_OPERATION_ID`
+- [ ] Do comments: type alias `SharedJournal`
+- [ ] Do comments: struct `JournalEntry`
+- [ ] Do comments: struct `Journal`
+- [ ] Do comments: enum `JournalOp`
+- [ ] Do comments: enum `JournalState`
+- [ ] Do comments: impl `Default for Journal` :: fn `default`
+- [ ] Do comments: impl Journal :: fn `load`
+- [ ] Do comments: impl Journal :: fn `load_from`
+- [ ] Do comments: impl Journal :: fn `clear_leftover`
+- [ ] Do comments: impl Journal :: fn `begin`
+- [ ] Do comments: impl Journal :: fn `advance`
+- [ ] Do comments: impl Journal :: fn `complete`
+- [ ] Do comments: impl Journal :: fn `current`
+- [ ] Do comments: impl Journal :: fn `persist`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: const `JOURNAL_FILE`
-- [ ] Review testability: static `NEXT_OPERATION_ID`
-- [ ] Review testability: type alias `SharedJournal`
-- [ ] Review testability: struct `JournalEntry`
-- [ ] Review testability: struct `Journal`
-- [ ] Review testability: enum `JournalOp`
-- [ ] Review testability: enum `JournalState`
-- [ ] Review testability: impl `Default for Journal` :: fn `default`
-- [ ] Review testability: impl Journal :: fn `load`
-- [ ] Review testability: impl Journal :: fn `load_from`
-- [ ] Review testability: impl Journal :: fn `clear_leftover`
-- [ ] Review testability: impl Journal :: fn `begin`
-- [ ] Review testability: impl Journal :: fn `advance`
-- [ ] Review testability: impl Journal :: fn `complete`
-- [ ] Review testability: impl Journal :: fn `current`
-- [ ] Review testability: impl Journal :: fn `persist`
-- [ ] Review testability: tests module
+- [ ] Do testing: const `JOURNAL_FILE`
+- [ ] Do testing: static `NEXT_OPERATION_ID`
+- [ ] Do testing: type alias `SharedJournal`
+- [ ] Do testing: struct `JournalEntry`
+- [ ] Do testing: struct `Journal`
+- [ ] Do testing: enum `JournalOp`
+- [ ] Do testing: enum `JournalState`
+- [ ] Do testing: impl `Default for Journal` :: fn `default`
+- [ ] Do testing: impl Journal :: fn `load`
+- [ ] Do testing: impl Journal :: fn `load_from`
+- [ ] Do testing: impl Journal :: fn `clear_leftover`
+- [ ] Do testing: impl Journal :: fn `begin`
+- [ ] Do testing: impl Journal :: fn `advance`
+- [ ] Do testing: impl Journal :: fn `complete`
+- [ ] Do testing: impl Journal :: fn `current`
+- [ ] Do testing: impl Journal :: fn `persist`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: const `JOURNAL_FILE`
-- [ ] Review logging: static `NEXT_OPERATION_ID`
-- [ ] Review logging: type alias `SharedJournal`
-- [ ] Review logging: struct `JournalEntry`
-- [ ] Review logging: struct `Journal`
-- [ ] Review logging: enum `JournalOp`
-- [ ] Review logging: enum `JournalState`
-- [ ] Review logging: impl `Default for Journal` :: fn `default`
-- [ ] Review logging: impl Journal :: fn `load`
-- [ ] Review logging: impl Journal :: fn `load_from`
-- [ ] Review logging: impl Journal :: fn `clear_leftover`
-- [ ] Review logging: impl Journal :: fn `begin`
-- [ ] Review logging: impl Journal :: fn `advance`
-- [ ] Review logging: impl Journal :: fn `complete`
-- [ ] Review logging: impl Journal :: fn `current`
-- [ ] Review logging: impl Journal :: fn `persist`
-- [ ] Review logging: tests module
+- [ ] Do logging: const `JOURNAL_FILE`
+- [ ] Do logging: static `NEXT_OPERATION_ID`
+- [ ] Do logging: type alias `SharedJournal`
+- [ ] Do logging: struct `JournalEntry`
+- [ ] Do logging: struct `Journal`
+- [ ] Do logging: enum `JournalOp`
+- [ ] Do logging: enum `JournalState`
+- [ ] Do logging: impl `Default for Journal` :: fn `default`
+- [ ] Do logging: impl Journal :: fn `load`
+- [ ] Do logging: impl Journal :: fn `load_from`
+- [ ] Do logging: impl Journal :: fn `clear_leftover`
+- [ ] Do logging: impl Journal :: fn `begin`
+- [ ] Do logging: impl Journal :: fn `advance`
+- [ ] Do logging: impl Journal :: fn `complete`
+- [ ] Do logging: impl Journal :: fn `current`
+- [ ] Do logging: impl Journal :: fn `persist`
+- [ ] Do logging: tests module
 
 ### src/store/orders.rs
 
@@ -1396,41 +1578,41 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `BuyPlan`
-- [ ] Review comments: struct `SellPlan`
-- [ ] Review comments: enum `ChestDirection`
-- [ ] Review comments: async fn `execute_chest_transfers`
-- [ ] Review comments: async fn `perform_trade`
-- [ ] Review comments: async fn `validate_and_plan_buy`
-- [ ] Review comments: async fn `handle_buy_order`
-- [ ] Review comments: async fn `validate_and_plan_sell`
-- [ ] Review comments: async fn `handle_sell_order`
-- [ ] Review comments: async fn `execute_queued_order`
-- [ ] Review comments: tests module
+- [ ] Do comments: struct `BuyPlan`
+- [ ] Do comments: struct `SellPlan`
+- [ ] Do comments: enum `ChestDirection`
+- [ ] Do comments: async fn `execute_chest_transfers`
+- [ ] Do comments: async fn `perform_trade`
+- [ ] Do comments: async fn `validate_and_plan_buy`
+- [ ] Do comments: async fn `handle_buy_order`
+- [ ] Do comments: async fn `validate_and_plan_sell`
+- [ ] Do comments: async fn `handle_sell_order`
+- [ ] Do comments: async fn `execute_queued_order`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: struct `BuyPlan`
-- [ ] Review testability: struct `SellPlan`
-- [ ] Review testability: enum `ChestDirection`
-- [ ] Review testability: async fn `execute_chest_transfers`
-- [ ] Review testability: async fn `perform_trade`
-- [ ] Review testability: async fn `validate_and_plan_buy`
-- [ ] Review testability: async fn `handle_buy_order`
-- [ ] Review testability: async fn `validate_and_plan_sell`
-- [ ] Review testability: async fn `handle_sell_order`
-- [ ] Review testability: async fn `execute_queued_order`
-- [ ] Review testability: tests module
+- [ ] Do testing: struct `BuyPlan`
+- [ ] Do testing: struct `SellPlan`
+- [ ] Do testing: enum `ChestDirection`
+- [ ] Do testing: async fn `execute_chest_transfers`
+- [ ] Do testing: async fn `perform_trade`
+- [ ] Do testing: async fn `validate_and_plan_buy`
+- [ ] Do testing: async fn `handle_buy_order`
+- [ ] Do testing: async fn `validate_and_plan_sell`
+- [ ] Do testing: async fn `handle_sell_order`
+- [ ] Do testing: async fn `execute_queued_order`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: struct `BuyPlan`
-- [ ] Review logging: struct `SellPlan`
-- [ ] Review logging: enum `ChestDirection`
-- [ ] Review logging: async fn `execute_chest_transfers`
-- [ ] Review logging: async fn `perform_trade`
-- [ ] Review logging: async fn `validate_and_plan_buy`
-- [ ] Review logging: async fn `handle_buy_order`
-- [ ] Review logging: async fn `validate_and_plan_sell`
-- [ ] Review logging: async fn `handle_sell_order`
-- [ ] Review logging: async fn `execute_queued_order`
-- [ ] Review logging: tests module
+- [ ] Do logging: struct `BuyPlan`
+- [ ] Do logging: struct `SellPlan`
+- [ ] Do logging: enum `ChestDirection`
+- [ ] Do logging: async fn `execute_chest_transfers`
+- [ ] Do logging: async fn `perform_trade`
+- [ ] Do logging: async fn `validate_and_plan_buy`
+- [ ] Do logging: async fn `handle_buy_order`
+- [ ] Do logging: async fn `validate_and_plan_sell`
+- [ ] Do logging: async fn `handle_sell_order`
+- [ ] Do logging: async fn `execute_queued_order`
+- [ ] Do logging: tests module
 
 ### src/store/pricing.rs
 
@@ -1444,29 +1626,29 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `validate_fee`
-- [ ] Review comments: fn `reserves_sufficient`
-- [ ] Review comments: fn `calculate_buy_cost`
-- [ ] Review comments: fn `buy_cost_pure`
-- [ ] Review comments: fn `calculate_sell_payout`
-- [ ] Review comments: fn `sell_payout_pure`
-- [ ] Review comments: tests module (includes proptests)
+- [ ] Do comments: fn `validate_fee`
+- [ ] Do comments: fn `reserves_sufficient`
+- [ ] Do comments: fn `calculate_buy_cost`
+- [ ] Do comments: fn `buy_cost_pure`
+- [ ] Do comments: fn `calculate_sell_payout`
+- [ ] Do comments: fn `sell_payout_pure`
+- [ ] Do comments: tests module (includes proptests)
 
-- [ ] Review testability: fn `validate_fee`
-- [ ] Review testability: fn `reserves_sufficient`
-- [ ] Review testability: fn `calculate_buy_cost`
-- [ ] Review testability: fn `buy_cost_pure`
-- [ ] Review testability: fn `calculate_sell_payout`
-- [ ] Review testability: fn `sell_payout_pure`
-- [ ] Review testability: tests module (includes proptests)
+- [ ] Do testing: fn `validate_fee`
+- [ ] Do testing: fn `reserves_sufficient`
+- [ ] Do testing: fn `calculate_buy_cost`
+- [ ] Do testing: fn `buy_cost_pure`
+- [ ] Do testing: fn `calculate_sell_payout`
+- [ ] Do testing: fn `sell_payout_pure`
+- [ ] Do testing: tests module (includes proptests)
 
-- [ ] Review logging: fn `validate_fee`
-- [ ] Review logging: fn `reserves_sufficient`
-- [ ] Review logging: fn `calculate_buy_cost`
-- [ ] Review logging: fn `buy_cost_pure`
-- [ ] Review logging: fn `calculate_sell_payout`
-- [ ] Review logging: fn `sell_payout_pure`
-- [ ] Review logging: tests module (includes proptests)
+- [ ] Do logging: fn `validate_fee`
+- [ ] Do logging: fn `reserves_sufficient`
+- [ ] Do logging: fn `calculate_buy_cost`
+- [ ] Do logging: fn `buy_cost_pure`
+- [ ] Do logging: fn `calculate_sell_payout`
+- [ ] Do logging: fn `sell_payout_pure`
+- [ ] Do logging: tests module (includes proptests)
 
 ### src/store/queue.rs
 
@@ -1493,68 +1675,68 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `QueuedOrder`
-- [ ] Review comments: struct `OrderQueue`
-- [ ] Review comments: struct `QueuePersist`
-- [ ] Review comments: impl QueuedOrder :: fn `new`
-- [ ] Review comments: impl QueuedOrder :: fn `description`
-- [ ] Review comments: impl `Default for OrderQueue` :: fn `default`
-- [ ] Review comments: impl OrderQueue :: fn `new`
-- [ ] Review comments: impl OrderQueue :: fn `load`
-- [ ] Review comments: impl OrderQueue :: fn `save`
-- [ ] Review comments: impl OrderQueue :: fn `add`
-- [ ] Review comments: impl OrderQueue :: fn `pop`
-- [ ] Review comments: impl OrderQueue :: fn `is_empty`
-- [ ] Review comments: impl OrderQueue :: fn `len`
-- [ ] Review comments: impl OrderQueue :: fn `get_position`
-- [ ] Review comments: impl OrderQueue :: fn `get_user_position`
-- [ ] Review comments: impl OrderQueue :: fn `user_order_count`
-- [ ] Review comments: impl OrderQueue :: fn `get_user_orders`
-- [ ] Review comments: impl OrderQueue :: fn `cancel`
-- [ ] Review comments: impl OrderQueue :: fn `estimate_wait`
-- [ ] Review comments: tests module
+- [ ] Do comments: struct `QueuedOrder`
+- [ ] Do comments: struct `OrderQueue`
+- [ ] Do comments: struct `QueuePersist`
+- [ ] Do comments: impl QueuedOrder :: fn `new`
+- [ ] Do comments: impl QueuedOrder :: fn `description`
+- [ ] Do comments: impl `Default for OrderQueue` :: fn `default`
+- [ ] Do comments: impl OrderQueue :: fn `new`
+- [ ] Do comments: impl OrderQueue :: fn `load`
+- [ ] Do comments: impl OrderQueue :: fn `save`
+- [ ] Do comments: impl OrderQueue :: fn `add`
+- [ ] Do comments: impl OrderQueue :: fn `pop`
+- [ ] Do comments: impl OrderQueue :: fn `is_empty`
+- [ ] Do comments: impl OrderQueue :: fn `len`
+- [ ] Do comments: impl OrderQueue :: fn `get_position`
+- [ ] Do comments: impl OrderQueue :: fn `get_user_position`
+- [ ] Do comments: impl OrderQueue :: fn `user_order_count`
+- [ ] Do comments: impl OrderQueue :: fn `get_user_orders`
+- [ ] Do comments: impl OrderQueue :: fn `cancel`
+- [ ] Do comments: impl OrderQueue :: fn `estimate_wait`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: struct `QueuedOrder`
-- [ ] Review testability: struct `OrderQueue`
-- [ ] Review testability: struct `QueuePersist`
-- [ ] Review testability: impl QueuedOrder :: fn `new`
-- [ ] Review testability: impl QueuedOrder :: fn `description`
-- [ ] Review testability: impl `Default for OrderQueue` :: fn `default`
-- [ ] Review testability: impl OrderQueue :: fn `new`
-- [ ] Review testability: impl OrderQueue :: fn `load`
-- [ ] Review testability: impl OrderQueue :: fn `save`
-- [ ] Review testability: impl OrderQueue :: fn `add`
-- [ ] Review testability: impl OrderQueue :: fn `pop`
-- [ ] Review testability: impl OrderQueue :: fn `is_empty`
-- [ ] Review testability: impl OrderQueue :: fn `len`
-- [ ] Review testability: impl OrderQueue :: fn `get_position`
-- [ ] Review testability: impl OrderQueue :: fn `get_user_position`
-- [ ] Review testability: impl OrderQueue :: fn `user_order_count`
-- [ ] Review testability: impl OrderQueue :: fn `get_user_orders`
-- [ ] Review testability: impl OrderQueue :: fn `cancel`
-- [ ] Review testability: impl OrderQueue :: fn `estimate_wait`
-- [ ] Review testability: tests module
+- [ ] Do testing: struct `QueuedOrder`
+- [ ] Do testing: struct `OrderQueue`
+- [ ] Do testing: struct `QueuePersist`
+- [ ] Do testing: impl QueuedOrder :: fn `new`
+- [ ] Do testing: impl QueuedOrder :: fn `description`
+- [ ] Do testing: impl `Default for OrderQueue` :: fn `default`
+- [ ] Do testing: impl OrderQueue :: fn `new`
+- [ ] Do testing: impl OrderQueue :: fn `load`
+- [ ] Do testing: impl OrderQueue :: fn `save`
+- [ ] Do testing: impl OrderQueue :: fn `add`
+- [ ] Do testing: impl OrderQueue :: fn `pop`
+- [ ] Do testing: impl OrderQueue :: fn `is_empty`
+- [ ] Do testing: impl OrderQueue :: fn `len`
+- [ ] Do testing: impl OrderQueue :: fn `get_position`
+- [ ] Do testing: impl OrderQueue :: fn `get_user_position`
+- [ ] Do testing: impl OrderQueue :: fn `user_order_count`
+- [ ] Do testing: impl OrderQueue :: fn `get_user_orders`
+- [ ] Do testing: impl OrderQueue :: fn `cancel`
+- [ ] Do testing: impl OrderQueue :: fn `estimate_wait`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: struct `QueuedOrder`
-- [ ] Review logging: struct `OrderQueue`
-- [ ] Review logging: struct `QueuePersist`
-- [ ] Review logging: impl QueuedOrder :: fn `new`
-- [ ] Review logging: impl QueuedOrder :: fn `description`
-- [ ] Review logging: impl `Default for OrderQueue` :: fn `default`
-- [ ] Review logging: impl OrderQueue :: fn `new`
-- [ ] Review logging: impl OrderQueue :: fn `load`
-- [ ] Review logging: impl OrderQueue :: fn `save`
-- [ ] Review logging: impl OrderQueue :: fn `add`
-- [ ] Review logging: impl OrderQueue :: fn `pop`
-- [ ] Review logging: impl OrderQueue :: fn `is_empty`
-- [ ] Review logging: impl OrderQueue :: fn `len`
-- [ ] Review logging: impl OrderQueue :: fn `get_position`
-- [ ] Review logging: impl OrderQueue :: fn `get_user_position`
-- [ ] Review logging: impl OrderQueue :: fn `user_order_count`
-- [ ] Review logging: impl OrderQueue :: fn `get_user_orders`
-- [ ] Review logging: impl OrderQueue :: fn `cancel`
-- [ ] Review logging: impl OrderQueue :: fn `estimate_wait`
-- [ ] Review logging: tests module
+- [ ] Do logging: struct `QueuedOrder`
+- [ ] Do logging: struct `OrderQueue`
+- [ ] Do logging: struct `QueuePersist`
+- [ ] Do logging: impl QueuedOrder :: fn `new`
+- [ ] Do logging: impl QueuedOrder :: fn `description`
+- [ ] Do logging: impl `Default for OrderQueue` :: fn `default`
+- [ ] Do logging: impl OrderQueue :: fn `new`
+- [ ] Do logging: impl OrderQueue :: fn `load`
+- [ ] Do logging: impl OrderQueue :: fn `save`
+- [ ] Do logging: impl OrderQueue :: fn `add`
+- [ ] Do logging: impl OrderQueue :: fn `pop`
+- [ ] Do logging: impl OrderQueue :: fn `is_empty`
+- [ ] Do logging: impl OrderQueue :: fn `len`
+- [ ] Do logging: impl OrderQueue :: fn `get_position`
+- [ ] Do logging: impl OrderQueue :: fn `get_user_position`
+- [ ] Do logging: impl OrderQueue :: fn `user_order_count`
+- [ ] Do logging: impl OrderQueue :: fn `get_user_orders`
+- [ ] Do logging: impl OrderQueue :: fn `cancel`
+- [ ] Do logging: impl OrderQueue :: fn `estimate_wait`
+- [ ] Do logging: tests module
 
 ### src/store/rate_limit.rs
 
@@ -1570,35 +1752,35 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `UserRateLimit`
-- [ ] Review comments: struct `RateLimiter`
-- [ ] Review comments: fn `calculate_cooldown`
-- [ ] Review comments: impl UserRateLimit :: fn `new`
-- [ ] Review comments: impl `Default for RateLimiter` :: fn `default`
-- [ ] Review comments: impl RateLimiter :: fn `new`
-- [ ] Review comments: impl RateLimiter :: fn `check`
-- [ ] Review comments: impl RateLimiter :: fn `cleanup_stale`
-- [ ] Review comments: tests module
+- [ ] Do comments: struct `UserRateLimit`
+- [ ] Do comments: struct `RateLimiter`
+- [ ] Do comments: fn `calculate_cooldown`
+- [ ] Do comments: impl UserRateLimit :: fn `new`
+- [ ] Do comments: impl `Default for RateLimiter` :: fn `default`
+- [ ] Do comments: impl RateLimiter :: fn `new`
+- [ ] Do comments: impl RateLimiter :: fn `check`
+- [ ] Do comments: impl RateLimiter :: fn `cleanup_stale`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: struct `UserRateLimit`
-- [ ] Review testability: struct `RateLimiter`
-- [ ] Review testability: fn `calculate_cooldown`
-- [ ] Review testability: impl UserRateLimit :: fn `new`
-- [ ] Review testability: impl `Default for RateLimiter` :: fn `default`
-- [ ] Review testability: impl RateLimiter :: fn `new`
-- [ ] Review testability: impl RateLimiter :: fn `check`
-- [ ] Review testability: impl RateLimiter :: fn `cleanup_stale`
-- [ ] Review testability: tests module
+- [ ] Do testing: struct `UserRateLimit`
+- [ ] Do testing: struct `RateLimiter`
+- [ ] Do testing: fn `calculate_cooldown`
+- [ ] Do testing: impl UserRateLimit :: fn `new`
+- [ ] Do testing: impl `Default for RateLimiter` :: fn `default`
+- [ ] Do testing: impl RateLimiter :: fn `new`
+- [ ] Do testing: impl RateLimiter :: fn `check`
+- [ ] Do testing: impl RateLimiter :: fn `cleanup_stale`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: struct `UserRateLimit`
-- [ ] Review logging: struct `RateLimiter`
-- [ ] Review logging: fn `calculate_cooldown`
-- [ ] Review logging: impl UserRateLimit :: fn `new`
-- [ ] Review logging: impl `Default for RateLimiter` :: fn `default`
-- [ ] Review logging: impl RateLimiter :: fn `new`
-- [ ] Review logging: impl RateLimiter :: fn `check`
-- [ ] Review logging: impl RateLimiter :: fn `cleanup_stale`
-- [ ] Review logging: tests module
+- [ ] Do logging: struct `UserRateLimit`
+- [ ] Do logging: struct `RateLimiter`
+- [ ] Do logging: fn `calculate_cooldown`
+- [ ] Do logging: impl UserRateLimit :: fn `new`
+- [ ] Do logging: impl `Default for RateLimiter` :: fn `default`
+- [ ] Do logging: impl RateLimiter :: fn `new`
+- [ ] Do logging: impl RateLimiter :: fn `check`
+- [ ] Do logging: impl RateLimiter :: fn `cleanup_stale`
+- [ ] Do logging: tests module
 
 ### src/store/rollback.rs
 
@@ -1610,23 +1792,23 @@
 
 **TODO:**
 
-- [ ] Review comments: struct `RollbackResult`
-- [ ] Review comments: impl RollbackResult :: fn `has_failures`
-- [ ] Review comments: fn `chest_from_transfer`
-- [ ] Review comments: async fn `deposit_transfers`
-- [ ] Review comments: async fn `rollback_amount_to_storage`
+- [ ] Do comments: struct `RollbackResult`
+- [ ] Do comments: impl RollbackResult :: fn `has_failures`
+- [ ] Do comments: fn `chest_from_transfer`
+- [ ] Do comments: async fn `deposit_transfers`
+- [ ] Do comments: async fn `rollback_amount_to_storage`
 
-- [ ] Review testability: struct `RollbackResult`
-- [ ] Review testability: impl RollbackResult :: fn `has_failures`
-- [ ] Review testability: fn `chest_from_transfer`
-- [ ] Review testability: async fn `deposit_transfers`
-- [ ] Review testability: async fn `rollback_amount_to_storage`
+- [ ] Do testing: struct `RollbackResult`
+- [ ] Do testing: impl RollbackResult :: fn `has_failures`
+- [ ] Do testing: fn `chest_from_transfer`
+- [ ] Do testing: async fn `deposit_transfers`
+- [ ] Do testing: async fn `rollback_amount_to_storage`
 
-- [ ] Review logging: struct `RollbackResult`
-- [ ] Review logging: impl RollbackResult :: fn `has_failures`
-- [ ] Review logging: fn `chest_from_transfer`
-- [ ] Review logging: async fn `deposit_transfers`
-- [ ] Review logging: async fn `rollback_amount_to_storage`
+- [ ] Do logging: struct `RollbackResult`
+- [ ] Do logging: impl RollbackResult :: fn `has_failures`
+- [ ] Do logging: fn `chest_from_transfer`
+- [ ] Do logging: async fn `deposit_transfers`
+- [ ] Do logging: async fn `rollback_amount_to_storage`
 
 ### src/store/trade_state.rs
 
@@ -1651,62 +1833,62 @@
 
 **TODO:**
 
-- [ ] Review comments: const `TRADE_STATE_FILE`
-- [ ] Review comments: struct `TradeResult`
-- [ ] Review comments: struct `CompletedTrade`
-- [ ] Review comments: enum `TradeState`
-- [ ] Review comments: impl TradeState :: fn `new`
-- [ ] Review comments: impl TradeState :: fn `begin_withdrawal`
-- [ ] Review comments: impl TradeState :: fn `begin_trading`
-- [ ] Review comments: impl TradeState :: fn `begin_depositing`
-- [ ] Review comments: impl TradeState :: fn `commit`
-- [ ] Review comments: impl TradeState :: fn `rollback`
-- [ ] Review comments: impl TradeState :: fn `phase`
-- [ ] Review comments: impl TradeState :: fn `is_terminal`
-- [ ] Review comments: impl TradeState :: fn `order`
-- [ ] Review comments: impl `fmt::Display for TradeState` :: fn `fmt`
-- [ ] Review comments: fn `persist`
-- [ ] Review comments: fn `load_persisted`
-- [ ] Review comments: fn `clear_persisted`
-- [ ] Review comments: tests module
+- [ ] Do comments: const `TRADE_STATE_FILE`
+- [ ] Do comments: struct `TradeResult`
+- [ ] Do comments: struct `CompletedTrade`
+- [ ] Do comments: enum `TradeState`
+- [ ] Do comments: impl TradeState :: fn `new`
+- [ ] Do comments: impl TradeState :: fn `begin_withdrawal`
+- [ ] Do comments: impl TradeState :: fn `begin_trading`
+- [ ] Do comments: impl TradeState :: fn `begin_depositing`
+- [ ] Do comments: impl TradeState :: fn `commit`
+- [ ] Do comments: impl TradeState :: fn `rollback`
+- [ ] Do comments: impl TradeState :: fn `phase`
+- [ ] Do comments: impl TradeState :: fn `is_terminal`
+- [ ] Do comments: impl TradeState :: fn `order`
+- [ ] Do comments: impl `fmt::Display for TradeState` :: fn `fmt`
+- [ ] Do comments: fn `persist`
+- [ ] Do comments: fn `load_persisted`
+- [ ] Do comments: fn `clear_persisted`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: const `TRADE_STATE_FILE`
-- [ ] Review testability: struct `TradeResult`
-- [ ] Review testability: struct `CompletedTrade`
-- [ ] Review testability: enum `TradeState`
-- [ ] Review testability: impl TradeState :: fn `new`
-- [ ] Review testability: impl TradeState :: fn `begin_withdrawal`
-- [ ] Review testability: impl TradeState :: fn `begin_trading`
-- [ ] Review testability: impl TradeState :: fn `begin_depositing`
-- [ ] Review testability: impl TradeState :: fn `commit`
-- [ ] Review testability: impl TradeState :: fn `rollback`
-- [ ] Review testability: impl TradeState :: fn `phase`
-- [ ] Review testability: impl TradeState :: fn `is_terminal`
-- [ ] Review testability: impl TradeState :: fn `order`
-- [ ] Review testability: impl `fmt::Display for TradeState` :: fn `fmt`
-- [ ] Review testability: fn `persist`
-- [ ] Review testability: fn `load_persisted`
-- [ ] Review testability: fn `clear_persisted`
-- [ ] Review testability: tests module
+- [ ] Do testing: const `TRADE_STATE_FILE`
+- [ ] Do testing: struct `TradeResult`
+- [ ] Do testing: struct `CompletedTrade`
+- [ ] Do testing: enum `TradeState`
+- [ ] Do testing: impl TradeState :: fn `new`
+- [ ] Do testing: impl TradeState :: fn `begin_withdrawal`
+- [ ] Do testing: impl TradeState :: fn `begin_trading`
+- [ ] Do testing: impl TradeState :: fn `begin_depositing`
+- [ ] Do testing: impl TradeState :: fn `commit`
+- [ ] Do testing: impl TradeState :: fn `rollback`
+- [ ] Do testing: impl TradeState :: fn `phase`
+- [ ] Do testing: impl TradeState :: fn `is_terminal`
+- [ ] Do testing: impl TradeState :: fn `order`
+- [ ] Do testing: impl `fmt::Display for TradeState` :: fn `fmt`
+- [ ] Do testing: fn `persist`
+- [ ] Do testing: fn `load_persisted`
+- [ ] Do testing: fn `clear_persisted`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: const `TRADE_STATE_FILE`
-- [ ] Review logging: struct `TradeResult`
-- [ ] Review logging: struct `CompletedTrade`
-- [ ] Review logging: enum `TradeState`
-- [ ] Review logging: impl TradeState :: fn `new`
-- [ ] Review logging: impl TradeState :: fn `begin_withdrawal`
-- [ ] Review logging: impl TradeState :: fn `begin_trading`
-- [ ] Review logging: impl TradeState :: fn `begin_depositing`
-- [ ] Review logging: impl TradeState :: fn `commit`
-- [ ] Review logging: impl TradeState :: fn `rollback`
-- [ ] Review logging: impl TradeState :: fn `phase`
-- [ ] Review logging: impl TradeState :: fn `is_terminal`
-- [ ] Review logging: impl TradeState :: fn `order`
-- [ ] Review logging: impl `fmt::Display for TradeState` :: fn `fmt`
-- [ ] Review logging: fn `persist`
-- [ ] Review logging: fn `load_persisted`
-- [ ] Review logging: fn `clear_persisted`
-- [ ] Review logging: tests module
+- [ ] Do logging: const `TRADE_STATE_FILE`
+- [ ] Do logging: struct `TradeResult`
+- [ ] Do logging: struct `CompletedTrade`
+- [ ] Do logging: enum `TradeState`
+- [ ] Do logging: impl TradeState :: fn `new`
+- [ ] Do logging: impl TradeState :: fn `begin_withdrawal`
+- [ ] Do logging: impl TradeState :: fn `begin_trading`
+- [ ] Do logging: impl TradeState :: fn `begin_depositing`
+- [ ] Do logging: impl TradeState :: fn `commit`
+- [ ] Do logging: impl TradeState :: fn `rollback`
+- [ ] Do logging: impl TradeState :: fn `phase`
+- [ ] Do logging: impl TradeState :: fn `is_terminal`
+- [ ] Do logging: impl TradeState :: fn `order`
+- [ ] Do logging: impl `fmt::Display for TradeState` :: fn `fmt`
+- [ ] Do logging: fn `persist`
+- [ ] Do logging: fn `load_persisted`
+- [ ] Do logging: fn `clear_persisted`
+- [ ] Do logging: tests module
 
 ### src/store/utils.rs
 
@@ -1727,50 +1909,50 @@
 
 **TODO:**
 
-- [ ] Review comments: static `UUID_CACHE`
-- [ ] Review comments: type alias `UuidCache`
-- [ ] Review comments: fn `uuid_cache`
-- [ ] Review comments: fn `normalize_item_id`
-- [ ] Review comments: async fn `resolve_user_uuid`
-- [ ] Review comments: fn `clear_uuid_cache`
-- [ ] Review comments: fn `cleanup_uuid_cache`
-- [ ] Review comments: fn `ensure_user_exists`
-- [ ] Review comments: fn `is_operator`
-- [ ] Review comments: fn `get_node_position`
-- [ ] Review comments: async fn `send_message_to_player`
-- [ ] Review comments: fn `summarize_transfers`
-- [ ] Review comments: fn `fmt_issues`
-- [ ] Review comments: tests module
+- [ ] Do comments: static `UUID_CACHE`
+- [ ] Do comments: type alias `UuidCache`
+- [ ] Do comments: fn `uuid_cache`
+- [ ] Do comments: fn `normalize_item_id`
+- [ ] Do comments: async fn `resolve_user_uuid`
+- [ ] Do comments: fn `clear_uuid_cache`
+- [ ] Do comments: fn `cleanup_uuid_cache`
+- [ ] Do comments: fn `ensure_user_exists`
+- [ ] Do comments: fn `is_operator`
+- [ ] Do comments: fn `get_node_position`
+- [ ] Do comments: async fn `send_message_to_player`
+- [ ] Do comments: fn `summarize_transfers`
+- [ ] Do comments: fn `fmt_issues`
+- [ ] Do comments: tests module
 
-- [ ] Review testability: static `UUID_CACHE`
-- [ ] Review testability: type alias `UuidCache`
-- [ ] Review testability: fn `uuid_cache`
-- [ ] Review testability: fn `normalize_item_id`
-- [ ] Review testability: async fn `resolve_user_uuid`
-- [ ] Review testability: fn `clear_uuid_cache`
-- [ ] Review testability: fn `cleanup_uuid_cache`
-- [ ] Review testability: fn `ensure_user_exists`
-- [ ] Review testability: fn `is_operator`
-- [ ] Review testability: fn `get_node_position`
-- [ ] Review testability: async fn `send_message_to_player`
-- [ ] Review testability: fn `summarize_transfers`
-- [ ] Review testability: fn `fmt_issues`
-- [ ] Review testability: tests module
+- [ ] Do testing: static `UUID_CACHE`
+- [ ] Do testing: type alias `UuidCache`
+- [ ] Do testing: fn `uuid_cache`
+- [ ] Do testing: fn `normalize_item_id`
+- [ ] Do testing: async fn `resolve_user_uuid`
+- [ ] Do testing: fn `clear_uuid_cache`
+- [ ] Do testing: fn `cleanup_uuid_cache`
+- [ ] Do testing: fn `ensure_user_exists`
+- [ ] Do testing: fn `is_operator`
+- [ ] Do testing: fn `get_node_position`
+- [ ] Do testing: async fn `send_message_to_player`
+- [ ] Do testing: fn `summarize_transfers`
+- [ ] Do testing: fn `fmt_issues`
+- [ ] Do testing: tests module
 
-- [ ] Review logging: static `UUID_CACHE`
-- [ ] Review logging: type alias `UuidCache`
-- [ ] Review logging: fn `uuid_cache`
-- [ ] Review logging: fn `normalize_item_id`
-- [ ] Review logging: async fn `resolve_user_uuid`
-- [ ] Review logging: fn `clear_uuid_cache`
-- [ ] Review logging: fn `cleanup_uuid_cache`
-- [ ] Review logging: fn `ensure_user_exists`
-- [ ] Review logging: fn `is_operator`
-- [ ] Review logging: fn `get_node_position`
-- [ ] Review logging: async fn `send_message_to_player`
-- [ ] Review logging: fn `summarize_transfers`
-- [ ] Review logging: fn `fmt_issues`
-- [ ] Review logging: tests module
+- [ ] Do logging: static `UUID_CACHE`
+- [ ] Do logging: type alias `UuidCache`
+- [ ] Do logging: fn `uuid_cache`
+- [ ] Do logging: fn `normalize_item_id`
+- [ ] Do logging: async fn `resolve_user_uuid`
+- [ ] Do logging: fn `clear_uuid_cache`
+- [ ] Do logging: fn `cleanup_uuid_cache`
+- [ ] Do logging: fn `ensure_user_exists`
+- [ ] Do logging: fn `is_operator`
+- [ ] Do logging: fn `get_node_position`
+- [ ] Do logging: async fn `send_message_to_player`
+- [ ] Do logging: fn `summarize_transfers`
+- [ ] Do logging: fn `fmt_issues`
+- [ ] Do logging: tests module
 
 ### src/store/handlers/mod.rs
 
@@ -1786,35 +1968,35 @@
 
 **TODO:**
 
-- [ ] Review comments: pub mod `player`
-- [ ] Review comments: pub mod `operator`
-- [ ] Review comments: pub mod `cli`
-- [ ] Review comments: mod `buy`
-- [ ] Review comments: mod `sell`
-- [ ] Review comments: mod `deposit`
-- [ ] Review comments: mod `withdraw`
-- [ ] Review comments: mod `info`
-- [ ] Review comments: pub(crate) mod `validation`
+- [ ] Do comments: pub mod `player`
+- [ ] Do comments: pub mod `operator`
+- [ ] Do comments: pub mod `cli`
+- [ ] Do comments: mod `buy`
+- [ ] Do comments: mod `sell`
+- [ ] Do comments: mod `deposit`
+- [ ] Do comments: mod `withdraw`
+- [ ] Do comments: mod `info`
+- [ ] Do comments: pub(crate) mod `validation`
 
-- [ ] Review testability: pub mod `player`
-- [ ] Review testability: pub mod `operator`
-- [ ] Review testability: pub mod `cli`
-- [ ] Review testability: mod `buy`
-- [ ] Review testability: mod `sell`
-- [ ] Review testability: mod `deposit`
-- [ ] Review testability: mod `withdraw`
-- [ ] Review testability: mod `info`
-- [ ] Review testability: pub(crate) mod `validation`
+- [ ] Do testing: pub mod `player`
+- [ ] Do testing: pub mod `operator`
+- [ ] Do testing: pub mod `cli`
+- [ ] Do testing: mod `buy`
+- [ ] Do testing: mod `sell`
+- [ ] Do testing: mod `deposit`
+- [ ] Do testing: mod `withdraw`
+- [ ] Do testing: mod `info`
+- [ ] Do testing: pub(crate) mod `validation`
 
-- [ ] Review logging: pub mod `player`
-- [ ] Review logging: pub mod `operator`
-- [ ] Review logging: pub mod `cli`
-- [ ] Review logging: mod `buy`
-- [ ] Review logging: mod `sell`
-- [ ] Review logging: mod `deposit`
-- [ ] Review logging: mod `withdraw`
-- [ ] Review logging: mod `info`
-- [ ] Review logging: pub(crate) mod `validation`
+- [ ] Do logging: pub mod `player`
+- [ ] Do logging: pub mod `operator`
+- [ ] Do logging: pub mod `cli`
+- [ ] Do logging: mod `buy`
+- [ ] Do logging: mod `sell`
+- [ ] Do logging: mod `deposit`
+- [ ] Do logging: mod `withdraw`
+- [ ] Do logging: mod `info`
+- [ ] Do logging: pub(crate) mod `validation`
 
 ### src/store/handlers/validation.rs
 
@@ -1824,17 +2006,17 @@
 
 **TODO:**
 
-- [ ] Review comments: fn `validate_item_name`
-- [ ] Review comments: fn `validate_quantity`
-- [ ] Review comments: fn `validate_username`
+- [ ] Do comments: fn `validate_item_name`
+- [ ] Do comments: fn `validate_quantity`
+- [ ] Do comments: fn `validate_username`
 
-- [ ] Review testability: fn `validate_item_name`
-- [ ] Review testability: fn `validate_quantity`
-- [ ] Review testability: fn `validate_username`
+- [ ] Do testing: fn `validate_item_name`
+- [ ] Do testing: fn `validate_quantity`
+- [ ] Do testing: fn `validate_username`
 
-- [ ] Review logging: fn `validate_item_name`
-- [ ] Review logging: fn `validate_quantity`
-- [ ] Review logging: fn `validate_username`
+- [ ] Do logging: fn `validate_item_name`
+- [ ] Do logging: fn `validate_quantity`
+- [ ] Do logging: fn `validate_username`
 
 ### src/store/handlers/buy.rs
 
@@ -1842,11 +2024,11 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle`
+- [ ] Do comments: async fn `handle`
 
-- [ ] Review testability: async fn `handle`
+- [ ] Do testing: async fn `handle`
 
-- [ ] Review logging: async fn `handle`
+- [ ] Do logging: async fn `handle`
 
 ### src/store/handlers/sell.rs
 
@@ -1854,11 +2036,11 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle`
+- [ ] Do comments: async fn `handle`
 
-- [ ] Review testability: async fn `handle`
+- [ ] Do testing: async fn `handle`
 
-- [ ] Review logging: async fn `handle`
+- [ ] Do logging: async fn `handle`
 
 ### src/store/handlers/withdraw.rs
 
@@ -1867,14 +2049,14 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle_enqueue`
-- [ ] Review comments: async fn `handle_withdraw_balance_queued`
+- [ ] Do comments: async fn `handle_enqueue`
+- [ ] Do comments: async fn `handle_withdraw_balance_queued`
 
-- [ ] Review testability: async fn `handle_enqueue`
-- [ ] Review testability: async fn `handle_withdraw_balance_queued`
+- [ ] Do testing: async fn `handle_enqueue`
+- [ ] Do testing: async fn `handle_withdraw_balance_queued`
 
-- [ ] Review logging: async fn `handle_enqueue`
-- [ ] Review logging: async fn `handle_withdraw_balance_queued`
+- [ ] Do logging: async fn `handle_enqueue`
+- [ ] Do logging: async fn `handle_withdraw_balance_queued`
 
 ### src/store/handlers/deposit.rs
 
@@ -1883,14 +2065,14 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle_enqueue`
-- [ ] Review comments: async fn `handle_deposit_balance_queued`
+- [ ] Do comments: async fn `handle_enqueue`
+- [ ] Do comments: async fn `handle_deposit_balance_queued`
 
-- [ ] Review testability: async fn `handle_enqueue`
-- [ ] Review testability: async fn `handle_deposit_balance_queued`
+- [ ] Do testing: async fn `handle_enqueue`
+- [ ] Do testing: async fn `handle_deposit_balance_queued`
 
-- [ ] Review logging: async fn `handle_enqueue`
-- [ ] Review logging: async fn `handle_deposit_balance_queued`
+- [ ] Do logging: async fn `handle_enqueue`
+- [ ] Do logging: async fn `handle_deposit_balance_queued`
 
 ### src/store/handlers/player.rs
 
@@ -1898,11 +2080,11 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle_player_command`
+- [ ] Do comments: async fn `handle_player_command`
 
-- [ ] Review testability: async fn `handle_player_command`
+- [ ] Do testing: async fn `handle_player_command`
 
-- [ ] Review logging: async fn `handle_player_command`
+- [ ] Do logging: async fn `handle_player_command`
 
 ### src/store/handlers/operator.rs
 
@@ -1913,20 +2095,20 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle_additem_order`
-- [ ] Review comments: async fn `handle_removeitem_order`
-- [ ] Review comments: async fn `handle_add_currency`
-- [ ] Review comments: async fn `handle_remove_currency`
+- [ ] Do comments: async fn `handle_additem_order`
+- [ ] Do comments: async fn `handle_removeitem_order`
+- [ ] Do comments: async fn `handle_add_currency`
+- [ ] Do comments: async fn `handle_remove_currency`
 
-- [ ] Review testability: async fn `handle_additem_order`
-- [ ] Review testability: async fn `handle_removeitem_order`
-- [ ] Review testability: async fn `handle_add_currency`
-- [ ] Review testability: async fn `handle_remove_currency`
+- [ ] Do testing: async fn `handle_additem_order`
+- [ ] Do testing: async fn `handle_removeitem_order`
+- [ ] Do testing: async fn `handle_add_currency`
+- [ ] Do testing: async fn `handle_remove_currency`
 
-- [ ] Review logging: async fn `handle_additem_order`
-- [ ] Review logging: async fn `handle_removeitem_order`
-- [ ] Review logging: async fn `handle_add_currency`
-- [ ] Review logging: async fn `handle_remove_currency`
+- [ ] Do logging: async fn `handle_additem_order`
+- [ ] Do logging: async fn `handle_removeitem_order`
+- [ ] Do logging: async fn `handle_add_currency`
+- [ ] Do logging: async fn `handle_remove_currency`
 
 ### src/store/handlers/cli.rs
 
@@ -1934,11 +2116,11 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle_cli_message`
+- [ ] Do comments: async fn `handle_cli_message`
 
-- [ ] Review testability: async fn `handle_cli_message`
+- [ ] Do testing: async fn `handle_cli_message`
 
-- [ ] Review logging: async fn `handle_cli_message`
+- [ ] Do logging: async fn `handle_cli_message`
 
 ### src/store/handlers/info.rs
 
@@ -1959,49 +2141,47 @@
 
 **TODO:**
 
-- [ ] Review comments: async fn `handle_price`
-- [ ] Review comments: async fn `handle_balance`
-- [ ] Review comments: async fn `handle_pay`
-- [ ] Review comments: async fn `handle_items`
-- [ ] Review comments: async fn `handle_queue`
-- [ ] Review comments: async fn `handle_cancel`
-- [ ] Review comments: async fn `handle_status`
-- [ ] Review comments: async fn `handle_help`
-- [ ] Review comments: async fn `handle_price_command`
-- [ ] Review comments: async fn `handle_status_command`
-- [ ] Review comments: async fn `handle_items_command`
-- [ ] Review comments: async fn `handle_help_command`
-- [ ] Review comments: async fn `get_user_balance_async`
-- [ ] Review comments: async fn `pay_async`
+- [ ] Do comments: async fn `handle_price`
+- [ ] Do comments: async fn `handle_balance`
+- [ ] Do comments: async fn `handle_pay`
+- [ ] Do comments: async fn `handle_items`
+- [ ] Do comments: async fn `handle_queue`
+- [ ] Do comments: async fn `handle_cancel`
+- [ ] Do comments: async fn `handle_status`
+- [ ] Do comments: async fn `handle_help`
+- [ ] Do comments: async fn `handle_price_command`
+- [ ] Do comments: async fn `handle_status_command`
+- [ ] Do comments: async fn `handle_items_command`
+- [ ] Do comments: async fn `handle_help_command`
+- [ ] Do comments: async fn `get_user_balance_async`
+- [ ] Do comments: async fn `pay_async`
 
-- [ ] Review testability: async fn `handle_price`
-- [ ] Review testability: async fn `handle_balance`
-- [ ] Review testability: async fn `handle_pay`
-- [ ] Review testability: async fn `handle_items`
-- [ ] Review testability: async fn `handle_queue`
-- [ ] Review testability: async fn `handle_cancel`
-- [ ] Review testability: async fn `handle_status`
-- [ ] Review testability: async fn `handle_help`
-- [ ] Review testability: async fn `handle_price_command`
-- [ ] Review testability: async fn `handle_status_command`
-- [ ] Review testability: async fn `handle_items_command`
-- [ ] Review testability: async fn `handle_help_command`
-- [ ] Review testability: async fn `get_user_balance_async`
-- [ ] Review testability: async fn `pay_async`
+- [ ] Do testing: async fn `handle_price`
+- [ ] Do testing: async fn `handle_balance`
+- [ ] Do testing: async fn `handle_pay`
+- [ ] Do testing: async fn `handle_items`
+- [ ] Do testing: async fn `handle_queue`
+- [ ] Do testing: async fn `handle_cancel`
+- [ ] Do testing: async fn `handle_status`
+- [ ] Do testing: async fn `handle_help`
+- [ ] Do testing: async fn `handle_price_command`
+- [ ] Do testing: async fn `handle_status_command`
+- [ ] Do testing: async fn `handle_items_command`
+- [ ] Do testing: async fn `handle_help_command`
+- [ ] Do testing: async fn `get_user_balance_async`
+- [ ] Do testing: async fn `pay_async`
 
-- [ ] Review logging: async fn `handle_price`
-- [ ] Review logging: async fn `handle_balance`
-- [ ] Review logging: async fn `handle_pay`
-- [ ] Review logging: async fn `handle_items`
-- [ ] Review logging: async fn `handle_queue`
-- [ ] Review logging: async fn `handle_cancel`
-- [ ] Review logging: async fn `handle_status`
-- [ ] Review logging: async fn `handle_help`
-- [ ] Review logging: async fn `handle_price_command`
-- [ ] Review logging: async fn `handle_status_command`
-- [ ] Review logging: async fn `handle_items_command`
-- [ ] Review logging: async fn `handle_help_command`
-- [ ] Review logging: async fn `get_user_balance_async`
-- [ ] Review logging: async fn `pay_async`
-
-- [ ] Evaluate migrating user balances from `f64` to an integer representation (millidiamonds or similar) to eliminate accumulated rounding error on long histories.
+- [ ] Do logging: async fn `handle_price`
+- [ ] Do logging: async fn `handle_balance`
+- [ ] Do logging: async fn `handle_pay`
+- [ ] Do logging: async fn `handle_items`
+- [ ] Do logging: async fn `handle_queue`
+- [ ] Do logging: async fn `handle_cancel`
+- [ ] Do logging: async fn `handle_status`
+- [ ] Do logging: async fn `handle_help`
+- [ ] Do logging: async fn `handle_price_command`
+- [ ] Do logging: async fn `handle_status_command`
+- [ ] Do logging: async fn `handle_items_command`
+- [ ] Do logging: async fn `handle_help_command`
+- [ ] Do logging: async fn `get_user_balance_async`
+- [ ] Do logging: async fn `pay_async`

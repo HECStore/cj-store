@@ -12,7 +12,8 @@ use crate::constants::{
     CHEST_OP_MAX_RETRIES, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
     CHUNK_RELOAD_MAX_DELAY_MS, DELAY_BLOCK_OP_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS,
     DELAY_MEDIUM_MS, DELAY_SETTLE_MS, DELAY_SHORT_MS, DELAY_SHULKER_PLACE_MS,
-    DOUBLE_CHEST_SLOTS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay,
+    DOUBLE_CHEST_SLOTS, HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
+    SHULKER_BOX_SLOTS, exponential_backoff_delay,
 };
 use crate::types::Position;
 
@@ -77,7 +78,6 @@ pub async fn place_shulker_in_chest_slot_verified(
     chest_slot: usize,
 ) -> Result<(), String> {
     const MAX_VERIFICATION_ATTEMPTS: u32 = 7;
-    const CLICK_DELAY_MS: u64 = 300;
     const VERIFY_DELAY_MS: u64 = 250;
 
     info!(
@@ -110,7 +110,7 @@ pub async fn place_shulker_in_chest_slot_verified(
     container.click(PickupClick::Left {
         slot: Some(container_slot as u16),
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_DELAY_MS)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
     // Verify shulker was picked up (slot should now be empty or have different item)
     let slots_after_pickup = container
@@ -130,7 +130,7 @@ pub async fn place_shulker_in_chest_slot_verified(
             container.click(PickupClick::Left {
                 slot: Some(container_slot as u16),
             });
-            tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_DELAY_MS)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
             
             // Check again
             let slots_retry = container.slots().ok_or_else(|| "Container closed".to_string())?;
@@ -147,7 +147,7 @@ pub async fn place_shulker_in_chest_slot_verified(
     container.click(PickupClick::Left {
         slot: Some(chest_slot as u16),
     });
-    tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_DELAY_MS)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
     // Check state after placement
     let updated_slots = container
@@ -215,7 +215,7 @@ pub async fn place_shulker_in_chest_slot_verified(
         container.click(PickupClick::Left {
             slot: Some(chest_slot as u16),
         });
-        tokio::time::sleep(tokio::time::Duration::from_millis(CLICK_DELAY_MS)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
         // Final verification
         let final_slots = container
@@ -651,9 +651,9 @@ async fn transfer_withdraw_from_shulker(
             let all_slots = shulker_container
                 .slots()
                 .ok_or_else(|| "Shulker closed".to_string())?;
-            let shulker_size = contents.len(); // 27 slots
-            let inv_start = shulker_size; // 27
-            let inv_end = inv_start + 27; // 54 (inventory slots 9-35)
+            let shulker_size = contents.len(); // SHULKER_BOX_SLOTS
+            let inv_start = shulker_size;
+            let inv_end = inv_start + SHULKER_BOX_SLOTS; // inventory slots 9-35
 
             let mut target_slot: Option<usize> = None;
             for i in inv_start..inv_end.min(all_slots.len()) {
@@ -724,7 +724,7 @@ async fn transfer_deposit_into_shulker(
         .contents()
         .ok_or_else(|| "Shulker closed".to_string())?;
     let inv_start = shulker_contents.len(); // Bot inventory starts after shulker contents (27)
-    let inventory_end = inv_start + 36; // 27 inventory + 9 hotbar = 36 slots (27..63)
+    let inventory_end = inv_start + SHULKER_BOX_SLOTS + 9; // 27 inventory + 9 hotbar = 36 slots (27..63)
 
     debug!(
         "transfer_items_with_shulker: Deposit - searching slots {}-{} for {}",
@@ -759,13 +759,13 @@ async fn transfer_deposit_into_shulker(
                 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id
             {
                 found = Some((i, stack.count()));
-                let slot_type = if i < 54 { "inventory" } else { "hotbar" };
+                let slot_type = if i < DOUBLE_CHEST_SLOTS { "inventory" } else { "hotbar" };
                 debug!(
                     "transfer_items_with_shulker: Found {} x{} in {} slot {} (container idx {})",
                     stack.kind(),
                     stack.count(),
                     slot_type,
-                    if i >= 54 { i - 54 } else { i - 27 },
+                    if i >= DOUBLE_CHEST_SLOTS { i - DOUBLE_CHEST_SLOTS } else { i - SHULKER_BOX_SLOTS },
                     i
                 );
                 break;
@@ -1220,7 +1220,7 @@ async fn withdraw_shulkers(
                             .open_inventory()
                             .ok_or_else(|| "Failed to open inventory".to_string())?;
                         inv_handle.click(PickupClick::Left {
-                            slot: Some(36 as u16), // Hotbar slot 0
+                            slot: Some(HOTBAR_SLOT_0 as u16),
                         });
                         tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
                         drop(inv_handle);
@@ -1554,7 +1554,6 @@ async fn deposit_shulkers(
                 }
 
                 // Verify bot is holding shulker before placing
-                const HOTBAR_SLOT_0: usize = 36; // Hotbar slot 0 is inventory slot 36
                 if !super::inventory::verify_holding_shulker(&client) {
                     // Shulker should be in hotbar slot 0, pick it up
                     let inv_handle = client
@@ -1632,7 +1631,7 @@ async fn deposit_shulkers(
                     .ok_or_else(|| "Shulker closed".to_string())?;
                 let inv_start = shulker_contents.len(); // Bot inventory starts after shulker contents (27)
                 // Search BOTH inventory (27-53) AND hotbar (54-62) - items can be anywhere after a trade
-                let inventory_and_hotbar_end = inv_start + 36; // 27 inventory + 9 hotbar = 36 slots
+                let inventory_and_hotbar_end = inv_start + SHULKER_BOX_SLOTS + 9; // 27 inventory + 9 hotbar = 36 slots
                 let mut bot_item_count = 0i32;
                 for i in inv_start..inventory_and_hotbar_end.min(all_slots.len()) {
                     let stack = &all_slots[i];
@@ -1797,7 +1796,7 @@ async fn deposit_shulkers(
 
                     // Only close/reopen if we need to process more slots
                     // If remaining is 0 or we're at the last slot, we're done
-                    if remaining > 0 && slot_idx < 53 {
+                    if remaining > 0 && slot_idx < DOUBLE_CHEST_SLOTS - 1 {
                         // Close and reopen chest to ensure clean state for next iteration
                         // close() takes ownership, so we must reopen immediately
                         container.close();

@@ -106,19 +106,22 @@ recovered). The usual async discipline — never hold the guard across
 2. **Order audit log is session-only** — `data/orders.json` is cleared on
    each startup. For history use `data/trades/*.json`. The pending queue
    (`queue.json`) IS persistent.
-3. **Trade history grows unbounded** — one file per trade. Archive via
-   `Trade::archive_old_trades()` (1 year cutoff). Only the newest
-   `max_trades_in_memory` (default 50 000) are loaded into memory.
+3. **Trade history grows unbounded on disk** — one file per trade under
+   `data/trades/`, never pruned. `max_trades_in_memory` (default 50 000)
+   caps how many are *loaded into memory* at startup; older files stay on
+   disk untouched. Automatic archival / time-based cutoff is not
+   implemented — if disk footprint matters, delete old files out-of-band.
 4. **Retry logic**: constants live in [src/constants.rs](src/constants.rs).
    Chunk-not-loaded triggers the chunk-aware retry path, which reopens
    stale containers rather than giving up.
 
-   | Operation               | Trigger                         | Retries                                              | Base backoff | Max backoff | Notes                         |
-   | ----------------------- | ------------------------------- | ---------------------------------------------------- | ------------ | ----------- | ----------------------------- |
-   | Chest open              | Chunk unload / transient I/O    | 3 (`CHEST_OP_MAX_RETRIES`), +2 on chunk-not-loaded   | 3 s          | 10 s        | Exponential backoff           |
-   | Shulker open            | GUI open timeout                | 2 (`SHULKER_OP_MAX_RETRIES`)                         | —            | —           | —                             |
-   | Navigation              | Path failure                    | 2 (`NAVIGATION_MAX_RETRIES`)                         | —            | —           | —                             |
-   | Validation / discovery  | Fail-fast                       | 0                                                    | —            | —           | Fast fail (5 s per op)        |
+   | Operation                 | Trigger                      | Retries                              | Base backoff | Max backoff | Notes                                       |
+   | ------------------------- | ---------------------------- | ------------------------------------ | ------------ | ----------- | ------------------------------------------- |
+   | Chest open (normal)       | Transient I/O                | 3 (`CHEST_OP_MAX_RETRIES`)           | 500 ms       | 5 s         | Exponential backoff                         |
+   | Chest open (chunk reload) | Chunk not loaded             | +2 (`CHUNK_RELOAD_EXTRA_RETRIES`)    | 3 s          | 10 s        | Slower backoff to let the chunk stream in   |
+   | Shulker open              | GUI open timeout             | 2 (`SHULKER_OP_MAX_RETRIES`)         | 500 ms       | 5 s         | Exponential backoff                         |
+   | Navigation                | Path failure                 | 2 (`NAVIGATION_MAX_RETRIES`)         | 500 ms       | 5 s         | Exponential backoff                         |
+   | Validation / discovery    | Fail-fast                    | 0                                    | —            | —           | Fast fail (5 s per op)                      |
 5. **Single-server design** — no coordination between instances. Two bots
    pointing at the same `data/` directory will race each other's atomic
    writes (last-write-wins on every file), produce parallel trades that

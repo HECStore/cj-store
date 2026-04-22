@@ -71,20 +71,29 @@ completion before any new inbound message is picked up. See
 [src/store/mod.rs](src/store/mod.rs) `Store::run`.
 
 ```text
-    ┌─────────────────────────────────────────────────┐
-    │  loop {                                         │
-    │    if queue non-empty AND !processing_order {   │
-    │      pop order -> execute_queued_order          │ ◄── blocks other msgs
-    │      continue                                   │     until done
-    │    }                                            │
-    │    select! {                                    │
-    │      msg = rx.recv()     -> dispatch(msg)       │
-    │      _   = autosave_tick -> save_if_dirty()     │
-    │      _   = cleanup_tick  -> prune_caches()      │
-    │    }                                            │
-    │  }                                              │
-    └─────────────────────────────────────────────────┘
+    ┌───────────────────────────────────────────────────────┐
+    │  loop {                                               │
+    │    if queue non-empty AND !processing_order {         │
+    │      process_next_order()    ── runs to completion,   │
+    │      save_if_dirty()            no cancel points      │
+    │      continue                ── re-check queue before │
+    │    }                            blocking on recv      │
+    │                                                       │
+    │    msg = rx.recv().await    ── single blocking await  │
+    │    dispatch(msg)                                      │
+    │                                                       │
+    │    if dirty AND elapsed >= autosave_interval          │
+    │      save_if_dirty()                                  │
+    │    if elapsed >= cleanup_interval                     │
+    │      prune_caches()                                   │
+    │  }                                                    │
+    └───────────────────────────────────────────────────────┘
 ```
+
+Autosave and cleanup are elapsed-time checks on each post-message pass, not
+separate tick channels. `tokio::select!` was deliberately avoided — cancelling
+an in-flight order's oneshot receivers mid-operation caused stuck trades; see
+the inline comment in [src/store/mod.rs](src/store/mod.rs) `Store::run`.
 
 Tick cadence:
 
@@ -152,16 +161,23 @@ unrepresentable.
            │   Trading   │  trade GUI opened; wait for player confirm
            └──────┬──────┘
                   │  /trade completed (or timeout -> RolledBack)
-                  ▼
-           ┌─────────────┐
-           │ Depositing  │  bot puts received items back into storage
-           └──────┬──────┘
-                  │  deposit ok
-                  ▼
+                  │
+                  ├─── no post-trade chest work needed ────┐
+                  ▼                                        │
+           ┌─────────────┐                                 │
+           │ Depositing  │  bot puts received items        │
+           └──────┬──────┘  back into storage              │
+                  │  deposit ok                            │
+                  ▼                                        ▼
            ┌─────────────┐          ┌──────────────┐
            │  Committed  │          │  RolledBack  │  (terminal)
            └─────────────┘          └──────────────┘
 ```
+
+`Depositing` is optional — `Trading → Committed` is valid for trades whose
+payout goes straight to the user balance (e.g. buys where diamonds are
+credited to the ledger rather than written to a chest). `commit()` accepts
+either `Trading` or `Depositing` as the predecessor.
 
 `TradeState` is mirrored to `data/current_trade.json` at every transition
 and cleared on a terminal state. On startup the Store looks for a leftover
@@ -450,8 +466,7 @@ The coarse states a player sees map onto it as: `QUEUED` = `Queued`,
 | Max orders per user  | 8                             | Prevents queue monopolization                          |
 | Global queue cap     | 128 (`MAX_QUEUE_SIZE`)        | Enqueue rejected on saturation                         |
 | Persistence          | `data/queue.json`             | Survives restarts                                      |
-| Trade accept timeout | 30 s                          | Order cancelled if player doesn't accept               |
-| Trade complete timeout | `trade_timeout_ms` (45 s)   | Order cancelled if trade doesn't complete              |
+| Trade timeout        | `trade_timeout_ms` (45 s)     | Bounds the whole `/trade` lifecycle (request → accept → exchange); order cancelled on expiry |
 | Retry on timeout     | No                            | Timed-out orders are cancelled, not retried            |
 
 ### Player feedback messages
@@ -501,24 +516,23 @@ cannot be traded — only loose items.
 ```text
   1. Bot whispers player with trade details
   2. Bot sends: /trade <username>
-  3. ─┬─ Player accepts (within 30s) ──→ GUI opens
+  3. ─┬─ Player accepts ──→ GUI opens
      ├─ Player declines ──→ Trade aborted
-     └─ Timeout (30s) ──→ Trade aborted
+     └─ Server emits "not been accepted" ──→ Trade aborted
   4. Player adds items to their offer slots
-  5. Player clicks confirm (indicators turn lime)
-  6. Bot validates: correct items + counts + lime indicators
+  5. Player clicks confirm (indicators leave gray)
+  6. Bot validates: correct items + counts + no gray indicators
   7. ─┬─ Validation passes ──→ Bot clicks accept ──→ Trade completes
      └─ Validation fails ──→ Trade aborted
-  8. ─┬─ Completed within 45s ──→ Items exchanged ──→ Success
-     └─ Timeout (45s) ──→ Trade cancelled
+  8. ─┬─ Completes before `trade_timeout_ms` ──→ Items exchanged ──→ Success
+     └─ Timeout (`trade_timeout_ms`, default 45 s) ──→ Trade cancelled
 ```
 
 ### Timeouts
 
 | Phase                    | Timeout                       | On timeout                                      |
 | ------------------------ | ----------------------------- | ----------------------------------------------- |
-| Trade request acceptance | 30 s                          | Order cancelled, player notified                |
-| Trade completion         | `trade_timeout_ms` (45 s)     | Trade cancelled, rollback attempted             |
+| `/trade` lifecycle       | `trade_timeout_ms` (45 s)     | One bound covers request → accept → exchange; trade cancelled, rollback attempted |
 | Pathfinding              | `pathfinding_timeout_ms` (60 s) | Navigation aborted, current action fails      |
 
 ### Trade GUI layout (9×6, 54 slots)
@@ -566,7 +580,12 @@ Player status dye meanings:
 | `magenta_dye` | Waiting   | Player reviewing/modifying      |
 | `lime_dye`     | Confirmed | Player accepted the trade       |
 
-The bot only clicks accept when all player indicators show `lime_dye`.
+The bot clicks accept once no player indicator is still `gray_dye` —
+i.e. the player has moved past the default "not interacted" state on
+every slot. `magenta_dye` and `lime_dye` both count as ready; strict
+correctness is enforced by re-validating the player's offered items on
+every tick before the click (see the race-condition notes in
+[src/bot/trade.rs](src/bot/trade.rs) around the accept loop).
 
 ### Safety validations
 
@@ -575,7 +594,7 @@ Before accepting any trade, the bot verifies:
 1. Item types match using normalized item IDs.
 2. Item counts are exact (not less, not more).
 3. No unexpected items present in the offer.
-4. All player indicators show `lime_dye`.
+4. No player indicator is still `gray_dye` (player has interacted).
 
 Failure at any step aborts the trade and notifies the player.
 
@@ -650,7 +669,7 @@ Example — buy into a pool of 100 items, 1000 diamonds, fee 12.5 % (k =
 | 25       | 1000 × 25 / (100-25) × 1.125    | 375.00      | 15.00     | +32 %      |
 | 50       | 1000 × 50 / (100-50) × 1.125    | 1,125.00    | 22.50     | +98 %      |
 | 90       | 1000 × 90 / (100-90) × 1.125    | 10,125.00   | 112.50    | +890 %     |
-| 99       | 1000 × 99 / (100-99) × 1.125    | 111,375.00  | 1,125.00  | +9,807 %   |
+| 99       | 1000 × 99 / (100-99) × 1.125    | 111,375.00  | 1,125.00  | +9,800 %   |
 
 Sell payout at the same reserves (fee 12.5 %):
 

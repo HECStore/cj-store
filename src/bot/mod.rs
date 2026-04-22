@@ -252,17 +252,19 @@ pub async fn bot_task(
                         // Double backoff on failure (bounded by max_backoff) to avoid hammering the server.
                         backoff = (backoff * 2).min(max_backoff);
                     } else {
-                        // Poll up to 20s for Event::Init to populate bot.client. connect() returns
-                        // as soon as the task is spawned, but the client handle is only set once
-                        // the server completes the login/configuration handshake.
+                        // Poll up to init_timeout for Event::Init to populate bot.client.
+                        // connect() returns as soon as the task is spawned, but the client
+                        // handle is only set once the server completes the login /
+                        // configuration handshake.
+                        let init_timeout = tokio::time::Duration::from_secs(20);
                         let mut ok = false;
                         let start = tokio::time::Instant::now();
-                        while start.elapsed() < tokio::time::Duration::from_secs(20) {
+                        while start.elapsed() < init_timeout {
                             if bot.client.read().await.is_some() {
                                 ok = true;
                                 break;
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS)).await;
                         }
                         if ok {
                             // Successful reconnect: reset backoff to the initial floor.
@@ -328,7 +330,7 @@ pub async fn bot_task(
                                     // least one slot is non-zero. An all-zero array is ambiguous - it could
                                     // mean "never scanned yet" rather than "confirmed empty", and treating
                                     // an unscanned chest as empty would skip valid destinations.
-                                    let known_counts = if target_chest.amounts.len() == 54
+                                    let known_counts = if target_chest.amounts.len() == crate::constants::DOUBLE_CHEST_SLOTS
                                         && target_chest.amounts.iter().any(|&x| x > 0) {
                                         Some(&target_chest.amounts)
                                     } else {
@@ -373,7 +375,7 @@ pub async fn bot_task(
                                     // Same all-zero ambiguity guard as the deposit path: an unscanned chest
                                     // has a zero-filled amounts array which we must NOT treat as "all empty",
                                     // otherwise we'd refuse to pull from chests that actually have stock.
-                                    let known_counts = if target_chest.amounts.len() == 54
+                                    let known_counts = if target_chest.amounts.len() == crate::constants::DOUBLE_CHEST_SLOTS
                                         && target_chest.amounts.iter().any(|&x| x > 0) {
                                         Some(&target_chest.amounts)
                                     } else {
@@ -575,13 +577,14 @@ async fn validate_node_physically(
                 // Verify contents are all shulker boxes
                 match container.contents() {
                     Some(contents) => {
-                        // A valid storage chest is a double chest with exactly 54 slots.
-                        // Single chests (27) or any other size indicate the block at this
-                        // position isn't the expected double chest.
-                        if contents.len() != 54 {
+                        // A valid storage chest is a double chest with exactly
+                        // `DOUBLE_CHEST_SLOTS` slots. Single chests or any other
+                        // size indicate the block at this position isn't the
+                        // expected double chest.
+                        if contents.len() != crate::constants::DOUBLE_CHEST_SLOTS {
                             validation_errors.push(format!(
-                                "Chest {} has {} slots (expected 54)",
-                                chest_index, contents.len()
+                                "Chest {} has {} slots (expected {})",
+                                chest_index, contents.len(), crate::constants::DOUBLE_CHEST_SLOTS
                             ));
                         } else {
                             // Every slot must hold a shulker box - empty slots and non-shulker
@@ -678,7 +681,7 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             }
 
             // Broadcast chat to the bot task for trade failure detection.
-            let _ = state.chat_tx.send(message_text.clone());
+            let _ = state.chat_tx.send(message_text);
 
             if let Some(store_tx) = &state.store_tx {
                 if let Err(e) = handle_chat_message(client, m, store_tx).await {

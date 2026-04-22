@@ -38,8 +38,6 @@ pub async fn connect(
         connecting: bot.connecting.clone(),
     };
 
-    let account = account.clone();
-    let server_address = server_address.clone();
     let shutdown = bot.shutdown.clone();
 
     // In azalea 0.15+, ClientBuilder::start runs on a LocalSet (not Send).
@@ -86,8 +84,9 @@ pub async fn connect(
 /// 3. Aborting the Azalea client task
 /// 4. Waiting for OS-level TCP connection closure
 ///
-/// **Timing**: The function waits approximately 4 seconds total (2s for disconnect packet + 2s after abort)
-/// to ensure the server sees the disconnect immediately and the bot doesn't linger on the server.
+/// **Timing**: Up to ~4 seconds total (up to `DELAY_DISCONNECT_MS` for the disconnect
+/// packet to flush — exits early when the client clears — plus `DELAY_DISCONNECT_MS`
+/// after abort for TCP teardown).
 ///
 /// **Why the long waits?**
 /// - Network I/O: The disconnect packet must be sent over the network
@@ -119,19 +118,10 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
         }
     };
     
-    // Give the disconnect packet time to be sent and processed.
-    // This is the FIRST of two ~2s waits. It happens BEFORE aborting the task so
-    // that Azalea's event loop is still alive to actually flush the disconnect
-    // packet out of its send buffer; aborting too early would drop the packet
-    // and the server would only notice us via a keep-alive timeout.
-    // IMPORTANT: We need to wait long enough for:
-    // 1. The disconnect packet to be sent over the network
-    // 2. The server to receive and process it
-    // 3. The TCP connection to be closed by both sides
-    // 4. The OS to release the socket
-    // Wait for the disconnect packet to be sent before aborting the task.
-    // Azalea's event loop must still be alive to flush the packet; aborting too
-    // early would drop it and the server would only notice via keep-alive timeout.
+    // Wait for the disconnect packet to flush before aborting the task.
+    // Azalea's event loop must still be alive to flush the packet out of its
+    // send buffer; aborting too early would drop it and the server would only
+    // notice us via a keep-alive timeout. Exits early once the client clears.
     if had_client {
         let mut elapsed = tokio::time::Duration::from_millis(0);
         let check_interval = tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS);

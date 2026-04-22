@@ -4,6 +4,7 @@ use azalea::BlockPos;
 use azalea::inventory::operations::PickupClick;
 use tracing::{debug, error, info, warn};
 
+use crate::constants::HOTBAR_SLOT_0;
 use super::{Bot, shulker};
 
 /// Ensure inventory is empty by dumping items to buffer chest if configured
@@ -427,10 +428,6 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
             "Inventory closed".to_string()
         })?;
 
-    // Hotbar slot 0 is container index 36 in the player inventory slot space
-    // (0-8 = crafting/armor, 9-35 = main inventory, 36-44 = hotbar).
-    const HOTBAR_SLOT_0: usize = 36;
-
     // Log current state for debugging
     let cursor_item = carried_item(&client);
     debug!(
@@ -798,7 +795,6 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
 async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Result<(), String> {
     use azalea::inventory::operations::PickupClick;
     
-    const HOTBAR_SLOT_0: usize = 36;
     const MAX_RETRIES: u32 = 3;
     
     warn!("recover_shulker_to_slot_0: Starting shulker recovery process");

@@ -9,10 +9,9 @@
 //! - Operator flag for privileged commands (additem, removeitem, addcurrency, removecurrency)
 //!
 //! ## Mojang API Integration
-//! - `get_uuid()` and `get_uuid_async()` call Mojang's public API to resolve usernames to UUIDs
-//! - `get_uuid_async()` is the preferred async version for better runtime performance
-//! - `get_uuid()` is a blocking wrapper for backwards compatibility
+//! - `get_uuid_async()` calls Mojang's public API to resolve usernames to UUIDs
 //! - Returns hyphenated UUID format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+//! - Caching (TTL = `UUID_CACHE_TTL_SECS`) is handled in `store::utils::resolve_user_uuid`
 
 use std::{
     collections::{HashMap, HashSet},
@@ -98,7 +97,6 @@ impl User {
     /// - Network errors: Connection issues
     /// - Timeout: Request took longer than 10 seconds
     ///
-    /// **Preferred**: Use this async version instead of the blocking `get_uuid()`.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn get_uuid_async(username: &str) -> Result<String, String> {
         let url = format!(
@@ -184,7 +182,7 @@ impl User {
         let mut users = HashMap::new();
 
         if !dir_path.exists() {
-            println!(
+            eprintln!(
                 "Users directory not found at {}. Returning an empty HashMap.",
                 dir_path.display()
             );

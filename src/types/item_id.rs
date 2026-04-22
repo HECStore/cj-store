@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 /// A normalized, non-empty item identifier.
 ///
 /// Constructed via [`ItemId::new`] which strips any `minecraft:` prefix and
-/// rejects empty strings. The inner value is always lowercase and prefix-free
-/// (e.g. `"cobblestone"`, not `"minecraft:cobblestone"`).
+/// rejects empty strings. The inner value is prefix-free (e.g. `"cobblestone"`,
+/// not `"minecraft:cobblestone"`). Case is preserved as given — Minecraft item
+/// IDs are lowercase by convention but this type does not enforce casing.
 ///
 /// Implements `Deref<Target = str>` so it can be passed to any function
 /// expecting `&str` via deref coercion, and `Borrow<str>` so it works as a

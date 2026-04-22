@@ -65,14 +65,10 @@ impl Pair {
     // One file per pair keeps diffs small and avoids rewriting the whole catalog on every update.
     const PAIRS_DIR: &str = "data/pairs";
 
-    /// Number of slots in a shulker box (27 = 3 rows × 9 columns).
-    /// Used as the unit of storage capacity since the store organizes stock in shulker boxes.
-    pub const SHULKER_BOX_SLOTS: i32 = 27;
-
     /// Calculate shulker capacity for a given stack size.
     /// Use this when you don't have a Pair instance but know the stack size.
     pub fn shulker_capacity_for_stack_size(stack_size: i32) -> i32 {
-        Self::SHULKER_BOX_SLOTS * stack_size
+        crate::constants::SHULKER_BOX_SLOTS as i32 * stack_size
     }
 
     /// Sanitizes an item name for use in filenames.

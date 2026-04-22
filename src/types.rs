@@ -36,10 +36,6 @@ pub mod user;
 // instead of reaching into each submodule directly.
 pub use chest::Chest;
 pub use item_id::ItemId;
-// `Node` is accessed through `storage::Node` in most of the codebase and only
-// referenced via this re-export from tests, so the compiler flags it as unused
-// in non-test builds. Keep it exported for API consistency with the other types.
-#[allow(unused_imports)]
 pub use node::Node;
 pub use order::Order;
 pub use pair::Pair;

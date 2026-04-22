@@ -295,7 +295,12 @@ shape differs by variant. Two examples matter most for recovery:
       "queued_at": "2026-04-17T14:41:14Z"
     },
     "plan": [
-      { "chest_id": 0, "slot_index": 3, "amount": 64 }
+      {
+        "chest_id": 0,
+        "position": { "x": 100, "y": 64, "z": 100 },
+        "item": "cobblestone",
+        "amount": 64
+      }
     ]
   }
 }
@@ -310,11 +315,16 @@ hand-reconcile, referenced by [RECOVERY.md § 4](RECOVERY.md#phase-depositing)):
     "order": { /* same QueuedOrder shape as above */ },
     "trade_result": {
       "items_received": [
-        { "item": "cobblestone", "count": 64 }
+        { "item": "cobblestone", "amount": 64 }
       ]
     },
     "deposit_plan": [
-      { "chest_id": 2, "slot_index": 0, "amount": 64 }
+      {
+        "chest_id": 2,
+        "position": { "x": 106, "y": 64, "z": 100 },
+        "item": "cobblestone",
+        "amount": 64
+      }
     ]
   }
 }

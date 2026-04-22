@@ -1,7 +1,7 @@
 //! # Formal state machine for trade lifecycle
 //!
-//! Trade states (Queued -> Processing -> Trading -> Committed/RolledBack) used
-//! to be implicit in code flow.  This module encodes them as an enum so that:
+//! Trade states (Queued -> Withdrawing -> Trading -> [Depositing] -> Committed/RolledBack)
+//! used to be implicit in code flow.  This module encodes them as an enum so that:
 //!
 //! - The current phase of an in-flight trade is always inspectable (status
 //!   commands, debug logs, stuck-order diagnostics).
@@ -14,9 +14,17 @@
 //!
 //! ```text
 //!   Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
-//!               │               │           │
+//!               │               │  └────────────────►    ▲
+//!               │               │    (skip Depositing    │
+//!               │               │     for direct-to-     │
+//!               │               │     balance trades)    │
 //!               └───────────────┴───────────┴──► RolledBack
 //! ```
+//!
+//! `Depositing` is optional: `Trading → Committed` is a valid transition for
+//! trades whose payout goes straight to the user balance (e.g. buys delivering
+//! diamonds) and so have no post-trade chest work. See `commit()` accepting
+//! either `Trading` or `Depositing` as the predecessor.
 
 use std::fmt;
 use std::io;

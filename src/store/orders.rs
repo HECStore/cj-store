@@ -1114,7 +1114,7 @@ mod tests {
         let chest: &mut Chest = &mut storage.nodes[0].chests[2];
         chest.item = ItemId::from_normalized(item.to_string());
         // Put all stock in slot 0 for simplicity (within default shulker capacity).
-        chest.amounts = vec![0; 54];
+        chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
         chest.amounts[0] = stock;
         storage
     }
@@ -1162,7 +1162,7 @@ mod tests {
                                 item, amount, ..
                             } => (item, amount),
                         };
-                        let mut amounts = vec![-1i32; 54];
+                        let mut amounts = vec![-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
                         // Compute new value for slot 0 based on the prior state
                         let prior = target_chest.amounts.get(0).copied().unwrap_or(0);
                         amounts[0] = (prior + delta).max(0);
@@ -1183,7 +1183,7 @@ mod tests {
                         // (typically diamonds); for sells, it's bot_offers
                         // echoing back. We return player_offers so
                         // post-trade accounting uses what the player gave.
-                        let _received = bot_offers;
+                        let _ = bot_offers;
                         let _ = respond_to.send(Ok(player_offers));
                     }
                     _ => {

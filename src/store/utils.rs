@@ -199,8 +199,7 @@ pub fn summarize_transfers(transfers: &[crate::types::storage::ChestTransfer], m
     }
 
     let mut parts: Vec<String> = Vec::new();
-    for (i, t) in transfers.iter().take(max).enumerate() {
-        let _ = i;
+    for t in transfers.iter().take(max) {
         // DO NOT include coordinates in player-facing messages (security)
         parts.push(format!(
             "{}x {}",

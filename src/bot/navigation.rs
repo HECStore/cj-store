@@ -8,12 +8,12 @@ use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::PathfinderClientExt;
 use tracing::{info, warn};
 
-use crate::constants::{NAVIGATION_MAX_RETRIES, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay};
+use crate::constants::{
+    DELAY_MEDIUM_MS, NAVIGATION_MAX_RETRIES, PATHFINDING_CHECK_INTERVAL_MS,
+    RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay,
+};
 use crate::types::{Chest, Position};
 use super::Bot;
-
-/// Interval between position checks in milliseconds
-const PATHFINDING_CHECK_INTERVAL_MS: u64 = 100;
 
 /// Navigate to a position using pathfinding (single attempt).
 /// Uses Azalea's built-in pathfinding to walk to the target position.
@@ -204,7 +204,7 @@ pub async fn go_to_chest(bot: &Bot, chest: &Chest, node_position: &Position) -> 
     );
     
     // Small delay to ensure we're positioned correctly
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
     
     Ok(())
 }

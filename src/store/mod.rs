@@ -195,10 +195,11 @@ impl Store {
         }
 
         info!(
-            "Store initialized successfully with {} pairs, {} users, {} orders, {} nodes",
+            "Store initialized successfully with {} pairs, {} users, {} orders, {} trades, {} nodes",
             pairs.len(),
             users.len(),
             orders.len(),
+            trades.len(),
             storage.nodes.len()
         );
 

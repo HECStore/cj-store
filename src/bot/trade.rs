@@ -4,6 +4,7 @@ use azalea::inventory::operations::PickupClick;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+use crate::constants::{DOUBLE_CHEST_SLOTS, SHULKER_BOX_SLOTS};
 use crate::messages::TradeItem;
 use super::Bot;
 
@@ -99,7 +100,7 @@ pub async fn wait_for_trade_menu_or_failure(
         if inv.id() != 0 {
             let contents = inv.contents();
             let contents_len = contents.as_ref().map(|c| c.len()).unwrap_or(0);
-            if contents_len == 54 {
+            if contents_len == DOUBLE_CHEST_SLOTS {
                 // A 54-slot container alone is not proof this is the trade GUI -
                 // any double chest is also 54. Stronger identification: validate
                 // wool buttons and dye indicators exist at their expected slots.
@@ -210,7 +211,7 @@ pub async fn place_items_from_inventory_into_trade(
         for i in contents_len..slots_all.len() {
             let stack = &slots_all[i];
             if stack.count() > 0 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id {
-                let slot_type = if i >= contents_len + 27 { "hotbar" } else { "inventory" };
+                let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inventory" };
                 found_items.push(format!("slot {} ({}): {}x", i, slot_type, stack.count()));
                 total_count += stack.count();
             }
@@ -266,7 +267,7 @@ pub async fn place_items_from_inventory_into_trade(
             for i in contents_len..slots_all.len() {
                 let stack = &slots_all[i];
                 if stack.count() > 0 {
-                    let slot_type = if i >= contents_len + 27 { "hotbar" } else { "inv" };
+                    let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inv" };
                     inventory_contents.push(format!("slot {} ({}): {}x {}", i, slot_type, stack.count(), stack.kind()));
                 }
             }
@@ -280,7 +281,7 @@ pub async fn place_items_from_inventory_into_trade(
             ));
         };
 
-        let slot_type = if inv_slot >= contents_len + 27 { "hotbar" } else { "inventory" };
+        let slot_type = if inv_slot >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inventory" };
         debug!("Found {}x {} in slot {} ({})", stack_count, target_id, inv_slot, slot_type);
 
         // Find an empty offer slot (or a slot with same item and room).
@@ -684,7 +685,6 @@ pub async fn execute_trade_with_player(
     //    the server and accidentally un-accepting (a second click on lime wool toggles off).
     let status_slots = trade_player_status_slots();
     let player_slots = trade_player_offer_slots();
-    let _bot_slots = trade_bot_offer_slots();
 
     let start = tokio::time::Instant::now();
     let accept_slots = trade_accept_slots();

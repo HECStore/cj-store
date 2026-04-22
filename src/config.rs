@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::types::Position;
 use crate::fsutil::write_atomic;
-use crate::constants::{FEE_MIN, FEE_MAX};
+use crate::constants::{FEE_MIN, FEE_MAX, TRADE_TIMEOUT_MS, PATHFINDING_TIMEOUT_MS};
 
 /// Application configuration loaded from `data/config.json`.
 ///
@@ -78,9 +78,10 @@ pub struct Config {
     pub autosave_interval_secs: u64,
 }
 
-// Default value functions for serde
-fn default_trade_timeout_ms() -> u64 { 45_000 }
-fn default_pathfinding_timeout_ms() -> u64 { 60_000 }
+// Default value functions for serde. Timeout defaults reference the
+// canonical constants so the value lives in exactly one place.
+fn default_trade_timeout_ms() -> u64 { TRADE_TIMEOUT_MS }
+fn default_pathfinding_timeout_ms() -> u64 { PATHFINDING_TIMEOUT_MS }
 fn default_max_orders() -> usize { 10_000 }
 fn default_max_trades_in_memory() -> usize { 50_000 }
 fn default_autosave_interval_secs() -> u64 { 2 }

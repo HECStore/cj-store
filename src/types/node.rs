@@ -29,6 +29,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::constants::{CHESTS_PER_NODE, NODE_SPACING};
 use crate::fsutil::write_atomic;
 use crate::types::chest::Chest;
 use crate::types::ItemId;
@@ -63,9 +64,9 @@ impl Node {
         let node_position = Self::calc_position(node_id, storage_position);
 
         // Create 4 chests with their respective positions
-        let mut chests = Vec::with_capacity(4);
+        let mut chests = Vec::with_capacity(CHESTS_PER_NODE);
 
-        for index in 0..4 {
+        for index in 0..CHESTS_PER_NODE as i32 {
             let mut chest = Chest::new(node_id, &node_position, index);
 
             // Node 0 has special reserved chests (forced, cannot change)
@@ -128,12 +129,18 @@ impl Node {
 
         // Recalculate chest positions to ensure consistency (in case storage origin moved)
         for chest in &mut node.chests {
-            chest.position = Chest::new(id, &node.position, chest.index).position;
+            chest.position = Chest::calc_position(&node.position, chest.index);
         }
 
         // Ensure we have exactly 4 chests
-        if node.chests.len() != 4 {
-            return Err(format!("Node {} has {} chests, expected 4", id, node.chests.len()).into());
+        if node.chests.len() != CHESTS_PER_NODE {
+            return Err(format!(
+                "Node {} has {} chests, expected {}",
+                id,
+                node.chests.len(),
+                CHESTS_PER_NODE
+            )
+            .into());
         }
 
         // Sort chests by index for consistent ordering
@@ -250,7 +257,11 @@ impl Node {
                 ring += 1;
             }
 
-            // Offset of this id within its ring, starting at 0.
+            // Offset of this id within its ring. 1-indexed: the ring's first
+            // id maps to pos_in_ring=1 (e.g. id=1 for ring 1, id=9 for ring 2),
+            // and the last id maps to pos_in_ring=8*ring. The side-selection
+            // formula below compensates, so every ring walks its 8*ring nodes
+            // in a single clockwise pass.
             let pos_in_ring = id - (ring - 1) * ring * 4;
             // Each of the 4 sides of a ring holds `2*ring` nodes; together
             // they cover the 8*ring nodes of the ring.
@@ -270,41 +281,26 @@ impl Node {
                 _ => (-ring + (pos_in_ring - 3 * side), -ring), // Top side (walking +x)
             };
 
-            // Scale grid coordinates by 3-block spacing. The 3-block gap
-            // leaves room for the 2-wide chest footprint plus a walking lane
-            // between adjacent nodes, preventing their 2x2 chest clusters
-            // from overlapping.
+            // Scale grid coordinates by the per-node block spacing. The
+            // gap leaves room for the 2-wide chest footprint plus a walking
+            // lane between adjacent nodes, preventing their 2x2 chest
+            // clusters from overlapping.
             Position {
-                x: storage_position.x + dx * 3,
+                x: storage_position.x + dx * NODE_SPACING,
                 y: storage_position.y,
-                z: storage_position.z + dz * 3,
+                z: storage_position.z + dz * NODE_SPACING,
             }
         }
     }
 
-    /// Calculate chest position from node ID, chest index, and node position.
-    ///
-    /// This is a static method that can calculate a chest's world position
-    /// without creating a full Chest object. Useful for node validation
-    /// and for recomputing positions in `load()` when the storage origin
-    /// has shifted.
-    ///
-    /// The returned position is the block the bot interacts with (the
-    /// south-facing front block of the double chest), not the chest block
-    /// itself — that is why every branch uses `z - 1`.
+    /// Thin wrapper around [`Chest::calc_position`] kept for a stable call site
+    /// in the bot validation path, which passes the node_id for future use.
     ///
     /// # Arguments
-    /// * `_node_id` - Node ID (unused, for future use)
+    /// * `_node_id` - Node ID (unused; retained because the bot validation path
+    ///   carries it through for logging context)
     /// * `chest_index` - Chest index (0-3)
     /// * `node_position` - World position of the node
-    ///
-    /// # Layout (looking north from P)
-    /// All chests accessed from z-1 (south face of double chests).
-    /// ```
-    /// 01  <- y+1 (top row)
-    /// 23  <- y (bottom row)
-    /// ```
-    /// Chest 0,2: x-2 (left)    Chest 1,3: x-1 (right)
     ///
     /// # Panics
     /// Panics if chest_index is not in range 0-3.
@@ -313,29 +309,7 @@ impl Node {
         chest_index: i32,
         node_position: &Position,
     ) -> Position {
-        match chest_index {
-            0 => Position {
-                x: node_position.x - 2, // Left column
-                y: node_position.y + 1, // Top chest
-                z: node_position.z - 1, // South face (where we click)
-            },
-            1 => Position {
-                x: node_position.x - 1, // Right column
-                y: node_position.y + 1, // Top chest
-                z: node_position.z - 1, // South face (where we click)
-            },
-            2 => Position {
-                x: node_position.x - 2, // Left column
-                y: node_position.y,     // Bottom chest
-                z: node_position.z - 1, // South face (where we click)
-            },
-            3 => Position {
-                x: node_position.x - 1, // Right column
-                y: node_position.y,     // Bottom chest
-                z: node_position.z - 1, // South face (where we click)
-            },
-            _ => panic!("Invalid chest index: {} (must be 0-3)", chest_index),
-        }
+        Chest::calc_position(node_position, chest_index)
     }
 }
 

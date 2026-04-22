@@ -17,6 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::constants::{CHESTS_PER_NODE, DOUBLE_CHEST_SLOTS};
 use crate::types::item_id::ItemId;
 use crate::types::position::Position;
 
@@ -76,52 +77,8 @@ impl Chest {
     /// a bug in the calling code, not a runtime error that can be recovered from.
     /// All callers (Node::new, Node::load) control the index parameter directly.
     pub fn new(node_id: i32, node_position: &Position, index: i32) -> Chest {
-        // Validate index at creation time
-        assert!(
-            (0..=3).contains(&index),
-            "Invalid chest index: {} (must be 0-3). This is a programming error.",
-            index
-        );
-        
-        let id = node_id * 4 + index;
-
-        // Calculate chest position based on node position and index
-        // Layout (top down, P is southeast corner at x, z):
-        // ```
-        // NCCN  <- z-2 (back of double chests, not accessed)
-        // NCCN  <- z-1 (front of double chests, where we click)
-        // XSNP  <- z (working row)
-        // ```
-        // All 4 chests are accessed from z-1 (south face).
-        // When standing at P looking north, chest IDs are:
-        //   01  <- y+1 (top row)
-        //   23  <- y (bottom row)
-        // Chests are at x-2 (left) and x-1 (right), west of P.
-        let position = match index {
-            0 => Position {
-                x: node_position.x - 2,  // Left column
-                y: node_position.y + 1,  // Top chest
-                z: node_position.z - 1,  // South face (where we click)
-            },
-            1 => Position {
-                x: node_position.x - 1,  // Right column
-                y: node_position.y + 1,  // Top chest
-                z: node_position.z - 1,  // South face (where we click)
-            },
-            2 => Position {
-                x: node_position.x - 2,  // Left column
-                y: node_position.y,      // Bottom chest
-                z: node_position.z - 1,  // South face (where we click)
-            },
-            3 => Position {
-                x: node_position.x - 1,  // Right column
-                y: node_position.y,      // Bottom chest
-                z: node_position.z - 1,  // South face (where we click)
-            },
-            // This branch is unreachable due to the assert above,
-            // but we include it for completeness
-            _ => unreachable!("Index validated above"),
-        };
+        let id = node_id * CHESTS_PER_NODE as i32 + index;
+        let position = Self::calc_position(node_position, index);
 
         Chest {
             id,
@@ -129,8 +86,56 @@ impl Chest {
             index,
             position,
             item: ItemId::EMPTY,  // empty = unassigned chest
-            amounts: vec![0; 54], // one entry per slot in a double chest
+            amounts: vec![0; DOUBLE_CHEST_SLOTS],
         }
     }
 
+    /// Calculate the world position of a chest from its parent node's position and its index.
+    ///
+    /// Returned position is the block the bot interacts with (the south-facing
+    /// front block of the double chest), not the chest block itself — that is
+    /// why every branch uses `z - 1`.
+    ///
+    /// Layout (top down, P is southeast corner at x, z):
+    /// ```text
+    /// NCCN  <- z-2 (back of double chests, not accessed)
+    /// NCCN  <- z-1 (front of double chests, where we click)
+    /// NSNP  <- z (working row; N = empty, S = shulker station, P = bot position)
+    /// ```
+    /// When standing at P looking north, chest indices are:
+    /// ```text
+    /// 01  <- y+1 (top row)
+    /// 23  <- y (bottom row)
+    /// ```
+    /// Left column: x-2. Right column: x-1.
+    ///
+    /// # Panics
+    /// Panics if `index` is not in range 0-3. This is a programming error;
+    /// all callers (Node::new, Node::load, Node::calc_chest_position) control
+    /// the index parameter directly.
+    pub fn calc_position(node_position: &Position, index: i32) -> Position {
+        match index {
+            0 => Position {
+                x: node_position.x - 2,
+                y: node_position.y + 1,
+                z: node_position.z - 1,
+            },
+            1 => Position {
+                x: node_position.x - 1,
+                y: node_position.y + 1,
+                z: node_position.z - 1,
+            },
+            2 => Position {
+                x: node_position.x - 2,
+                y: node_position.y,
+                z: node_position.z - 1,
+            },
+            3 => Position {
+                x: node_position.x - 1,
+                y: node_position.y,
+                z: node_position.z - 1,
+            },
+            _ => panic!("Invalid chest index: {} (must be 0-3)", index),
+        }
+    }
 }

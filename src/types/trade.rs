@@ -132,30 +132,30 @@ impl Trade {
             return Ok(Vec::new());
         }
 
-        // Count files first for logging
-        let file_count = fs::read_dir(dir_path)?
+        // Collect .json entries in a single directory scan. Reading the
+        // directory twice (once for count, once for load) would be wasteful
+        // and could report inconsistent counts if files were added or removed
+        // between scans.
+        let json_paths: Vec<PathBuf> = fs::read_dir(dir_path)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-            .count();
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        let file_count = json_paths.len();
 
-        for entry in fs::read_dir(dir_path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-                match fs::read_to_string(&path) {
-                    Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
-                        Ok(trade) => {
-                            trades.push(trade);
-                        }
-                        Err(e) => tracing::warn!(
-                            "Could not deserialize trade from {}: {}",
-                            path.display(),
-                            e
-                        ),
-                    },
-                    Err(e) => tracing::warn!("Could not read trade file {}: {}", path.display(), e),
-                }
+        for path in &json_paths {
+            match fs::read_to_string(path) {
+                Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
+                    Ok(trade) => {
+                        trades.push(trade);
+                    }
+                    Err(e) => tracing::warn!(
+                        "Could not deserialize trade from {}: {}",
+                        path.display(),
+                        e
+                    ),
+                },
+                Err(e) => tracing::warn!("Could not read trade file {}: {}", path.display(), e),
             }
         }
 

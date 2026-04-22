@@ -88,11 +88,12 @@ pub struct Storage {
 // exercised by the unit tests in this file.
 #[allow(dead_code)]
 impl Storage {
-    /// Number of slots per chest (standard double chest = 54 slots)
-    pub const SLOTS_PER_CHEST: usize = 54;
+    /// Number of slots per chest (alias for `crate::constants::DOUBLE_CHEST_SLOTS`,
+    /// kept for readability at call sites inside this file).
+    pub const SLOTS_PER_CHEST: usize = crate::constants::DOUBLE_CHEST_SLOTS;
 
     /// Default maximum item capacity per shulker box (27 slots × 64 items = 1728).
-    /// 
+    ///
     /// **Note**: Actual capacity varies by item type. Use `Pair::shulker_capacity_for_stack_size()`
     /// or `pair.shulker_capacity()` for accurate capacity based on item stack size.
     ///
@@ -104,7 +105,7 @@ impl Storage {
     ///   - Ender pearls, eggs: 27 × 16 = 432 items
     ///   - Tools, armor: 27 × 1 = 27 items
     /// - Max per chest: 54 shulkers × capacity
-    pub const DEFAULT_SHULKER_CAPACITY: i32 = 27 * 64;
+    pub const DEFAULT_SHULKER_CAPACITY: i32 = (crate::constants::SHULKER_BOX_SLOTS as i32) * 64;
 
     /// Save the storage by calling save() on all nodes
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -340,10 +341,11 @@ impl Storage {
                     break;
                 }
                 if node_idx == 0 {
-                    if chest_idx == 0 && item != "diamond" {
+                    if chest_idx == crate::constants::DIAMOND_CHEST_ID as usize && item != "diamond" {
                         continue;
                     }
-                    if chest_idx == 1 && item != crate::constants::OVERFLOW_CHEST_ITEM {
+                    if chest_idx == crate::constants::OVERFLOW_CHEST_ID as usize
+                        && item != crate::constants::OVERFLOW_CHEST_ITEM {
                         continue;
                     }
                 }
@@ -386,11 +388,15 @@ impl Storage {
 
         if remaining > 0 && !self.nodes.is_empty() {
             let node_0 = &self.nodes[0];
-            if item == "diamond" && !node_0.chests.is_empty() {
-                try_claim(&mut remaining, &mut plan, &mut claimed_empty, &node_0.chests[0]);
+            if item == "diamond" {
+                if let Some(chest) = node_0.chests.get(crate::constants::DIAMOND_CHEST_ID as usize) {
+                    try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
+                }
             }
-            if item == crate::constants::OVERFLOW_CHEST_ITEM && node_0.chests.len() > 1 {
-                try_claim(&mut remaining, &mut plan, &mut claimed_empty, &node_0.chests[1]);
+            if item == crate::constants::OVERFLOW_CHEST_ITEM {
+                if let Some(chest) = node_0.chests.get(crate::constants::OVERFLOW_CHEST_ID as usize) {
+                    try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
+                }
             }
             for ci in 2..node_0.chests.len() {
                 if remaining <= 0 { break; }
@@ -531,10 +537,11 @@ impl Storage {
                 // - Chest 0: dedicated for diamonds only
                 // - Chest 1: dedicated for overflow only (bot deposits unknown/leftover items)
                 if node_idx == 0 {
-                    if chest_idx == 0 && item != "diamond" {
+                    if chest_idx == crate::constants::DIAMOND_CHEST_ID as usize && item != "diamond" {
                         continue;
                     }
-                    if chest_idx == 1 && item != crate::constants::OVERFLOW_CHEST_ITEM {
+                    if chest_idx == crate::constants::OVERFLOW_CHEST_ID as usize
+                        && item != crate::constants::OVERFLOW_CHEST_ITEM {
                         continue;
                     }
                 }
@@ -542,7 +549,6 @@ impl Storage {
                 if chest.item != item {
                     continue; // Skip chests assigned to other items
                 }
-                let before = qty;
                 let deposited_here = Self::deposit_into_chest(chest, &mut qty, stack_size);
                 if deposited_here > 0 {
                     plan.push(ChestTransfer {
@@ -552,7 +558,6 @@ impl Storage {
                         amount: deposited_here,
                     });
                 }
-                let _ = before; // Silence unused warning (used for debugging)
             }
         }
 
@@ -669,14 +674,16 @@ impl Storage {
             let node_0 = &nodes[0];
             // Check node 0 chest 0 if depositing diamonds and it's empty
             if item == "diamond" {
-                if node_0.chests[0].item.is_empty() {
-                    return Some((0, 0));
+                let idx = crate::constants::DIAMOND_CHEST_ID as usize;
+                if node_0.chests.get(idx).is_some_and(|c| c.item.is_empty()) {
+                    return Some((0, idx));
                 }
             }
             // Check node 0 chest 1 if depositing to overflow and it's empty
             if item == crate::constants::OVERFLOW_CHEST_ITEM {
-                if node_0.chests.len() > 1 && node_0.chests[1].item.is_empty() {
-                    return Some((0, 1));
+                let idx = crate::constants::OVERFLOW_CHEST_ID as usize;
+                if node_0.chests.get(idx).is_some_and(|c| c.item.is_empty()) {
+                    return Some((0, idx));
                 }
             }
             // For all items, check node 0 chests 2, 3 (skip chest 0 for non-diamonds, skip chest 1 for non-overflow)
@@ -702,22 +709,22 @@ impl Storage {
         None
     }
 
-    /// Get the overflow chest (node 0, chest 1) if it exists.
+    /// Get the overflow chest (node 0, chest `OVERFLOW_CHEST_ID`) if it exists.
     /// Returns None if node 0 doesn't exist yet.
     pub fn get_overflow_chest(&self) -> Option<&Chest> {
-        if self.nodes.is_empty() {
-            return None;
-        }
-        self.nodes[0].chests.get(1)
+        self.nodes
+            .first()?
+            .chests
+            .get(crate::constants::OVERFLOW_CHEST_ID as usize)
     }
 
-    /// Get a mutable reference to the overflow chest (node 0, chest 1).
+    /// Get a mutable reference to the overflow chest (node 0, chest `OVERFLOW_CHEST_ID`).
     /// Returns None if node 0 doesn't exist yet.
     pub fn get_overflow_chest_mut(&mut self) -> Option<&mut Chest> {
-        if self.nodes.is_empty() {
-            return None;
-        }
-        self.nodes[0].chests.get_mut(1)
+        self.nodes
+            .first_mut()?
+            .chests
+            .get_mut(crate::constants::OVERFLOW_CHEST_ID as usize)
     }
 
     /// Get the overflow chest position.

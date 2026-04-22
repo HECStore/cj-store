@@ -3,8 +3,6 @@
 //! Centralized constants for timeouts, delays, and other configurable values.
 //! This makes it easier to tune the bot's behavior and document what each value means.
 
-#![allow(dead_code)]
-
 // ============================================================================
 // INVENTORY CONSTANTS
 // ============================================================================
@@ -12,11 +10,8 @@
 /// Number of slots in a double chest (54 = 6 rows × 9 columns)
 pub const DOUBLE_CHEST_SLOTS: usize = 54;
 
-/// Number of slots in a shulker box (27 = 3 rows × 9 columns)
+/// Number of slots in a shulker box (27 = 3 rows × 9 columns).
 pub const SHULKER_BOX_SLOTS: usize = 27;
-
-/// Maximum stack size for most items
-pub const DEFAULT_STACK_SIZE: i32 = 64;
 
 /// Hotbar slot 0 in inventory slot numbering (36-44 are hotbar slots).
 /// Minecraft's container protocol numbers slots contiguously: 0-8 are crafting/armor,
@@ -24,28 +19,13 @@ pub const DEFAULT_STACK_SIZE: i32 = 64;
 /// to this constant to address a specific hotbar slot.
 pub const HOTBAR_SLOT_0: usize = 36;
 
-/// First inventory slot (non-hotbar) in player inventory.
-/// Slots 0-8 are reserved for crafting grid and armor, so the main inventory starts at 9.
-pub const INVENTORY_SLOT_START: usize = 9;
-
-/// Last inventory slot (non-hotbar) in player inventory.
-/// The main inventory ends at 35; slot 36 is where the hotbar begins.
-pub const INVENTORY_SLOT_END: usize = 35;
-
 // ============================================================================
 // TIMEOUT CONSTANTS (in milliseconds)
 // ============================================================================
 
-/// Timeout for opening a chest container (15 seconds = 300 ticks at 20 TPS).
-/// Measured in ticks because the chest-open handler runs inside the client's
-/// tick loop rather than on a wall-clock timer.
-pub const CHEST_OPEN_TIMEOUT_TICKS: u32 = 300;
-
-/// Timeout for trade operations (45 seconds)
+/// Timeout for trade operations (45 seconds). Canonical default for the
+/// `trade_timeout_ms` config field.
 pub const TRADE_TIMEOUT_MS: u64 = 45_000;
-
-/// Timeout for trade GUI wait loops (30 seconds)
-pub const TRADE_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 /// Timeout for complete chest operations (seconds).
 /// This needs to be generous because operations may involve:
@@ -57,11 +37,9 @@ pub const TRADE_WAIT_TIMEOUT_MS: u64 = 30_000;
 /// 90 seconds should handle even complex multi-shulker operations.
 pub const CHEST_OP_TIMEOUT_SECS: u64 = 90;
 
-/// Timeout for pathfinding operations (60 seconds)
+/// Timeout for pathfinding operations (60 seconds). Canonical default for
+/// the `pathfinding_timeout_ms` config field.
 pub const PATHFINDING_TIMEOUT_MS: u64 = 60_000;
-
-/// Timeout for waiting for client initialization during reconnect
-pub const CLIENT_INIT_TIMEOUT_MS: u64 = 20_000;
 
 // ============================================================================
 // DELAY CONSTANTS (in milliseconds)
@@ -71,6 +49,11 @@ pub const CLIENT_INIT_TIMEOUT_MS: u64 = 20_000;
 
 /// Short delay for quick inventory operations
 pub const DELAY_SHORT_MS: u64 = 100;
+
+/// Interval between pathfinding position checks (milliseconds).
+/// Shorter intervals mean faster reaction to "arrived at goal", at the cost
+/// of extra lock-acquire churn on the entity position component.
+pub const PATHFINDING_CHECK_INTERVAL_MS: u64 = 100;
 
 /// Medium delay for standard operations
 pub const DELAY_MEDIUM_MS: u64 = 200;
@@ -91,9 +74,6 @@ pub const DELAY_LOOK_AT_MS: u64 = 250;
 /// before the next read or click.
 pub const DELAY_SETTLE_MS: u64 = 500;
 
-/// Delay for network operations that need server round-trip
-pub const DELAY_NETWORK_MS: u64 = 450;
-
 /// Delay between chest operations during validation (allows server to process)
 pub const DELAY_VALIDATION_BETWEEN_CHESTS_MS: u64 = 750;
 
@@ -109,24 +89,6 @@ pub const DELAY_DISCONNECT_MS: u64 = 2_000;
 /// this long after the first event before reloading and drain anything that
 /// arrived in the meantime.
 pub const DELAY_CONFIG_DEBOUNCE_MS: u64 = 500;
-
-/// Additional buffer after disconnect for TCP cleanup.
-/// Without this extra pause, reconnect attempts can race the OS releasing
-/// the old socket and fail with "address in use" or half-closed state errors.
-pub const DELAY_DISCONNECT_BUFFER_MS: u64 = 1_000;
-
-// ============================================================================
-// RECONNECTION CONSTANTS
-// ============================================================================
-
-/// Initial backoff delay for reconnection attempts
-pub const RECONNECT_INITIAL_BACKOFF_SECS: u64 = 2;
-
-/// Maximum backoff delay for reconnection attempts
-pub const RECONNECT_MAX_BACKOFF_SECS: u64 = 60;
-
-/// Tick interval for checking connection status
-pub const CONNECTION_CHECK_INTERVAL_SECS: u64 = 1;
 
 // ============================================================================
 // RETRY CONSTANTS

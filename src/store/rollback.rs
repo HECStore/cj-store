@@ -15,7 +15,7 @@
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
-use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::messages::{BotInstruction, ChestAction};
 use crate::types::storage::ChestTransfer;
 use super::Store;
@@ -54,8 +54,8 @@ impl RollbackResult {
 pub fn chest_from_transfer(t: &ChestTransfer) -> crate::types::Chest {
     crate::types::Chest {
         id: t.chest_id,
-        node_id: t.chest_id / 4,
-        index: t.chest_id % 4,
+        node_id: t.chest_id / CHESTS_PER_NODE as i32,
+        index: t.chest_id % CHESTS_PER_NODE as i32,
         position: t.position,
         item: t.item.clone(),
         amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],

@@ -53,13 +53,17 @@ Each command runs in one of three modes:
 | `status` | Inline | Never reveals coordinates. Examples below. |
 | `help` | Inline | Per-command or overview. |
 
-`status` replies:
+`status` replies — every message starts with `Status:`; the `[phase]` tag is
+the lowercase phase name from `TradeState::phase()`; the trailing
+`N order(s) waiting in queue.` is appended only when the queue is non-empty:
 
-| State                | Reply                                                       |
-| -------------------- | ----------------------------------------------------------- |
-| Idle, empty queue    | `Idle. No orders being processed. Queue is empty.`          |
-| Executing a trade    | `Buying cobblestone x64. 3 order(s) waiting in queue.`      |
-| Executing a deposit  | `Processing deposit (128.00 diamonds).`                     |
+| State                          | Reply                                                                                     |
+| ------------------------------ | ----------------------------------------------------------------------------------------- |
+| Idle, empty queue              | `Status: Idle. No orders being processed. Queue is empty.`                                |
+| Queue pending, not yet running | `Status: Ready. 2 order(s) in queue, processing will start shortly.`                      |
+| Withdrawing (bot fetching)     | `Status: Withdrawing for: buy cobblestone 64 [withdrawing]. 3 order(s) waiting in queue.` |
+| Trading with player            | `Status: Trading with player: buy cobblestone 64 [trading].`                              |
+| Depositing (post-trade)        | `Status: Depositing after: sell iron_ingot 128 [depositing].`                             |
 
 ## Operator commands (require operator status)
 

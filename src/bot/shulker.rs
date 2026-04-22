@@ -8,7 +8,8 @@ use tracing::{debug, error, info, warn};
 
 use super::Bot;
 use crate::constants::{
-    RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, SHULKER_OP_MAX_RETRIES, exponential_backoff_delay,
+    DELAY_INTERACT_MS, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
+    SHULKER_OP_MAX_RETRIES, exponential_backoff_delay,
 };
 use crate::types::Position;
 
@@ -150,7 +151,7 @@ pub async fn pickup_shulker_from_station(
         station_pos.z as f64 + 0.5,
     );
     client.look_at(station_vec3);
-    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
 
     debug!("pickup_shulker_from_station: Starting mining operation");
     client.start_mining(station_block);
@@ -339,7 +340,7 @@ async fn open_shulker_at_station_once(
         station_vec3.x, station_vec3.y, station_vec3.z
     );
     client.look_at(station_vec3);
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
     // Right-click to open the shulker, then get the container handle
     debug!("open_shulker_at_station_once: Sending block_interact to open shulker");

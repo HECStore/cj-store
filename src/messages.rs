@@ -57,7 +57,9 @@ pub struct ChestSyncReport {
     pub chest_id: i32,
     /// Item type stored in this chest
     pub item: String,
-    /// Per-slot item counts (length 54, one per shulker box slot)
+    /// Per-slot item counts for the double chest — length 54, one entry
+    /// per chest slot (each slot may hold a shulker box whose contents
+    /// are aggregated into that entry's total).
     pub amounts: Vec<i32>,
 }
 
@@ -217,9 +219,8 @@ pub enum BotInstruction {
         message: String,
         respond_to: oneshot::Sender<Result<(), String>>,
     },
-    /// Send a public chat message.
-    /// 
-    /// Navigate to chest, perform action, then read chest contents and return a sync report.
+    /// Navigate to a chest, perform the given action, then read chest
+    /// contents and return a sync report.
     InteractWithChestAndSync {
         target_chest: Chest,
         node_position: crate::types::Position,

@@ -12,11 +12,11 @@ Subagents must be used to the maximum extent possible throughout this pass. The 
 
 **Delegate research.** When evaluating whether a comment, test, or log line is correct, a subagent can read the referenced code, check whether a struct's `Debug` impl exposes sensitive fields, or verify a constant's derivation — while the main agent waits for the full batch to complete before touching any file.
 
-**Subagents are read-only and flat.** A subagent must never write to, edit, or delete any file, and must never spawn child subagents. Its only job is to read, analyze, and report findings back to the main agent. All writes and all subagent spawning are performed by the main agent only, after every subagent in the current batch has returned.
+**Subagents are read-only and flat.** A subagent must never write to, edit, or delete any file, and must never spawn child subagents. Its only job is to read, analyze, and report findings back to the main agent. Only the main agent spawns subagents and performs writes; writes and any next-batch dispatches happen only after every subagent in the current batch has returned. Within a batch, all subagents are dispatched in parallel — the "wait" applies between batches, not inside one.
 
 **Edit in a dedicated phase.** A batch is all subagents spawned for a single source file. Once every subagent in the batch has returned, apply all edits to that file in one sequential pass before starting the next batch. Never interleave subagent dispatches and file edits for the same file — a subagent reading a file while the main agent is editing it will report stale findings.
 
-**Flag cross-file dependencies.** If a subagent finds that a function's behavior is defined, constrained, or called from another file not yet reviewed, do not act on the finding immediately. Note the dependency and resolve it once both files have been fully reviewed, so decisions are made against consistent state.
+**Flag cross-file dependencies.** If a subagent finds that a function's behavior is defined, constrained, or called from one or more other files not yet reviewed, do not act on the finding immediately. Note the dependency and resolve it once every involved file has been fully reviewed, so decisions are made against consistent state.
 
 **Main agent responsibilities only:** synthesizing subagent findings into concrete edits, resolving ambiguity that requires cross-function or cross-file context, and making the final call on borderline cases. Everything that is pure information-gathering or parallel-safe work goes to a subagent.
 
@@ -107,11 +107,16 @@ branch, and invariant, ask:
   panic for any reason.
 
 **Remove a test if:**
-- It is dead — never runs because of a `#[cfg]` gate, `#[ignore]`, or wrong
-  module placement.
+- It is dead — never runs because of a `#[cfg]` gate that is permanently
+  unsatisfied, or because of wrong module placement.
 - It tests a private helper that no longer exists or was inlined.
 - It covers the same scenario as another test — same inputs and assertions,
   regardless of name.
+
+**Re-evaluate (don't blindly remove) if:**
+- It is marked `#[ignore]`. This is a deliberate skip, usually flagging a
+  flaky test, an env-dependent test, or a TODO. Decide whether to resurrect
+  it, rewrite it, or remove it with a commit-message note on why.
 
 **Rename a test if:**
 - The name describes the mechanism rather than the behavior

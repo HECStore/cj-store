@@ -192,6 +192,7 @@ impl TradeState {
     /// Panics on a committed or already-rolled-back trade: the caller is
     /// trying to retreat from a terminal state, which indicates a handler
     /// bug, not a recoverable condition.
+    #[allow(dead_code)] // API surface; used in tests
     pub fn rollback(self, reason: String) -> Self {
         let order = match self {
             TradeState::Queued(order)

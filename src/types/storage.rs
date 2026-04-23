@@ -135,23 +135,23 @@ impl Storage {
 
             if path.is_file()
                 && let Some(extension) = path.extension()
-                    && extension == "json"
-                        && let Some(file_name) = path.file_stem()
-                            && let Some(file_str) = file_name.to_str() {
-                                if let Ok(node_id) = file_str.parse::<i32>() {
-                                    match Node::load(node_id, storage_position) {
-                                        Ok(node) => nodes.push(node),
-                                        Err(e) => {
-                                            skipped += 1;
-                                            tracing::warn!(
-                                                node_id,
-                                                error = %e,
-                                                "[Storage] failed to load node; skipping",
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                && extension == "json"
+                && let Some(file_name) = path.file_stem()
+                && let Some(file_str) = file_name.to_str()
+                && let Ok(node_id) = file_str.parse::<i32>()
+            {
+                match Node::load(node_id, storage_position) {
+                    Ok(node) => nodes.push(node),
+                    Err(e) => {
+                        skipped += 1;
+                        tracing::warn!(
+                            node_id,
+                            error = %e,
+                            "[Storage] failed to load node; skipping",
+                        );
+                    }
+                }
+            }
         }
 
         tracing::info!(

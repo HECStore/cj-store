@@ -14,13 +14,14 @@ use crate::constants::{
 use crate::types::Position;
 
 /// Calculate shulker station position from node position.
+///
 /// Layout (top down, P is southeast corner):
-/// ```
+/// ```text
 /// NCCN  <- z-2
 /// NCCN  <- z-1
 /// XSNP  <- z (S at x-2, P at x)
 /// ```
-/// Shulker station is 2 blocks west of P, at the same Y and Z level.
+/// Station (S) is two blocks west of the node position at the same Y/Z.
 pub fn shulker_station_position(node_position: &Position) -> Position {
     Position {
         x: node_position.x - 2,
@@ -29,8 +30,9 @@ pub fn shulker_station_position(node_position: &Position) -> Position {
     }
 }
 
-/// List of all Minecraft shulker box item IDs (including colored variants).
-/// Minecraft 1.20+ has 17 shulker box variants: 1 default + 16 colors.
+/// Every shulker box item ID: the undyed default plus the 16 dye colors.
+/// Must stay in sync with Minecraft's block registry — `is_shulker_box` is the
+/// trust boundary used by inventory code to decide whether a slot is storage.
 const SHULKER_BOX_IDS: &[&str] = &[
     "minecraft:shulker_box",
     "minecraft:white_shulker_box",
@@ -51,31 +53,18 @@ const SHULKER_BOX_IDS: &[&str] = &[
     "minecraft:black_shulker_box",
 ];
 
-/// Check if an item ID is a shulker box (any color).
+/// True for any of the 17 shulker box variants (undyed + 16 dye colors).
 ///
-/// This function correctly identifies all 17 shulker box variants:
-/// - `minecraft:shulker_box` (default/undyed)
-/// - `minecraft:{color}_shulker_box` (16 colored variants)
-///
-/// # Arguments
-/// * `item_id` - The item ID to check (e.g., "minecraft:red_shulker_box")
-///
-/// # Returns
-/// * `true` if the item is any type of shulker box
-/// * `false` otherwise
-///
-/// # Notes
-/// - Both `minecraft:` prefixed and non-prefixed IDs are accepted
-/// - All colors are treated equally - no distinction based on color
+/// Accepts IDs with or without the `minecraft:` prefix. This is an exact-match
+/// check against `SHULKER_BOX_IDS`, not a substring search — items like
+/// `minecraft:shulker_shell` and `minecraft:shulker_spawn_egg` return `false`.
 pub fn is_shulker_box(item_id: &str) -> bool {
-    // Normalize: add minecraft: prefix if missing
     let normalized = if item_id.contains(':') {
         item_id.to_string()
     } else {
         format!("minecraft:{}", item_id)
     };
 
-    // Check against known shulker box IDs
     SHULKER_BOX_IDS.contains(&normalized.as_str())
 }
 
@@ -101,50 +90,50 @@ pub fn validate_chest_slot_is_shulker(item_id: &str, slot_index: usize) -> Resul
     Ok(())
 }
 
-/// Pick up a shulker box from the shulker station.
-/// Breaks the shulker first, waits for it to be fully broken, then walks to the X position
-/// (x-3 from node position, one block west of S) to pick up the dropped item, then returns
-/// to the node position.
+/// Break the shulker at the station, walk over to collect the drop, then return to the node.
+///
+/// Returns `Err` if no shulker ends up in the bot inventory — callers rely on this
+/// strict post-condition rather than silently proceeding empty-handed.
 pub async fn pickup_shulker_from_station(
     bot: &Bot,
     station_pos: &Position,
     node_position: &Position,
 ) -> Result<(), String> {
     debug!(
-        "pickup_shulker_from_station: Picking up shulker at ({}, {}, {})",
+        "pickup_shulker_from_station: station=({}, {}, {})",
         station_pos.x, station_pos.y, station_pos.z
     );
 
     let client = bot.client.read().await.clone().ok_or_else(|| {
-        error!("pickup_shulker_from_station: Bot not connected");
+        error!(
+            "pickup_shulker_from_station: bot not connected (station=({}, {}, {}))",
+            station_pos.x, station_pos.y, station_pos.z
+        );
         "Bot not connected".to_string()
     })?;
 
     let station_block = BlockPos::new(station_pos.x, station_pos.y, station_pos.z);
 
-    // Check block state before breaking
     {
         let world = client.world();
         let block_state = world.read().get_block_state(station_block);
-        if let Some(state) = block_state {
-            let block_name = format!("{:?}", state);
-            debug!(
-                "pickup_shulker_from_station: Block at station before mining: {}",
-                block_name
-            );
-            if !block_name.to_lowercase().contains("shulker") {
-                warn!(
-                    "pickup_shulker_from_station: Expected shulker at station but found: {}",
-                    block_name
-                );
+        match block_state {
+            Some(state) => {
+                let block_name = format!("{:?}", state);
+                if !block_name.to_lowercase().contains("shulker") {
+                    warn!(
+                        "pickup_shulker_from_station: expected shulker at station ({}, {}, {}) but found {}",
+                        station_pos.x, station_pos.y, station_pos.z, block_name
+                    );
+                }
             }
-        } else {
-            warn!("pickup_shulker_from_station: Block state at station is None (no block?)");
+            None => warn!(
+                "pickup_shulker_from_station: no block state at station ({}, {}, {}) — chunk unloaded?",
+                station_pos.x, station_pos.y, station_pos.z
+            ),
         }
     }
 
-    // Break the shulker first (bot should already be positioned to see it)
-    // Look at center of shulker block for accurate mining
     let station_vec3 = Vec3::new(
         station_pos.x as f64 + 0.5,
         station_pos.y as f64 + 0.5,
@@ -153,120 +142,78 @@ pub async fn pickup_shulker_from_station(
     client.look_at(station_vec3);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
 
-    debug!("pickup_shulker_from_station: Starting mining operation");
     client.start_mining(station_block);
 
-    // Wait for block to actually be broken (check block state in a loop)
-    // Shulker boxes break quickly but we need to verify the block is actually gone
-    // before moving to pick it up. Walking away before the break completes can cancel
-    // mining server-side and leave the shulker intact.
-    const MAX_BREAK_WAIT_MS: u64 = 7000; // Maximum 7 seconds to wait for block to break
-    const CHECK_INTERVAL_MS: u64 = 150; // Check every 150ms
+    // Walking away before the server finishes the break cancels mining server-side
+    // and leaves the shulker intact, so we poll the block state until it's gone.
+    const MAX_BREAK_WAIT_MS: u64 = 7000;
+    const CHECK_INTERVAL_MS: u64 = 150;
     let mut waited_ms: u64 = 0;
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(CHECK_INTERVAL_MS)).await;
         waited_ms += CHECK_INTERVAL_MS;
 
-        // Check if block is broken (air or not a shulker anymore)
         let world = client.world();
         let block_state = world.read().get_block_state(station_block);
 
-        if let Some(state) = block_state {
-            let block_name = format!("{:?}", state);
-            let block_name_lower = block_name.to_lowercase();
-            // Block is broken if it's air or any non-solid block
-            // Use case-insensitive check since debug format produces "ShulkerBox" not "shulker"
-            if block_name_lower.contains("air") || !block_name_lower.contains("shulker") {
-                debug!(
-                    "pickup_shulker_from_station: Block broken after {}ms (now: {})",
-                    waited_ms, block_name
-                );
-                break;
-            } else {
-                if waited_ms.is_multiple_of(1000) {
+        match block_state {
+            Some(state) => {
+                let block_name = format!("{:?}", state);
+                let block_name_lower = block_name.to_lowercase();
+                if block_name_lower.contains("air") || !block_name_lower.contains("shulker") {
                     debug!(
-                        "pickup_shulker_from_station: Still mining... {}ms elapsed, block: {}",
+                        "pickup_shulker_from_station: broken after {}ms (now {})",
                         waited_ms, block_name
                     );
+                    break;
                 }
             }
-        } else {
-            // Block state is None, treat as broken
-            debug!(
-                "pickup_shulker_from_station: Block broken after {}ms (state=None)",
-                waited_ms
-            );
-            break;
+            None => {
+                debug!(
+                    "pickup_shulker_from_station: broken after {}ms (state=None)",
+                    waited_ms
+                );
+                break;
+            }
         }
 
         if waited_ms >= MAX_BREAK_WAIT_MS {
             error!(
-                "pickup_shulker_from_station: TIMEOUT waiting for shulker to break after {}ms!",
-                waited_ms
-            );
-            // Check final state
-            let world = client.world();
-            let block_state = world.read().get_block_state(station_block);
-            if let Some(state) = block_state {
-                error!(
-                    "pickup_shulker_from_station: Block at station after timeout: {:?}",
-                    state
-                );
-            }
-            warn!(
-                "pickup_shulker_from_station: Proceeding despite timeout - shulker may not have been picked up"
+                "pickup_shulker_from_station: timeout after {}ms at station ({}, {}, {}) — proceeding but pickup may fail",
+                waited_ms, station_pos.x, station_pos.y, station_pos.z
             );
             break;
         }
 
         // Re-mine safety net: azalea's mining can silently stop if the look direction
-        // drifts or the initial start_mining packet was dropped. Every 500ms we re-aim
-        // at the block center and re-issue start_mining so a transient glitch doesn't
-        // stall the whole pickup until the 7s timeout.
+        // drifts or the initial start_mining packet was dropped. Re-aim and re-issue
+        // every 500ms so a transient glitch doesn't stall until the 7s timeout.
         if waited_ms.is_multiple_of(500) {
-            debug!(
-                "pickup_shulker_from_station: Re-issuing mining command at {}ms",
-                waited_ms
-            );
             client.look_at(station_vec3);
             client.start_mining(station_block);
         }
     }
 
-    // Additional delay for the item to drop and settle.
-    // After the block is destroyed the server spawns the dropped item entity on a
-    // short delay, and it needs a moment to settle onto the floor before the bot's
-    // pickup radius can reliably vacuum it up.
-    // Wait for the dropped item entity to settle
+    // The server spawns the dropped item entity on a short delay after the break
+    // completes; it needs to settle before the pickup radius can vacuum it up.
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    // Walk to X position (x-3 from node position) to pick up the dropped shulker.
-    // X is one block west of S (which is at x-2), and coincides with the P position of the node to the west.
-    // Standing at the node itself is too far for the item pickup radius to reach the drop,
-    // so we deliberately step one block past S and then walk back.
+    // X is one block west of S (see layout diagram). Standing at the node itself is
+    // out of pickup radius, so we step past S and then walk back.
     let pickup_pos = Position {
-        x: node_position.x - 3, // One block left of S (which is at x-2)
+        x: node_position.x - 3,
         y: node_position.y,
         z: node_position.z,
     };
-    debug!(
-        "pickup_shulker_from_station: Walking to pickup position ({}, {}, {})",
-        pickup_pos.x, pickup_pos.y, pickup_pos.z
-    );
     super::navigation::navigate_to_position(bot, &pickup_pos).await?;
-    // Small pause after arriving so the server has time to deliver any pickup packets
-    // triggered by walking over the item before we move again.
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
-    // Walk back to node position
     super::navigation::navigate_to_position(bot, node_position).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
-    // Verify we picked up the shulker - this is CRITICAL, return error if not found.
-    // A missing shulker here usually means either the break never completed, the item
-    // despawned, or the bot failed to path into pickup range - all conditions the
-    // caller must handle rather than silently continuing with an empty hand.
+    // Post-condition check — see doc comment. A missing shulker here means either the
+    // break never completed, the item despawned, or the bot never pathed into range.
     let inv_handle = client.open_inventory();
     if let Some(handle) = inv_handle {
         let slots = handle.slots();
@@ -274,149 +221,118 @@ pub async fn pickup_shulker_from_station(
         if let Some(slots) = slots {
             for (i, slot) in slots.iter().enumerate() {
                 if slot.count() > 0 && is_shulker_box(&slot.kind().to_string()) {
-                    debug!("pickup_shulker_from_station: Found shulker in slot {}", i);
+                    debug!(
+                        "pickup_shulker_from_station: shulker found in inventory slot {} (station=({}, {}, {}))",
+                        i, station_pos.x, station_pos.y, station_pos.z
+                    );
                     return Ok(());
                 }
             }
         }
     }
 
-    // Shulker not found in inventory - this is a CRITICAL error, not just a warning
     error!(
-        "pickup_shulker_from_station: FAILED - No shulker found in inventory after pickup at station ({}, {}, {})",
+        "pickup_shulker_from_station: no shulker in inventory after pickup at station ({}, {}, {})",
         station_pos.x, station_pos.y, station_pos.z
     );
-    Err("Failed to pick up shulker from station - shulker not found in inventory after breaking and walking to pickup position".to_string())
+    Err(format!(
+        "Failed to pick up shulker from station ({}, {}, {}) — not found in inventory after break + walk",
+        station_pos.x, station_pos.y, station_pos.z
+    ))
 }
 
-/// Open a shulker box at the station position (single attempt, no retry).
+/// Single open attempt with no retry. See `open_shulker_at_station` for the retry wrapper.
 async fn open_shulker_at_station_once(
     bot: &Bot,
     station_pos: &Position,
 ) -> Result<azalea::container::ContainerHandle, String> {
-    debug!(
-        "open_shulker_at_station_once: Attempting to open shulker at ({}, {}, {})",
-        station_pos.x, station_pos.y, station_pos.z
-    );
-
     let client = bot.client.read().await.clone().ok_or_else(|| {
-        error!("open_shulker_at_station_once: Bot not connected");
+        error!(
+            "open_shulker_at_station_once: bot not connected (station=({}, {}, {}))",
+            station_pos.x, station_pos.y, station_pos.z
+        );
         "Bot not connected".to_string()
     })?;
 
     let station_block = BlockPos::new(station_pos.x, station_pos.y, station_pos.z);
 
-    // Check block state before opening
     {
         let world = client.world();
         let block_state = world.read().get_block_state(station_block);
-        if let Some(state) = block_state {
-            let block_name = format!("{:?}", state);
-            debug!(
-                "open_shulker_at_station_once: Block at station: {}",
-                block_name
-            );
-            if !block_name.to_lowercase().contains("shulker") {
-                warn!(
-                    "open_shulker_at_station_once: Expected shulker but found: {} - open may fail!",
-                    block_name
-                );
+        match block_state {
+            Some(state) => {
+                let block_name = format!("{:?}", state);
+                if !block_name.to_lowercase().contains("shulker") {
+                    warn!(
+                        "open_shulker_at_station_once: expected shulker at ({}, {}, {}) but found {} — open may fail",
+                        station_pos.x, station_pos.y, station_pos.z, block_name
+                    );
+                }
             }
-        } else {
-            warn!(
-                "open_shulker_at_station_once: Block state at station is None - no shulker placed?"
-            );
+            None => warn!(
+                "open_shulker_at_station_once: no block at station ({}, {}, {}) — chunk unloaded or shulker not placed",
+                station_pos.x, station_pos.y, station_pos.z
+            ),
         }
     }
 
-    // Look at the shulker block
     let station_vec3 = Vec3::new(
         station_pos.x as f64 + 0.5,
         station_pos.y as f64 + 0.5,
         station_pos.z as f64 + 0.5,
     );
-    debug!(
-        "open_shulker_at_station_once: Looking at shulker ({:.1}, {:.1}, {:.1})",
-        station_vec3.x, station_vec3.y, station_vec3.z
-    );
     client.look_at(station_vec3);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
-    // Right-click to open the shulker, then get the container handle.
-    // DELAY_CONTAINER_SYNC_MS (450) is the empirical container-open wait —
-    // shorter and the container contents read can race the server packet.
-    debug!("open_shulker_at_station_once: Sending block_interact to open shulker");
+    // DELAY_CONTAINER_SYNC_MS (450ms) is the empirical container-open wait —
+    // shorter and the contents read races the server packet.
     client.block_interact(station_block);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_CONTAINER_SYNC_MS)).await;
 
-    // Get the container handle for the opened shulker
-    // Use 300 ticks (15 seconds) timeout to handle server lag
-    debug!("open_shulker_at_station_once: Waiting for container handle (15s timeout)");
+    // 300 ticks (15s) to absorb server lag.
     let result = client
         .open_container_at_with_timeout_ticks(station_block, Some(300))
         .await;
 
     match result {
-        Some(container) => {
-            if let Some(contents) = container.contents() {
-                debug!(
-                    "open_shulker_at_station_once: Opened, {} slots, {} items",
-                    contents.len(),
-                    contents.iter().map(|s| s.count()).sum::<i32>()
-                );
-            }
-            Ok(container)
-        }
+        Some(container) => Ok(container),
         None => {
             error!(
-                "open_shulker_at_station_once: FAILED to open shulker at ({}, {}, {}) - timeout after 15 seconds",
+                "open_shulker_at_station_once: timeout after 15s at ({}, {}, {})",
                 station_pos.x, station_pos.y, station_pos.z
             );
             Err(format!(
-                "Failed to open shulker box at ({}, {}, {}) - timeout after 15 seconds",
+                "Failed to open shulker box at ({}, {}, {}) — timeout after 15s",
                 station_pos.x, station_pos.y, station_pos.z
             ))
         }
     }
 }
 
-/// Open a shulker box at the station position with retry logic.
-///
-/// Uses exponential backoff for retries: 500ms, 1s, 2s, etc.
+/// Open the shulker at `station_pos`, retrying with exponential backoff on failure.
 pub async fn open_shulker_at_station(
     bot: &Bot,
     station_pos: &Position,
 ) -> Result<azalea::container::ContainerHandle, String> {
-    debug!(
-        "open_shulker_at_station: Opening at ({}, {}, {})",
-        station_pos.x, station_pos.y, station_pos.z
-    );
-
     let mut last_error = String::new();
 
     for attempt in 0..SHULKER_OP_MAX_RETRIES {
         if attempt > 0 {
             let delay_ms =
                 exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
-            debug!(
-                "open_shulker_at_station: Retry {}/{} after {}ms",
-                attempt + 1, SHULKER_OP_MAX_RETRIES, delay_ms
-            );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-        } else {
-            debug!(
-                "open_shulker_at_station: Attempt 1/{}",
-                SHULKER_OP_MAX_RETRIES
-            );
         }
 
         match open_shulker_at_station_once(bot, station_pos).await {
             Ok(container) => {
                 if attempt > 0 {
                     info!(
-                        "open_shulker_at_station: SUCCESS on attempt {}/{}",
+                        "open_shulker_at_station: succeeded on attempt {}/{} at ({}, {}, {})",
                         attempt + 1,
-                        SHULKER_OP_MAX_RETRIES
+                        SHULKER_OP_MAX_RETRIES,
+                        station_pos.x,
+                        station_pos.y,
+                        station_pos.z
                     );
                 }
                 return Ok(container);
@@ -424,7 +340,7 @@ pub async fn open_shulker_at_station(
             Err(e) => {
                 last_error = e.clone();
                 warn!(
-                    "open_shulker_at_station: Attempt {}/{} FAILED at ({}, {}, {}): {}",
+                    "open_shulker_at_station: attempt {}/{} failed at ({}, {}, {}): {}",
                     attempt + 1,
                     SHULKER_OP_MAX_RETRIES,
                     station_pos.x,
@@ -437,7 +353,7 @@ pub async fn open_shulker_at_station(
     }
 
     error!(
-        "open_shulker_at_station: FAILED after {} attempts at ({}, {}, {}): {}",
+        "open_shulker_at_station: exhausted {} attempts at ({}, {}, {}): {}",
         SHULKER_OP_MAX_RETRIES, station_pos.x, station_pos.y, station_pos.z, last_error
     );
     Err(format!(
@@ -446,21 +362,17 @@ pub async fn open_shulker_at_station(
     ))
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_is_shulker_box() {
-        // Default shulker box
+    fn is_shulker_box_accepts_all_17_variants_with_or_without_prefix() {
+        // Undyed default.
         assert!(is_shulker_box("minecraft:shulker_box"));
         assert!(is_shulker_box("shulker_box"));
 
-        // All colored variants
+        // All 16 dye colors, prefixed.
         assert!(is_shulker_box("minecraft:white_shulker_box"));
         assert!(is_shulker_box("minecraft:orange_shulker_box"));
         assert!(is_shulker_box("minecraft:magenta_shulker_box"));
@@ -478,36 +390,61 @@ mod tests {
         assert!(is_shulker_box("minecraft:red_shulker_box"));
         assert!(is_shulker_box("minecraft:black_shulker_box"));
 
-        // Without minecraft: prefix
+        // Colors without the minecraft: prefix.
         assert!(is_shulker_box("red_shulker_box"));
         assert!(is_shulker_box("blue_shulker_box"));
-
-        // Non-shulker items
-        assert!(!is_shulker_box("minecraft:chest"));
-        assert!(!is_shulker_box("minecraft:diamond"));
-        assert!(!is_shulker_box("minecraft:ender_chest"));
-        assert!(!is_shulker_box("chest"));
-        assert!(!is_shulker_box(""));
     }
 
     #[test]
-    fn test_validate_chest_slot_is_shulker() {
-        // Valid shulker boxes
+    fn is_shulker_box_rejects_empty_and_unrelated_items() {
+        assert!(!is_shulker_box(""));
+        assert!(!is_shulker_box("minecraft:chest"));
+        assert!(!is_shulker_box("minecraft:ender_chest"));
+        assert!(!is_shulker_box("minecraft:diamond"));
+        assert!(!is_shulker_box("chest"));
+    }
+
+    #[test]
+    fn is_shulker_box_rejects_items_that_merely_contain_shulker() {
+        // Guards against regressing to a substring check — these all contain
+        // "shulker" but are NOT storage containers.
+        assert!(!is_shulker_box("minecraft:shulker_shell"));
+        assert!(!is_shulker_box("minecraft:shulker_spawn_egg"));
+        assert!(!is_shulker_box("shulker_shell"));
+        assert!(!is_shulker_box("shulker"));
+    }
+
+    #[test]
+    fn validate_chest_slot_accepts_any_color_shulker() {
         assert!(validate_chest_slot_is_shulker("minecraft:shulker_box", 0).is_ok());
         assert!(validate_chest_slot_is_shulker("minecraft:red_shulker_box", 5).is_ok());
-
-        // Empty slot
-        let err = validate_chest_slot_is_shulker("", 10).unwrap_err();
-        assert!(err.contains("slot 10 is empty"));
-
-        // Non-shulker item
-        let err = validate_chest_slot_is_shulker("minecraft:diamond", 20).unwrap_err();
-        assert!(err.contains("slot 20 contains"));
-        assert!(err.contains("diamond"));
+        assert!(validate_chest_slot_is_shulker("minecraft:black_shulker_box", 53).is_ok());
     }
 
     #[test]
-    fn test_shulker_station_position() {
+    fn validate_chest_slot_rejects_empty_slot_with_index_in_message() {
+        let err = validate_chest_slot_is_shulker("", 10).unwrap_err();
+        assert!(err.contains("slot 10 is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_chest_slot_rejects_non_shulker_item_with_index_and_id_in_message() {
+        let err = validate_chest_slot_is_shulker("minecraft:diamond", 20).unwrap_err();
+        assert!(err.contains("slot 20 contains"), "got: {err}");
+        assert!(err.contains("diamond"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_chest_slot_rejects_shulker_shell_lookalike() {
+        // A chest filled with shulker shells would break storage semantics just
+        // as badly as one filled with dirt — confirm the validator catches it.
+        let err = validate_chest_slot_is_shulker("minecraft:shulker_shell", 3).unwrap_err();
+        assert!(err.contains("slot 3 contains"), "got: {err}");
+        assert!(err.contains("shulker_shell"), "got: {err}");
+    }
+
+    #[test]
+    fn shulker_station_is_two_blocks_west_of_node() {
         let node_pos = Position {
             x: 100,
             y: 64,
@@ -515,9 +452,21 @@ mod tests {
         };
         let station = shulker_station_position(&node_pos);
 
-        // Station should be two blocks left (west) of node position
-        assert_eq!(station.x, 98); // x - 2
-        assert_eq!(station.y, 64); // same Y
-        assert_eq!(station.z, 200); // same Z
+        assert_eq!(station.x, 98);
+        assert_eq!(station.y, 64);
+        assert_eq!(station.z, 200);
+    }
+
+    #[test]
+    fn shulker_station_preserves_negative_and_zero_coordinates() {
+        let node_pos = Position {
+            x: 0,
+            y: -64,
+            z: -5,
+        };
+        let station = shulker_station_position(&node_pos);
+        assert_eq!(station.x, -2);
+        assert_eq!(station.y, -64);
+        assert_eq!(station.z, -5);
     }
 }

@@ -19,6 +19,19 @@ use tracing::{error, info, warn};
 /// every `.interact()` was wrapped in `.expect(..)`, which killed the entire
 /// CLI task on the first hiccup. The loop re-prompts with a short backoff so
 /// the operator sees the prompt again instead of the process exiting.
+/// Compute buy/sell quotes from a pair's reserves and fee spread.
+///
+/// Returns `(None, None)` when either reserve is zero: the pair is untradeable
+/// and the constant-product mid-price would be undefined or infinite.
+fn quote_prices(item_stock: i32, currency_stock: f64, fee: f64) -> (Option<f64>, Option<f64>) {
+    if item_stock > 0 && currency_stock > 0.0 {
+        let base = currency_stock / (item_stock as f64);
+        (Some(base * (1.0 + fee)), Some(base * (1.0 - fee)))
+    } else {
+        (None, None)
+    }
+}
+
 fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result<T, E>) -> T {
     loop {
         match f() {
@@ -39,8 +52,8 @@ fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result
 /// `store_tx` so the `Store`'s receiver closes and its task can terminate.
 pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
     loop {
-        // NOTE: The numeric indices in the match below are tied to the order
-        // of this vector. Keep them in sync when adding/removing entries.
+        // Indices in the match below are positional — adding/removing an entry
+        // shifts every case after it.
         let options = vec![
             "Get user balances",
             "Get pairs",
@@ -79,8 +92,6 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
             8 => remove_pair(&store_tx),
             9 => view_storage(&store_tx),
             10 => view_trades(&store_tx),
-            // Audit in read-only vs. repair mode — the bool flag is the only
-            // difference, so both menu entries route through `audit_state`.
             11 => audit_state(&store_tx, false),
             12 => audit_state(&store_tx, true),
             13 => restart_bot(&store_tx),
@@ -93,12 +104,12 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
                 });
 
                 if store_tx.blocking_send(msg).is_err() {
-                    error!("[CLI] Failed to send shutdown request");
+                    error!("[CLI] Shutdown send failed: Store channel closed");
                     return;
                 }
 
                 if response_rx.blocking_recv().is_err() {
-                    error!("[CLI] Failed to receive shutdown confirmation");
+                    error!("[CLI] Shutdown response channel closed without reply");
                     return;
                 }
 
@@ -120,7 +131,7 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send QueryBalances request");
+        error!("[CLI] QueryBalances send failed: Store channel closed");
         return;
     }
 
@@ -141,7 +152,7 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
         }
         Err(_) => {
             println!("Failed to receive balances.");
-            error!("Failed to receive balances");
+            error!("[CLI] QueryBalances response channel closed without reply");
         }
     }
 }
@@ -149,12 +160,9 @@ fn get_balances(store_tx: &mpsc::Sender<StoreMessage>) {
 /// Sends a QueryPairs request and displays the results, including
 /// AMM-style buy/sell prices derived from each pair's current reserves.
 fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
-    // Fetch the configured fee rate first so buy/sell prices reflect the
-    // actual spread the store charges. We fall back to 12.5% (the default
-    // configured fee) if the query fails for any reason, so the operator
-    // still sees a sensible price estimate rather than an error — but log
-    // a warning, because a silent fallback on a non-default fee would
-    // display materially wrong prices.
+    // Fall back to the default configured fee on query failure so the operator
+    // still sees a price estimate. A non-default fee would make the displayed
+    // prices materially wrong, so the fallback path must warn.
     const DEFAULT_FEE_FALLBACK: f64 = 0.125;
     let (fee_tx, fee_rx) = oneshot::channel();
     let fee_msg = StoreMessage::FromCli(CliMessage::QueryFee {
@@ -180,7 +188,7 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send QueryPairs request");
+        error!("[CLI] QueryPairs send failed: Store channel closed");
         return;
     }
 
@@ -191,22 +199,7 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
             } else {
                 println!("\n=== Pairs ===");
                 for pair in pairs {
-                    // Base price is the constant-product mid-price
-                    // (currency / item). We only show prices when both
-                    // reserves are positive — otherwise the pair is not
-                    // tradeable and the quote would be undefined / infinite.
-                    let price_buy = if pair.item_stock > 0 && pair.currency_stock > 0.0 {
-                        let base = pair.currency_stock / (pair.item_stock as f64);
-                        Some(base * (1.0 + fee)) // Buy price: mid + fee spread
-                    } else {
-                        None
-                    };
-                    let price_sell = if pair.item_stock > 0 && pair.currency_stock > 0.0 {
-                        let base = pair.currency_stock / (pair.item_stock as f64);
-                        Some(base * (1.0 - fee)) // Sell price: mid - fee spread
-                    } else {
-                        None
-                    };
+                    let (price_buy, price_sell) = quote_prices(pair.item_stock, pair.currency_stock, fee);
                     println!(
                         "Item: {}, Stock: {}, Currency: {:.2}",
                         pair.item, pair.item_stock, pair.currency_stock
@@ -223,7 +216,7 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
         }
         Err(_) => {
             println!("Failed to receive pairs.");
-            error!("Failed to receive pairs");
+            error!("[CLI] QueryPairs response channel closed without reply");
         }
     }
 }
@@ -246,7 +239,7 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
             .interact()
     }) == 1;
 
-    info!("Setting operator status for {} to {}", username_or_uuid, is_operator);
+    info!("[CLI] Setting operator status for {} to {}", username_or_uuid, is_operator);
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::SetOperator {
@@ -256,7 +249,7 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send SetOperator request");
+        error!("[CLI] SetOperator send failed: Store channel closed");
         return;
     }
 
@@ -264,9 +257,9 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(())) => println!("Operator status updated successfully."),
         Ok(Err(e)) => {
             println!("Failed to update operator status: {}", e);
-            error!("Failed to update operator status: {}", e);
+            error!("[CLI] SetOperator for {username_or_uuid} failed: {e}");
         }
-        Err(_) => error!("Failed to receive operator status update response"),
+        Err(_) => error!("[CLI] SetOperator response channel closed without reply"),
     }
 }
 
@@ -281,7 +274,7 @@ fn add_node(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send AddNode request");
+        error!("[CLI] AddNode send failed: Store channel closed");
         return;
     }
 
@@ -289,9 +282,9 @@ fn add_node(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(node_id)) => println!("Node {} added successfully.", node_id),
         Ok(Err(e)) => {
             println!("Failed to add node: {}", e);
-            error!("Failed to add node: {}", e);
+            error!("[CLI] AddNode failed: {e}");
         }
-        Err(_) => error!("Failed to receive add node response"),
+        Err(_) => error!("[CLI] AddNode response channel closed without reply"),
     }
 }
 
@@ -308,7 +301,7 @@ fn add_node_with_validation(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send AddNodeWithValidation request");
+        error!("[CLI] AddNodeWithValidation send failed: Store channel closed");
         return;
     }
 
@@ -316,9 +309,9 @@ fn add_node_with_validation(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(node_id)) => println!("Node {} validated and added successfully!", node_id),
         Ok(Err(e)) => {
             println!("Failed to add node: {}", e);
-            error!("Failed to add node: {}", e);
+            error!("[CLI] AddNodeWithValidation failed: {e}");
         }
-        Err(_) => error!("Failed to receive add node response"),
+        Err(_) => error!("[CLI] AddNodeWithValidation response channel closed without reply"),
     }
 }
 
@@ -338,7 +331,7 @@ fn discover_storage(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send DiscoverStorage request");
+        error!("[CLI] DiscoverStorage send failed: Store channel closed");
         return;
     }
 
@@ -346,9 +339,9 @@ fn discover_storage(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(count)) => println!("Storage discovery complete! {} nodes discovered.", count),
         Ok(Err(e)) => {
             println!("Storage discovery failed: {}", e);
-            error!("Storage discovery failed: {}", e);
+            error!("[CLI] DiscoverStorage failed: {e}");
         }
-        Err(_) => error!("Failed to receive discovery response"),
+        Err(_) => error!("[CLI] DiscoverStorage response channel closed without reply"),
     }
 }
 
@@ -360,7 +353,7 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
             .interact_text()
     });
 
-    info!("Requesting to remove node {}", node_id);
+    info!("[CLI] Requesting to remove node {}", node_id);
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::RemoveNode {
@@ -369,7 +362,7 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send RemoveNode request");
+        error!("[CLI] RemoveNode send failed: Store channel closed");
         return;
     }
 
@@ -377,9 +370,9 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(())) => println!("Node {} removed successfully.", node_id),
         Ok(Err(e)) => {
             println!("Failed to remove node: {}", e);
-            error!("Failed to remove node: {}", e);
+            error!("[CLI] RemoveNode {node_id} failed: {e}");
         }
-        Err(_) => error!("Failed to receive remove node response"),
+        Err(_) => error!("[CLI] RemoveNode response channel closed without reply"),
     }
 }
 
@@ -407,10 +400,10 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
         0 => 64,
         1 => 16,
         2 => 1,
-        _ => 64, // Unreachable: Select only returns valid indices above.
+        _ => unreachable!("Select bounded by items() above"),
     };
 
-    info!("Requesting to add pair for {} with stack size {}", item_name, stack_size);
+    info!("[CLI] Requesting to add pair for {} with stack size {}", item_name, stack_size);
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::AddPair {
@@ -420,7 +413,7 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send AddPair request");
+        error!("[CLI] AddPair send failed: Store channel closed");
         return;
     }
 
@@ -428,9 +421,9 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(())) => println!("Pair '{}' added successfully (stack size: {}, stocks set to zero).", item_name, stack_size),
         Ok(Err(e)) => {
             println!("Failed to add pair: {}", e);
-            error!("Failed to add pair: {}", e);
+            error!("[CLI] AddPair for {item_name} (stack {stack_size}) failed: {e}");
         }
-        Err(_) => error!("Failed to receive add pair response"),
+        Err(_) => error!("[CLI] AddPair response channel closed without reply"),
     }
 }
 
@@ -442,7 +435,7 @@ fn remove_pair(store_tx: &mpsc::Sender<StoreMessage>) {
             .interact_text()
     });
 
-    info!("Requesting to remove pair for {}", item_name);
+    info!("[CLI] Requesting to remove pair for {}", item_name);
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::RemovePair {
@@ -451,7 +444,7 @@ fn remove_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send RemovePair request");
+        error!("[CLI] RemovePair send failed: Store channel closed");
         return;
     }
 
@@ -459,9 +452,9 @@ fn remove_pair(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(())) => println!("Pair '{}' removed successfully.", item_name),
         Ok(Err(e)) => {
             println!("Failed to remove pair: {}", e);
-            error!("Failed to remove pair: {}", e);
+            error!("[CLI] RemovePair for {item_name} failed: {e}");
         }
-        Err(_) => error!("Failed to receive remove pair response"),
+        Err(_) => error!("[CLI] RemovePair response channel closed without reply"),
     }
 }
 
@@ -473,7 +466,7 @@ fn view_storage(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send QueryStorage request");
+        error!("[CLI] QueryStorage send failed: Store channel closed");
         return;
     }
 
@@ -501,7 +494,7 @@ fn view_storage(store_tx: &mpsc::Sender<StoreMessage>) {
             }
             println!("====================\n");
         }
-        Err(_) => error!("Failed to receive storage state"),
+        Err(_) => error!("[CLI] QueryStorage response channel closed without reply"),
     }
 }
 
@@ -521,7 +514,7 @@ fn view_trades(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send QueryTrades request");
+        error!("[CLI] QueryTrades send failed: Store channel closed");
         return;
     }
 
@@ -555,7 +548,7 @@ fn view_trades(store_tx: &mpsc::Sender<StoreMessage>) {
                 println!("====================\n");
             }
         }
-        Err(_) => error!("Failed to receive trades"),
+        Err(_) => error!("[CLI] QueryTrades response channel closed without reply"),
     }
 }
 
@@ -567,7 +560,7 @@ fn restart_bot(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send RestartBot request");
+        error!("[CLI] RestartBot send failed: Store channel closed");
         return;
     }
 
@@ -575,9 +568,9 @@ fn restart_bot(store_tx: &mpsc::Sender<StoreMessage>) {
         Ok(Ok(())) => println!("Bot restart initiated successfully."),
         Ok(Err(e)) => {
             println!("Failed to restart Bot: {}", e);
-            error!("Failed to restart Bot: {}", e);
+            error!("[CLI] RestartBot failed: {e}");
         }
-        Err(_) => error!("Failed to receive restart response"),
+        Err(_) => error!("[CLI] RestartBot response channel closed without reply"),
     }
 }
 
@@ -592,7 +585,7 @@ fn clear_stuck_order(store_tx: &mpsc::Sender<StoreMessage>) {
     });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send ClearStuckOrder request");
+        error!("[CLI] ClearStuckOrder send failed: Store channel closed");
         return;
     }
 
@@ -602,7 +595,7 @@ fn clear_stuck_order(store_tx: &mpsc::Sender<StoreMessage>) {
             println!("Queue will now continue processing remaining orders.");
         }
         Ok(None) => println!("No stuck order was detected (processing was not blocked)."),
-        Err(_) => error!("Failed to receive clear stuck order response"),
+        Err(_) => error!("[CLI] ClearStuckOrder response channel closed without reply"),
     }
 }
 
@@ -613,7 +606,7 @@ fn audit_state(store_tx: &mpsc::Sender<StoreMessage>, repair: bool) {
     let msg = StoreMessage::FromCli(CliMessage::AuditState { repair, respond_to: response_tx });
 
     if store_tx.blocking_send(msg).is_err() {
-        error!("Failed to send AuditState request");
+        error!("[CLI] AuditState send failed: Store channel closed");
         return;
     }
 
@@ -631,7 +624,45 @@ fn audit_state(store_tx: &mpsc::Sender<StoreMessage>, repair: bool) {
         }
         Err(_) => {
             println!("Failed to receive audit response.");
-            error!("Failed to receive audit response");
+            error!("[CLI] AuditState response channel closed without reply");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_prices_returns_none_when_item_stock_is_zero() {
+        assert_eq!(quote_prices(0, 100.0, 0.125), (None, None));
+    }
+
+    #[test]
+    fn quote_prices_returns_none_when_currency_stock_is_zero() {
+        assert_eq!(quote_prices(10, 0.0, 0.125), (None, None));
+    }
+
+    #[test]
+    fn quote_prices_returns_none_when_currency_stock_is_negative() {
+        // Defensive: constant-product is undefined for non-positive reserves.
+        assert_eq!(quote_prices(10, -1.0, 0.125), (None, None));
+    }
+
+    #[test]
+    fn quote_prices_applies_fee_symmetrically_around_mid() {
+        // item_stock=10, currency_stock=100 -> mid = 10.0, fee = 0.125
+        // buy  = 10.0 * 1.125 = 11.25
+        // sell = 10.0 * 0.875 =  8.75
+        let (buy, sell) = quote_prices(10, 100.0, 0.125);
+        assert!((buy.unwrap() - 11.25).abs() < 1e-9);
+        assert!((sell.unwrap() - 8.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quote_prices_with_zero_fee_collapses_buy_and_sell_to_mid() {
+        let (buy, sell) = quote_prices(4, 8.0, 0.0);
+        assert_eq!(buy, sell);
+        assert!((buy.unwrap() - 2.0).abs() < 1e-9);
     }
 }

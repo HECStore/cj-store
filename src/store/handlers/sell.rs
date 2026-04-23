@@ -18,6 +18,12 @@ pub(super) async fn handle(
     quantity: u32,
 ) -> Result<(), StoreError> {
     if !store.pairs.contains_key(item) {
+        debug!(
+            player = player_name,
+            uuid = user_uuid,
+            item = item,
+            "Rejected sell command: item not tradable"
+        );
         return utils::send_message_to_player(
             store,
             player_name,
@@ -27,8 +33,11 @@ pub(super) async fn handle(
     }
 
     debug!(
-        "Queueing sell order: {} wants to sell {} of {}",
-        player_name, quantity, item
+        player = player_name,
+        uuid = user_uuid,
+        item = item,
+        quantity = quantity,
+        "Queueing sell order"
     );
 
     match store.order_queue.add(

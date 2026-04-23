@@ -106,8 +106,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (store_tx, store_rx) = mpsc::channel::<StoreMessage>(128);
             let (bot_tx, bot_rx) = mpsc::channel::<BotInstruction>(128);
 
-            // Create Store instance: loads all persistent state (users, pairs, orders, trades, storage)
-            // See `Store::new()` for initialization details.
             let store = Store::new(bot_tx.clone()).await?;
 
             // Snapshot the config fields needed by bot_task before `store` is
@@ -119,10 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let trade_timeout_ms = store.config.trade_timeout_ms;
             let pathfinding_timeout_ms = store.config.pathfinding_timeout_ms;
 
-            // Spawn Store task (authoritative source of truth for all store data)
             let store_handle = tokio::spawn(store.run(store_rx, bot_tx.clone()));
 
-            // Spawn Bot task (local due to Azalea's !Send requirements)
+            // Local spawn: Azalea's bot_task is !Send.
             let bot_handle = tokio::task::spawn_local(crate::bot::bot_task(
                 store_tx.clone(),
                 bot_rx,
@@ -138,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // if edited — see `Store::reload_config`.
             spawn_config_watcher(store_tx.clone());
 
-            // Spawn CLI task (blocking I/O for interactive menu)
+            // Blocking spawn: cli_task uses stdin which blocks the thread.
             let cli_handle = tokio::task::spawn_blocking(move || cli_task(store_tx));
 
             info!("[Main] All tasks spawned");
@@ -157,13 +154,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             false
         }
         Ok(Err(e)) => {
-            error!("[Main] Main loop error: {}", e);
-            eprintln!("❌ Error during runtime: {}", e);
+            error!("[Main] Main loop failed: {e}");
+            eprintln!("❌ Error during runtime: {e}");
             true
         }
         Err(e) => {
-            error!("[Main] LocalSet join error: {}", e);
-            eprintln!("❌ Error during runtime: {}", e);
+            error!("[Main] Task join failed: {e}");
+            eprintln!("❌ Error during runtime: {e}");
             true
         }
     };
@@ -247,12 +244,12 @@ fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
         }) {
             Ok(w) => w,
             Err(e) => {
-                warn!("[ConfigWatcher] Failed to create watcher, hot-reload disabled: {}", e);
+                warn!("[ConfigWatcher] Failed to create watcher, hot-reload disabled: {e}");
                 return;
             }
         };
         if let Err(e) = watcher.watch(Path::new("data/config.json"), RecursiveMode::NonRecursive) {
-            warn!("[ConfigWatcher] Failed to watch data/config.json, hot-reload disabled: {}", e);
+            warn!("[ConfigWatcher] Failed to watch data/config.json, hot-reload disabled: {e}");
             return;
         }
         info!("[ConfigWatcher] Watching data/config.json for changes");
@@ -276,15 +273,16 @@ fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
                     match crate::config::Config::load() {
                         Ok(cfg) => {
                             if store_tx.send(StoreMessage::ReloadConfig(cfg)).await.is_err() {
-                                info!("[ConfigWatcher] Store channel closed, exiting");
+                                info!("[ConfigWatcher] Store channel closed, watcher exiting");
                                 return;
                             }
+                            info!("[ConfigWatcher] Config reload dispatched to Store");
                         }
-                        Err(e) => warn!("[ConfigWatcher] Reload failed, keeping old config: {}", e),
+                        Err(e) => warn!("[ConfigWatcher] Reload failed, keeping old config: {e}"),
                     }
                 }
                 Ok(_) => {}
-                Err(e) => warn!("[ConfigWatcher] Watch error: {}", e),
+                Err(e) => warn!("[ConfigWatcher] Watch error: {e}"),
             }
         }
     });

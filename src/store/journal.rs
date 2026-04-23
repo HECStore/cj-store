@@ -134,13 +134,19 @@ impl Journal {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    "[Journal] Failed to parse {:?} ({}); treating as empty - any in-flight operation record is lost",
-                    path, e
+                    "[Journal] corrupt journal file {:?}: {e} - treating as empty, any in-flight shulker operation record is lost",
+                    path
                 );
                 Vec::new()
             }
         };
         let leftover = entries.into_iter().last();
+        if let Some(entry) = &leftover {
+            tracing::info!(
+                "[Journal] loaded leftover entry: op_id={} type={:?} chest_id={} slot={} state={:?}",
+                entry.operation_id, entry.operation_type, entry.chest_id, entry.slot_index, entry.state
+            );
+        }
         Ok((
             Self { entry: None, path: path.to_path_buf() },
             leftover,
@@ -150,7 +156,15 @@ impl Journal {
     /// Discard whatever was on disk at startup. Writes an empty journal file.
     pub fn clear_leftover(&mut self) -> io::Result<()> {
         self.entry = None;
-        self.persist()
+        let res = self.persist();
+        match &res {
+            Ok(()) => tracing::info!("[Journal] cleared leftover entry from {:?}", self.path),
+            Err(e) => tracing::error!(
+                "[Journal] failed to clear leftover entry at {:?}: {e}",
+                self.path
+            ),
+        }
+        res
     }
 
     /// Start tracking a new shulker operation.
@@ -167,8 +181,8 @@ impl Journal {
     ) -> io::Result<u64> {
         if let Some(prev) = &self.entry {
             tracing::warn!(
-                "Journal: overwriting stale in-memory entry {:?} (previous op did not complete cleanly)",
-                prev
+                "[Journal] overwriting stale in-memory entry op_id={} type={:?} chest_id={} slot={} state={:?} - previous op did not complete cleanly",
+                prev.operation_id, prev.operation_type, prev.chest_id, prev.slot_index, prev.state
             );
         }
         let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
@@ -179,7 +193,11 @@ impl Journal {
             slot_index,
             state: JournalState::ShulkerTaken,
         });
-        self.persist()?;
+        self.persist().inspect_err(|e| {
+            tracing::error!(
+                "[Journal] failed to persist begin: op_id={operation_id} type={operation_type:?} chest_id={chest_id} slot={slot_index}: {e}"
+            );
+        })?;
         Ok(operation_id)
     }
 
@@ -190,17 +208,31 @@ impl Journal {
     /// sites got out of sync.
     pub fn advance(&mut self, state: JournalState) -> io::Result<()> {
         let Some(entry) = self.entry.as_mut() else {
-            tracing::warn!("Journal: advance({:?}) called with no active entry", state);
+            tracing::warn!(
+                "[Journal] advance to {state:?} called with no active entry - begin/advance call sites out of sync"
+            );
             return Ok(());
         };
+        let op_id = entry.operation_id;
+        let chest_id = entry.chest_id;
+        let slot_index = entry.slot_index;
         entry.state = state;
-        self.persist()
+        self.persist().inspect_err(|e| {
+            tracing::error!(
+                "[Journal] failed to persist advance to {state:?}: op_id={op_id} chest_id={chest_id} slot={slot_index}: {e}"
+            );
+        })
     }
 
     /// Mark the active operation complete and clear the journal.
     pub fn complete(&mut self) -> io::Result<()> {
+        let op_id = self.entry.as_ref().map(|e| e.operation_id);
         self.entry = None;
-        self.persist()
+        self.persist().inspect_err(|e| {
+            tracing::error!(
+                "[Journal] failed to persist complete: op_id={op_id:?}: {e}"
+            );
+        })
     }
 
     /// View the currently-active entry, if any.
@@ -295,6 +327,98 @@ mod tests {
         loaded.clear_leftover().unwrap();
         let (_again, leftover) = Journal::load_from(&path).unwrap();
         assert!(leftover.is_none(), "clear_leftover should empty the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_returns_none_when_file_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "cj-store-journal-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.json");
+        assert!(!path.exists());
+
+        let (j, leftover) = Journal::load_from(&path).unwrap();
+        assert!(leftover.is_none());
+        assert!(j.current().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_treats_corrupt_json_as_empty() {
+        let (j, dir) = temp_journal("corrupt");
+        let path = j.path.clone();
+        drop(j);
+        std::fs::write(&path, "{ this is not valid json ][").unwrap();
+
+        let (_loaded, leftover) = Journal::load_from(&path).unwrap();
+        assert!(
+            leftover.is_none(),
+            "corrupt JSON must surface as empty leftover, not an error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_overwrites_stale_entry() {
+        let (mut j, dir) = temp_journal("stale");
+
+        let first = j.begin(JournalOp::WithdrawFromChest, 11, 3).unwrap();
+        j.advance(JournalState::ShulkerOnStation).unwrap();
+        // Simulate a previous op that never reached `complete` (e.g. crash).
+        let second = j.begin(JournalOp::DepositToChest, 22, 7).unwrap();
+        assert_ne!(first, second);
+        let cur = j.current().expect("entry must exist after begin");
+        assert_eq!(cur.operation_id, second);
+        assert_eq!(cur.chest_id, 22);
+        assert_eq!(cur.slot_index, 7);
+        assert_eq!(cur.state, JournalState::ShulkerTaken);
+        assert_eq!(cur.operation_type, JournalOp::DepositToChest);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advance_without_active_entry_is_noop_not_error() {
+        let (mut j, dir) = temp_journal("advance-noop");
+
+        j.advance(JournalState::ShulkerOnStation).unwrap();
+        assert!(j.current().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn complete_without_active_entry_is_noop_not_error() {
+        let (mut j, dir) = temp_journal("complete-noop");
+
+        j.complete().unwrap();
+        assert!(j.current().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_survives_round_trip_through_disk() {
+        let (mut j, dir) = temp_journal("roundtrip");
+        let path = j.path.clone();
+
+        let op_id = j.begin(JournalOp::WithdrawFromChest, 101, 17).unwrap();
+        j.advance(JournalState::ShulkerPickedUp).unwrap();
+
+        let (_loaded, leftover) = Journal::load_from(&path).unwrap();
+        let entry = leftover.expect("persisted entry must be readable");
+        assert_eq!(entry.operation_id, op_id);
+        assert_eq!(entry.chest_id, 101);
+        assert_eq!(entry.slot_index, 17);
+        assert_eq!(entry.state, JournalState::ShulkerPickedUp);
+        assert_eq!(entry.operation_type, JournalOp::WithdrawFromChest);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -43,31 +43,25 @@ pub enum TradeType {
     RemoveCurrency,
 }
 
-/// Represents a single executed trade with timestamp.
-/// 
-/// Each trade is persisted to its own file in `data/trades/{timestamp}.json`.
-/// This allows for efficient appending and historical queries.
+/// A single executed trade. Persisted one-file-per-trade in
+/// `data/trades/{timestamp}.json` so a new trade is a single atomic write and
+/// no existing history is rewritten on append.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Trade {
-    /// Type of trade (buy, sell, deposit, withdraw, etc.)
     pub trade_type: TradeType,
-    /// Item involved in the trade
     pub item: crate::types::ItemId,
-    /// Quantity of items traded
     pub amount: i32,
-    /// Currency amount involved (diamonds)
+    /// Currency (diamonds) exchanged.
     pub amount_currency: f64,
-    /// UUID of the user who executed the trade
     pub user_uuid: String,
-    /// When the trade was executed
     pub timestamp: DateTime<Utc>,
 }
 
 impl Trade {
-    // Directory where all individual trade files will be stored
     const TRADES_DIR: &str = "data/trades";
 
-    /// Helper method to create a new trade with current timestamp
+    /// Construct a trade stamped with the current wall-clock time. The timestamp
+    /// is authoritative — it becomes the on-disk filename.
     pub fn new(
         trade_type: TradeType,
         item: crate::types::ItemId,
@@ -85,23 +79,18 @@ impl Trade {
         }
     }
 
-    // Helper function to get the file path for a single trade.
-    // The timestamp doubles as the filename, so two trades created at the
-    // exact same nanosecond would collide — in practice this is fine since
-    // trades are created serially and sub-nanosecond collisions are not expected.
+    // Colons are reserved on Windows (NTFS), so RFC3339 timestamps must have
+    // them replaced before use as a filename.
     fn get_trade_file_path(timestamp: &DateTime<Utc>) -> PathBuf {
-        // Colons are reserved on Windows (NTFS) filesystems, so RFC3339
-        // timestamps must have them replaced before use as a filename.
         let timestamp_str = timestamp.to_rfc3339().replace(':', "-");
-        PathBuf::from(Self::TRADES_DIR).join(format!("{}.json", timestamp_str))
+        PathBuf::from(Self::TRADES_DIR).join(format!("{timestamp_str}.json"))
     }
 
-    /// Saves this single `Trade` instance to `data/trades/{timestamp}.json`.
-    /// Creates the 'data/trades' directory if it doesn't exist.
+    /// Saves this single `Trade` to `data/trades/{timestamp}.json`, creating
+    /// the directory if needed.
     pub fn save(&self) -> io::Result<()> {
         let path = Self::get_trade_file_path(&self.timestamp);
 
-        // Ensure the directory exists
         if let Some(parent_dir) = path.parent()
             && !parent_dir.exists() {
                 fs::create_dir_all(parent_dir)?;
@@ -109,6 +98,7 @@ impl Trade {
 
         let json_str = serde_json::to_string_pretty(self)?;
         write_atomic(&path, &json_str)?;
+        tracing::debug!("[Trade] saved {} ({:?} {} x{})", self.timestamp, self.trade_type, self.item.as_str(), self.amount);
         Ok(())
     }
 
@@ -152,19 +142,22 @@ impl Trade {
             &json_paths[..]
         };
 
+        let mut skipped = 0usize;
         for path in paths_to_load {
             match fs::read_to_string(path) {
                 Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                     Ok(trade) => {
                         trades.push(trade);
                     }
-                    Err(e) => tracing::warn!(
-                        "Could not deserialize trade from {}: {}",
-                        path.display(),
-                        e
-                    ),
+                    Err(e) => {
+                        skipped += 1;
+                        tracing::warn!("[Trade] skipping malformed {}: {e}", path.display());
+                    }
                 },
-                Err(e) => tracing::warn!("Could not read trade file {}: {}", path.display(), e),
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!("[Trade] skipping unreadable {}: {e}", path.display());
+                }
             }
         }
 
@@ -172,17 +165,14 @@ impl Trade {
         // but sort by timestamp field to be safe against any filename anomalies.
         trades.sort_by_key(|a| a.timestamp);
 
-        if file_count > max_trades {
-            tracing::info!(
-                "Loaded {} of {} trades into memory (limited to {})",
-                trades.len(),
-                file_count,
-                max_trades
-            );
-        } else {
-            tracing::info!("Loaded {} trades from disk", trades.len());
-        }
-        
+        tracing::info!(
+            "[Trade] loaded {} of {} trades (limit {}, skipped {})",
+            trades.len(),
+            file_count,
+            max_trades,
+            skipped,
+        );
+
         Ok(trades)
     }
     
@@ -204,23 +194,20 @@ impl Trade {
 
         let dir_path = Path::new(Self::TRADES_DIR);
 
-        // Ensure the directory exists
         if !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
         }
 
-        // Keep track of files that should exist after saving
         let mut expected_files = std::collections::HashSet::new();
 
-        // Save each trade individually using the individual trade.save() method
         for trade in trades {
             trade.save()?;
             let timestamp_str = trade.timestamp.to_rfc3339().replace(':', "-");
-            let filename = format!("{}.json", timestamp_str);
+            let filename = format!("{timestamp_str}.json");
             expected_files.insert(filename);
         }
 
-        // Remove any files that shouldn't exist anymore
+        let mut removed = 0usize;
         if dir_path.exists() {
             for entry in fs::read_dir(dir_path)? {
                 let entry = entry?;
@@ -229,10 +216,76 @@ impl Trade {
                     && let Some(filename) = path.file_name().and_then(|n| n.to_str())
                         && !expected_files.contains(filename) {
                             fs::remove_file(&path)?;
+                            removed += 1;
                         }
             }
         }
 
+        tracing::info!(
+            "[Trade] save_all: wrote {} trades, cleaned {} orphan files",
+            trades.len(),
+            removed,
+        );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ItemId;
+
+    #[test]
+    fn new_captures_current_timestamp() {
+        let before = Utc::now();
+        let t = Trade::new(
+            TradeType::Buy,
+            ItemId::new("diamond").unwrap(),
+            1,
+            2.5,
+            "u".to_string(),
+        );
+        let after = Utc::now();
+        assert!(t.timestamp >= before && t.timestamp <= after);
+        assert_eq!(t.trade_type, TradeType::Buy);
+    }
+
+    #[test]
+    fn trade_type_default_is_buy() {
+        assert_eq!(TradeType::default(), TradeType::Buy);
+    }
+
+    #[test]
+    fn trade_type_serde_round_trip_preserves_variant() {
+        for variant in [
+            TradeType::Buy,
+            TradeType::Sell,
+            TradeType::AddStock,
+            TradeType::RemoveStock,
+            TradeType::DepositBalance,
+            TradeType::WithdrawBalance,
+            TradeType::AddCurrency,
+            TradeType::RemoveCurrency,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: TradeType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn save_all_refuses_empty_vec_to_prevent_accidental_wipe() {
+        let err = Trade::save_all(&Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("empty trades vec"));
+    }
+
+    #[test]
+    fn get_trade_file_path_replaces_colons_for_windows() {
+        let ts: DateTime<Utc> = "2024-01-02T03:04:05Z".parse().unwrap();
+        let p = Trade::get_trade_file_path(&ts);
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert!(!name.contains(':'), "file name should have no colons: {name}");
+        assert!(name.ends_with(".json"));
     }
 }

@@ -18,6 +18,13 @@ pub(super) async fn handle(
     quantity: u32,
 ) -> Result<(), StoreError> {
     if !store.pairs.contains_key(item) {
+        debug!(
+            user = player_name,
+            uuid = user_uuid,
+            item = item,
+            quantity = quantity,
+            "Buy rejected: item not in pairs"
+        );
         return utils::send_message_to_player(
             store,
             player_name,
@@ -27,8 +34,11 @@ pub(super) async fn handle(
     }
 
     debug!(
-        "Queueing buy order: {} wants {} of {}",
-        player_name, quantity, item
+        user = player_name,
+        uuid = user_uuid,
+        item = item,
+        quantity = quantity,
+        "Queueing buy order"
     );
 
     match store.order_queue.add(

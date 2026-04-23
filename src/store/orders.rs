@@ -16,7 +16,7 @@
 //! ~470-line monoliths we had before.
 
 use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn, Instrument};
 
 use crate::constants::CHEST_OP_TIMEOUT_SECS;
 use crate::error::StoreError;
@@ -93,7 +93,14 @@ pub(crate) async fn execute_chest_transfers(
                 return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
             }
             Err(_) => {
-                error!(phase = log_tag, chest_id = t.chest_id, "Chest operation timeout");
+                error!(
+                    phase = log_tag,
+                    chest_id = t.chest_id,
+                    item = %item,
+                    amount = t.amount,
+                    timeout_secs = CHEST_OP_TIMEOUT_SECS,
+                    "Chest operation timed out"
+                );
                 return Err(StoreError::TradeTimeout(CHEST_OP_TIMEOUT_SECS));
             }
         };
@@ -158,7 +165,12 @@ pub(crate) async fn perform_trade(
     )
     .await
     .map_err(|_| {
-        error!(phase = log_tag, player = %target_username, "Trade timeout");
+        error!(
+            phase = log_tag,
+            player = %target_username,
+            timeout_ms = store.config.trade_timeout_ms,
+            "Trade GUI handoff timed out"
+        );
         StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000)
     })?
     .map_err(|e| {
@@ -179,9 +191,13 @@ struct BuyPlan {
     user_uuid: String,
     qty_i32: i32,
     total_cost: f64,
+    /// Whole diamonds the player must place in the trade GUI to cover the
+    /// shortfall between their stored balance and `total_cost`. Zero when the
+    /// balance already covers the full cost.
     diamonds_to_offer: i32,
-    user_balance_at_plan: f64,
     withdraw_plan: Vec<ChestTransfer>,
+    /// Physical item count in storage at planning time, used for a post-trade
+    /// sanity check that the bot actually removed what it was told to.
     physical_stock: i32,
     stack_size: i32,
 }
@@ -266,10 +282,9 @@ async fn validate_and_plan_buy(
     let stack_size = pair.stack_size;
 
     let user_balance = store.users.get(&user_uuid).map(|u| u.balance).unwrap_or(0.0);
-    let balance_shortfall = total_cost - user_balance;
-    let diamonds_to_offer = if balance_shortfall > 0.0 {
-        let ceil_value = balance_shortfall.ceil();
-        if ceil_value > i32::MAX as f64 {
+    let diamonds_to_offer = match diamonds_to_offer_for_buy(total_cost, user_balance) {
+        Some(d) => d,
+        None => {
             utils::send_message_to_player(
                 store,
                 player_name,
@@ -278,9 +293,6 @@ async fn validate_and_plan_buy(
             .await?;
             return Ok(None);
         }
-        ceil_value as i32
-    } else {
-        0
     };
 
     if user_balance + (diamonds_to_offer as f64) < total_cost {
@@ -316,11 +328,38 @@ async fn validate_and_plan_buy(
         qty_i32,
         total_cost,
         diamonds_to_offer,
-        user_balance_at_plan: user_balance,
         withdraw_plan,
         physical_stock,
         stack_size,
     }))
+}
+
+/// Diamonds the buyer must place in the trade GUI to cover a `total_cost`
+/// given their current `balance`. Returns `None` if the shortfall overflows
+/// `i32` (the bot can't offer more than that in a single trade).
+fn diamonds_to_offer_for_buy(total_cost: f64, balance: f64) -> Option<i32> {
+    let shortfall = total_cost - balance;
+    if shortfall <= 0.0 {
+        return Some(0);
+    }
+    let ceil_value = shortfall.ceil();
+    if ceil_value > i32::MAX as f64 {
+        return None;
+    }
+    Some(ceil_value as i32)
+}
+
+/// Split a sell payout into the whole-diamond portion handed over in the
+/// trade GUI and the fractional portion credited to the seller's balance.
+/// Returns `None` when the whole-diamond portion overflows `i32`.
+fn split_sell_payout(total_payout: f64) -> Option<(i32, f64)> {
+    let floor_value = total_payout.floor();
+    if floor_value > i32::MAX as f64 {
+        return None;
+    }
+    let whole = floor_value as i32;
+    let fractional = total_payout - (whole as f64);
+    Some((whole, fractional))
 }
 
 /// Handle buy orders.
@@ -555,7 +594,6 @@ pub async fn handle_buy_order(
         surplus = format_args!("{:.2}", surplus),
         "Buy order completed"
     );
-    let _ = plan.user_balance_at_plan; // kept for audit log context
 
     if let Err(e) = state::assert_invariants(store, "post-buy", true) {
         error!(phase = "buy.invariant", player = %player_name, item = %item, "Invariant violation after buy: {}", e);
@@ -671,18 +709,18 @@ async fn validate_and_plan_sell(
         return Ok(None);
     }
 
-    let floor_value = total_payout.floor();
-    if floor_value > i32::MAX as f64 {
-        utils::send_message_to_player(
-            store,
-            player_name,
-            "Payout amount too large (exceeds maximum diamond limit)",
-        )
-        .await?;
-        return Ok(None);
-    }
-    let whole_diamonds = floor_value as i32;
-    let fractional_diamonds = total_payout - (whole_diamonds as f64);
+    let (whole_diamonds, fractional_diamonds) = match split_sell_payout(total_payout) {
+        Some(pair) => pair,
+        None => {
+            utils::send_message_to_player(
+                store,
+                player_name,
+                "Payout amount too large (exceeds maximum diamond limit)",
+            )
+            .await?;
+            return Ok(None);
+        }
+    };
 
     Ok(Some(SellPlan {
         user_uuid,
@@ -1010,24 +1048,32 @@ pub async fn execute_queued_order(
 
     let start_time = std::time::Instant::now();
 
-    let result = match &order.order_type {
-        QueuedOrderType::Buy => handle_buy_order(store, &order.username, &order.item, order.quantity)
-            .await
-            .map(|()| format!("Buy order completed: {} {} for {}", order.quantity, order.item, order.username)),
-        QueuedOrderType::Sell => handle_sell_order(store, &order.username, &order.item, order.quantity)
-            .await
-            .map(|()| format!("Sell order completed: {} {} for {}", order.quantity, order.item, order.username)),
-        QueuedOrderType::Deposit { amount } => {
-            super::handlers::player::handle_deposit_balance_queued(store, &order.username, *amount)
+    // Attach order_id to every log line emitted by the inner handler so an
+    // operator can trace a single order end-to-end through withdraw, trade,
+    // deposit, commit, and rollback phases.
+    let order_span = info_span!("order", order_id = order.id, player = %order.username);
+    let result = async {
+        match &order.order_type {
+            QueuedOrderType::Buy => handle_buy_order(store, &order.username, &order.item, order.quantity)
                 .await
-                .map(|()| format!("Deposit completed for {}", order.username))
-        }
-        QueuedOrderType::Withdraw { amount } => {
-            super::handlers::player::handle_withdraw_balance_queued(store, &order.username, *amount)
+                .map(|()| format!("Buy order completed: {} {} for {}", order.quantity, order.item, order.username)),
+            QueuedOrderType::Sell => handle_sell_order(store, &order.username, &order.item, order.quantity)
                 .await
-                .map(|()| format!("Withdraw completed for {}", order.username))
+                .map(|()| format!("Sell order completed: {} {} for {}", order.quantity, order.item, order.username)),
+            QueuedOrderType::Deposit { amount } => {
+                super::handlers::player::handle_deposit_balance_queued(store, &order.username, *amount)
+                    .await
+                    .map(|()| format!("Deposit completed for {}", order.username))
+            }
+            QueuedOrderType::Withdraw { amount } => {
+                super::handlers::player::handle_withdraw_balance_queued(store, &order.username, *amount)
+                    .await
+                    .map(|()| format!("Withdraw completed for {}", order.username))
+            }
         }
-    };
+    }
+    .instrument(order_span)
+    .await;
 
     let elapsed = start_time.elapsed();
     match &result {
@@ -1446,6 +1492,127 @@ mod tests {
         let result = player::handle_withdraw_balance_queued(&mut store, "Neg", Some(0.0)).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
+    }
+
+    #[test]
+    fn diamonds_to_offer_is_zero_when_balance_covers_cost() {
+        assert_eq!(diamonds_to_offer_for_buy(100.0, 150.0), Some(0));
+        assert_eq!(diamonds_to_offer_for_buy(100.0, 100.0), Some(0));
+    }
+
+    #[test]
+    fn diamonds_to_offer_ceils_fractional_shortfall() {
+        // 12.3 shortfall rounds up to 13 whole diamonds — bot cannot accept
+        // a fractional stack count in the trade GUI.
+        assert_eq!(diamonds_to_offer_for_buy(50.3, 38.0), Some(13));
+        // Exact fractional boundary: 0.5 still rounds up to 1.
+        assert_eq!(diamonds_to_offer_for_buy(1.5, 1.0), Some(1));
+    }
+
+    #[test]
+    fn diamonds_to_offer_rejects_overflow() {
+        let huge = (i32::MAX as f64) * 2.0;
+        assert_eq!(diamonds_to_offer_for_buy(huge, 0.0), None);
+    }
+
+    #[test]
+    fn split_sell_payout_separates_whole_and_fraction() {
+        let (whole, frac) = split_sell_payout(42.75).unwrap();
+        assert_eq!(whole, 42);
+        assert!((frac - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_sell_payout_handles_integer_amount() {
+        let (whole, frac) = split_sell_payout(10.0).unwrap();
+        assert_eq!(whole, 10);
+        assert!(frac.abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_sell_payout_handles_sub_diamond_amount() {
+        let (whole, frac) = split_sell_payout(0.42).unwrap();
+        assert_eq!(whole, 0);
+        assert!((frac - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn split_sell_payout_rejects_overflow() {
+        let huge = (i32::MAX as f64) + 1.0e9;
+        assert!(split_sell_payout(huge).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_buy_happy_path_records_trade_and_order() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("HappyBuyer", 10_000.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair("cobblestone", 64, 500.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage("cobblestone", 64);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+        let balance_before = store.users.get(&uuid).unwrap().balance;
+        let pair_currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
+
+        let result = handle_buy_order(&mut store, "HappyBuyer", "cobblestone", 10).await;
+        assert!(result.is_ok(), "buy failed: {:?}", result);
+
+        // Trade journal + order history received one new entry each.
+        assert_eq!(store.trades.len(), trades_before + 1);
+        assert_eq!(store.orders.len(), orders_before + 1);
+        // Buyer was charged (balance strictly decreased).
+        let balance_after = store.users.get(&uuid).unwrap().balance;
+        assert!(
+            balance_after < balance_before,
+            "balance should decrease on successful buy"
+        );
+        // Reserve currency_stock went up by the paid cost.
+        let pair_after = store.pairs.get("cobblestone").unwrap();
+        assert!(pair_after.currency_stock > pair_currency_before);
+    }
+
+    #[tokio::test]
+    async fn test_sell_happy_path_records_trade_and_order() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("HappySeller", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair("cobblestone", 64, 5_000.0);
+        pairs.insert(k, p);
+
+        // Storage contains some cobblestone plus diamonds the store will pay out with.
+        let mut storage = make_storage("cobblestone", 64);
+        let diamond_chest = &mut storage.nodes[0].chests[3];
+        diamond_chest.item = ItemId::from_normalized("diamond".to_string());
+        diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        diamond_chest.amounts[0] = 64 * 10;
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+        let pair_currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
+
+        let result = handle_sell_order(&mut store, "HappySeller", "cobblestone", 10).await;
+        assert!(result.is_ok(), "sell failed: {:?}", result);
+
+        assert_eq!(store.trades.len(), trades_before + 1);
+        assert_eq!(store.orders.len(), orders_before + 1);
+        // Reserve currency_stock decreased by the payout.
+        let pair_after = store.pairs.get("cobblestone").unwrap();
+        assert!(pair_after.currency_stock < pair_currency_before);
     }
 
     #[tokio::test]

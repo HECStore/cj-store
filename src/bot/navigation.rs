@@ -58,9 +58,6 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
         dx, dy, dz
     );
 
-    // Use Azalea's pathfinding with BlockPosGoal wrapper
-    // Azalea's pathfinding should NOT break blocks - it only walks around obstacles
-    // If blocks are being broken, it's likely from a different source (e.g., block_interact misuse)
     client.goto(BlockPosGoal(target_block)).await;
 
     // Wait for pathfinding to complete (timeout from config)
@@ -133,12 +130,28 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
         match navigate_to_position_once(bot, target).await {
             Ok(true) => return Ok(()), // Successfully reached target
             Ok(false) => {
-                // Timed out, will retry
-                warn!(
-                    "Navigation attempt {}/{} timed out for target ({}, {}, {})",
-                    attempt + 1, NAVIGATION_MAX_RETRIES,
-                    target.x, target.y, target.z
-                );
+                // Capture current bot position for the warn so an operator can
+                // see where pathfinding stalled, not just where we wanted to go.
+                let current = {
+                    let guard = bot.client.read().await;
+                    guard.as_ref().map(|c| {
+                        let p = c.entity().position();
+                        BlockPos::from(p)
+                    })
+                };
+                match current {
+                    Some(cur) => warn!(
+                        "Navigation attempt {}/{} timed out - target: ({}, {}, {}), current: ({}, {}, {})",
+                        attempt + 1, NAVIGATION_MAX_RETRIES,
+                        target.x, target.y, target.z,
+                        cur.x, cur.y, cur.z
+                    ),
+                    None => warn!(
+                        "Navigation attempt {}/{} timed out - target: ({}, {}, {}), current: unknown (bot disconnected)",
+                        attempt + 1, NAVIGATION_MAX_RETRIES,
+                        target.x, target.y, target.z
+                    ),
+                }
             }
             Err(e) => {
                 // Bot not connected or other error, propagate immediately
@@ -153,11 +166,23 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
     // inventory validation, and aborting the entire task here would strand the
     // bot mid-operation. A loud warning is logged so failures remain visible,
     // but the pipeline is allowed to continue and recover downstream.
-    warn!(
-        "Navigation to ({}, {}, {}) failed after {} attempts, continuing anyway",
-        target.x, target.y, target.z,
-        NAVIGATION_MAX_RETRIES
-    );
+    let final_current = {
+        let guard = bot.client.read().await;
+        guard.as_ref().map(|c| BlockPos::from(c.entity().position()))
+    };
+    match final_current {
+        Some(cur) => warn!(
+            "Navigation to ({}, {}, {}) failed after {} attempts - current: ({}, {}, {}), continuing anyway",
+            target.x, target.y, target.z,
+            NAVIGATION_MAX_RETRIES,
+            cur.x, cur.y, cur.z
+        ),
+        None => warn!(
+            "Navigation to ({}, {}, {}) failed after {} attempts - current: unknown (bot disconnected), continuing anyway",
+            target.x, target.y, target.z,
+            NAVIGATION_MAX_RETRIES
+        ),
+    }
     Ok(())
 }
 
@@ -194,11 +219,8 @@ pub async fn go_to_chest(bot: &Bot, chest: &Chest, node_position: &Position) -> 
         )
     })?;
     
-    // The chest should be accessible from the node position
-    // Bot is now centered on the node block, facing the center.
-    // Logged at `debug!` (not `info!`) because go_to_chest is on the hot path
-    // for every trade/chest operation; one line per chest visit is too chatty
-    // for default production logs.
+    // debug! (not info!) because this fires for every trade/chest op; one line
+    // per visit would swamp default production logs.
     debug!(
         "At node ({}, {}, {}), chest {} accessible at ({}, {}, {})",
         node_position.x, node_position.y, node_position.z,
@@ -206,7 +228,10 @@ pub async fn go_to_chest(bot: &Bot, chest: &Chest, node_position: &Position) -> 
         chest.position.x, chest.position.y, chest.position.z
     );
     
-    // Small delay to ensure we're positioned correctly
+    // Brief settle delay before the caller opens the chest: Azalea can report
+    // arrival a tick before the client-side entity position fully stabilizes,
+    // and opening a chest while still in motion occasionally targets the wrong
+    // block. DELAY_MEDIUM_MS is short enough to be invisible in aggregate.
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
     
     Ok(())

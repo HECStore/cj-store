@@ -15,21 +15,21 @@
 //! **Reconnection**: Automatic with exponential backoff (2s → 60s max).
 //! Prevents concurrent connection attempts via `AtomicBool`.
 
-pub mod connection;
-pub mod navigation;
-pub mod trade;
 pub mod chest_io;
-pub mod shulker;
+pub mod connection;
 pub mod inventory;
+pub mod navigation;
+pub mod shulker;
+pub mod trade;
 
+use azalea::account::Account;
 use azalea::prelude::*;
 use azalea::{Client, Event};
-use azalea::account::Account;
 use std::sync::Arc;
-use tokio::sync::{RwLock, broadcast, mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::messages::{BotInstruction, BotMessage, ChestAction, ChestSyncReport, StoreMessage};
 use crate::types::Position;
@@ -126,6 +126,10 @@ impl Bot {
             debug!("Sent chat message: {}", message);
             Ok(())
         } else {
+            warn!(
+                "send_chat_message dropped: bot not connected (message={})",
+                message
+            );
             Err("Bot not connected".to_string())
         }
     }
@@ -136,6 +140,10 @@ impl Bot {
             debug!("Sent whisper to {}: {}", target, message);
             Ok(())
         } else {
+            warn!(
+                "send_whisper dropped: bot not connected (target={} message={})",
+                target, message
+            );
             Err("Bot not connected".to_string())
         }
     }
@@ -153,7 +161,7 @@ impl Bot {
     pub fn normalize_item_id(item: &str) -> String {
         item.strip_prefix("minecraft:").unwrap_or(item).to_string()
     }
-    
+
     pub fn chat_subscribe(&self) -> broadcast::Receiver<String> {
         self.chat_tx.subscribe()
     }
@@ -197,12 +205,16 @@ pub async fn bot_task(
             shared
         }
         Err(e) => {
-            warn!("[Bot] Failed to load operation journal: {} — starting with empty journal", e);
-            std::sync::Arc::new(parking_lot::Mutex::new(crate::store::journal::Journal::default()))
+            warn!(
+                "[Bot] Failed to load operation journal: {} — starting with empty journal",
+                e
+            );
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::store::journal::Journal::default(),
+            ))
         }
     };
 
-    // Create bot instance using config values
     let bot = match Bot::new(
         account_email,
         server_address,
@@ -245,7 +257,7 @@ pub async fn bot_task(
                 if bot.shutdown.load(Ordering::SeqCst) {
                     break 'outer;
                 }
-                
+
                 let disconnected = bot.client.read().await.is_none();
                 if disconnected && last_attempt.elapsed() >= backoff {
                     info!("Bot appears disconnected; attempting reconnect");
@@ -297,7 +309,12 @@ pub async fn bot_task(
                 respond_to,
             } => {
                 let result = bot.send_whisper(&target, &message).await;
-                let _ = respond_to.send(result);
+                if respond_to.send(result).is_err() {
+                    warn!(
+                        "[Bot] Whisper response channel dropped before ack (target={})",
+                        target
+                    );
+                }
             }
             BotInstruction::InteractWithChestAndSync {
                 target_chest,
@@ -322,7 +339,7 @@ pub async fn bot_task(
                             target_chest.position.y,
                             target_chest.position.z,
                         );
-                        
+
                         match action.clone() {
                             ChestAction::Deposit { item, amount, from_player, stack_size } => {
                                 if from_player.is_some() {
@@ -358,7 +375,7 @@ pub async fn bot_task(
                                         stack_size,
                                     ).await;
                                     let io_elapsed = io_start.elapsed();
-                                    
+
                                     match io_result {
                                         Ok(amounts) => {
                                             Ok(ChestSyncReport {
@@ -464,7 +481,7 @@ pub async fn bot_task(
                         error!("[Bot] Trade failed after {:.2}s: {}", trade_elapsed.as_secs_f64(), e);
                     }
                 }
-                
+
                 if respond_to.send(result).is_err() {
                     error!("[Bot] Trade response channel dropped");
                 }
@@ -474,17 +491,19 @@ pub async fn bot_task(
                 node_position,
                 respond_to,
             } => {
-                info!("Validating node {} at position ({}, {}, {})", 
-                      node_id, node_position.x, node_position.y, node_position.z);
+                // Single info! is emitted inside validate_node_physically;
+                // logging here too would just double every validation run.
                 let result = validate_node_physically(&bot, node_id, &node_position).await;
-                let _ = respond_to.send(result);
+                if respond_to.send(result).is_err() {
+                    error!("[Bot] ValidateNode response channel dropped for node {}", node_id);
+                }
             }
             BotInstruction::Restart => {
                 info!("Restarting bot");
 
                 // Clear shutdown flag for restart
                 bot.shutdown.store(false, Ordering::SeqCst);
-                
+
                 // Disconnect (but don't set shutdown flag)
                 if let Err(e) = connection::disconnect(&bot, false).await {
                     error!("Error during disconnect: {}", e);
@@ -533,36 +552,34 @@ pub async fn bot_task(
     info!("[Bot] Bot task shutdown complete");
 }
 
-/// Physically validate a node by checking that all 4 chests exist and contain shulker boxes.
+/// Physically validate a node: walk to it, open each of the 4 chests, and
+/// confirm every slot holds a shulker box.
 ///
-/// # Validation Steps
-/// 1. Navigate to the node position
-/// 2. For each of the 4 chests:
-///    a. Calculate chest position from node position and chest index
-///    b. Attempt to open the chest
-///    c. Verify all 54 slots contain shulker boxes
-/// 3. Return Ok if all checks pass, Err with detailed failure info otherwise
-///
-/// # Arguments
-/// * `bot` - Bot instance
-/// * `node_id` - Node ID being validated (for error messages)
-/// * `node_position` - Calculated position where bot should stand for this node
+/// Errors from individual chests are accumulated so a single validation run
+/// reports every broken chest at once, rather than forcing the operator to
+/// re-run after each fix.
 async fn validate_node_physically(
     bot: &Bot,
     node_id: i32,
     node_position: &Position,
 ) -> Result<(), String> {
     use crate::types::Node;
-    
-    info!("Validating node {} at ({}, {}, {})",
-          node_id, node_position.x, node_position.y, node_position.z);
-    
+
+    info!(
+        "Validating node {} at ({}, {}, {})",
+        node_id, node_position.x, node_position.y, node_position.z
+    );
+
     // Step 1: Navigate to node position
-    navigation::go_to_node(bot, node_position).await.map_err(|e| {
-        format!("Node {} validation failed: could not navigate to position ({}, {}, {}): {}",
-                node_id, node_position.x, node_position.y, node_position.z, e)
-    })?;
-    
+    navigation::go_to_node(bot, node_position)
+        .await
+        .map_err(|e| {
+            format!(
+                "Node {} validation failed: could not navigate to position ({}, {}, {}): {}",
+                node_id, node_position.x, node_position.y, node_position.z, e
+            )
+        })?;
+
     // Step 2: Check each of the 4 chests.
     // Errors are accumulated (not early-return) so the report lists every broken chest
     // in a single validation pass, instead of forcing the operator to re-run after each fix.
@@ -573,16 +590,19 @@ async fn validate_node_physically(
         // packet before we issue another open (prevents "container already open" races).
         if chest_index > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(
-                crate::constants::DELAY_VALIDATION_BETWEEN_CHESTS_MS
-            )).await;
+                crate::constants::DELAY_VALIDATION_BETWEEN_CHESTS_MS,
+            ))
+            .await;
         }
-        
+
         let chest_pos = Node::calc_chest_position(chest_index, node_position);
         let block_pos = azalea::BlockPos::new(chest_pos.x, chest_pos.y, chest_pos.z);
-        
-        debug!("Validating chest {} at ({}, {}, {})",
-               chest_index, chest_pos.x, chest_pos.y, chest_pos.z);
-        
+
+        debug!(
+            "Validating node {} chest {} at ({}, {}, {})",
+            node_id, chest_index, chest_pos.x, chest_pos.y, chest_pos.z
+        );
+
         // Try to open the chest using fast validation (no retries, short timeout)
         // If there's no chest at this position, we fail fast instead of waiting 45+ seconds
         match chest_io::open_chest_container_for_validation(bot, block_pos).await {
@@ -597,7 +617,9 @@ async fn validate_node_physically(
                         if contents.len() != crate::constants::DOUBLE_CHEST_SLOTS {
                             validation_errors.push(format!(
                                 "Chest {} has {} slots (expected {})",
-                                chest_index, contents.len(), crate::constants::DOUBLE_CHEST_SLOTS
+                                chest_index,
+                                contents.len(),
+                                crate::constants::DOUBLE_CHEST_SLOTS
                             ));
                         } else {
                             // Every slot must hold a shulker box - empty slots and non-shulker
@@ -609,7 +631,10 @@ async fn validate_node_physically(
                                 } else {
                                     let item_id = stack.kind().to_string();
                                     if !shulker::is_shulker_box(&item_id) {
-                                        non_shulker_slots.push(format!("slot {} has {} (not shulker)", slot_idx, item_id));
+                                        non_shulker_slots.push(format!(
+                                            "slot {} has {} (not shulker)",
+                                            slot_idx, item_id
+                                        ));
                                     }
                                 }
                             }
@@ -618,35 +643,52 @@ async fn validate_node_physically(
                                 // Cap the per-chest error detail at 5 slots to keep error
                                 // messages readable when a whole chest is misconfigured.
                                 let issues = if non_shulker_slots.len() > 5 {
-                                    format!("{} slots missing shulkers (first 5: {})", 
-                                            non_shulker_slots.len(),
-                                            non_shulker_slots.iter().take(5).cloned().collect::<Vec<_>>().join(", "))
+                                    format!(
+                                        "{} slots missing shulkers (first 5: {})",
+                                        non_shulker_slots.len(),
+                                        non_shulker_slots
+                                            .iter()
+                                            .take(5)
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
                                 } else {
                                     non_shulker_slots.join(", ")
                                 };
-                                validation_errors.push(format!("Chest {}: {}", chest_index, issues));
+                                validation_errors
+                                    .push(format!("Chest {}: {}", chest_index, issues));
                             }
                         }
                     }
                     None => {
-                        validation_errors.push(format!("Chest {} opened but contents unavailable", chest_index));
+                        validation_errors.push(format!(
+                            "Chest {} opened but contents unavailable",
+                            chest_index
+                        ));
                     }
                 }
                 container.close();
                 // Small delay after closing to ensure server processes it
                 tokio::time::sleep(tokio::time::Duration::from_millis(
-                    crate::constants::DELAY_MEDIUM_MS
-                )).await;
+                    crate::constants::DELAY_MEDIUM_MS,
+                ))
+                .await;
             }
             Err(e) => {
-                validation_errors.push(format!("Chest {} at ({}, {}, {}): {}",
-                    chest_index, chest_pos.x, chest_pos.y, chest_pos.z, e));
+                validation_errors.push(format!(
+                    "Chest {} at ({}, {}, {}): {}",
+                    chest_index, chest_pos.x, chest_pos.y, chest_pos.z, e
+                ));
             }
         }
     }
-    
+
     if validation_errors.is_empty() {
-        info!("Node {} validation passed: all 4 chests exist with 54 shulker boxes each", node_id);
+        info!(
+            "Node {} validation passed: all 4 chests exist with 54 shulker boxes each",
+            node_id
+        );
         Ok(())
     } else {
         let error_msg = format!(
@@ -660,14 +702,17 @@ async fn validate_node_physically(
     }
 }
 
-// Function pointer that matches the expected signature
+// Azalea's event-handler slot wants an `fn(Client, Event, State) -> impl Future<Output = ...>`
+// with owned `State`, but our real handler takes `&mut BotState` so it can mutate in place.
+// This thin wrapper bridges the two signatures.
 pub(crate) async fn handle_event_fn(
     client: Client,
     event: Event,
     mut state: BotState,
-) -> anyhow::Result<()> { handle_event(client, event, &mut state).await }
+) -> anyhow::Result<()> {
+    handle_event(client, event, &mut state).await
+}
 
-// Your event handler that works with the state
 async fn handle_event(client: Client, event: Event, state: &mut BotState) -> anyhow::Result<()> {
     match event {
         Event::Init => {
@@ -695,18 +740,25 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             let _ = state.chat_tx.send(message_text);
 
             if let Some(store_tx) = &state.store_tx
-                && let Err(e) = handle_chat_message(client, m, store_tx).await {
-                    error!("Error handling chat message: {}", e);
-                }
+                && let Err(e) = handle_chat_message(client, m, store_tx).await
+            {
+                error!("Error handling chat message: {}", e);
+            }
         }
         Event::Disconnect(reason) => {
-            warn!("[Event] Bot disconnected from server - reason: {:?}", reason);
+            warn!(
+                "[Event] Bot disconnected from server - reason: {:?}",
+                reason
+            );
             let disconnect_time = std::time::Instant::now();
             state.connected = false;
             *state.client.write().await = None;
             state.connecting.store(false, Ordering::SeqCst);
             info!("[Event] Disconnect event processed - client cleared, flags updated");
-            debug!("[Event] Disconnect processing took: {:?}", disconnect_time.elapsed());
+            debug!(
+                "[Event] Disconnect processing took: {:?}",
+                disconnect_time.elapsed()
+            );
         }
         _ => {}
     }
@@ -715,22 +767,20 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
 
 async fn handle_chat_message(
     _client: Client,
-    message: azalea::chat::ChatPacket,
+    message: azalea::client_chat::ChatPacket,
     store_tx: &mpsc::Sender<StoreMessage>,
 ) -> anyhow::Result<()> {
     let msg = message.message().to_string();
     let sender = message.sender().unwrap_or_else(|| "Unknown".to_string());
 
-    // Check if this is a whisper to our bot
     if msg.contains("whispers:") {
-        // Extract the actual message content (already logged at event handler level)
+        // Whisper text was already logged at info! in handle_event; don't re-log here.
         let content = if let Some(pos) = msg.find("whispers:") {
             msg[pos + 9..].trim()
         } else {
             return Ok(());
         };
 
-        // Send the command to the store for processing
         let bot_message = BotMessage::PlayerCommand {
             player_name: sender.clone(),
             command: content.to_string(),
@@ -739,12 +789,78 @@ async fn handle_chat_message(
         let store_message = StoreMessage::FromBot(bot_message);
 
         if let Err(e) = store_tx.send(store_message).await {
-            error!("Failed to send message to store: {}", e);
+            error!(
+                "Failed to forward player command to store (sender={} command={}): {}",
+                sender, content, e
+            );
         }
-    } else {
-        // Log other chat messages for debugging
-        tracing::trace!("Public chat - {}: {}", sender, msg);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn normalize_item_id_strips_minecraft_prefix() {
+        assert_eq!(Bot::normalize_item_id("minecraft:diamond"), "diamond");
+    }
+
+    #[test]
+    fn normalize_item_id_passes_unprefixed_through() {
+        assert_eq!(Bot::normalize_item_id("diamond"), "diamond");
+    }
+
+    #[test]
+    fn normalize_item_id_only_strips_leading_occurrence() {
+        // The prefix is only stripped once at the start — a middle-of-string
+        // "minecraft:" must be preserved verbatim, otherwise we'd mangle tags
+        // or namespaced NBT data that happen to embed the literal substring.
+        assert_eq!(
+            Bot::normalize_item_id("foo_minecraft:diamond"),
+            "foo_minecraft:diamond"
+        );
+    }
+
+    #[test]
+    fn normalize_item_id_empty_input_returns_empty() {
+        // Empty input is explicitly allowed: normalize_item_id does not enforce
+        // a non-empty invariant (callers that need one use ItemId::new instead).
+        assert_eq!(Bot::normalize_item_id(""), "");
+    }
+
+    #[test]
+    fn normalize_item_id_bare_prefix_returns_empty() {
+        assert_eq!(Bot::normalize_item_id("minecraft:"), "");
+    }
+
+    #[test]
+    fn bot_state_default_starts_disconnected_and_idle() {
+        let state = BotState::default();
+        assert!(!state.connected, "new BotState must not claim to be connected");
+        assert!(state.store_tx.is_none(), "new BotState must have no store channel");
+        assert!(
+            !state.connecting.load(Ordering::SeqCst),
+            "new BotState must not claim a connect is in flight"
+        );
+        // Client handle is present but holds no Client yet.
+        let guard = state.client.try_read().expect("client RwLock should not be poisoned");
+        assert!(guard.is_none(), "new BotState must have no attached Client");
+    }
+
+    #[test]
+    fn bot_state_default_chat_channel_is_live() {
+        // Subscribers attached to a fresh BotState must receive broadcasts;
+        // this guards against regressions that would silently drop the sender
+        // (e.g. if someone switched the channel capacity to 0 or forgot to
+        // store the Arc).
+        let state = BotState::default();
+        let mut rx = state.chat_tx.subscribe();
+        state.chat_tx.send("hello".to_string()).expect("send");
+        let got = rx.try_recv().expect("receiver should have a message buffered");
+        assert_eq!(got, "hello");
+    }
 }

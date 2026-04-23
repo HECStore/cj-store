@@ -16,7 +16,7 @@ use std::path::Path;
 /// 2. Remove destination file if it exists (Windows requirement)
 /// 3. Rename temp file to final name
 ///
-/// **Atomicity**: This is "best-effort" - not crash-proof in all edge cases,
+/// **Atomicity**: This is "best-effort" — not crash-proof in all edge cases,
 /// but prevents torn writes in normal operation. For true atomicity, consider
 /// using platform-specific APIs (e.g., `CreateFile` with `FILE_FLAG_WRITE_THROUGH` on Windows).
 ///
@@ -24,9 +24,7 @@ use std::path::Path;
 /// This ensures state files are never left in a corrupted state.
 pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     let path = path.as_ref();
-    tracing::debug!("[File] write_atomic: Starting write operation for {:?}", path);
-    
-    // Ensure we have a valid file name.
+
     // `file_name()` returns None for `.` and `..`, and the inner `to_str()` can
     // reject non-UTF-8 names on Unix; both cases produce `InvalidInput` so the
     // caller sees the real reason rather than a confusing later error.
@@ -34,87 +32,62 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid file path: {:?}", path)
+            format!("Invalid file path: {path:?}")
         ))?;
-    
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    tracing::debug!("[File] write_atomic: Creating parent directory if needed: {:?}", parent);
-    fs::create_dir_all(parent)?;
-    tracing::debug!("[File] write_atomic: Parent directory ready");
 
-    let tmp_name = format!("{}.tmp", file_name);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let tmp_name = format!("{file_name}.tmp");
     let tmp_path = parent.join(&tmp_name);
-    tracing::debug!("[File] write_atomic: Temp file path: {:?}", tmp_path);
-    
-    // Validate paths are valid (not empty, no invalid characters on Windows)
+
     let path_str = path.to_string_lossy();
     let tmp_path_str = tmp_path.to_string_lossy();
     if path_str.is_empty() || tmp_path_str.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Empty path: path={:?}, tmp_path={:?}", path, tmp_path)
+            format!("Empty path: path={path:?}, tmp_path={tmp_path:?}")
         ));
     }
 
-    // Write to temp file with explicit sync to ensure it's fully written
-    // This is especially important on Windows to avoid file handle issues
-    tracing::debug!("[File] write_atomic: Writing {} bytes to temp file", contents.len());
+    // sync_all forces the bytes and metadata out before rename — important on
+    // Windows so the rename sees a fully-flushed file.
     {
         let mut file = fs::File::create(&tmp_path)?;
         file.write_all(contents.as_bytes())?;
-        tracing::debug!("[File] write_atomic: Data written, syncing to disk");
         file.sync_all()?;
-        tracing::debug!("[File] write_atomic: File synced, closing handle");
-        // File handle is closed here when it goes out of scope
     }
-    tracing::debug!("[File] write_atomic: Temp file handle closed");
-    
-    // Verify temp file was created successfully
+
     if !tmp_path.exists() {
         return Err(io::Error::other(
-            format!("Temp file was not created: {:?}", tmp_path)
+            format!("Temp file was not created: {tmp_path:?}")
         ));
     }
-    tracing::debug!("[File] write_atomic: Temp file verified to exist");
 
     // On Windows, rename won't overwrite an existing file, so we must remove it first.
-    // If the file is locked (e.g., by antivirus or another process), we retry a few times.
-    let dest_exists = path.exists();
-    tracing::debug!("[File] write_atomic: Destination file exists: {}", dest_exists);
-    if dest_exists {
-        tracing::debug!("[File] write_atomic: Attempting to remove existing destination file");
-        // Try to remove the existing file, with retries for Windows file locking issues.
-        // 5 attempts with exponential backoff gives ~150ms total wait (10+20+40+80),
-        // which is enough for transient AV scans / indexer handles to release the file
-        // without making the UI feel unresponsive.
+    // 5 attempts with exponential backoff gives ~150ms total wait (10+20+40+80),
+    // which is enough for transient AV scans / indexer handles to release the file
+    // without making the UI feel unresponsive.
+    if path.exists() {
         for attempt in 0..5 {
             match fs::remove_file(path) {
-                Ok(_) => {
-                    tracing::debug!("[File] write_atomic: Existing file removed successfully (attempt {})", attempt + 1);
-                    break;
-                }
+                Ok(_) => break,
                 Err(e) => {
-                    tracing::debug!("[File] write_atomic: Failed to remove existing file (attempt {}): {}", attempt + 1, e);
                     if attempt == 4 {
-                        // Last attempt failed, try rename anyway (might work if file was just closed).
-                        // We don't return an error here because the rename/copy fallback below
-                        // may still succeed, and if not, it produces a more informative error.
-                        tracing::debug!("[File] write_atomic: All remove attempts failed, will try rename anyway");
+                        // All remove attempts failed — fall through to rename,
+                        // which may still succeed (handle could have just closed),
+                        // and if it doesn't the copy fallback produces a better error.
+                        tracing::debug!("[File] {path:?}: remove failed after 5 attempts: {e} — trying rename anyway");
                         break;
                     }
-                    // Wait a bit before retrying (exponential backoff: 10ms, 20ms, 40ms, 80ms)
                     std::thread::sleep(std::time::Duration::from_millis(10 * (1 << attempt)));
                 }
             }
         }
     }
 
-    // Attempt rename - on Windows this will fail if the destination still exists
-    // In that case, try one more remove and rename
-    tracing::debug!("[File] write_atomic: Attempting to rename temp file to destination");
     match fs::rename(&tmp_path, path) {
         Ok(_) => {
-            tracing::debug!("[File] write_atomic: Rename successful");
             #[cfg(unix)]
             {
                 if let Ok(dir) = fs::File::open(parent) {
@@ -124,57 +97,42 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
             Ok(())
         },
         Err(e) => {
-            tracing::warn!("[File] write_atomic: Rename failed: {} (path: {:?}, tmp_path: {:?})", e, path, tmp_path);
-            // If rename failed, try fallback: copy + remove.
-            // This handles cases where rename fails due to Windows path issues
-            // (e.g., cross-volume moves, or quirks with UNC / long paths).
-            // Copy loses the atomicity guarantee, but it's preferable to losing the write entirely.
-            tracing::debug!("[File] write_atomic: Trying copy fallback");
+            // Rename can fail for cross-volume moves, UNC quirks, long paths,
+            // or Windows locks we couldn't clear. Copy loses atomicity but
+            // prevents losing the write entirely.
+            tracing::warn!("[File] rename {tmp_path:?} -> {path:?} failed: {e} — falling back to copy");
             match fs::copy(&tmp_path, path) {
                 Ok(_) => {
-                    tracing::debug!("[File] write_atomic: Copy succeeded, removing temp file");
-                    // Copy succeeded, remove temp file
                     let _ = fs::remove_file(&tmp_path);
-                    tracing::debug!("[File] write_atomic: Copy fallback successful");
                     Ok(())
                 }
                 Err(copy_err) => {
-                    tracing::warn!("[File] write_atomic: Copy also failed: {} (path: {:?})", copy_err, path);
-                    // Copy also failed - try one more time to remove existing file and copy
                     if path.exists() {
-                        tracing::debug!("[File] write_atomic: Destination still exists, trying to remove before copy");
-                        // Try to remove the existing file
                         if let Err(remove_err) = fs::remove_file(path) {
-                            tracing::error!("[File] write_atomic: Failed to remove existing file: {}", remove_err);
-                            // If remove failed, clean up temp file and return error
                             let _ = fs::remove_file(&tmp_path);
+                            tracing::error!("[File] cannot save {path:?}: rename={e}, copy={copy_err}, remove={remove_err}");
                             return Err(io::Error::other(
-                                format!("Failed to save file: rename error: {}, copy error: {}, remove error: {} (path: {:?})", e, copy_err, remove_err, path)
+                                format!("Failed to save file: rename error: {e}, copy error: {copy_err}, remove error: {remove_err} (path: {path:?})")
                             ));
                         }
-                        tracing::debug!("[File] write_atomic: Existing file removed, trying copy again");
-                        // Try copy again after removal
                         match fs::copy(&tmp_path, path) {
                             Ok(_) => {
-                                tracing::debug!("[File] write_atomic: Copy after removal succeeded");
                                 let _ = fs::remove_file(&tmp_path);
                                 Ok(())
                             }
                             Err(final_copy_err) => {
-                                tracing::error!("[File] write_atomic: Final copy attempt failed: {}", final_copy_err);
-                                // Clean up temp file on final failure
                                 let _ = fs::remove_file(&tmp_path);
+                                tracing::error!("[File] cannot save {path:?}: rename={e}, copy={copy_err}, final_copy={final_copy_err}");
                                 Err(io::Error::other(
-                                    format!("Failed to save file after removing existing: rename error: {}, copy error: {}, final copy error: {} (path: {:?}, tmp_path: {:?})", e, copy_err, final_copy_err, path, tmp_path)
+                                    format!("Failed to save file after removing existing: rename error: {e}, copy error: {copy_err}, final copy error: {final_copy_err} (path: {path:?}, tmp_path: {tmp_path:?})")
                                 ))
                             }
                         }
                     } else {
-                        tracing::error!("[File] write_atomic: Destination doesn't exist but both rename and copy failed");
-                        // Path doesn't exist, but both rename and copy failed
                         let _ = fs::remove_file(&tmp_path);
+                        tracing::error!("[File] cannot save {path:?} (no existing dest): rename={e}, copy={copy_err}");
                         Err(io::Error::other(
-                            format!("Failed to save file (destination doesn't exist): rename error: {}, copy error: {} (path: {:?}, tmp_path: {:?})", e, copy_err, path, tmp_path)
+                            format!("Failed to save file (destination doesn't exist): rename error: {e}, copy error: {copy_err} (path: {path:?}, tmp_path: {tmp_path:?})")
                         ))
                     }
                 }
@@ -182,10 +140,6 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
         }
     }
 }
-
-// ============================================================================
-// TESTS
-// ============================================================================
 
 #[cfg(test)]
 mod tests {

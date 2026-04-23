@@ -130,6 +130,9 @@ impl From<ItemId> for String {
     }
 }
 
+/// `default()` returns [`EMPTY`](ItemId::EMPTY), the sentinel for unassigned
+/// slots — it is NOT a valid item ID. Callers needing a real ID must use
+/// [`ItemId::new`].
 impl Default for ItemId {
     fn default() -> Self {
         Self::EMPTY
@@ -200,5 +203,36 @@ mod tests {
         map.insert("gold_ingot".to_string(), 42);
         let id = ItemId::new("gold_ingot").unwrap();
         assert_eq!(map.get(id.as_str()), Some(&42));
+    }
+
+    #[test]
+    fn borrow_str_enables_hashmap_lookup_with_itemid_ref() {
+        // Borrow<str> + Hash/Eq consistency is what lets &ItemId look up a
+        // String-keyed map. Regression guard: if Borrow<str> is removed or
+        // the hash/eq contract diverges, this fails.
+        use std::borrow::Borrow;
+        let mut map: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        map.insert("iron_ingot".to_string(), 7);
+        let id = ItemId::new("iron_ingot").unwrap();
+        let key: &str = (&id).borrow();
+        assert_eq!(map.get(key), Some(&7));
+    }
+
+    #[test]
+    fn partial_eq_compares_normalized_form_only() {
+        // ItemId("minecraft:diamond") is stored as "diamond", so comparing
+        // against the prefixed literal is false. This documents the asymmetry
+        // and guards against a future "fix" that would change the semantics.
+        let id = ItemId::new("minecraft:diamond").unwrap();
+        assert!(id == "diamond");
+        assert!(id != "minecraft:diamond");
+    }
+
+    #[test]
+    fn default_is_empty_sentinel() {
+        let id = ItemId::default();
+        assert!(id.is_empty());
+        assert_eq!(id, ItemId::EMPTY);
     }
 }

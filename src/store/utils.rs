@@ -8,20 +8,17 @@ use parking_lot::Mutex;
 
 use tokio::sync::oneshot;
 use tracing::debug;
-#[cfg(not(test))]
-use tracing::info;
 
 use crate::constants::UUID_CACHE_TTL_SECS;
 use crate::messages::BotInstruction;
 use crate::types::User;
 use super::Store;
 
-/// Cached UUID entry: (uuid, timestamp of lookup).
+/// Map of lowercased username -> (uuid, lookup timestamp).
 type UuidCache = HashMap<String, (String, Instant)>;
 
-/// Global UUID cache for Mojang API lookups.
-/// Uses a simple HashMap with TTL-based expiry — entries older than
-/// `UUID_CACHE_TTL_SECS` are treated as stale and re-fetched.
+/// Global UUID cache for Mojang API lookups. TTL-expiry only — stale entries
+/// are rejected on read and pruned periodically by `cleanup_uuid_cache`.
 static UUID_CACHE: OnceLock<Mutex<UuidCache>> = OnceLock::new();
 
 fn uuid_cache() -> &'static Mutex<UuidCache> {
@@ -32,7 +29,8 @@ fn uuid_cache() -> &'static Mutex<UuidCache> {
 ///
 /// Lookups are cached for `UUID_CACHE_TTL_SECS` (default 5 minutes). Repeated
 /// commands from the same player reuse the cached UUID instead of hitting the
-/// Mojang API on every interaction.
+/// Mojang API on every interaction. Cache keys are lowercased so `Steve` and
+/// `steve` share an entry.
 ///
 /// Returns a typed `StoreError::ValidationError` on Mojang lookup failure —
 /// the text is user-safe and the handlers whisper it straight back to the
@@ -50,26 +48,29 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, crate::error::S
     #[cfg(not(test))]
     {
         let key = username.to_lowercase();
-        let ttl = std::time::Duration::from_secs(UUID_CACHE_TTL_SECS);
+        let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
 
-        // Check cache first
         {
             let cache = uuid_cache().lock();
-            if let Some((uuid, ts)) = cache.get(&key)
-                && ts.elapsed() < ttl {
-                    debug!("UUID cache hit for '{}' -> {}", username, uuid);
+            if let Some((uuid, ts)) = cache.get(&key) {
+                if ts.elapsed() < ttl {
+                    debug!(username = username, uuid = %uuid, "UUID cache hit");
                     return Ok(uuid.clone());
                 }
+                debug!(
+                    username = username,
+                    age_secs = ts.elapsed().as_secs(),
+                    "UUID cache stale, refetching"
+                );
+            } else {
+                debug!(username = username, "UUID cache miss");
+            }
         }
 
-        // Cache miss or stale — fetch from Mojang API.
-        // Map the legacy `String` error into a typed variant explicitly so
-        // the conversion is visible at the boundary (no blanket
-        // `From<String>` impl any more).
         let uuid = User::get_uuid_async(username)
             .await
             .map_err(crate::error::StoreError::ValidationError)?;
-        info!("UUID cache miss for '{}', fetched {}", username, uuid);
+        debug!(username = username, uuid = %uuid, "UUID fetched from Mojang");
 
         {
             let mut cache = uuid_cache().lock();
@@ -80,7 +81,7 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, crate::error::S
     }
 }
 
-/// Clear the entire UUID cache. Useful for testing or after long idle periods.
+/// Clear the entire UUID cache. Test-only — used to isolate cache tests.
 #[cfg(test)]
 pub fn clear_uuid_cache() {
     uuid_cache().lock().clear();
@@ -99,7 +100,13 @@ pub fn cleanup_uuid_cache() {
     cache.retain(|_, (_, inserted)| now.duration_since(*inserted) < ttl);
     let removed = before - cache.len();
     if removed > 0 {
-        debug!("Cleaned up {} stale UUID cache entries", removed);
+        debug!(
+            removed = removed,
+            remaining = cache.len(),
+            "Evicted stale UUID cache entries"
+        );
+    } else {
+        debug!(remaining = cache.len(), "UUID cache cleanup: no stale entries");
     }
 }
 
@@ -120,14 +127,21 @@ pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
             },
         );
         store.dirty = true;
+        debug!(uuid = uuid, username = username, "Created new user record");
     } else if let Some(user) = store.users.get_mut(uuid)
         && user.username != username {
-            user.username = username.to_string();
+            let old = std::mem::replace(&mut user.username, username.to_string());
             store.dirty = true;
+            debug!(
+                uuid = uuid,
+                old_username = %old,
+                new_username = username,
+                "Updated user's changed username"
+            );
         }
 }
 
-/// Check if a user is an operator
+/// Returns true iff the user with `user_uuid` exists and has the operator flag set.
 pub fn is_operator(store: &Store, user_uuid: &str) -> bool {
     store.users.get(user_uuid).is_some_and(|u| u.operator)
 }
@@ -144,7 +158,6 @@ pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position
         .find(|n| n.id == node_id)
         .map(|n| n.position)
         .unwrap_or_else(|| {
-            // Fallback: calculate from storage position
             crate::types::Node::calc_position(node_id, &store.storage.position)
         })
 }
@@ -162,7 +175,7 @@ pub async fn send_message_to_player(
     player_name: &str,
     message: &str,
 ) -> Result<(), crate::error::StoreError> {
-    debug!("Sending message to {}: {}", player_name, message);
+    debug!(player = player_name, message = message, "Whispering to player");
     let (tx, rx) = oneshot::channel();
     store
         .bot_tx
@@ -174,7 +187,6 @@ pub async fn send_message_to_player(
         .await
         .map_err(|_| crate::error::StoreError::BotDisconnected)?;
 
-    // Inner result: the bot's own response - if it's Err(String), surface as BotError.
     rx.await
         .map_err(|_| crate::error::StoreError::BotDisconnected)?
         .map_err(crate::error::StoreError::BotError)
@@ -193,11 +205,8 @@ pub fn summarize_transfers(transfers: &[crate::types::storage::ChestTransfer], m
 
     let mut parts: Vec<String> = Vec::new();
     for t in transfers.iter().take(max) {
-        // DO NOT include coordinates in player-facing messages (security)
-        parts.push(format!(
-            "{}x {}",
-            t.amount, t.item
-        ));
+        // Intentionally omit t.position — coordinates must not leak to players.
+        parts.push(format!("{}x {}", t.amount, t.item));
     }
 
     if transfers.len() > max {
@@ -231,58 +240,73 @@ pub fn fmt_issues(prefix: &str, issues: &[String], max: usize) -> String {
     out
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_fmt_issues() {
-        // Empty issues
+    fn fmt_issues_empty_returns_bare_prefix() {
         assert_eq!(fmt_issues("Errors", &[], 5), "Errors");
-        
-        // Single issue
+    }
+
+    #[test]
+    fn fmt_issues_single_item_separates_with_colon() {
         assert_eq!(
             fmt_issues("Errors", &["Issue 1".to_string()], 5),
             "Errors: Issue 1"
         );
-        
-        // Multiple issues within limit
+    }
+
+    #[test]
+    fn fmt_issues_joins_multiple_items_with_semicolons() {
         assert_eq!(
             fmt_issues("Errors", &["A".to_string(), "B".to_string()], 5),
             "Errors: A; B"
         );
-        
-        // Issues exceeding limit
+    }
+
+    #[test]
+    fn fmt_issues_at_max_does_not_append_more_suffix() {
+        // Exactly `max` issues: no truncation suffix
+        let issues: Vec<String> = (1..=3).map(|i| format!("I{}", i)).collect();
+        assert_eq!(fmt_issues("E", &issues, 3), "E: I1; I2; I3");
+    }
+
+    #[test]
+    fn fmt_issues_truncates_with_more_suffix_above_max() {
         let issues: Vec<String> = (1..=10).map(|i| format!("Issue {}", i)).collect();
         let result = fmt_issues("Errors", &issues, 3);
-        assert!(result.contains("Issue 1"));
-        assert!(result.contains("Issue 2"));
-        assert!(result.contains("Issue 3"));
-        assert!(result.contains("(+7 more)"));
+        assert_eq!(result, "Errors: Issue 1; Issue 2; Issue 3 (+7 more)");
     }
-    
+
     #[test]
-    fn test_summarize_transfers() {
+    fn summarize_transfers_empty_returns_none_literal() {
+        assert_eq!(summarize_transfers(&[], 5), "none");
+    }
+
+    #[test]
+    fn summarize_transfers_formats_single_entry_without_coords() {
         use crate::types::storage::ChestTransfer;
         use crate::types::Position;
-        
-        // Empty transfers
-        assert_eq!(summarize_transfers(&[], 5), "none");
-        
-        // Single transfer
+
         let transfers = vec![ChestTransfer {
             chest_id: 0,
             item: crate::types::ItemId::new("diamond").unwrap(),
             amount: 64,
-            position: Position::default(),
+            position: Position { x: 123, y: 64, z: -456 },
         }];
-        assert_eq!(summarize_transfers(&transfers, 5), "64x diamond");
-        
-        // Multiple transfers
+        let s = summarize_transfers(&transfers, 5);
+        assert_eq!(s, "64x diamond");
+        // Security invariant: coordinates must never appear in the summary
+        assert!(!s.contains("123"));
+        assert!(!s.contains("-456"));
+    }
+
+    #[test]
+    fn summarize_transfers_joins_multiple_with_semicolons() {
+        use crate::types::storage::ChestTransfer;
+        use crate::types::Position;
+
         let transfers = vec![
             ChestTransfer {
                 chest_id: 0,
@@ -297,15 +321,31 @@ mod tests {
                 position: Position::default(),
             },
         ];
-        assert_eq!(summarize_transfers(&transfers, 5), "64x diamond; 128x iron_ingot");
+        assert_eq!(
+            summarize_transfers(&transfers, 5),
+            "64x diamond; 128x iron_ingot"
+        );
     }
 
-    // ========================================================================
-    // UUID cache tests
-    // ========================================================================
+    #[test]
+    fn summarize_transfers_truncates_above_max_with_more_suffix() {
+        use crate::types::storage::ChestTransfer;
+        use crate::types::Position;
+
+        let transfers: Vec<ChestTransfer> = (0..5)
+            .map(|i| ChestTransfer {
+                chest_id: i,
+                item: crate::types::ItemId::new("stone").unwrap(),
+                amount: 1,
+                position: Position::default(),
+            })
+            .collect();
+        let s = summarize_transfers(&transfers, 2);
+        assert_eq!(s, "1x stone; 1x stone; (+3 more)");
+    }
 
     #[test]
-    fn test_uuid_cache_insert_and_lookup() {
+    fn uuid_cache_insert_then_read_returns_same_entry() {
         clear_uuid_cache();
         let cache = uuid_cache();
         let key = "testplayer".to_string();
@@ -314,52 +354,47 @@ mod tests {
         cache.lock().insert(key.clone(), (uuid.clone(), Instant::now()));
 
         let cached = cache.lock().get(&key).cloned();
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().0, uuid);
+        assert_eq!(cached.map(|(u, _)| u), Some(uuid));
     }
 
     #[test]
-    fn test_uuid_cache_case_insensitive_key() {
-        // The cache uses lowercased keys so "Steve" and "steve" hit the same entry
+    fn uuid_cache_lookup_uses_lowercased_key() {
+        // resolve_user_uuid lowercases before inserting, so lookup callers
+        // must also lowercase — verify the contract holds for "steve".
         clear_uuid_cache();
         let cache = uuid_cache();
         let uuid = "00000000-0000-0000-0000-000000000002".to_string();
 
         cache.lock().insert("steve".to_string(), (uuid.clone(), Instant::now()));
 
-        // Lookup must use the same lowercased key (resolve_user_uuid does this)
         let hit = cache.lock().get("steve").cloned();
-        assert_eq!(hit.unwrap().0, uuid);
+        assert_eq!(hit.map(|(u, _)| u), Some(uuid));
     }
 
     #[test]
-    fn test_uuid_cache_ttl_expiry() {
+    fn uuid_cache_entry_older_than_ttl_is_treated_as_stale() {
         clear_uuid_cache();
         let cache = uuid_cache();
         let key = "expiredplayer".to_string();
         let uuid = "00000000-0000-0000-0000-000000000003".to_string();
 
-        // Insert with a timestamp far in the past
-        let old_instant = Instant::now() - std::time::Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
-        cache.lock().insert(key.clone(), (uuid.clone(), old_instant));
+        let old_instant = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
+        cache.lock().insert(key.clone(), (uuid, old_instant));
 
-        // Entry exists but is stale
         let entry = cache.lock().get(&key).cloned().unwrap();
-        let ttl = std::time::Duration::from_secs(UUID_CACHE_TTL_SECS);
-        assert!(entry.1.elapsed() >= ttl, "Entry should be expired");
+        let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
+        assert!(entry.1.elapsed() >= ttl, "Entry should be past TTL");
     }
 
     #[test]
-    fn test_cleanup_uuid_cache_drops_stale_entries() {
+    fn cleanup_uuid_cache_drops_stale_entries_and_keeps_fresh_ones() {
         clear_uuid_cache();
         let cache = uuid_cache();
 
-        // Fresh entry
         cache.lock().insert(
             "fresh".to_string(),
             ("uuid-fresh".to_string(), Instant::now()),
         );
-        // Stale entry (older than TTL)
         let stale_ts = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
         cache.lock().insert(
             "stale".to_string(),
@@ -374,18 +409,128 @@ mod tests {
     }
 
     #[test]
-    fn test_uuid_cache_clear() {
+    fn cleanup_uuid_cache_is_noop_when_all_entries_are_fresh() {
+        clear_uuid_cache();
         let cache = uuid_cache();
-        cache.lock().insert(
-            "a".to_string(),
-            ("uuid-a".to_string(), Instant::now()),
-        );
-        cache.lock().insert(
-            "b".to_string(),
-            ("uuid-b".to_string(), Instant::now()),
-        );
+        cache.lock().insert("a".to_string(), ("uuid-a".to_string(), Instant::now()));
+        cache.lock().insert("b".to_string(), ("uuid-b".to_string(), Instant::now()));
+
+        cleanup_uuid_cache();
+
+        assert_eq!(cache.lock().len(), 2);
+    }
+
+    #[test]
+    fn clear_uuid_cache_empties_the_cache() {
+        let cache = uuid_cache();
+        cache.lock().insert("a".to_string(), ("uuid-a".to_string(), Instant::now()));
+        cache.lock().insert("b".to_string(), ("uuid-b".to_string(), Instant::now()));
 
         clear_uuid_cache();
         assert!(cache.lock().is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // ensure_user_exists / is_operator / get_node_position each need a Store.
+    // Use `Store::new_for_test` to bypass disk I/O.
+    // ------------------------------------------------------------------------
+    fn test_store() -> Store {
+        use tokio::sync::mpsc;
+        let (tx, _rx) = mpsc::channel::<BotInstruction>(1);
+        let config = crate::config::Config {
+            position: crate::types::Position { x: 0, y: 64, z: 0 },
+            fee: 0.125,
+            account_email: String::new(),
+            server_address: "test".to_string(),
+            buffer_chest_position: None,
+            trade_timeout_ms: 5_000,
+            pathfinding_timeout_ms: 5_000,
+            max_orders: 1000,
+            max_trades_in_memory: 1000,
+            autosave_interval_secs: 10,
+        };
+        Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), crate::types::Storage::default())
+    }
+
+    #[test]
+    fn ensure_user_exists_creates_new_user_and_marks_dirty() {
+        let mut store = test_store();
+        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        let u = store.users.get("uuid-a").expect("user inserted");
+        assert_eq!(u.username, "Alice");
+        assert_eq!(u.balance, 0.0);
+        assert!(!u.operator);
+        assert!(store.dirty);
+    }
+
+    #[test]
+    fn ensure_user_exists_updates_username_on_drift_and_marks_dirty() {
+        let mut store = test_store();
+        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        store.dirty = false;
+
+        ensure_user_exists(&mut store, "AliceRenamed", "uuid-a");
+        assert_eq!(store.users.get("uuid-a").unwrap().username, "AliceRenamed");
+        assert!(store.dirty);
+    }
+
+    #[test]
+    fn ensure_user_exists_is_noop_when_username_matches() {
+        let mut store = test_store();
+        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        store.dirty = false;
+
+        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        assert!(!store.dirty, "no change should not mark dirty");
+    }
+
+    #[test]
+    fn is_operator_returns_false_for_unknown_uuid() {
+        let store = test_store();
+        assert!(!is_operator(&store, "missing"));
+    }
+
+    #[test]
+    fn is_operator_returns_false_for_regular_user() {
+        let mut store = test_store();
+        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        assert!(!is_operator(&store, "uuid-a"));
+    }
+
+    #[test]
+    fn is_operator_returns_true_when_operator_flag_set() {
+        let mut store = test_store();
+        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        store.users.get_mut("uuid-a").unwrap().operator = true;
+        assert!(is_operator(&store, "uuid-a"));
+    }
+
+    #[test]
+    fn get_node_position_falls_back_to_calc_when_node_absent() {
+        let store = test_store();
+        // Storage has no nodes; fallback must equal Node::calc_position for
+        // the derived node_id (chest_id / CHESTS_PER_NODE).
+        let chest_id = 5; // node_id = 5 / 4 = 1
+        let pos = get_node_position(&store, chest_id);
+        let expected = crate::types::Node::calc_position(
+            chest_id / crate::constants::CHESTS_PER_NODE as i32,
+            &store.storage.position,
+        );
+        assert_eq!(pos, expected);
+    }
+
+    #[test]
+    fn get_node_position_uses_materialized_node_when_present() {
+        use crate::types::Position;
+        let mut store = test_store();
+        let explicit = Position { x: 999, y: 64, z: -999 };
+        store.storage.nodes.push(crate::types::Node {
+            id: 1,
+            position: explicit,
+            chests: Vec::new(),
+        });
+        // chest_id 5 -> node_id 1 -> should pick up the materialized node,
+        // not the calc_position fallback.
+        assert_eq!(get_node_position(&store, 5), explicit);
     }
 }

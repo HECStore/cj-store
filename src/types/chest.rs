@@ -31,7 +31,7 @@ use crate::types::position::Position;
 ///
 /// **Invariants**:
 /// - `amounts.len() == 54` (enforced by `Storage::normalize_amounts_len()`)
-/// - `amounts[i] >= 0` (negative values reserved for future use)
+/// - `amounts[i] >= 0`
 /// - `amounts[i] <= pair.shulker_capacity()` (varies by item stack size)
 ///   - Most items: 27 × 64 = 1728 max per shulker
 ///   - Stack-16 items (ender pearls, etc.): 27 × 16 = 432 max
@@ -59,23 +59,12 @@ pub struct Chest {
 }
 
 impl Chest {
-    /// Creates a new Chest with the given node_id, node position, and index.
-    /// The chest ID is calculated as node_id * 4 + index.
-    /// Item is initialized as empty string and amounts as vector of 54 zeros.
-    /// Position is calculated based on node position and chest index.
-    /// 
-    /// # Arguments
-    /// * `node_id` - The parent node's ID
-    /// * `node_position` - The world position of the parent node
-    /// * `index` - The chest index within the node (must be 0-3)
-    /// 
+    /// Creates a new Chest with ID `node_id * 4 + index`.
+    ///
     /// # Panics
-    /// Panics if `index` is not in range 0-3. This is a programming error
-    /// that should never occur in normal operation.
-    /// 
-    /// **Design note**: We use panic here because an invalid index indicates
-    /// a bug in the calling code, not a runtime error that can be recovered from.
-    /// All callers (Node::new, Node::load) control the index parameter directly.
+    /// Panics if `index` is not in `0..4`. Invalid indices indicate a bug in
+    /// the caller (Node::new, Node::load) — these callers control the index
+    /// directly, so an out-of-range value is unrecoverable, not a runtime error.
     pub fn new(node_id: i32, node_position: &Position, index: i32) -> Chest {
         let id = node_id * CHESTS_PER_NODE as i32 + index;
         let position = Self::calc_position(node_position, index);
@@ -85,7 +74,7 @@ impl Chest {
             node_id,
             index,
             position,
-            item: ItemId::EMPTY,  // empty = unassigned chest
+            item: ItemId::EMPTY,
             amounts: vec![0; DOUBLE_CHEST_SLOTS],
         }
     }
@@ -135,7 +124,49 @@ impl Chest {
                 y: node_position.y,
                 z: node_position.z - 1,
             },
-            _ => panic!("Invalid chest index: {} (must be 0-3)", index),
+            _ => panic!("Invalid chest index: {index} (must be 0-3)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_origin() -> Position { Position { x: 100, y: 70, z: -50 } }
+
+    #[test]
+    fn new_computes_id_from_node_and_index() {
+        for index in 0..4 {
+            let c = Chest::new(3, &node_origin(), index);
+            assert_eq!(c.id, 3 * CHESTS_PER_NODE as i32 + index);
+            assert_eq!(c.node_id, 3);
+            assert_eq!(c.index, index);
+            assert_eq!(c.amounts.len(), DOUBLE_CHEST_SLOTS);
+            assert!(c.item.is_empty());
+            assert!(c.amounts.iter().all(|&a| a == 0));
+        }
+    }
+
+    #[test]
+    fn calc_position_matches_layout_for_all_indices() {
+        let n = node_origin();
+        // All chests use z-1 (front of double chest); columns x-2 / x-1; rows y+1 / y.
+        assert_eq!(Chest::calc_position(&n, 0), Position { x: n.x - 2, y: n.y + 1, z: n.z - 1 });
+        assert_eq!(Chest::calc_position(&n, 1), Position { x: n.x - 1, y: n.y + 1, z: n.z - 1 });
+        assert_eq!(Chest::calc_position(&n, 2), Position { x: n.x - 2, y: n.y,     z: n.z - 1 });
+        assert_eq!(Chest::calc_position(&n, 3), Position { x: n.x - 1, y: n.y,     z: n.z - 1 });
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid chest index: 4")]
+    fn calc_position_panics_on_out_of_range_index() {
+        Chest::calc_position(&node_origin(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid chest index: -1")]
+    fn calc_position_panics_on_negative_index() {
+        Chest::calc_position(&node_origin(), -1);
     }
 }

@@ -8,14 +8,15 @@ use crate::messages::TradeItem;
 use crate::types::{ItemId, Order, Trade, TradeType};
 use super::super::{Store, state, utils};
 
-/// Handle additem orders (operator-only)
+/// Operator command: move items from the operator's inventory into storage via
+/// a one-sided trade, then deposit them across chests according to the planner.
+/// The operator is made whole with a reverse trade if any deposit step fails.
 pub async fn handle_additem_order(
     store: &mut Store,
     player_name: &str,
     item: &str,
     quantity: u32,
 ) -> Result<(), StoreError> {
-    info!("[Additem] === STARTING ADDITEM ORDER === player={} item={} qty={}", player_name, item, quantity);
     state::assert_invariants(store, "pre-additem", false)?;
     let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
@@ -37,20 +38,24 @@ pub async fn handle_additem_order(
             .await;
     }
 
+    let stock_before = store.pairs.get(item).map(|p| p.item_stock).unwrap_or(0);
+    info!(
+        "[Additem] start: operator={} uuid={} item={} qty={} stock_before={}",
+        player_name, user_uuid, item, quantity, stock_before
+    );
+
     // Plan deposit against a read-only view of storage so we don't pay the
     // cost of cloning the entire structure just to preview placement.
     let stack_size = store.expect_pair(item, "additem/preview")?.stack_size;
     let (preview_deposit_plan, _) =
         store.storage.simulate_deposit_plan(item, qty_i32, stack_size);
 
-    // Notify operator before trade
     utils::send_message_to_player(
         store,
         player_name,
         &format!("Additem {} {}: Please offer the items in the trade.", quantity, item),
     ).await?;
 
-    // Perform trade: player offers items, bot offers nothing
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
     let trade_send_result = store.bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
@@ -71,7 +76,8 @@ pub async fn handle_additem_order(
         .await;
     
     if let Err(e) = trade_send_result {
-        error!("[Additem] FAILED to send trade instruction: {}", e);
+        error!("[Additem] failed to send trade instruction: operator={} item={} qty={} err={}",
+            player_name, item, quantity, e);
         return Err(StoreError::BotError(format!("Failed to send trade instruction to bot: {}", e)));
     }
 
@@ -87,14 +93,9 @@ pub async fn handle_additem_order(
         )
         .await;
     }
-    // Trade succeeded - for operator additem we trust the exact amount was given
-    info!("[Additem] Trade succeeded, depositing items into storage...");
-
-    // Deposit items into storage.
-    // At this point the trade has already succeeded, so the items physically live in the
-    // bot's inventory. If any subsequent chest step fails we must account for exactly how
-    // much made it into storage vs. how much is still held by the bot, so we can hand the
-    // remainder back to the operator rather than silently losing it.
+    // Trade accepted exact quantity; items now live in the bot's inventory. If any
+    // chest step below fails we must track how much was deposited vs. still held so
+    // the remainder can be returned via a reverse trade rather than silently lost.
     let mut items_deposited = 0i32;
     let mut deposit_failed = false;
     let mut failed_reason = String::new();
@@ -126,7 +127,8 @@ pub async fn handle_additem_order(
             .await;
         
         if let Err(e) = send_result {
-            error!("[Additem] Deposit step {} FAILED to send: {}", step + 1, e);
+            error!("[Additem] deposit step {} failed to send: operator={} item={} chunk_amount={} err={}",
+                step + 1, player_name, item, t.amount, e);
             deposit_failed = true;
             failed_reason = format!("Failed to send deposit instruction: {}", e);
             break;
@@ -140,19 +142,21 @@ pub async fn handle_additem_order(
         match bot_result {
             Ok(Ok(report)) => {
                 if let Err(e) = store.apply_chest_sync(report) {
-                    warn!("[Additem] Chest sync failed after deposit: {}", e);
+                    warn!("[Additem] chest sync failed after deposit: item={} chest_id={} err={}",
+                        item, t.chest_id, e);
                 }
                 items_deposited += t.amount;
-                info!("[Additem] Deposit step {} succeeded, {} items deposited so far", step + 1, items_deposited);
             }
             Ok(Err(err)) => {
-                error!("[Additem] Deposit step {} bot error: {}", step + 1, err);
+                error!("[Additem] deposit step {} bot error: item={} chest_id={} chunk_amount={} err={}",
+                    step + 1, item, t.chest_id, t.amount, err);
                 deposit_failed = true;
                 failed_reason = format!("Bot failed chest deposit: {}", err);
                 break;
             }
             Err(err) => {
-                error!("[Additem] Deposit step {} error: {}", step + 1, err);
+                error!("[Additem] deposit step {} error: item={} chest_id={} chunk_amount={} err={}",
+                    step + 1, item, t.chest_id, t.amount, err);
                 deposit_failed = true;
                 failed_reason = err;
                 break;
@@ -160,16 +164,16 @@ pub async fn handle_additem_order(
         }
     }
     
-    // Failsafe: the operator already parted with their items in the trade above, so any
+    // The operator already parted with their items in the trade above, so any
     // undeposited remainder is sitting in the bot's inventory. Return it via a reverse
     // trade so the operator is made whole. If that reverse trade also fails, the items
-    // are genuinely stuck and need manual admin recovery - we log a CRITICAL message.
+    // are genuinely stuck and need manual admin recovery (logged at error level).
     if deposit_failed {
         let items_in_bot_inventory = qty_i32 - items_deposited;
         if items_in_bot_inventory > 0 {
             warn!(
-                "[Additem] Storage deposit failed. {} items in bot inventory, attempting to return to operator...",
-                items_in_bot_inventory
+                "[Additem] deposit failed, returning to operator: operator={} item={} deposited={} stuck={} reason={}",
+                player_name, item, items_deposited, items_in_bot_inventory, failed_reason
             );
             
             let (rb_tx, rb_rx) = tokio::sync::oneshot::channel();
@@ -191,7 +195,10 @@ pub async fn handle_additem_order(
             
             match tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), rb_rx).await {
                 Ok(Ok(Ok(_))) => {
-                    info!("[Additem] Successfully returned {} items to operator", items_in_bot_inventory);
+                    info!(
+                        "[Additem] returned items to operator: operator={} item={} returned={} deposited={}",
+                        player_name, item, items_in_bot_inventory, items_deposited
+                    );
                     return utils::send_message_to_player(
                         store,
                         player_name,
@@ -202,7 +209,10 @@ pub async fn handle_additem_order(
                     ).await;
                 }
                 _ => {
-                    error!("[Additem] Failed to return items to operator - items stuck in bot inventory");
+                    error!(
+                        "[Additem] CRITICAL: return-to-operator trade failed, {} item(s) of '{}' stuck in bot inventory; operator={} deposited={}",
+                        items_in_bot_inventory, item, player_name, items_deposited
+                    );
                     return utils::send_message_to_player(
                         store,
                         player_name,
@@ -222,7 +232,8 @@ pub async fn handle_additem_order(
         }
     }
 
-    // Commit: update pair stock from actual storage (bot has already synced chest contents)
+    // Resync pair stock from authoritative storage totals (chest syncs above may have
+    // moved the real amount by more than `items_deposited` if there was drift).
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "additem/commit")?;
     pair.item_stock = new_stock;
@@ -247,14 +258,17 @@ pub async fn handle_additem_order(
         user_uuid: user_uuid.clone(),
     });
 
-    info!("Executed additem: user={} item={} qty={}", player_name, item, quantity);
+    info!(
+        "[Additem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
+        player_name, user_uuid, item, quantity, stock_before, new_stock
+    );
 
     if let Err(e) = state::assert_invariants(store, "post-additem", true) {
-        error!("Invariant violation after additem: {}", e);
+        error!("[Additem] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e);
         let _ = state::save(store);
     }
 
-    let new_stock = store.pairs.get(item).map(|p| p.item_stock).unwrap_or(0);
     utils::send_message_to_player(
         store,
         player_name,
@@ -263,7 +277,9 @@ pub async fn handle_additem_order(
     .await
 }
 
-/// Handle removeitem orders (operator-only)
+/// Operator command: withdraw items from storage chests into the bot's inventory,
+/// then hand them to the operator via a one-sided trade. On any failure the
+/// withdrawal is rolled back into its source chunks via the shared rollback helper.
 pub async fn handle_removeitem_order(
     store: &mut Store,
     player_name: &str,
@@ -290,6 +306,12 @@ pub async fn handle_removeitem_order(
         return utils::send_message_to_player(store, player_name, "Quantity must be positive")
             .await;
     }
+
+    let stock_before = store.pairs.get(item).map(|p| p.item_stock).unwrap_or(0);
+    info!(
+        "[Removeitem] start: operator={} uuid={} item={} qty={} stock_before={}",
+        player_name, user_uuid, item, quantity, stock_before
+    );
 
     let physical_stock = store.storage.total_item_amount(item);
     if physical_stock < qty_i32 {
@@ -319,14 +341,12 @@ pub async fn handle_removeitem_order(
         .await;
     }
 
-    // Notify operator before withdrawal
     utils::send_message_to_player(
         store,
         player_name,
         &format!("Removeitem {} {}: Withdrawing from storage, then trading to you.", quantity, item),
     ).await?;
 
-    // Withdraw items from storage
     for t in &preview_withdraw_plan {
         let node_position = store.get_node_position(t.chest_id);
         let chest = crate::types::Chest {
@@ -361,6 +381,8 @@ pub async fn handle_removeitem_order(
 
         match bot_result {
             Err(err) => {
+                error!("[Removeitem] chest withdraw step failed: operator={} item={} chest_id={} chunk_amount={} err={}",
+                    player_name, item, t.chest_id, t.amount, err);
                 return utils::send_message_to_player(
                     store,
                     player_name,
@@ -370,13 +392,13 @@ pub async fn handle_removeitem_order(
             }
             Ok(report) => {
                 if let Err(e) = store.apply_chest_sync(report) {
-                    warn!("Chest sync failed after withdraw: {}", e);
+                    warn!("[Removeitem] chest sync failed after withdraw: item={} chest_id={} err={}",
+                        item, t.chest_id, e);
                 }
             }
         }
     }
 
-    // Perform trade: bot offers items, player offers nothing
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
     let trade_send_result = store.bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
@@ -386,15 +408,16 @@ pub async fn handle_removeitem_order(
                 amount: qty_i32,
             }],
             player_offers: vec![],
-            // Removeitem: player offers nothing
+            // Operator offers nothing, so exact-amount enforcement is meaningless.
             require_exact_amount: false,
             flexible_validation: false,
             respond_to: trade_tx,
         })
         .await;
-    
+
     if let Err(e) = trade_send_result {
-        error!("[Removeitem] FAILED to send trade instruction: {}", e);
+        error!("[Removeitem] failed to send trade instruction: operator={} item={} qty={} err={}",
+            player_name, item, quantity, e);
         // Rollback: withdrawal already moved items from chests into the bot.
         // Re-deposit each planned chunk back into its source chest via the shared helper.
         let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
@@ -428,9 +451,9 @@ pub async fn handle_removeitem_order(
         .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
     
     if let Err(err) = &trade_result {
-        error!("[Removeitem] Trade FAILED: {} - rolling back items to storage", err);
-        // Rollback: items are still in the bot's inventory. Deposit them back using
-        // the same plan we withdrew with via the shared helper.
+        warn!("[Removeitem] trade failed, rolling back to storage: operator={} item={} qty={} err={}",
+            player_name, item, quantity, err);
+        // Items are still in the bot's inventory; re-deposit them via the same plan.
         let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
         let rb = super::super::rollback::deposit_transfers(
             store,
@@ -473,9 +496,7 @@ pub async fn handle_removeitem_order(
         )
         .await;
     }
-    // Trade succeeded - bot gave items to operator
 
-    // Commit: update pair stock from actual storage
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "removeitem/commit")?;
     pair.item_stock = new_stock;
@@ -500,23 +521,27 @@ pub async fn handle_removeitem_order(
         user_uuid: user_uuid.clone(),
     });
 
-    info!("Executed removeitem: user={} item={} qty={}", player_name, item, quantity);
+    info!(
+        "[Removeitem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
+        player_name, user_uuid, item, quantity, stock_before, new_stock
+    );
 
     if let Err(e) = state::assert_invariants(store, "post-removeitem", true) {
-        error!("Invariant violation after removeitem: {}", e);
+        error!("[Removeitem] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e);
         let _ = state::save(store);
     }
 
-    let remaining_stock = store.pairs.get(item).map(|p| p.item_stock).unwrap_or(0);
     utils::send_message_to_player(
         store,
         player_name,
-        &format!("Removed {} {} from storage. Remaining stock: {}", quantity, item, remaining_stock),
+        &format!("Removed {} {} from storage. Remaining stock: {}", quantity, item, new_stock),
     )
     .await
 }
 
-/// Handle add currency (operator-only)
+/// Operator command: credit a pair's currency reserve by `amount` diamonds. No
+/// trade occurs — this is a pure bookkeeping adjustment, audited via Trade+Order.
 pub async fn handle_add_currency(
     store: &mut Store,
     player_name: &str,
@@ -541,12 +566,19 @@ pub async fn handle_add_currency(
             .await;
     }
 
+    let reserve_before = store.pairs.get(item).map(|p| p.currency_stock).unwrap_or(0.0);
+    info!(
+        "[AddCurrency] start: operator={} uuid={} item={} amount={:.2} reserve_before={:.2}",
+        player_name, user_uuid, item, amount, reserve_before
+    );
+
     let pair = store.expect_pair_mut(item, "add-currency/commit")?;
     pair.currency_stock += amount;
     assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
         "[AddCurrency] INVARIANT VIOLATED: currency_stock invalid after add_currency \
         (item={}, stock={}). This indicates a currency accounting bug.",
         item, pair.currency_stock);
+    let new_reserve = pair.currency_stock;
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -564,14 +596,17 @@ pub async fn handle_add_currency(
         user_uuid: user_uuid.clone(),
     });
 
-    info!("Executed add currency: user={} item={} amount={}", player_name, item, amount);
+    info!(
+        "[AddCurrency] committed: operator={} uuid={} item={} amount={:.2} reserve_before={:.2} reserve_after={:.2}",
+        player_name, user_uuid, item, amount, reserve_before, new_reserve
+    );
 
     if let Err(e) = state::assert_invariants(store, "post-add-currency", true) {
-        error!("Invariant violation after add currency: {}", e);
+        error!("[AddCurrency] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e);
         let _ = state::save(store);
     }
 
-    let new_reserve = store.pairs.get(item).map(|p| p.currency_stock).unwrap_or(0.0);
     utils::send_message_to_player(
         store,
         player_name,
@@ -580,7 +615,8 @@ pub async fn handle_add_currency(
     .await
 }
 
-/// Handle remove currency (operator-only)
+/// Operator command: debit a pair's currency reserve by `amount` diamonds. No
+/// trade occurs — this is a pure bookkeeping adjustment, audited via Trade+Order.
 pub async fn handle_remove_currency(
     store: &mut Store,
     player_name: &str,
@@ -606,17 +642,23 @@ pub async fn handle_remove_currency(
     }
 
     let pair = store.expect_pair(item, "remove-currency/check")?;
-    if pair.currency_stock < amount {
+    let reserve_before = pair.currency_stock;
+    if reserve_before < amount {
         return utils::send_message_to_player(
             store,
             player_name,
             &format!(
                 "Insufficient currency reserve. Available: {:.2}, requested: {:.2}",
-                pair.currency_stock, amount
+                reserve_before, amount
             ),
         )
         .await;
     }
+
+    info!(
+        "[RemoveCurrency] start: operator={} uuid={} item={} amount={:.2} reserve_before={:.2}",
+        player_name, user_uuid, item, amount, reserve_before
+    );
 
     let pair = store.expect_pair_mut(item, "remove-currency/commit")?;
     pair.currency_stock -= amount;
@@ -624,6 +666,7 @@ pub async fn handle_remove_currency(
         "[RemoveCurrency] INVARIANT VIOLATED: currency_stock invalid after remove_currency \
         (item={}, stock={}). This indicates a currency accounting bug.",
         item, pair.currency_stock);
+    let new_reserve = pair.currency_stock;
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -641,18 +684,21 @@ pub async fn handle_remove_currency(
         user_uuid: user_uuid.clone(),
     });
 
-    info!("Executed remove currency: user={} item={} amount={}", player_name, item, amount);
+    info!(
+        "[RemoveCurrency] committed: operator={} uuid={} item={} amount={:.2} reserve_before={:.2} reserve_after={:.2}",
+        player_name, user_uuid, item, amount, reserve_before, new_reserve
+    );
 
     if let Err(e) = state::assert_invariants(store, "post-remove-currency", true) {
-        error!("Invariant violation after remove currency: {}", e);
+        error!("[RemoveCurrency] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e);
         let _ = state::save(store);
     }
 
-    let remaining_reserve = store.pairs.get(item).map(|p| p.currency_stock).unwrap_or(0.0);
     utils::send_message_to_player(
         store,
         player_name,
-        &format!("Removed {:.2} diamonds from {} reserve. Remaining reserve: {:.2}", amount, item, remaining_reserve),
+        &format!("Removed {:.2} diamonds from {} reserve. Remaining reserve: {:.2}", amount, item, new_reserve),
     )
     .await
 }

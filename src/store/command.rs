@@ -209,22 +209,39 @@ fn parse_cancel(parts: &[&str]) -> Result<Command, String> {
 mod tests {
     use super::*;
 
+    // ---- top-level dispatch ------------------------------------------------
+
     #[test]
-    fn test_parse_empty() {
+    fn empty_input_prompts_help() {
         let err = parse_command("").unwrap_err();
         assert!(err.contains("help"));
+    }
+
+    #[test]
+    fn whitespace_only_input_prompts_help() {
+        // `split_whitespace` strips everything, so this hits the same arm as "".
         let err = parse_command("   ").unwrap_err();
         assert!(err.contains("help"));
     }
 
     #[test]
-    fn test_parse_unknown() {
+    fn unknown_verb_is_rejected_and_named() {
+        // The error must name the offending verb so the player can see the typo.
         let err = parse_command("teleport").unwrap_err();
         assert!(err.contains("Unknown command"));
+        assert!(err.contains("teleport"));
     }
 
     #[test]
-    fn test_parse_buy() {
+    fn unknown_verb_ignores_trailing_args() {
+        let err = parse_command("teleport home now").unwrap_err();
+        assert!(err.contains("teleport"));
+    }
+
+    // ---- buy / sell --------------------------------------------------------
+
+    #[test]
+    fn buy_command_parses_item_and_quantity() {
         assert_eq!(
             parse_command("buy cobblestone 64").unwrap(),
             Command::Buy {
@@ -232,7 +249,10 @@ mod tests {
                 quantity: 64
             }
         );
-        // Alias
+    }
+
+    #[test]
+    fn buy_alias_b_is_equivalent() {
         assert_eq!(
             parse_command("b diamond 1").unwrap(),
             Command::Buy {
@@ -240,7 +260,10 @@ mod tests {
                 quantity: 1
             }
         );
-        // minecraft: prefix is stripped
+    }
+
+    #[test]
+    fn buy_strips_minecraft_namespace_prefix() {
         assert_eq!(
             parse_command("buy minecraft:iron_ingot 32").unwrap(),
             Command::Buy {
@@ -248,16 +271,45 @@ mod tests {
                 quantity: 32
             }
         );
-        // Missing args
-        assert!(parse_command("buy").is_err());
-        assert!(parse_command("buy cobblestone").is_err());
-        // Bad quantity
-        assert!(parse_command("buy cobblestone abc").is_err());
-        assert!(parse_command("buy cobblestone 0").is_err());
     }
 
     #[test]
-    fn test_parse_sell() {
+    fn buy_without_args_reports_usage() {
+        let err = parse_command("buy").unwrap_err();
+        assert!(err.contains("Usage: buy"));
+    }
+
+    #[test]
+    fn buy_without_quantity_reports_usage() {
+        let err = parse_command("buy cobblestone").unwrap_err();
+        assert!(err.contains("Usage: buy"));
+    }
+
+    #[test]
+    fn buy_with_non_numeric_quantity_is_rejected() {
+        let err = parse_command("buy cobblestone abc").unwrap_err();
+        // Error flows through `validate_quantity`, which names the bad token
+        // and the operation.
+        assert!(err.contains("abc"));
+        assert!(err.contains("buy"));
+    }
+
+    #[test]
+    fn buy_with_zero_quantity_is_rejected() {
+        let err = parse_command("buy cobblestone 0").unwrap_err();
+        assert!(err.contains("at least 1"));
+    }
+
+    #[test]
+    fn buy_with_invalid_item_name_is_rejected() {
+        // Space characters can't appear in a single token, so use a hyphen to
+        // exercise the validator.
+        let err = parse_command("buy iron-ingot 1").unwrap_err();
+        assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn sell_command_parses_item_and_quantity() {
         assert_eq!(
             parse_command("sell iron_ingot 128").unwrap(),
             Command::Sell {
@@ -265,6 +317,10 @@ mod tests {
                 quantity: 128
             }
         );
+    }
+
+    #[test]
+    fn sell_alias_s_is_equivalent() {
         assert_eq!(
             parse_command("s diamond 5").unwrap(),
             Command::Sell {
@@ -275,24 +331,62 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_deposit() {
+    fn sell_with_bad_quantity_names_sell_in_error() {
+        let err = parse_command("sell diamond abc").unwrap_err();
+        assert!(err.contains("sell"));
+    }
+
+    // ---- deposit / withdraw ------------------------------------------------
+
+    #[test]
+    fn deposit_without_amount_leaves_amount_none() {
         assert_eq!(parse_command("deposit").unwrap(), Command::Deposit { amount: None });
         assert_eq!(parse_command("d").unwrap(), Command::Deposit { amount: None });
+    }
+
+    #[test]
+    fn deposit_with_amount_parses_as_float() {
         assert_eq!(
             parse_command("deposit 64").unwrap(),
             Command::Deposit { amount: Some(64.0) }
         );
-        // Negative / zero rejected
-        assert!(parse_command("deposit 0").is_err());
-        assert!(parse_command("deposit -1").is_err());
-        // Non-numeric
-        assert!(parse_command("deposit abc").is_err());
     }
 
     #[test]
-    fn test_parse_withdraw() {
+    fn deposit_rejects_zero_amount() {
+        let err = parse_command("deposit 0").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn deposit_rejects_negative_amount() {
+        let err = parse_command("deposit -1").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn deposit_rejects_non_numeric_amount() {
+        // Error must name the bad token and the verb.
+        let err = parse_command("deposit abc").unwrap_err();
+        assert!(err.contains("abc"));
+        assert!(err.contains("deposit"));
+    }
+
+    #[test]
+    fn deposit_rejects_non_finite_amount() {
+        // f64 parses "inf" and "nan" successfully; the finite check catches them.
+        assert!(parse_command("deposit inf").is_err());
+        assert!(parse_command("deposit NaN").is_err());
+    }
+
+    #[test]
+    fn withdraw_without_amount_leaves_amount_none() {
         assert_eq!(parse_command("withdraw").unwrap(), Command::Withdraw { amount: None });
         assert_eq!(parse_command("w").unwrap(), Command::Withdraw { amount: None });
+    }
+
+    #[test]
+    fn withdraw_with_amount_parses_as_float() {
         assert_eq!(
             parse_command("withdraw 32").unwrap(),
             Command::Withdraw { amount: Some(32.0) }
@@ -300,7 +394,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_price() {
+    fn withdraw_rejects_non_finite_amount() {
+        assert!(parse_command("withdraw inf").is_err());
+    }
+
+    // ---- price -------------------------------------------------------------
+
+    #[test]
+    fn price_without_quantity_leaves_quantity_none() {
         assert_eq!(
             parse_command("price cobblestone").unwrap(),
             Command::Price {
@@ -308,6 +409,10 @@ mod tests {
                 quantity: None
             }
         );
+    }
+
+    #[test]
+    fn price_alias_p_accepts_quantity() {
         assert_eq!(
             parse_command("p cobblestone 64").unwrap(),
             Command::Price {
@@ -315,35 +420,67 @@ mod tests {
                 quantity: Some(64)
             }
         );
-        // No item
-        assert!(parse_command("price").is_err());
-        // Zero quantity
-        assert!(parse_command("price x 0").is_err());
     }
 
     #[test]
-    fn test_parse_balance() {
-        assert_eq!(
-            parse_command("balance").unwrap(),
-            Command::Balance { target: None }
-        );
-        assert_eq!(
-            parse_command("bal").unwrap(),
-            Command::Balance { target: None }
-        );
+    fn price_without_item_reports_usage() {
+        let err = parse_command("price").unwrap_err();
+        assert!(err.contains("Usage: price"));
+    }
+
+    #[test]
+    fn price_with_zero_quantity_is_rejected() {
+        let err = parse_command("price diamond 0").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn price_with_negative_quantity_is_rejected() {
+        // u32 parse rejects the leading `-`, so this hits the same error arm.
+        let err = parse_command("price diamond -1").unwrap_err();
+        assert!(err.contains("Invalid quantity"));
+    }
+
+    #[test]
+    fn price_with_bad_item_name_is_rejected() {
+        let err = parse_command("price iron-ingot").unwrap_err();
+        assert!(err.contains("invalid character"));
+    }
+
+    // ---- balance -----------------------------------------------------------
+
+    #[test]
+    fn balance_without_target_leaves_target_none() {
+        assert_eq!(parse_command("balance").unwrap(), Command::Balance { target: None });
+        assert_eq!(parse_command("bal").unwrap(), Command::Balance { target: None });
+    }
+
+    #[test]
+    fn balance_with_target_captures_username() {
         assert_eq!(
             parse_command("bal Steve").unwrap(),
             Command::Balance {
                 target: Some("Steve".to_string())
             }
         );
-        // Invalid username
-        assert!(parse_command("bal ab").is_err());
-        assert!(parse_command("bal thisnameistoolongforminecraft").is_err());
     }
 
     #[test]
-    fn test_parse_pay() {
+    fn balance_rejects_too_short_username() {
+        let err = parse_command("bal ab").unwrap_err();
+        assert!(err.contains("3-16 characters"));
+    }
+
+    #[test]
+    fn balance_rejects_too_long_username() {
+        let err = parse_command("bal thisnameistoolongforminecraft").unwrap_err();
+        assert!(err.contains("3-16 characters"));
+    }
+
+    // ---- pay ---------------------------------------------------------------
+
+    #[test]
+    fn pay_parses_target_and_amount() {
         assert_eq!(
             parse_command("pay Steve 10.5").unwrap(),
             Command::Pay {
@@ -351,56 +488,165 @@ mod tests {
                 amount: 10.5
             }
         );
-        // Missing amount
-        assert!(parse_command("pay Steve").is_err());
-        // Bad amount
-        assert!(parse_command("pay Steve abc").is_err());
-        // Zero / negative
-        assert!(parse_command("pay Steve 0").is_err());
-        assert!(parse_command("pay Steve -5").is_err());
-        // Too large
-        assert!(parse_command("pay Steve 2000000").is_err());
     }
 
     #[test]
-    fn test_parse_items() {
+    fn pay_without_amount_reports_usage() {
+        let err = parse_command("pay Steve").unwrap_err();
+        assert!(err.contains("Usage: pay"));
+    }
+
+    #[test]
+    fn pay_with_non_numeric_amount_is_rejected() {
+        let err = parse_command("pay Steve abc").unwrap_err();
+        assert!(err.contains("abc"));
+    }
+
+    #[test]
+    fn pay_rejects_zero_amount() {
+        let err = parse_command("pay Steve 0").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn pay_rejects_negative_amount() {
+        let err = parse_command("pay Steve -5").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn pay_rejects_amount_above_cap() {
+        // Cap is 1,000,000 per payment.
+        let err = parse_command("pay Steve 2000000").unwrap_err();
+        assert!(err.contains("Maximum"));
+    }
+
+    #[test]
+    fn pay_accepts_amount_at_cap() {
+        assert_eq!(
+            parse_command("pay Steve 1000000").unwrap(),
+            Command::Pay {
+                target: "Steve".to_string(),
+                amount: 1_000_000.0
+            }
+        );
+    }
+
+    #[test]
+    fn pay_rejects_invalid_username() {
+        let err = parse_command("pay hi 10").unwrap_err();
+        assert!(err.contains("3-16 characters"));
+    }
+
+    #[test]
+    fn pay_rejects_non_finite_amount() {
+        assert!(parse_command("pay Steve inf").is_err());
+        assert!(parse_command("pay Steve NaN").is_err());
+    }
+
+    // ---- items / queue (paged) --------------------------------------------
+
+    #[test]
+    fn items_without_page_defaults_to_one() {
         assert_eq!(parse_command("items").unwrap(), Command::Items { page: 1 });
+    }
+
+    #[test]
+    fn items_accepts_explicit_page() {
         assert_eq!(parse_command("items 3").unwrap(), Command::Items { page: 3 });
-        // Bad page defaults to 1
+    }
+
+    #[test]
+    fn items_non_numeric_page_falls_back_to_one() {
+        // `parse_page` swallows malformed input rather than erroring — the list
+        // view is low-risk and friendlier to mistype.
         assert_eq!(parse_command("items abc").unwrap(), Command::Items { page: 1 });
     }
 
     #[test]
-    fn test_parse_queue() {
+    fn items_zero_page_is_clamped_to_one() {
+        // `.max(1)` guards the 1-indexed pager.
+        assert_eq!(parse_command("items 0").unwrap(), Command::Items { page: 1 });
+    }
+
+    #[test]
+    fn queue_without_page_defaults_to_one() {
         assert_eq!(parse_command("queue").unwrap(), Command::Queue { page: 1 });
         assert_eq!(parse_command("q").unwrap(), Command::Queue { page: 1 });
+    }
+
+    #[test]
+    fn queue_accepts_explicit_page() {
         assert_eq!(parse_command("queue 2").unwrap(), Command::Queue { page: 2 });
     }
 
+    // ---- cancel ------------------------------------------------------------
+
     #[test]
-    fn test_parse_cancel() {
+    fn cancel_parses_bare_order_id() {
         assert_eq!(parse_command("cancel 5").unwrap(), Command::Cancel { order_id: 5 });
-        assert_eq!(parse_command("c 5").unwrap(), Command::Cancel { order_id: 5 });
-        assert_eq!(parse_command("c #5").unwrap(), Command::Cancel { order_id: 5 });
-        // Missing
-        assert!(parse_command("cancel").is_err());
-        // Non-numeric
-        assert!(parse_command("cancel abc").is_err());
     }
 
     #[test]
-    fn test_parse_status_and_help() {
+    fn cancel_alias_c_is_equivalent() {
+        assert_eq!(parse_command("c 5").unwrap(), Command::Cancel { order_id: 5 });
+    }
+
+    #[test]
+    fn cancel_strips_leading_hash() {
+        // `queue` shows order IDs as `#5`, so accept that form verbatim.
+        assert_eq!(parse_command("c #5").unwrap(), Command::Cancel { order_id: 5 });
+    }
+
+    #[test]
+    fn cancel_without_id_reports_usage() {
+        let err = parse_command("cancel").unwrap_err();
+        assert!(err.contains("Usage: cancel"));
+    }
+
+    #[test]
+    fn cancel_rejects_non_numeric_id() {
+        let err = parse_command("cancel abc").unwrap_err();
+        assert!(err.contains("abc"));
+    }
+
+    #[test]
+    fn cancel_rejects_hash_only() {
+        // `#` strips to an empty string, which `u64::parse` rejects.
+        assert!(parse_command("cancel #").is_err());
+    }
+
+    // ---- status / help -----------------------------------------------------
+
+    #[test]
+    fn status_command_parses_with_no_args() {
         assert_eq!(parse_command("status").unwrap(), Command::Status);
+    }
+
+    #[test]
+    fn status_ignores_trailing_args() {
+        // Extra tokens are silently dropped; `status` takes none.
+        assert_eq!(parse_command("status now").unwrap(), Command::Status);
+    }
+
+    #[test]
+    fn help_without_topic_leaves_topic_none() {
         assert_eq!(parse_command("help").unwrap(), Command::Help { topic: None });
         assert_eq!(parse_command("h").unwrap(), Command::Help { topic: None });
+    }
+
+    #[test]
+    fn help_captures_topic_token() {
         assert_eq!(
             parse_command("help buy").unwrap(),
             Command::Help { topic: Some("buy".to_string()) }
         );
     }
 
+    // ---- operator commands -------------------------------------------------
+
     #[test]
-    fn test_parse_operator_commands() {
+    fn additem_parses_item_and_quantity() {
         assert_eq!(
             parse_command("additem diamond 100").unwrap(),
             Command::AddItem {
@@ -408,6 +654,10 @@ mod tests {
                 quantity: 100
             }
         );
+    }
+
+    #[test]
+    fn additem_alias_ai_is_equivalent() {
         assert_eq!(
             parse_command("ai diamond 100").unwrap(),
             Command::AddItem {
@@ -415,6 +665,17 @@ mod tests {
                 quantity: 100
             }
         );
+    }
+
+    #[test]
+    fn additem_without_args_reports_usage_with_verb() {
+        let err = parse_command("additem").unwrap_err();
+        // Error must name the specific operator verb, not a generic "missing args".
+        assert!(err.contains("additem"));
+    }
+
+    #[test]
+    fn removeitem_parses_item_and_quantity() {
         assert_eq!(
             parse_command("removeitem coal 50").unwrap(),
             Command::RemoveItem {
@@ -422,6 +683,10 @@ mod tests {
                 quantity: 50
             }
         );
+    }
+
+    #[test]
+    fn removeitem_alias_ri_is_equivalent() {
         assert_eq!(
             parse_command("ri coal 50").unwrap(),
             Command::RemoveItem {
@@ -429,6 +694,10 @@ mod tests {
                 quantity: 50
             }
         );
+    }
+
+    #[test]
+    fn addcurrency_parses_item_and_amount() {
         assert_eq!(
             parse_command("addcurrency cobblestone 1000").unwrap(),
             Command::AddCurrency {
@@ -436,6 +705,10 @@ mod tests {
                 amount: 1000.0
             }
         );
+    }
+
+    #[test]
+    fn addcurrency_alias_ac_is_equivalent() {
         assert_eq!(
             parse_command("ac cobblestone 1000").unwrap(),
             Command::AddCurrency {
@@ -443,6 +716,40 @@ mod tests {
                 amount: 1000.0
             }
         );
+    }
+
+    #[test]
+    fn addcurrency_accepts_fractional_amount() {
+        // `parse_item_amount` uses f64, unlike item quantities.
+        assert_eq!(
+            parse_command("ac diamond 12.5").unwrap(),
+            Command::AddCurrency {
+                item: "diamond".to_string(),
+                amount: 12.5
+            }
+        );
+    }
+
+    #[test]
+    fn addcurrency_rejects_non_numeric_amount() {
+        let err = parse_command("addcurrency diamond xyz").unwrap_err();
+        assert!(err.contains("xyz"));
+    }
+
+    #[test]
+    fn addcurrency_rejects_non_finite_amount() {
+        assert!(parse_command("addcurrency diamond inf").is_err());
+        assert!(parse_command("addcurrency diamond NaN").is_err());
+    }
+
+    #[test]
+    fn addcurrency_without_args_reports_usage_with_verb() {
+        let err = parse_command("addcurrency").unwrap_err();
+        assert!(err.contains("addcurrency"));
+    }
+
+    #[test]
+    fn removecurrency_parses_item_and_amount() {
         assert_eq!(
             parse_command("removecurrency cobblestone 500").unwrap(),
             Command::RemoveCurrency {
@@ -450,6 +757,10 @@ mod tests {
                 amount: 500.0
             }
         );
+    }
+
+    #[test]
+    fn removecurrency_alias_rc_is_equivalent() {
         assert_eq!(
             parse_command("rc cobblestone 500").unwrap(),
             Command::RemoveCurrency {

@@ -1,15 +1,11 @@
 //! `deposit` / `d` command: enqueue handler + queued-order processor.
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::super::{Store, state, utils};
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
-
-// =========================================================================
-// Dispatcher entry point (enqueue)
-// =========================================================================
 
 pub(super) async fn handle_enqueue(
     store: &mut Store,
@@ -18,8 +14,10 @@ pub(super) async fn handle_enqueue(
     amount: Option<f64>,
 ) -> Result<(), StoreError> {
     debug!(
-        "Queueing deposit order: {} amount={:?}",
-        player_name, amount
+        player = player_name,
+        uuid = user_uuid,
+        amount = ?amount,
+        "Queueing deposit order"
     );
 
     match store.order_queue.add(
@@ -46,36 +44,39 @@ pub(super) async fn handle_enqueue(
     }
 }
 
-// =========================================================================
-// Queued-order processor (called from orders.rs)
-// =========================================================================
-
-/// Handle deposit balance (user deposits diamonds to their balance)
+/// Processes a dequeued deposit order: runs the trade, credits the user's
+/// balance, and moves the received diamonds into storage.
 ///
-/// If `amount` is Some, expects exactly that many diamonds (ceil'd to whole diamonds).
-/// If `amount` is None, flexible deposit - credits whatever the player puts in (up to 12 stacks = 768 diamonds).
-///
-/// This is a public function called by the order queue processor.
+/// If `amount` is `Some`, the player must offer exactly that many diamonds
+/// (ceiled to whole diamonds). If `amount` is `None`, the deposit is flexible
+/// and credits whatever the player puts in, up to 12 stacks (768 diamonds).
 pub async fn handle_deposit_balance_queued(
     store: &mut Store,
     player_name: &str,
     amount: Option<f64>,
 ) -> Result<(), StoreError> {
-    info!("[Deposit] Starting: player={} amount={:?}", player_name, amount);
+    info!(
+        player = player_name,
+        amount = ?amount,
+        "Deposit starting"
+    );
     state::assert_invariants(store, "pre-deposit-balance", false)?;
 
-    // Maximum diamonds the trade GUI can hold (12 stacks of 64 = 768).
-    // Rationale: Minecraft's vanilla trade/offer UI exposes 12 offer slots
-    // (4x3 grid on each side). Each slot holds at most one 64-stack of
-    // diamonds, so a single trade round-trip can move at most 768 diamonds.
-    // Requests larger than this cannot fit into one trade window and must
-    // be split - we reject them at the handler rather than silently
-    // truncating so the player isn't surprised by a partial transaction.
+    // Minecraft's vanilla trade UI exposes 12 offer slots (4x3 grid); each
+    // slot holds at most one 64-stack of diamonds, so a single trade can move
+    // at most 768 diamonds. We reject larger requests at the handler rather
+    // than silently truncating so the player isn't surprised by a partial
+    // transaction.
     const MAX_TRADE_DIAMONDS: i32 = 12 * 64; // 768
 
     let (diamonds_to_trade, is_flexible) = match amount {
         Some(amt) => {
             if !amt.is_finite() || amt <= 0.0 {
+                debug!(
+                    player = player_name,
+                    amount = amt,
+                    "Deposit rejected: non-positive or non-finite amount"
+                );
                 return utils::send_message_to_player(
                     store,
                     player_name,
@@ -85,6 +86,12 @@ pub async fn handle_deposit_balance_queued(
             }
             let diamonds = amt.ceil() as i32;
             if diamonds > MAX_TRADE_DIAMONDS {
+                debug!(
+                    player = player_name,
+                    amount = amt,
+                    max = MAX_TRADE_DIAMONDS,
+                    "Deposit rejected: amount exceeds single-trade capacity"
+                );
                 return utils::send_message_to_player(
                     store,
                     player_name,
@@ -109,8 +116,7 @@ pub async fn handle_deposit_balance_queued(
             MAX_TRADE_DIAMONDS
         )
     } else {
-        // unwrap: `is_flexible` is true iff `amount.is_none()`, so this branch
-        // is only reached when `amount` is `Some`.
+        // unwrap is sound: `is_flexible` is false iff `amount` is `Some`.
         format!(
             "Deposit {:.2} diamonds: Please offer {} diamonds in the trade.",
             amount.unwrap(),
@@ -119,13 +125,18 @@ pub async fn handle_deposit_balance_queued(
     };
     utils::send_message_to_player(store, player_name, &msg).await?;
 
-    // Advance: Queued -> Withdrawing (empty plan) -> Trading
+    // Empty withdrawal plan: a deposit has nothing to pull from storage first,
+    // but the trade state machine still requires the Queued -> Withdrawing ->
+    // Trading progression.
     store.advance_trade(|s| s.begin_withdrawal(vec![]));
     store.advance_trade(|s| s.begin_trading());
 
     info!(
-        "[Deposit] Initiating trade: {} offers up to {} diamonds (flexible={})",
-        player_name, diamonds_to_trade, is_flexible
+        player = player_name,
+        uuid = %user_uuid,
+        diamonds = diamonds_to_trade,
+        flexible = is_flexible,
+        "Deposit initiating trade"
     );
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
     let send_result = store
@@ -144,7 +155,12 @@ pub async fn handle_deposit_balance_queued(
         .await;
 
     if let Err(e) = send_result {
-        tracing::error!("[Deposit] Failed to send trade instruction: {}", e);
+        error!(
+            player = player_name,
+            uuid = %user_uuid,
+            error = %e,
+            "Deposit failed to send trade instruction"
+        );
         return Err(StoreError::BotError(format!(
             "Failed to send trade instruction to bot: {}",
             e
@@ -159,18 +175,33 @@ pub async fn handle_deposit_balance_queued(
     {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
-            tracing::error!("[Deposit] Trade channel dropped: {}", e);
+            error!(
+                player = player_name,
+                uuid = %user_uuid,
+                error = %e,
+                "Deposit trade channel dropped"
+            );
             return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
         }
         Err(_) => {
-            tracing::error!("[Deposit] Trade timeout");
+            error!(
+                player = player_name,
+                uuid = %user_uuid,
+                timeout_ms = store.config.trade_timeout_ms,
+                "Deposit trade timed out"
+            );
             return Err(StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000));
         }
     };
 
     let actual_received = match trade_result {
         Err(err) => {
-            warn!("[Deposit] Trade failed: {}", err);
+            warn!(
+                player = player_name,
+                uuid = %user_uuid,
+                error = %err,
+                "Deposit trade failed"
+            );
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -188,6 +219,11 @@ pub async fn handle_deposit_balance_queued(
         .sum();
 
     if diamonds_actually_received <= 0 {
+        warn!(
+            player = player_name,
+            uuid = %user_uuid,
+            "Deposit aborted: trade completed but zero diamonds received"
+        );
         return utils::send_message_to_player(
             store,
             player_name,
@@ -205,9 +241,19 @@ pub async fn handle_deposit_balance_queued(
     )
     .await;
     if rb.has_failures() {
-        tracing::warn!(
-            "[Deposit] Failed to deposit {} diamond step(s) into storage - some diamonds may remain in bot inventory",
-            rb.operations_failed
+        warn!(
+            player = player_name,
+            uuid = %user_uuid,
+            failed_steps = rb.operations_failed,
+            diamonds = diamonds_actually_received,
+            "Deposit storage write partially failed; some diamonds may remain in bot inventory"
+        );
+    } else {
+        info!(
+            uuid = %user_uuid,
+            item = "diamond",
+            amount = diamonds_actually_received,
+            "Deposit storage credited"
         );
     }
 
@@ -219,6 +265,14 @@ pub async fn handle_deposit_balance_queued(
         user.balance
     };
     store.dirty = true;
+
+    info!(
+        uuid = %user_uuid,
+        item = "diamond",
+        amount = actual_amount,
+        new_balance = new_balance,
+        "Deposit balance credited"
+    );
 
     store.orders.push_back(crate::types::Order {
         order_type: crate::types::order::OrderType::DepositBalance,
@@ -240,12 +294,19 @@ pub async fn handle_deposit_balance_queued(
     });
 
     info!(
-        "[Deposit] Completed: user={} amount={}",
-        player_name, actual_amount
+        player = player_name,
+        uuid = %user_uuid,
+        amount = actual_amount,
+        new_balance = new_balance,
+        "Deposit completed"
     );
 
     if let Err(e) = state::assert_invariants(store, "post-deposit-balance", true) {
-        tracing::error!("Invariant violation after deposit balance: {}", e);
+        error!(
+            uuid = %user_uuid,
+            error = %e,
+            "Invariant violation after deposit balance"
+        );
         let _ = state::save(store);
     }
 

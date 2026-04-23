@@ -517,14 +517,14 @@ pub async fn transfer_items_with_shulker(
         }
         _ => {
             error!("transfer_items_with_shulker: Invalid direction: {}", direction);
-            return Err("Invalid direction".to_string());
+            return Err(format!("Invalid direction: {}", direction));
         }
     };
 
     if total_moved < amount {
         warn!(
-            "Incomplete transfer: moved {}/{} ({})",
-            total_moved, amount, direction
+            "transfer_items_with_shulker: Incomplete {} of {}: moved {}/{}",
+            direction, item, total_moved, amount
         );
     }
 
@@ -620,11 +620,14 @@ async fn transfer_withdraw_from_shulker(
                     // Items really didn't move - retry
                     consecutive_failures += 1;
                     warn!(
-                        "transfer_items_with_shulker: Shift-click moved 0 items (failure {}/3)",
-                        consecutive_failures
+                        "transfer_items_with_shulker: Shift-click withdraw from shulker slot {} moved 0 items for {} (failure {}/3, moved {} of {} so far)",
+                        slot, target_id, consecutive_failures, total_moved, amount
                     );
                     if consecutive_failures >= 3 {
-                        error!("transfer_items_with_shulker: Shift-click failed 3 times in a row, stopping extraction");
+                        error!(
+                            "transfer_items_with_shulker: Shift-click withdraw from shulker slot {} failed 3 times in a row for {} (moved {} of {} so far), stopping extraction",
+                            slot, target_id, total_moved, amount
+                        );
                         break;
                     }
                 }
@@ -805,11 +808,14 @@ async fn transfer_deposit_into_shulker(
                     // Items really didn't move - retry
                     consecutive_failures += 1;
                     warn!(
-                        "Shift-click moved 0 items (failure {}/3)",
-                        consecutive_failures
+                        "transfer_items_with_shulker: Shift-click deposit of {} from inventory slot {} moved 0 items (failure {}/3, moved {} of {} so far)",
+                        target_id, slot, consecutive_failures, total_moved, amount
                     );
                     if consecutive_failures >= 3 {
-                        error!("Shift-click failed 3 times in a row, stopping deposit");
+                        error!(
+                            "transfer_items_with_shulker: Shift-click deposit of {} from inventory slot {} failed 3 times in a row (moved {} of {} so far), stopping deposit",
+                            target_id, slot, total_moved, amount
+                        );
                         break;
                     }
                 }
@@ -1064,13 +1070,18 @@ pub async fn automated_chest_io(
 
     if moved < amount {
         return Err(format!(
-            "Incomplete chest IO: moved {}, needed {}",
-            moved, amount
+            "Incomplete chest IO at chest {}: {} {} of {}, moved {}/{}",
+            chest_id, direction, item, amount, moved, amount
         ));
     }
 
     info!(
-        "Chest IO complete, returning counts for {} processed slots",
+        "[ChestIO] Chest {} {} complete: moved {}/{} of {}, {} slots processed",
+        chest_id,
+        direction,
+        moved,
+        amount,
+        item,
         slot_counts.iter().filter(|&&c| c >= 0).count()
     );
     Ok(slot_counts)
@@ -1267,8 +1278,8 @@ async fn finish_shulker_round_trip(
         place_shulker_in_chest_slot_verified(&container, container_slot, slot_idx).await?;
     } else {
         warn!(
-            "Could not find shulker in inventory (via chest container view) to place back in chest slot {}",
-            slot_idx
+            "finish_shulker_round_trip: Could not find shulker in inventory view to place back in chest at ({}, {}, {}) slot {}",
+            chest_pos.x, chest_pos.y, chest_pos.z, slot_idx
         );
     }
 
@@ -1355,7 +1366,10 @@ async fn withdraw_shulkers(
             // container handle is stale, reopen the chest (which itself uses
             // the chunk-aware retry loop) before reading contents.
             if container.contents().is_none() {
-                warn!("withdraw_shulkers: Container lost at slot {} scan, reopening chest", slot_idx);
+                warn!(
+                    "withdraw_shulkers: Container lost at chest {} slot {} scan, reopening chest",
+                    chest_id, slot_idx
+                );
                 drop(container);
                 container = open_chest_container(bot, chest_pos).await?;
             }
@@ -1430,7 +1444,10 @@ async fn withdraw_shulkers(
             }
 
             if moved == 0 && shulker_item_count > 0 {
-                warn!("No items were withdrawn from shulker despite {} available", shulker_item_count);
+                warn!(
+                    "withdraw_shulkers: No items withdrawn from chest {} slot {} despite shulker containing {} x {}",
+                    chest_id, slot_idx, shulker_item_count, target_id
+                );
             }
 
             // Phase 3: Close shulker, pick up, put back in chest.
@@ -1491,7 +1508,10 @@ async fn deposit_shulkers(
 
     // Ensure the chest is still open before scanning for shulkers.
     if container.contents().is_none() {
-        warn!("deposit_shulkers: Container lost before shulker scan, reopening chest");
+        warn!(
+            "deposit_shulkers: Container lost before shulker scan at chest {}, reopening",
+            chest_id
+        );
         drop(container);
         container = open_chest_container(bot, chest_pos).await?;
     }
@@ -1509,12 +1529,19 @@ async fn deposit_shulkers(
 
     if !has_any_shulker {
         warn!(
-            "Chest has no shulkers! Cannot deposit. Chest should be pre-filled with shulkers."
+            "deposit_shulkers: Chest {} at ({}, {}, {}) has no shulkers - cannot deposit, chest must be pre-filled with shulkers",
+            chest_id, chest_pos.x, chest_pos.y, chest_pos.z
         );
-        return Err("Chest has no shulkers - cannot deposit items".to_string());
+        return Err(format!(
+            "Chest {} has no shulkers - cannot deposit items",
+            chest_id
+        ));
     }
 
-    info!("Found shulkers in chest, starting deposit process");
+    info!(
+        "deposit_shulkers: Chest {} has shulkers, starting deposit of {} x {}",
+        chest_id, amount, target_id
+    );
 
     // Calculate shulker capacity based on item's stack size (27 slots × stack_size)
     let shulker_capacity = crate::types::Pair::shulker_capacity_for_stack_size(stack_size);
@@ -1551,7 +1578,10 @@ async fn deposit_shulkers(
         // chunk unload, or previous shulker iteration). Reopen uses the
         // chunk-aware retry loop so transient unloads are handled.
         if container.contents().is_none() {
-            warn!("deposit_shulkers: Container lost at slot {} scan, reopening chest", slot_idx);
+            warn!(
+                "deposit_shulkers: Container lost at chest {} slot {} scan, reopening chest",
+                chest_id, slot_idx
+            );
             drop(container);
             container = open_chest_container(bot, chest_pos).await?;
         }
@@ -1629,16 +1659,22 @@ async fn deposit_shulkers(
 
         // Decide how many items to move (may be 0 if shulker is full/wrong item).
         let moved = if bot_item_count == 0 {
-            warn!("Bot has no items of {} in inventory to deposit", target_id);
+            warn!(
+                "deposit_shulkers: Bot has no items of {} in inventory while depositing at chest {} slot {} (remaining {}/{} to move)",
+                target_id, chest_id, slot_idx, remaining, amount
+            );
             // Release container before returning error.
             drop(shulker_container);
             return Err(format!(
-                "Bot inventory is empty - no items of {} to deposit",
-                target_id
+                "Bot inventory is empty - no items of {} to deposit at chest {} slot {}",
+                target_id, chest_id, slot_idx
             ));
         } else if total_space == 0 {
             // Shulker is full or contains a different item type — skip it.
-            debug!("Shulker full or wrong item for {}, trying next", target_id);
+            debug!(
+                "deposit_shulkers: Chest {} slot {} shulker full or wrong item for {}, trying next",
+                chest_id, slot_idx, target_id
+            );
             slot_counts[slot_idx] = initial_item_count;
             confirmed_full.insert(slot_idx);
             0 // no items transferred
@@ -1652,14 +1688,20 @@ async fn deposit_shulkers(
                 stack_size,
             )
             .await?;
-            debug!("Deposited {} items into shulker", moved);
+            debug!(
+                "deposit_shulkers: Deposited {} x {} into chest {} slot {}",
+                moved, target_id, chest_id, slot_idx
+            );
             if moved == 0 {
-                warn!("No items were transferred, shulker may be full or bot inventory empty");
+                warn!(
+                    "deposit_shulkers: No items transferred into chest {} slot {} for {} (shulker space={}, bot has={})",
+                    chest_id, slot_idx, target_id, total_space, bot_item_count
+                );
                 if total_space > 0 && bot_item_count > 0 {
                     drop(shulker_container);
                     return Err(format!(
-                        "Failed to transfer items to shulker despite having {} space and {} items in inventory",
-                        total_space, bot_item_count
+                        "Failed to transfer {} to shulker at chest {} slot {} despite {} space and {} items in inventory",
+                        target_id, chest_id, slot_idx, total_space, bot_item_count
                     ));
                 }
             }

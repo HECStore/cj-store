@@ -2,33 +2,41 @@
 
 This is a systematic quality pass over the entire codebase, function by function. The goal is not to add things — it is to reach the right state: every comment that remains earns its place, every meaningful behavior has a test that would catch a regression, and every log line gives an operator exactly what they need to understand what the system is doing or what went wrong. Proceed file by file: batch-read all functions in a file in parallel, apply all three reviews, then move to the next. When this pass is complete, the codebase should be in a state where no comment is noise, no test is misleading, and no operator is flying blind.
 
-## Subagent strategy
+## Agent strategy — three tiers
 
-Subagents must be used to the maximum extent possible throughout this pass. The main agent's job is coordination and final judgment — not raw reading and searching.
+Work is distributed across three tiers. The main agent holds the global view, file coordinators own one source file each end-to-end, and read-only analyst subagents swarm the individual functions.
 
-**Parallelize aggressively.** When starting a file, spawn one subagent per function simultaneously — do not read functions one at a time. Each subagent reads whatever it needs for its function (source, test file, call sites) and reports back. Never wait for one subagent to finish before starting another whose inputs are already known. Collect all subagent results first, then synthesize and make decisions.
+**Tier 1 — Main agent (you).** Plans batches, enforces the batch-composition rule, dispatches file coordinators in parallel, and checks TODO.md boxes when each file reports complete. The main agent does NOT read functions, write per-function edits, or run codebase searches itself. Everything else delegates down.
 
-**Delegate all exploration.** Use `Explore` subagents for any codebase search: finding where a function is tested, locating all call sites, checking whether a log field is used consistently across files. Do not run these searches in the main context.
+**Tier 2 — File coordinators (`general-purpose` subagent, one per file).** Owns a single source file end-to-end: spawns its own per-function analyst subagents in parallel, synthesizes their findings, applies the resulting edits directly to its file (Edit/Write), runs its own compile check (`cargo check` scoped to that file's warnings if possible), and reports back a concise summary. A coordinator never touches any file other than its assigned one, and never dispatches analysts that would read another coordinator's file in the same batch. The main agent's batch-composition rule (below) makes this safe.
 
-**Delegate research.** When evaluating whether a comment, test, or log line is correct, delegate verification work to a subagent: read the referenced code, check whether a struct's `Debug` impl exposes sensitive fields, or verify a constant's derivation. The main agent never does these lookups in its own context.
+**Tier 3 — Analyst subagents (`Explore`, spawned by a coordinator, one per function).** Read-only. Evaluates a single function against the three Review Pass checklists and returns findings with line numbers and concrete replacement text. Never edits. Never spawns further subagents. Reads only files outside the coordinator's batch (since intra-batch edits are being applied concurrently).
 
-**Subagents are read-only and flat.** A subagent must never write to, edit, or delete any file, and must never spawn child subagents. Its only job is to read, analyze, and report findings back to the main agent. Only the main agent spawns subagents and performs writes; writes and any next-batch dispatches happen only after every subagent in the current batch has returned (and then may run concurrently per the pipeline rule below). Within a batch, all subagents are dispatched in parallel — the per-batch synchronization point is when every subagent in it returns, not anywhere inside it.
+**Parallelism target.** Main fires N file coordinators concurrently in a batch. Each coordinator fires M analysts concurrently (one per function in its file). Aim for a batch that saturates the worker pool — e.g. 4–8 coordinators × 5–15 analysts each ≈ 40–80 concurrent workers. Size coordinators to files; the number of analysts inside each is whatever the function count dictates.
 
-**Edit in a dedicated phase.** A batch is all subagents spawned for a single source file. Once every subagent in the batch has returned, apply all edits to that file in one sequential pass. Never let a subagent read a file the main agent is currently editing — a subagent reading a file mid-edit will report stale findings.
+**Batch composition rule (carries across all tiers).** For any two files A and B assigned to coordinators in the same batch:
 
-**Pipeline reads with writes.** The edit phase must not become a bottleneck while subagents sit idle. As soon as a batch's subagents return, the main agent may dispatch the next batch concurrently with applying the current batch's edits — subject to a strict invariant: **no subagent in the new batch may read the file being edited, via any path.** Before every pipelined dispatch, verify all of the following:
+- A's source does not import B (and vice-versa).
+- A's test file does not import B (and vice-versa).
+- A and B share no test file, fixture, or other read dependency.
+- No coordinator in the batch performs a codebase-wide search (log-field consistency, global usage scans, etc.) — those must be run as their own isolated batch with no concurrent edits.
 
-- The next file's source does not import the editing file.
-- The next file's test file does not import the editing file.
-- The editing file does not import the next file (which would place the next file's call sites inside the editing file).
-- The two files do not share a test file, fixture, or other read dependency.
-- The new batch has no planned codebase-wide search (log-field consistency, global usage scans, etc.) that would traverse the editing file.
+If two files would violate this, put them in separate batches. The main agent verifies this before dispatching.
 
-If you cannot prove every condition holds, defer the spawn until the edit phase completes. When in doubt, defer — a correct sequential run beats a fast run with stale findings. If all conditions hold, fire immediately so reads overlap writes.
+**Coordinator contract.** A coordinator's prompt must spell out:
 
-**Flag cross-file dependencies.** If a subagent finds that a function's behavior is defined, constrained, or called from one or more other files not yet reviewed, do not act on the finding immediately. Note the dependency and resolve it once every involved file has been fully reviewed, so decisions are made against consistent state.
+1. Its assigned file (one absolute path).
+2. The full list of functions it owns from TODO.md.
+3. The review criteria source (link to Review Pass).
+4. The invariant that it must not read or edit any file outside its assigned one (list the other concurrent-batch files explicitly so it knows what is off-limits).
+5. That it must compile-check its file when done and report the result.
+6. The return format: concise summary of changes applied + compile result + any flagged cross-file dependencies for the main agent to resolve later.
 
-**Main agent responsibilities only:** synthesizing subagent findings into concrete edits, resolving ambiguity that requires cross-function or cross-file context, and making the final call on borderline cases. Everything that is pure information-gathering or parallel-safe work goes to a subagent.
+**Cross-file dependencies.** If an analyst surfaces a finding that requires knowledge of an unreviewed file, the coordinator notes it in its report rather than acting. The main agent collects these across batches and resolves once every involved file has been reviewed.
+
+**Shared test files are edited last.** Integration test files shared across multiple source files must not be edited by any coordinator. Queue such edits and apply them in a final isolated batch after every source file has been reviewed, so no analyst ever reads a partially-edited shared test file.
+
+**When in doubt, defer.** A correct sequential run beats a fast run with stale findings. If a coordinator cannot prove its batch is safe, the main agent narrows the batch.
 
 ---
 
@@ -36,7 +44,7 @@ If you cannot prove every condition holds, defer the spawn until the edit phase 
 
 The per-file, per-function checklist lives in [TODO.md](TODO.md). Each item there is tagged with one of three review types (`Do comments`, `Do testing`, `Do logging`). Read this section before starting any pass so every decision is made against the same standard.
 
-**Subagents report; the main agent acts.** The criteria below ("Remove it if", "Add one if", etc.) are evaluation standards, not edit commands. When a subagent works through a function it identifies which criteria are met and reports those findings. The main agent reads all findings and applies the edits to the source, then checks the corresponding box in [TODO.md](TODO.md). A subagent that makes a direct edit violates the read-only rule.
+**Analysts report; coordinators act.** The criteria below ("Remove it if", "Add one if", etc.) are evaluation standards. Analyst subagents (tier 3) evaluate functions against them and return findings with line numbers and concrete replacement text. The file coordinator (tier 2) reads all findings, applies edits to its file, and compile-checks. The main agent (tier 1) receives the coordinator's summary and checks the box in [TODO.md](TODO.md). Analysts never edit; coordinators never touch files outside their assignment.
 
 **Shared test files are edited last.** Integration test files shared across multiple source files must not be edited during any individual source file's edit phase. Queue all pending edits to shared test files and apply them in a single pass after every source file batch has completed, so no subagent ever reads a partially-edited shared test file.
 

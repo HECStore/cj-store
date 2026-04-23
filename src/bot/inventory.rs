@@ -7,7 +7,13 @@ use tracing::{debug, error, info, warn};
 use crate::constants::HOTBAR_SLOT_0;
 use super::{Bot, shulker};
 
-/// Ensure inventory is empty by dumping items to buffer chest if configured
+/// Ensure inventory is empty by dumping items to buffer chest if configured.
+///
+/// Also clears any leftover cursor stack before dumping — a held cursor stack makes
+/// subsequent left-clicks behave as "place" instead of "pick up", which silently
+/// corrupts any shift-click / pickup sequence that follows. The server only learns
+/// about cursor state on the next click, so leftovers from a previous operation must
+/// be stashed in an inventory slot (or dropped outside) before anything else.
 pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
     let client = bot
         .client
@@ -19,28 +25,22 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
             "Bot not connected".to_string()
         })?;
 
-    // CRITICAL: First check and clear the cursor if it has items.
-    // Items in cursor from previous operations can cause subsequent operations to fail:
-    // a held cursor stack makes left-clicks behave as "place" instead of "pick up",
-    // which silently corrupts any shift-click / pickup sequence that follows. Leftover
-    // cursor state is also invisible to the server until the next click, so we proactively
-    // stash it in an empty inventory slot (or drop it outside) before doing anything else.
     let cursor = carried_item(&client);
     if cursor.count() > 0 {
         warn!(
             "ensure_inventory_empty: Cursor has {}x {} from previous operation - clearing it",
             cursor.count(), cursor.kind()
         );
-        // Open inventory to access cursor operations
         let inv_handle = client
             .open_inventory()
             .ok_or_else(|| {
                 error!("ensure_inventory_empty: Failed to open inventory to clear cursor");
                 "Failed to open inventory to clear cursor".to_string()
             })?;
-        
-        // Find an empty slot to put cursor items
-        let slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
+
+        let slots = inv_handle
+            .slots()
+            .ok_or_else(|| "Inventory closed while searching for empty slot to stash cursor".to_string())?;
         let mut placed = false;
         for i in 9..45 {
             if i < slots.len() && slots[i].count() == 0 {
@@ -53,15 +53,13 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
                 break;
             }
         }
-        
+
         if !placed {
-            // No empty slot, try to drop outside
             warn!("ensure_inventory_empty: No empty slot for cursor items, dropping outside");
             inv_handle.click(azalea::inventory::operations::PickupClick::LeftOutside);
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
-        
-        // Verify cursor is now empty
+
         let cursor_after = carried_item(&client);
         if cursor_after.count() > 0 {
             error!(
@@ -69,7 +67,7 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
                 cursor_after.count(), cursor_after.kind()
             );
         }
-        
+
         drop(inv_handle);
     }
 
@@ -79,11 +77,10 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
     };
 
     debug!(
-        "ensure_inventory_empty: Checking inventory, buffer chest at ({}, {}, {})", 
+        "ensure_inventory_empty: Checking inventory, buffer chest at ({}, {}, {})",
         pos.x, pos.y, pos.z
     );
 
-    // Quick check: if there are any non-empty stacks in player inventory/hotbar, attempt to dump.
     let inv_handle = client
         .open_inventory()
         .ok_or_else(|| {
@@ -92,9 +89,8 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
         })?;
     let slots = inv_handle
         .slots()
-        .ok_or_else(|| "Inventory closed".to_string())?;
+        .ok_or_else(|| "Inventory closed while counting stacks to dump".to_string())?;
 
-    // Count items for logging
     let mut total_items = 0i32;
     let mut item_types = 0;
     for slot in slots.iter() {
@@ -104,7 +100,7 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
         }
     }
     drop(inv_handle);
-    
+
     if total_items == 0 {
         debug!("ensure_inventory_empty: Inventory is already empty");
         return Ok(());
@@ -115,7 +111,6 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
         total_items, item_types
     );
 
-    // Open buffer chest and shift-click all items from inventory into it.
     let chest = client
         .open_container_at_with_timeout_ticks(
             BlockPos::new(pos.x, pos.y, pos.z),
@@ -127,13 +122,14 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
             "Failed to open buffer chest".to_string()
         })?;
 
+    // `contents_len` is the container-side slot count; player slots start at that offset.
     let contents_len = chest
         .contents()
-        .ok_or_else(|| "Buffer chest closed".to_string())?
+        .ok_or_else(|| "Buffer chest closed while reading contents length".to_string())?
         .len();
     let all = chest
         .slots()
-        .ok_or_else(|| "Buffer chest closed".to_string())?;
+        .ok_or_else(|| "Buffer chest closed while reading all slots".to_string())?;
     
     let mut items_moved = 0;
     for (i, stack) in all.iter().enumerate().skip(contents_len) {
@@ -160,8 +156,6 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
 /// 0-8 are crafting/armor, 9-35 are the main inventory rows, and 36-44 are the hotbar.
 /// The in-game "hotbar slot N" (0-8) corresponds to container slot `36 + N`.
 pub async fn move_hotbar_to_inventory(bot: &Bot) -> Result<(), String> {
-    debug!("move_hotbar_to_inventory: Starting hotbar cleanup");
-    
     let client = bot
         .client
         .read()
@@ -178,15 +172,14 @@ pub async fn move_hotbar_to_inventory(bot: &Bot) -> Result<(), String> {
             error!("move_hotbar_to_inventory: Failed to open inventory (another container is open?)");
             "Failed to open inventory".to_string()
         })?;
-    
+
     let all_slots = inv_handle
         .slots()
         .ok_or_else(|| {
-            error!("move_hotbar_to_inventory: Inventory closed unexpectedly");
-            "Inventory closed".to_string()
+            error!("move_hotbar_to_inventory: Inventory closed while reading hotbar state");
+            "Inventory closed while reading hotbar state".to_string()
         })?;
 
-    // Log current hotbar state
     debug!("move_hotbar_to_inventory: Current hotbar state:");
     for hotbar_idx in 36..45 {
         if let Some(stack) = all_slots.get(hotbar_idx)
@@ -195,8 +188,6 @@ pub async fn move_hotbar_to_inventory(bot: &Bot) -> Result<(), String> {
             }
     }
 
-    // Hotbar slots are 36-44 (inventory indices)
-    // Inventory slots are 9-35
     let mut moved_count = 0;
     for hotbar_idx in 36..45 {
         let stack = all_slots.get(hotbar_idx);

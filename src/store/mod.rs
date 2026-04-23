@@ -54,10 +54,6 @@ pub struct Store {
     /// Channel to send instructions to the bot
     pub(crate) bot_tx: mpsc::Sender<BotInstruction>,
 
-    // ========================================================================
-    // Order Queue System
-    // ========================================================================
-    
     /// Queue of pending orders waiting to be processed
     pub order_queue: OrderQueue,
     /// Rate limiter for anti-spam protection
@@ -73,44 +69,36 @@ pub struct Store {
 impl Store {
     /// Creates a new `Store` instance, loading the configuration.
     pub async fn new(bot_tx: mpsc::Sender<BotInstruction>) -> io::Result<Self> {
-
         let config = Config::load()?;
         let mut pairs = Pair::load_all()?;
-        
-        // Normalize all pair item IDs to ensure consistent lookup
-        // This strips "minecraft:" prefix from item names for cleaner storage/display
-        // Also filters out invalid pairs (empty item names)
-        //
-        // Normalization happens at load time (not lookup time) so that the in-memory
-        // HashMap key, the Pair.item field, and the on-disk filename all agree on the
-        // same canonical form. This avoids subtle bugs where e.g. "minecraft:diamond"
-        // and "diamond" would be treated as distinct pairs.
+
+        // Normalize at load time (not lookup time) so the in-memory HashMap key,
+        // the Pair.item field, and the on-disk filename all agree on the same
+        // canonical form. Without this, "minecraft:diamond" and "diamond" would
+        // be treated as distinct pairs. Invalid / empty entries are dropped here
+        // rather than being allowed to poison later lookups.
         let mut normalized_pairs = HashMap::new();
         let mut needs_save = false;
         for (old_key, mut pair) in pairs.drain() {
-            // Skip pairs with empty item names
             if pair.item.trim().is_empty() {
                 warn!("Skipping pair with empty item name (file key: {})", old_key);
-                needs_save = true; // Will remove invalid pair file
+                needs_save = true;
                 continue;
             }
             let item_id = match ItemId::new(&pair.item) {
                 Ok(id) => id,
                 Err(_) => {
                     warn!("Skipping pair with invalid item name '{}' (normalized to empty)", pair.item);
-                    needs_save = true; // Will remove invalid pair file
+                    needs_save = true;
                     continue;
                 }
             };
             let normalized_item = item_id.to_string();
-            // If the item was not normalized (e.g., had minecraft: prefix), we need to update it and save
             if old_key != normalized_item {
                 warn!("Normalizing pair item name from '{}' to '{}'", old_key, normalized_item);
                 needs_save = true;
             }
-            // Update the pair's item field to normalized form (without minecraft: prefix)
             pair.item = item_id;
-            // Insert with normalized key
             normalized_pairs.insert(normalized_item, pair);
         }
         let pairs = normalized_pairs;
@@ -158,7 +146,6 @@ impl Store {
         let mut storage = Storage::load(&config.position)
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        // If storage is empty, auto-create node 0
         if storage.nodes.is_empty() {
             info!("Storage empty, auto-creating node 0");
             let node = storage.add_node();
@@ -251,12 +238,14 @@ impl Store {
         // takes effect without restart. See `Store::reload_config`.
         let mut min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
 
-        // Main event loop. Each iteration either drains one order from the queue
-        // OR blocks on one incoming message - never both concurrently. Orders are
-        // given strict priority over messages (see PRIORITY 1/2 below) so that an
-        // in-flight trade cannot be starved or interrupted by chatty players.
+        // Each iteration either drains one order from the queue OR blocks on
+        // one incoming message — never both concurrently. Orders take strict
+        // priority (PRIORITY 1 below) so an in-flight trade cannot be starved
+        // or interrupted by chatty players. A previous `tokio::select!` version
+        // cancelled order processing mid-way and dropped oneshot receivers;
+        // sequential polling is the fix — any message arriving during order
+        // execution simply accumulates in the channel buffer.
         loop {
-            // Periodic state logging for debugging stuck conditions
             if !self.order_queue.is_empty() || self.processing_order {
                 debug!("[Store] Loop state: processing_order={} queue_len={}",
                        self.processing_order, self.order_queue.len());
@@ -265,21 +254,13 @@ impl Store {
                 }
             }
 
-            // PRIORITY 1: Process queued orders first (if any and not already processing)
-            // This ensures order processing runs to COMPLETION before handling new messages.
-            // Previously, using tokio::select! would CANCEL order processing when messages
-            // arrived, causing the oneshot channel receiver to be dropped mid-operation.
-            //
-            // The ordering here is deliberate: we poll the order queue on every loop
-            // iteration BEFORE calling store_rx.recv(). Any messages that arrive while
-            // an order is executing simply accumulate in the channel buffer and are
-            // picked up on a later iteration once the queue drains.
+            // PRIORITY 1: drain an order if one is waiting.
             if !self.processing_order && !self.order_queue.is_empty() {
                 debug!("[Store] Starting order processing (queue_len={})", self.order_queue.len());
                 self.process_next_order().await;
 
-                // ALWAYS save after order completion for data integrity
-                // (trades, stock updates must not be lost due to crash).
+                // Save eagerly after every order so trades and stock updates
+                // cannot be lost to a crash before the next debounced autosave.
                 if self.dirty {
                     if let Err(e) = state::save(&self) {
                         error!("[Store] Autosave failed: {}", e);
@@ -288,13 +269,11 @@ impl Store {
                         self.dirty = false;
                     }
                 }
-                
-                // Continue loop to check for more orders before blocking on messages
+
                 continue;
             }
 
-            // PRIORITY 2: Wait for incoming messages (blocking)
-            // Only reached when no orders are being processed
+            // PRIORITY 2: block on the next incoming message.
             let msg = store_rx.recv().await;
             match msg {
                 Some(message) => {
@@ -333,9 +312,9 @@ impl Store {
                         }
                     }
 
-                    // Periodic in-memory cleanup: drops stale rate-limiter
-                    // and UUID-cache entries so long-running instances don't
-                    // accumulate HashMap entries for users who never return.
+                    // Drop stale rate-limiter and UUID-cache entries so a
+                    // long-running instance doesn't accumulate HashMap entries
+                    // for users who never return.
                     if last_cleanup.elapsed() >= cleanup_interval {
                         self.rate_limiter.cleanup_stale(rate_limit_stale_after);
                         utils::cleanup_uuid_cache();
@@ -350,7 +329,6 @@ impl Store {
             }
         }
 
-        // Final cleanup: save and drop channels
         if let Err(e) = state::save(&self) {
             error!("[Store] Final save failed: {}", e);
         }
@@ -358,20 +336,17 @@ impl Store {
         info!("[Store] Shutdown complete");
     }
 
-    /// Process the next order from the queue
-    ///
-    /// This method is called by the main store loop when there are orders waiting
-    /// and no order is currently being processed. It sets `processing_order = true`
-    /// at the start and `false` at the end to prevent concurrent order execution.
-    ///
-    /// Note: The order handlers (buy, sell, deposit, withdraw) send their own
-    /// messages to the player, so we only send the "Now processing" notification
-    /// here and log the result for debugging purposes.
+    /// Pops and executes the next queued order, holding `processing_order`
+    /// high for the duration so the main loop cannot start a second order in
+    /// parallel. Order handlers (buy/sell/deposit/withdraw) whisper their own
+    /// completion and error messages to the player; only the "Now processing"
+    /// notification and lifecycle logging are emitted here.
     async fn process_next_order(&mut self) {
-        // Pop the next order
         let order = match self.order_queue.pop() {
             Some(o) => o,
             None => {
+                // Invariant violation: the main loop only calls this when the
+                // queue is non-empty. Surface loudly but stay running.
                 warn!("[Store] Queue was empty when trying to pop");
                 return;
             }
@@ -389,13 +364,12 @@ impl Store {
             "order processing started"
         );
 
-        // Notify user that their order is being processed
         let processing_msg = format!("Now processing: {}...", order.description());
         if let Err(e) = utils::send_message_to_player(self, &order.username, &processing_msg).await {
             warn!(order_id = order.id, player = %order.username, error = %e, "failed to notify user of order start");
         }
 
-        // Execute the order (handlers send their own completion/error messages)
+        // Handlers send their own completion/error messages to the player.
         let result = orders::execute_queued_order(self, &order).await;
 
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -607,5 +581,186 @@ impl Store {
             processing_order: false,
             current_trade: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for pure-in-memory Store helpers. The async actor loop
+    //! (`Store::run`, `process_next_order`) is deliberately not tested here;
+    //! it is covered end-to-end via the handler tests in `handlers/` and
+    //! `orders.rs` that drive the same code paths with mock bot channels.
+
+    use super::*;
+    use crate::config::Config;
+    use crate::types::{Pair, Position, Storage, User};
+
+    fn test_config() -> Config {
+        Config {
+            position: Position { x: 0, y: 64, z: 0 },
+            fee: 0.125,
+            account_email: String::new(),
+            server_address: "test".to_string(),
+            buffer_chest_position: None,
+            trade_timeout_ms: 5_000,
+            pathfinding_timeout_ms: 5_000,
+            max_orders: 1000,
+            max_trades_in_memory: 1000,
+            autosave_interval_secs: 10,
+        }
+    }
+
+    fn make_store(pairs: HashMap<String, Pair>, users: HashMap<String, User>) -> Store {
+        let (tx, _rx) = mpsc::channel::<BotInstruction>(16);
+        Store::new_for_test(tx, test_config(), pairs, users, Storage::default())
+    }
+
+    // ---------- new_for_test ----------
+
+    #[test]
+    fn new_for_test_initializes_idle_store_with_supplied_collections() {
+        let mut pairs = HashMap::new();
+        pairs.insert(
+            "iron_ingot".to_string(),
+            Pair {
+                item: ItemId::from_normalized("iron_ingot".to_string()),
+                stack_size: 64,
+                item_stock: 42,
+                currency_stock: 3.5,
+            },
+        );
+        let mut users = HashMap::new();
+        users.insert(
+            "u1".to_string(),
+            User { uuid: "u1".to_string(), username: "alice".to_string(), balance: 10.0, operator: false },
+        );
+
+        let store = make_store(pairs, users);
+
+        assert_eq!(store.pairs.len(), 1);
+        assert_eq!(store.users.len(), 1);
+        assert!(store.orders.is_empty());
+        assert!(store.trades.is_empty());
+        assert!(!store.dirty);
+        assert!(!store.processing_order);
+        assert!(store.current_trade.is_none());
+        assert!(store.order_queue.is_empty());
+    }
+
+    // ---------- expect_pair / expect_user ----------
+
+    #[test]
+    fn expect_pair_returns_ref_when_present() {
+        let mut pairs = HashMap::new();
+        pairs.insert(
+            "iron_ingot".to_string(),
+            Pair {
+                item: ItemId::from_normalized("iron_ingot".to_string()),
+                stack_size: 64,
+                item_stock: 7,
+                currency_stock: 1.0,
+            },
+        );
+        let store = make_store(pairs, HashMap::new());
+        let p = store.expect_pair("iron_ingot", "test").expect("pair should exist");
+        assert_eq!(p.item_stock, 7);
+    }
+
+    #[test]
+    fn expect_pair_missing_returns_unknown_pair_error_with_context() {
+        let store = make_store(HashMap::new(), HashMap::new());
+        let err = store.expect_pair("diamond", "test_ctx").unwrap_err();
+        match err {
+            crate::error::StoreError::UnknownPair { item, context } => {
+                assert_eq!(item, "diamond");
+                assert_eq!(context, "test_ctx");
+            }
+            other => panic!("expected UnknownPair, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expect_pair_mut_missing_returns_unknown_pair_error_with_context() {
+        let mut store = make_store(HashMap::new(), HashMap::new());
+        let err = store.expect_pair_mut("diamond", "ctx_mut").unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::StoreError::UnknownPair { ref item, context }
+                if item == "diamond" && context == "ctx_mut"
+        ));
+    }
+
+    #[test]
+    fn expect_user_missing_returns_unknown_user_error_with_context() {
+        let store = make_store(HashMap::new(), HashMap::new());
+        let err = store.expect_user("uuid-1", "lookup").unwrap_err();
+        match err {
+            crate::error::StoreError::UnknownUser { uuid, context } => {
+                assert_eq!(uuid, "uuid-1");
+                assert_eq!(context, "lookup");
+            }
+            other => panic!("expected UnknownUser, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expect_user_mut_present_returns_mutable_ref() {
+        let mut users = HashMap::new();
+        users.insert(
+            "u1".to_string(),
+            User { uuid: "u1".to_string(), username: "alice".to_string(), balance: 5.0, operator: false },
+        );
+        let mut store = make_store(HashMap::new(), users);
+        let u = store.expect_user_mut("u1", "test").expect("user should exist");
+        u.balance = 99.0;
+        assert_eq!(store.users.get("u1").unwrap().balance, 99.0);
+    }
+
+    // ---------- reload_config ----------
+
+    #[test]
+    fn reload_config_hot_applies_fee_change() {
+        let mut store = make_store(HashMap::new(), HashMap::new());
+        let mut new_cfg = test_config();
+        new_cfg.fee = 0.25;
+        store.reload_config(new_cfg);
+        assert!((store.config.fee - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reload_config_hot_applies_autosave_interval_change() {
+        let mut store = make_store(HashMap::new(), HashMap::new());
+        let mut new_cfg = test_config();
+        new_cfg.autosave_interval_secs = 60;
+        store.reload_config(new_cfg);
+        assert_eq!(store.config.autosave_interval_secs, 60);
+    }
+
+    #[test]
+    fn reload_config_leaves_restart_only_fields_unchanged_in_memory() {
+        // Editing trade_timeout_ms / server_address at runtime must warn and
+        // keep the prior in-memory value so behavior stays consistent with
+        // other tasks that cached the config at startup.
+        let mut store = make_store(HashMap::new(), HashMap::new());
+        let original_timeout = store.config.trade_timeout_ms;
+        let original_addr = store.config.server_address.clone();
+
+        let mut new_cfg = test_config();
+        new_cfg.trade_timeout_ms = original_timeout + 1_000;
+        new_cfg.server_address = "elsewhere.example".to_string();
+        store.reload_config(new_cfg);
+
+        assert_eq!(store.config.trade_timeout_ms, original_timeout);
+        assert_eq!(store.config.server_address, original_addr);
+    }
+
+    #[test]
+    fn reload_config_noop_when_nothing_hot_reloadable_changed() {
+        let mut store = make_store(HashMap::new(), HashMap::new());
+        let before_fee = store.config.fee;
+        let before_interval = store.config.autosave_interval_secs;
+        store.reload_config(test_config());
+        assert!((store.config.fee - before_fee).abs() < f64::EPSILON);
+        assert_eq!(store.config.autosave_interval_secs, before_interval);
     }
 }

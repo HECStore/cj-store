@@ -1,10 +1,10 @@
 //! Connection management for the bot
 
+use super::{Bot, BotState, handle_event_fn};
 use azalea::account::Account;
-use tracing::{debug, info};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use super::{Bot, BotState, handle_event_fn};
+use tracing::{debug, info, warn};
 
 /// Connect the bot to the server
 pub async fn connect(
@@ -12,20 +12,35 @@ pub async fn connect(
     account: Account,
     server_address: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Check if shutdown was requested
+    let account_name = account.username().to_string();
+
     if bot.shutdown.load(Ordering::SeqCst) {
+        debug!(
+            "[Connection] Connect skipped (shutdown flag set): account={} server={}",
+            account_name, server_address
+        );
         return Err("Shutdown requested, cannot connect".into());
     }
 
     // Prevent spawning multiple concurrent client start tasks.
     if bot.connecting.swap(true, Ordering::SeqCst) {
+        debug!(
+            "[Connection] Connect skipped (already connecting): account={} server={}",
+            account_name, server_address
+        );
         return Ok(());
     }
 
-    info!("Connecting to server: {}", server_address);
+    info!(
+        "[Connection] Connecting: account={} server={}",
+        account_name, server_address
+    );
 
-    // Abort any existing client task
     if let Some(old_task) = bot.client_task.lock().await.take() {
+        debug!(
+            "[Connection] Aborting previous client task before reconnect: account={}",
+            account_name
+        );
         old_task.abort();
     }
 
@@ -39,40 +54,38 @@ pub async fn connect(
     };
 
     let shutdown = bot.shutdown.clone();
+    let task_account = account_name.clone();
+    let task_server = server_address.clone();
 
-    // In azalea 0.15+, ClientBuilder::start runs on a LocalSet (not Send).
-    // Spawn it locally so we can continue processing BotInstruction messages.
-    // NOTE: This requires the caller to be running inside a tokio LocalSet
-    // (see main.rs). Using tokio::spawn instead would fail to compile because
-    // the future returned by start() is !Send.
+    // Azalea's ClientBuilder::start returns !Send, so it must run on a LocalSet
+    // (see main.rs). tokio::spawn would fail to compile.
     let handle = tokio::task::spawn_local(async move {
-        // Check shutdown flag before starting
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
-        
-        // Use ClientBuilder::new() - it will try to set up LogPlugin which conflicts with our tracing setup
-        // This causes a harmless error message: "Could not set global logger and tracing subscriber as they are already set"
-        // The error is safe to ignore - our logging setup takes precedence and works correctly
-        // To properly fix this, we would need to add bevy as a dependency and use:
-        //   ClientBuilder::new_without_plugins()
-        //       .add_plugins(DefaultPlugins.build().disable::<LogPlugin>())
-        //       .add_plugins(DefaultBotPlugins)
-        // But that adds significant dependencies, so we accept the harmless error instead.
-        // The `let _ =` intentionally discards the Result: the only failure path here is
-        // bevy's LogPlugin double-initialization error described above, which is benign
-        // and must not abort the connect task.
-        let _ = azalea::ClientBuilder::new()
+
+        // ClientBuilder::new() tries to install bevy's LogPlugin, which clashes with our
+        // tracing subscriber and emits a benign "Could not set global logger" error.
+        // Switching to new_without_plugins() + custom plugin list would fix it but drags
+        // in a direct bevy dep. start() returns AppExit; any real connection error is
+        // reported separately via Event::Disconnect.
+        let exit = azalea::ClientBuilder::new()
             .set_handler(handle_event_fn)
             .set_state(initial_state)
-            .start(account, server_address)
+            .start(account, task_server.clone())
             .await;
+        debug!(
+            "[Connection] ClientBuilder::start returned: account={} server={} exit={:?}",
+            task_account, task_server, exit
+        );
     });
 
-    // Store the task handle
     *bot.client_task.lock().await = Some(handle);
 
-    info!("Bot connect task spawned");
+    debug!(
+        "[Connection] Connect task spawned: account={} server={}",
+        account_name, server_address
+    );
     Ok(())
 }
 
@@ -97,7 +110,10 @@ pub async fn connect(
 /// If `shutdown` is true, sets the shutdown flag to prevent automatic reconnection attempts.
 ///
 /// See README.md "Graceful Shutdown" section for the complete shutdown sequence.
-pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn disconnect(
+    bot: &Bot,
+    shutdown: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let disconnect_start = Instant::now();
     info!("[Connection] Disconnect starting (shutdown={})", shutdown);
 
@@ -106,7 +122,7 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
     }
 
     bot.connecting.store(false, Ordering::SeqCst);
-    
+
     // Disconnect the client first to send disconnect packet gracefully
     let had_client = {
         let client_guard = bot.client.write().await;
@@ -117,7 +133,7 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
             false
         }
     };
-    
+
     // Wait for the disconnect packet to flush before aborting the task.
     // Azalea's event loop must still be alive to flush the packet out of its
     // send buffer; aborting too early would drop it and the server would only
@@ -126,17 +142,25 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
         let mut elapsed = tokio::time::Duration::from_millis(0);
         let check_interval = tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS);
         let max_wait = tokio::time::Duration::from_millis(crate::constants::DELAY_DISCONNECT_MS);
+        let mut cleared = false;
 
         while elapsed < max_wait {
             tokio::time::sleep(check_interval).await;
             elapsed += check_interval;
             if bot.client.read().await.is_none() {
                 debug!("[Connection] Client cleared after {:?}", elapsed);
+                cleared = true;
                 break;
             }
         }
+        if !cleared {
+            warn!(
+                "[Connection] Disconnect packet did not flush within {}ms; aborting task anyway",
+                crate::constants::DELAY_DISCONNECT_MS
+            );
+        }
     }
-    
+
     // Abort the Azalea client task, then wait for OS-level TCP teardown.
     // task.abort() is async — the Drop chain (which closes the socket) runs after
     // the task's current await point, so a fast reconnect could race the old socket.
@@ -144,7 +168,10 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
         let mut task_guard = bot.client_task.lock().await;
         if let Some(task) = task_guard.take() {
             task.abort();
-            tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_DISCONNECT_MS)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                crate::constants::DELAY_DISCONNECT_MS,
+            ))
+            .await;
             true
         } else {
             false
@@ -154,7 +181,11 @@ pub async fn disconnect(bot: &Bot, shutdown: bool) -> Result<(), Box<dyn std::er
     // Clear the client reference
     bot.client.write().await.take();
 
-    info!("[Connection] Disconnect complete in {:?} (had_client={}, task_aborted={})",
-          disconnect_start.elapsed(), had_client, task_aborted);
+    info!(
+        "[Connection] Disconnect complete in {:?} (had_client={}, task_aborted={})",
+        disconnect_start.elapsed(),
+        had_client,
+        task_aborted
+    );
     Ok(())
 }

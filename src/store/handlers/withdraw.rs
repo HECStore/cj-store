@@ -1,16 +1,12 @@
 //! `withdraw` / `w` command: enqueue handler + queued-order processor.
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::super::{Store, state, utils};
 use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
-
-// =========================================================================
-// Dispatcher entry point (enqueue)
-// =========================================================================
 
 pub(super) async fn handle_enqueue(
     store: &mut Store,
@@ -19,8 +15,10 @@ pub(super) async fn handle_enqueue(
     amount: Option<f64>,
 ) -> Result<(), StoreError> {
     debug!(
-        "Queueing withdraw order: {} amount={:?}",
-        player_name, amount
+        player = player_name,
+        uuid = user_uuid,
+        amount = ?amount,
+        "Queueing withdraw order"
     );
 
     match store.order_queue.add(
@@ -47,29 +45,27 @@ pub(super) async fn handle_enqueue(
     }
 }
 
-// =========================================================================
-// Queued-order processor (called from orders.rs)
-// =========================================================================
-
-/// Handle withdraw balance (user withdraws diamonds from their balance).
+/// Withdraw diamonds from the user's balance and hand them over in a trade.
 ///
-/// If `amount` is Some, withdraws that amount (floor'd to whole diamonds for the trade).
-/// If `amount` is None, withdraws full balance as whole diamonds.
+/// `amount = Some(x)`: withdraws `x` (floored to whole diamonds for the trade).
+/// `amount = None`: withdraws the full balance, capped at `MAX_TRADE_DIAMONDS`
+/// (the user is told to re-issue the command for any remainder).
 ///
-/// This is a public function called by the order queue processor.
+/// Called by the order queue processor.
 pub async fn handle_withdraw_balance_queued(
     store: &mut Store,
     player_name: &str,
     amount: Option<f64>,
 ) -> Result<(), StoreError> {
-    info!("[Withdraw] Starting: player={} amount={:?}", player_name, amount);
+    info!(
+        player = player_name,
+        amount = ?amount,
+        "Withdraw starting"
+    );
     state::assert_invariants(store, "pre-withdraw-balance", false)?;
 
-    // Maximum diamonds the trade GUI can hold per transaction: 12 slots
-    // times a 64-stack each = 768 diamonds. See handle_deposit_balance_queued
-    // for the full rationale - the cap comes from the vanilla trade window
-    // layout, not from any arbitrary policy.
-    const MAX_TRADE_DIAMONDS: i32 = 12 * 64; // 768
+    // 12 trade-window slots * 64 items per stack = 768 diamonds per trade.
+    const MAX_TRADE_DIAMONDS: i32 = 12 * 64;
 
     let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
@@ -93,9 +89,6 @@ pub async fn handle_withdraw_balance_queued(
                     &format!("No whole diamonds to withdraw. Balance: {:.2} (need at least 1.00)", user_balance),
                 ).await;
             }
-            // If the user's balance exceeds the per-trade cap, tell them
-            // explicitly so they know to issue another /withdraw for the rest
-            // instead of assuming the full balance came out in one go.
             if whole_balance > MAX_TRADE_DIAMONDS as f64 {
                 utils::send_message_to_player(
                     store,
@@ -148,18 +141,24 @@ pub async fn handle_withdraw_balance_queued(
         ).await;
     }
 
-    // Advance: Queued -> Withdrawing (diamonds from storage)
     store.advance_trade(|s| s.begin_withdrawal(vec![]));
 
-    // Withdraw diamonds from storage (diamond chest) before trading.
+    // Pull diamonds from storage before the trade. Balance is NOT decremented
+    // here: if the trade fails we roll diamonds back into storage, and because
+    // the ledger was never touched there is nothing to restore on the balance
+    // side.
     if whole_diamonds > 0 {
         let (withdraw_plan, preview_withdrawn) =
             store.storage.simulate_withdraw_plan("diamond", whole_diamonds);
 
         if preview_withdrawn < whole_diamonds {
-            tracing::error!(
-                "[Withdraw] Insufficient physical diamonds: need {}, storage has {}",
-                whole_diamonds, preview_withdrawn
+            error!(
+                uuid = %user_uuid,
+                player = player_name,
+                item = "diamond",
+                need = whole_diamonds,
+                available = preview_withdrawn,
+                "Withdraw blocked: insufficient physical diamonds in storage"
             );
             return utils::send_message_to_player(
                 store,
@@ -171,6 +170,15 @@ pub async fn handle_withdraw_balance_queued(
             )
             .await;
         }
+
+        info!(
+            uuid = %user_uuid,
+            player = player_name,
+            item = "diamond",
+            amount = whole_diamonds,
+            chests = withdraw_plan.len(),
+            "Withdraw: decrementing storage"
+        );
 
         for t in &withdraw_plan {
             let node_position = store.get_node_position(t.chest_id);
@@ -199,7 +207,12 @@ pub async fn handle_withdraw_balance_queued(
                 .await;
 
             if let Err(e) = send_result {
-                tracing::error!("[Withdraw] Failed to send chest instruction: {}", e);
+                error!(
+                    uuid = %user_uuid,
+                    player = player_name,
+                    chest_id = t.chest_id,
+                    "Withdraw: failed to send chest instruction: {}", e
+                );
                 return Err(StoreError::BotError(format!(
                     "Failed to send chest instruction to bot: {}",
                     e
@@ -214,11 +227,22 @@ pub async fn handle_withdraw_balance_queued(
             {
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => {
-                    tracing::error!("[Withdraw] Channel dropped: {}", e);
+                    error!(
+                        uuid = %user_uuid,
+                        player = player_name,
+                        chest_id = t.chest_id,
+                        "Withdraw: chest response channel dropped: {}", e
+                    );
                     return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
                 }
                 Err(_) => {
-                    tracing::error!("[Withdraw] Timeout waiting for bot");
+                    error!(
+                        uuid = %user_uuid,
+                        player = player_name,
+                        chest_id = t.chest_id,
+                        timeout_secs = CHEST_OP_TIMEOUT_SECS,
+                        "Withdraw: timed out waiting for bot chest operation"
+                    );
                     return Err(StoreError::ChestOp(
                         "Bot timed out withdrawing diamonds from storage".to_string(),
                     ));
@@ -227,7 +251,12 @@ pub async fn handle_withdraw_balance_queued(
 
             match bot_result {
                 Err(err) => {
-                    tracing::error!("[Withdraw] Diamond withdrawal failed: {}", err);
+                    error!(
+                        uuid = %user_uuid,
+                        player = player_name,
+                        chest_id = t.chest_id,
+                        "Withdraw: bot failed to withdraw diamonds from chest: {}", err
+                    );
                     return utils::send_message_to_player(
                         store,
                         player_name,
@@ -237,22 +266,26 @@ pub async fn handle_withdraw_balance_queued(
                 }
                 Ok(report) => {
                     if let Err(e) = store.apply_chest_sync(report) {
-                        tracing::warn!("[Withdraw] Chest sync failed after diamond withdrawal: {}", e);
+                        warn!(
+                            uuid = %user_uuid,
+                            player = player_name,
+                            chest_id = t.chest_id,
+                            "Withdraw: chest sync failed after diamond withdrawal: {}", e
+                        );
                     }
                 }
             }
         }
     }
 
-    // NOTE: Do NOT deduct balance yet - wait until trade succeeds.
-    // Ordering keeps physical diamonds and ledger balance in lockstep if the
-    // trade fails: the rollback path below redeposits physical diamonds back
-    // into storage, and because the balance was never touched, no balance
-    // restoration is needed.
-
     store.advance_trade(|s| s.begin_trading());
 
-    info!("[Withdraw] Initiating trade: {} diamonds to {}", whole_diamonds, player_name);
+    info!(
+        uuid = %user_uuid,
+        player = player_name,
+        amount = whole_diamonds,
+        "Withdraw: initiating trade"
+    );
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
     let trade_send_result = store.bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
@@ -273,7 +306,12 @@ pub async fn handle_withdraw_balance_queued(
         .await;
 
     if let Err(e) = trade_send_result {
-        tracing::error!("[Withdraw] Failed to send trade instruction: {}", e);
+        error!(
+            uuid = %user_uuid,
+            player = player_name,
+            amount = whole_diamonds,
+            "Withdraw: failed to send trade instruction, rolling diamonds back to storage: {}", e
+        );
         let _ = super::super::rollback::rollback_amount_to_storage(
             store,
             "diamond",
@@ -296,7 +334,12 @@ pub async fn handle_withdraw_balance_queued(
     {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => {
-            tracing::error!("[Withdraw] Trade channel dropped: {}", e);
+            warn!(
+                uuid = %user_uuid,
+                player = player_name,
+                amount = whole_diamonds,
+                "Withdraw: trade response channel dropped, rolling diamonds back to storage: {}", e
+            );
             let _ = super::super::rollback::rollback_amount_to_storage(
                 store,
                 "diamond",
@@ -313,7 +356,13 @@ pub async fn handle_withdraw_balance_queued(
             .await;
         }
         Err(_) => {
-            tracing::error!("[Withdraw] Trade timeout");
+            warn!(
+                uuid = %user_uuid,
+                player = player_name,
+                amount = whole_diamonds,
+                timeout_ms = store.config.trade_timeout_ms,
+                "Withdraw: trade timed out, rolling diamonds back to storage"
+            );
             let _ = super::super::rollback::rollback_amount_to_storage(
                 store,
                 "diamond",
@@ -332,7 +381,12 @@ pub async fn handle_withdraw_balance_queued(
     };
 
     if let Err(ref err) = trade_result {
-        warn!("[Withdraw] Trade failed: {}", err);
+        warn!(
+            uuid = %user_uuid,
+            player = player_name,
+            amount = whole_diamonds,
+            "Withdraw: trade failed, rolling diamonds back to storage: {}", err
+        );
         let _ = super::super::rollback::rollback_amount_to_storage(
             store,
             "diamond",
@@ -350,13 +404,21 @@ pub async fn handle_withdraw_balance_queued(
         .await;
     }
 
-    // Trade succeeded - NOW deduct from balance
+    // Trade succeeded: decrement the ledger balance now that the diamonds are
+    // in the player's hands.
     {
         let user = store.expect_user_mut(&user_uuid, "withdraw-balance/commit")?;
         user.balance -= amount;
         user.username = player_name.to_owned();
     }
     store.dirty = true;
+    info!(
+        uuid = %user_uuid,
+        player = player_name,
+        item = "diamond",
+        amount = amount,
+        "Withdraw: decremented user balance"
+    );
 
     store.orders.push_back(crate::types::Order {
         order_type: crate::types::order::OrderType::WithdrawBalance,
@@ -375,10 +437,23 @@ pub async fn handle_withdraw_balance_queued(
 
     store.advance_trade(|s| s.commit("diamond".to_string(), whole_diamonds, amount));
 
-    info!("[Withdraw] Completed: user={} amount={}", player_name, amount);
+    info!(
+        uuid = %user_uuid,
+        player = player_name,
+        amount = amount,
+        whole_diamonds = whole_diamonds,
+        "Withdraw completed"
+    );
 
+    // With `repair=true`, `assert_invariants` returns Ok once any fixable
+    // drift has been repaired; an Err here means the audit found something it
+    // could not reconcile and operator attention is required.
     if let Err(e) = state::assert_invariants(store, "post-withdraw-balance", true) {
-        tracing::error!("Invariant violation after withdraw balance: {}", e);
+        error!(
+            uuid = %user_uuid,
+            player = player_name,
+            "Unrecoverable invariant violation after withdraw balance: {}", e
+        );
         let _ = state::save(store);
     }
 

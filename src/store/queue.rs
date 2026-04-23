@@ -1,20 +1,8 @@
-//! # Order Queue System
+//! Persistent FIFO order queue.
 //!
-//! Manages queued orders (buy, sell, deposit, withdraw) for sequential processing.
-//! Orders are processed one at a time to prevent race conditions and ensure
-//! reliable bot operations.
-//!
-//! ## Features
-//! - FIFO queue with persistence to disk
-//! - Per-user order limit (max 8 orders)
-//! - Position tracking for user feedback
-//! - Order cancellation
-//!
-//! ## Data Flow
-//! 1. Player sends command -> validated and queued
-//! 2. Player gets immediate response with queue position
-//! 3. Orders processed sequentially by Store::run() loop
-//! 4. Player notified when order starts and completes
+//! Orders (buy/sell/deposit/withdraw) land here the moment a player command is
+//! validated, and are processed one at a time by `Store::run()`. Persisting on
+//! every mutation means a restart can't lose a player's place in line.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -29,27 +17,25 @@ use crate::constants::{MAX_ORDERS_PER_USER, MAX_QUEUE_SIZE, QUEUE_FILE};
 use crate::fsutil::write_atomic;
 use crate::messages::QueuedOrderType;
 
-/// A queued order waiting to be processed
+/// An order waiting to be processed.
+///
+/// Serialized as part of the on-disk queue file (see [`QueuePersist`]); any
+/// field rename is a persisted-format break.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedOrder {
-    /// Unique identifier for this order
     pub id: u64,
-    /// UUID of the user who placed the order
     pub user_uuid: String,
-    /// Username of the user (for messaging)
     pub username: String,
-    /// Type of order (Buy, Sell, Deposit, Withdraw)
     pub order_type: QueuedOrderType,
-    /// Item being traded (for buy/sell) or "diamond" (for deposit/withdraw)
+    /// Item being traded (buy/sell) or `"diamond"` for deposit/withdraw.
     pub item: String,
-    /// Quantity of items (for buy/sell) or 0 for flexible deposit/withdraw
+    /// Quantity for buy/sell. Ignored for deposit/withdraw, which carry their
+    /// amount inside `order_type` (or `None` for flexible).
     pub quantity: u32,
-    /// When the order was queued
     pub queued_at: DateTime<Utc>,
 }
 
 impl QueuedOrder {
-    /// Create a new queued order
     pub fn new(
         id: u64,
         user_uuid: String,
@@ -69,39 +55,27 @@ impl QueuedOrder {
         }
     }
 
-    /// Get a human-readable description of the order
+    /// Short human-readable summary used in player messages and log lines.
     pub fn description(&self) -> String {
         match &self.order_type {
-            QueuedOrderType::Buy => {
-                format!("buy {} {}", self.item, self.quantity)
-            }
-            QueuedOrderType::Sell => {
-                format!("sell {} {}", self.item, self.quantity)
-            }
-            QueuedOrderType::Deposit { amount } => {
-                if let Some(amt) = amount {
-                    format!("deposit {:.2}", amt)
-                } else {
-                    "deposit (flexible)".to_string()
-                }
-            }
-            QueuedOrderType::Withdraw { amount } => {
-                if let Some(amt) = amount {
-                    format!("withdraw {:.2}", amt)
-                } else {
-                    "withdraw (full balance)".to_string()
-                }
-            }
+            QueuedOrderType::Buy => format!("buy {} {}", self.item, self.quantity),
+            QueuedOrderType::Sell => format!("sell {} {}", self.item, self.quantity),
+            QueuedOrderType::Deposit { amount } => match amount {
+                Some(amt) => format!("deposit {:.2}", amt),
+                None => "deposit (flexible)".to_string(),
+            },
+            QueuedOrderType::Withdraw { amount } => match amount {
+                Some(amt) => format!("withdraw {:.2}", amt),
+                None => "withdraw (full balance)".to_string(),
+            },
         }
     }
 }
 
-/// The order queue manager
 #[derive(Debug)]
 pub struct OrderQueue {
-    /// Queue of orders waiting to be processed (FIFO)
     orders: VecDeque<QueuedOrder>,
-    /// Next order ID to assign
+    /// Monotonic order ID counter; persisted so IDs don't recycle across restarts.
     next_id: u64,
 }
 
@@ -112,7 +86,6 @@ impl Default for OrderQueue {
 }
 
 impl OrderQueue {
-    /// Create a new empty order queue
     pub fn new() -> Self {
         Self {
             orders: VecDeque::new(),
@@ -120,15 +93,25 @@ impl OrderQueue {
         }
     }
 
-    /// Load queue from disk, or create empty queue if file doesn't exist.
-    ///
-    /// Called at startup to restore any orders that were pending when the bot
-    /// last shut down, so players don't lose their place in line across restarts.
+    /// Load queue from `QUEUE_FILE`, or return an empty queue if the file is
+    /// absent. Called once at startup to restore pending orders across restarts.
     pub fn load() -> io::Result<Self> {
-        let path = Path::new(QUEUE_FILE);
-        
+        Self::load_from(QUEUE_FILE)
+    }
+
+    /// Write queue to `QUEUE_FILE`. Uses [`write_atomic`] so a crash mid-write
+    /// cannot leave a truncated or corrupt queue file.
+    pub fn save(&self) -> io::Result<()> {
+        self.save_to(QUEUE_FILE)
+    }
+
+    /// Path-parameterized load, separated so tests can round-trip without
+    /// touching the production `QUEUE_FILE`.
+    fn load_from(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+
         if !path.exists() {
-            info!("No queue file found, starting with empty queue");
+            info!("[Queue] No queue file at {:?}, starting empty", path);
             return Ok(Self::new());
         }
 
@@ -137,8 +120,9 @@ impl OrderQueue {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         info!(
-            "Loaded queue from disk: {} orders, next_id={}",
+            "[Queue] Loaded {} orders from {:?} (next_id={})",
             queue_data.orders.len(),
+            path,
             queue_data.next_id
         );
 
@@ -148,11 +132,9 @@ impl OrderQueue {
         })
     }
 
-    /// Save queue to disk atomically.
-    ///
-    /// Uses `write_atomic` (write-to-temp + rename) so a crash mid-write cannot
-    /// leave a truncated/corrupt queue file on disk.
-    pub fn save(&self) -> io::Result<()> {
+    /// Path-parameterized save, separated so tests can round-trip without
+    /// touching the production `QUEUE_FILE`.
+    fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let data = QueuePersist {
             orders: self.orders.iter().cloned().collect(),
             next_id: self.next_id,
@@ -161,21 +143,13 @@ impl OrderQueue {
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        write_atomic(QUEUE_FILE, &json)
+        write_atomic(path, &json)
     }
 
-    /// Add a new order to the queue
+    /// Enqueue a new order.
     ///
-    /// # Arguments
-    /// * `user_uuid` - UUID of the user placing the order
-    /// * `username` - Username for messaging
-    /// * `order_type` - Type of order
-    /// * `item` - Item name
-    /// * `quantity` - Quantity (0 for flexible deposit/withdraw)
-    ///
-    /// # Returns
-    /// * `Ok((order_id, position))` - Order was queued, returns ID and 1-indexed position
-    /// * `Err(message)` - Queue is full for this user
+    /// Returns `Ok((order_id, 1-indexed position))` on success, `Err(message)`
+    /// when either cap is hit (both are recoverable rejections).
     pub fn add(
         &mut self,
         user_uuid: String,
@@ -184,25 +158,26 @@ impl OrderQueue {
         item: String,
         quantity: u32,
     ) -> Result<(u64, usize), String> {
-        // Global backpressure: reject new orders when the queue is already
-        // saturated. MAX_ORDERS_PER_USER alone is not enough — a coordinated
-        // burst of distinct users could still blow the queue past any memory
-        // or latency budget. This cap protects every user, including future
-        // arrivals who would otherwise wait behind an unbounded backlog.
+        // Global backpressure. MAX_ORDERS_PER_USER alone is not enough — a
+        // coordinated burst of distinct users could still blow the queue past
+        // any memory or latency budget.
         if self.orders.len() >= MAX_QUEUE_SIZE {
-            warn!("[Queue] Order from {} rejected: queue at capacity ({}/{})",
-                  username, self.orders.len(), MAX_QUEUE_SIZE);
+            warn!(
+                "[Queue] Rejected order from {} ({}): global cap reached ({}/{})",
+                username, user_uuid, self.orders.len(), MAX_QUEUE_SIZE
+            );
             return Err(format!(
                 "The store queue is currently full ({} orders). Please try again later.",
                 self.orders.len()
             ));
         }
 
-        // Enforce MAX_ORDERS_PER_USER to prevent a single player from flooding
-        // the queue and blocking other users behind a long tail of their orders.
         let user_count = self.user_order_count(&user_uuid);
         if user_count >= MAX_ORDERS_PER_USER {
-            warn!("[Queue] User {} rejected: already has {} orders (max {})", username, user_count, MAX_ORDERS_PER_USER);
+            warn!(
+                "[Queue] Rejected order from {} ({}): per-user cap reached ({}/{}, queue size {})",
+                username, user_uuid, user_count, MAX_ORDERS_PER_USER, self.orders.len()
+            );
             return Err(format!(
                 "Queue full. You have {} pending orders (max {}). Wait for some to complete.",
                 user_count, MAX_ORDERS_PER_USER
@@ -212,28 +187,38 @@ impl OrderQueue {
         let id = self.next_id;
         self.next_id += 1;
 
-        let order = QueuedOrder::new(id, user_uuid.clone(), username.clone(), order_type, item.clone(), quantity);
+        let order = QueuedOrder::new(
+            id,
+            user_uuid.clone(),
+            username.clone(),
+            order_type,
+            item.clone(),
+            quantity,
+        );
         self.orders.push_back(order);
 
-        let position = self.orders.len(); // 1-indexed position
+        let position = self.orders.len();
 
         // Persist on every mutation so an unexpected shutdown never loses a queued order.
         if let Err(e) = self.save() {
-            error!("[Queue] Failed to persist after adding order {}: {}", id, e);
+            error!("[Queue] Failed to persist after adding order #{}: {}", id, e);
         }
 
-        info!("[Queue] Order {} added to queue at position {} (user={} item={} qty={})", 
-              id, position, username, item, quantity);
+        info!(
+            "[Queue] Order #{} queued at position {} (user={} uuid={} item={} qty={})",
+            id, position, username, user_uuid, item, quantity
+        );
         Ok((id, position))
     }
 
-    /// Pop the next order from the front of the queue
     pub fn pop(&mut self) -> Option<QueuedOrder> {
         let order = self.orders.pop_front();
 
         if let Some(ref o) = order {
-            debug!("[Queue] Popped order #{}: {} for {} (remaining: {})",
-                   o.id, o.description(), o.username, self.orders.len());
+            debug!(
+                "[Queue] Popped order #{}: {} for {} (remaining: {})",
+                o.id, o.description(), o.username, self.orders.len()
+            );
             if let Err(e) = self.save() {
                 error!("[Queue] Failed to persist after popping order #{}: {}", o.id, e);
             }
@@ -242,17 +227,14 @@ impl OrderQueue {
         order
     }
 
-    /// Check if the queue is empty
     pub fn is_empty(&self) -> bool {
         self.orders.is_empty()
     }
 
-    /// Get the total number of orders in the queue
     pub fn len(&self) -> usize {
         self.orders.len()
     }
 
-    /// Get 1-indexed position of an order by ID (test-only helper).
     #[cfg(test)]
     pub fn get_position(&self, order_id: u64) -> Option<usize> {
         self.orders
@@ -261,7 +243,6 @@ impl OrderQueue {
             .map(|p| p + 1)
     }
 
-    /// Get 1-indexed position of a user's first order (test-only helper).
     #[cfg(test)]
     pub fn get_user_position(&self, user_uuid: &str) -> Option<usize> {
         self.orders
@@ -270,29 +251,26 @@ impl OrderQueue {
             .map(|p| p + 1)
     }
 
-    /// Count how many orders a user has in the queue
     pub fn user_order_count(&self, user_uuid: &str) -> usize {
         self.orders.iter().filter(|o| o.user_uuid == user_uuid).count()
     }
 
-    /// Get all orders for a specific user with their positions
-    /// Returns Vec of (order, 1-indexed position)
+    /// All orders for `user_uuid` paired with their 1-indexed queue position.
     pub fn get_user_orders(&self, user_uuid: &str) -> Vec<(&QueuedOrder, usize)> {
         self.orders
             .iter()
             .enumerate()
             .filter(|(_, o)| o.user_uuid == user_uuid)
-            .map(|(i, o)| (o, i + 1)) // Convert to 1-indexed
+            .map(|(i, o)| (o, i + 1))
             .collect()
     }
 
-    /// Cancel an order by ID (only if it belongs to the user)
-    ///
-    /// # Returns
-    /// * `Ok(())` - Order was cancelled
-    /// * `Err(message)` - Order not found or doesn't belong to user
+    /// Cancel `order_id` if it belongs to `user_uuid`. Returns an error when
+    /// the order is missing or owned by another user (kept distinct in logs
+    /// so operators can tell misuse from a stale client).
     pub fn cancel(&mut self, user_uuid: &str, order_id: u64) -> Result<(), String> {
-        let position = self.orders
+        let position = self
+            .orders
             .iter()
             .position(|o| o.id == order_id && o.user_uuid == user_uuid);
 
@@ -300,33 +278,40 @@ impl OrderQueue {
             Some(pos) => {
                 let order = self.orders.remove(pos).unwrap();
                 info!(
-                    "[Queue] Order #{} CANCELLED by user {} (was: {}, position was {})",
+                    "[Queue] Order #{} cancelled by uuid={} (was: {}, position {})",
                     order_id, user_uuid, order.description(), pos + 1
                 );
 
                 if let Err(e) = self.save() {
-                    error!("[Queue] Failed to persist after cancelling order {}: {}", order_id, e);
+                    error!(
+                        "[Queue] Failed to persist after cancelling order #{}: {}",
+                        order_id, e
+                    );
                 }
 
                 Ok(())
             }
             None => {
-                // Check if order exists but belongs to someone else
                 if self.orders.iter().any(|o| o.id == order_id) {
-                    warn!("[Queue] User {} tried to cancel order #{} but it belongs to another user", user_uuid, order_id);
+                    warn!(
+                        "[Queue] uuid={} tried to cancel order #{} owned by another user",
+                        user_uuid, order_id
+                    );
                     Err("You can only cancel your own orders.".to_string())
                 } else {
-                    warn!("[Queue] User {} tried to cancel order #{} but it doesn't exist", user_uuid, order_id);
+                    warn!(
+                        "[Queue] uuid={} tried to cancel order #{} but it doesn't exist (queue size {})",
+                        user_uuid, order_id, self.orders.len()
+                    );
                     Err(format!("Order #{} not found in queue.", order_id))
                 }
             }
         }
     }
 
-    /// Estimate wait time based on position (rough estimate)
-    /// Assumes ~30 seconds per order (actual time varies by order type).
-    /// This is only used for player-facing "you'll be served in ~X" hints,
-    /// so a coarse constant is preferred over a real moving average.
+    /// Rough wait-time hint shown to players; assumes ~30s per order ahead.
+    /// Coarse by design — real processing time varies by order type, and this
+    /// is only used for a player-facing "you'll be served in ~X" string.
     pub fn estimate_wait(&self, position: usize) -> String {
         let orders_ahead = position.saturating_sub(1);
         if orders_ahead == 0 {
@@ -342,7 +327,7 @@ impl OrderQueue {
     }
 }
 
-/// Serializable form of the queue for persistence
+/// On-disk shape for the queue. Field renames break existing queue files.
 #[derive(Serialize, Deserialize)]
 struct QueuePersist {
     orders: Vec<QueuedOrder>,
@@ -353,17 +338,47 @@ struct QueuePersist {
 mod tests {
     use super::*;
 
+    /// Scratch directory under the system temp dir, mirroring the pattern in
+    /// `fsutil::tests` so queue round-trip tests don't collide with each other
+    /// or the real `QUEUE_FILE`.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cj-store-queue-{}-{}",
+                name,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            Self(base)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn test_add_and_pop() {
+    fn add_then_pop_returns_same_order_and_empties_queue() {
         let mut queue = OrderQueue::new();
-        
-        let (id, pos) = queue.add(
-            "uuid1".to_string(),
-            "player1".to_string(),
-            QueuedOrderType::Buy,
-            "cobblestone".to_string(),
-            64,
-        ).unwrap();
+
+        let (id, pos) = queue
+            .add(
+                "uuid1".to_string(),
+                "player1".to_string(),
+                QueuedOrderType::Buy,
+                "cobblestone".to_string(),
+                64,
+            )
+            .unwrap();
 
         assert_eq!(id, 1);
         assert_eq!(pos, 1);
@@ -376,116 +391,255 @@ mod tests {
     }
 
     #[test]
-    fn test_user_limit() {
+    fn per_user_cap_rejects_ninth_order_but_other_users_unaffected() {
         let mut queue = OrderQueue::new();
-        
-        // Add MAX_ORDERS_PER_USER orders
+
         for i in 0..MAX_ORDERS_PER_USER {
-            let result = queue.add(
+            queue
+                .add(
+                    "uuid1".to_string(),
+                    "player1".to_string(),
+                    QueuedOrderType::Buy,
+                    format!("item{}", i),
+                    64,
+                )
+                .expect("within per-user cap");
+        }
+
+        let err = queue
+            .add(
                 "uuid1".to_string(),
                 "player1".to_string(),
                 QueuedOrderType::Buy,
-                format!("item{}", i),
+                "overflow".to_string(),
                 64,
-            );
-            assert!(result.is_ok());
-        }
+            )
+            .expect_err("per-user cap must reject");
+        assert!(err.contains(&MAX_ORDERS_PER_USER.to_string()));
 
-        // Next order should fail
-        let result = queue.add(
-            "uuid1".to_string(),
-            "player1".to_string(),
-            QueuedOrderType::Buy,
-            "overflow".to_string(),
-            64,
-        );
-        assert!(result.is_err());
-
-        // But a different user can still add
-        let result = queue.add(
-            "uuid2".to_string(),
-            "player2".to_string(),
-            QueuedOrderType::Buy,
-            "different_user".to_string(),
-            64,
-        );
-        assert!(result.is_ok());
+        assert!(queue
+            .add(
+                "uuid2".to_string(),
+                "player2".to_string(),
+                QueuedOrderType::Buy,
+                "different_user".to_string(),
+                64,
+            )
+            .is_ok());
     }
 
     #[test]
-    fn test_cancel() {
+    fn cancel_rejects_other_users_order_and_accepts_own() {
         let mut queue = OrderQueue::new();
-        
-        let (id1, _) = queue.add(
-            "uuid1".to_string(),
-            "player1".to_string(),
-            QueuedOrderType::Buy,
-            "item1".to_string(),
-            64,
-        ).unwrap();
 
-        let (id2, _) = queue.add(
-            "uuid2".to_string(),
-            "player2".to_string(),
-            QueuedOrderType::Buy,
-            "item2".to_string(),
-            64,
-        ).unwrap();
+        let (id1, _) = queue
+            .add(
+                "uuid1".to_string(),
+                "player1".to_string(),
+                QueuedOrderType::Buy,
+                "item1".to_string(),
+                64,
+            )
+            .unwrap();
 
-        // Can't cancel someone else's order
+        let (id2, _) = queue
+            .add(
+                "uuid2".to_string(),
+                "player2".to_string(),
+                QueuedOrderType::Buy,
+                "item2".to_string(),
+                64,
+            )
+            .unwrap();
+
         assert!(queue.cancel("uuid1", id2).is_err());
-
-        // Can cancel own order
         assert!(queue.cancel("uuid1", id1).is_ok());
         assert_eq!(queue.len(), 1);
     }
 
     #[test]
-    fn test_global_queue_cap() {
+    fn cancel_missing_order_reports_not_found() {
+        let mut queue = OrderQueue::new();
+        let err = queue.cancel("uuid1", 9999).expect_err("missing id must fail");
+        assert!(err.contains("9999"));
+    }
+
+    #[test]
+    fn global_cap_rejects_even_fresh_users() {
         let mut queue = OrderQueue::new();
 
-        // Fill up to MAX_QUEUE_SIZE with distinct users (below per-user cap)
         for i in 0..MAX_QUEUE_SIZE {
-            let uuid = format!("uuid-{}", i);
-            let user = format!("player-{}", i);
-            assert!(queue
+            queue
                 .add(
-                    uuid,
-                    user,
+                    format!("uuid-{}", i),
+                    format!("player-{}", i),
                     QueuedOrderType::Buy,
                     "cobblestone".to_string(),
                     1,
                 )
-                .is_ok());
+                .expect("within global cap");
         }
 
-        // Any new order should now be rejected even from a fresh user
-        let result = queue.add(
-            "uuid-overflow".to_string(),
-            "overflow-player".to_string(),
-            QueuedOrderType::Buy,
-            "cobblestone".to_string(),
-            1,
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("full"));
+        let err = queue
+            .add(
+                "uuid-overflow".to_string(),
+                "overflow-player".to_string(),
+                QueuedOrderType::Buy,
+                "cobblestone".to_string(),
+                1,
+            )
+            .expect_err("global cap must reject");
+        assert!(err.contains("full"));
     }
 
     #[test]
-    fn test_position_tracking() {
+    fn position_helpers_report_1_indexed_positions() {
         let mut queue = OrderQueue::new();
-        
-        queue.add("uuid1".to_string(), "p1".to_string(), QueuedOrderType::Buy, "a".to_string(), 1).unwrap();
-        let (id2, _) = queue.add("uuid2".to_string(), "p2".to_string(), QueuedOrderType::Buy, "b".to_string(), 1).unwrap();
-        queue.add("uuid1".to_string(), "p1".to_string(), QueuedOrderType::Buy, "c".to_string(), 1).unwrap();
 
-        // User 1 has position 1 (first order)
+        queue
+            .add("uuid1".to_string(), "p1".to_string(), QueuedOrderType::Buy, "a".to_string(), 1)
+            .unwrap();
+        let (id2, _) = queue
+            .add("uuid2".to_string(), "p2".to_string(), QueuedOrderType::Buy, "b".to_string(), 1)
+            .unwrap();
+        queue
+            .add("uuid1".to_string(), "p1".to_string(), QueuedOrderType::Buy, "c".to_string(), 1)
+            .unwrap();
+
         assert_eq!(queue.get_user_position("uuid1"), Some(1));
-        // User 2 has position 2
         assert_eq!(queue.get_user_position("uuid2"), Some(2));
-        // Order 2 is at position 2
         assert_eq!(queue.get_position(id2), Some(2));
-        // User 1 has 2 orders
         assert_eq!(queue.user_order_count("uuid1"), 2);
+    }
+
+    #[test]
+    fn get_user_orders_returns_every_match_with_positions() {
+        let mut queue = OrderQueue::new();
+        queue.add("a".into(), "pa".into(), QueuedOrderType::Buy, "x".into(), 1).unwrap();
+        queue.add("b".into(), "pb".into(), QueuedOrderType::Buy, "y".into(), 1).unwrap();
+        queue.add("a".into(), "pa".into(), QueuedOrderType::Sell, "z".into(), 2).unwrap();
+
+        let orders = queue.get_user_orders("a");
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].1, 1);
+        assert_eq!(orders[1].1, 3);
+        assert_eq!(orders[0].0.item, "x");
+        assert_eq!(orders[1].0.item, "z");
+    }
+
+    #[test]
+    fn description_renders_every_order_variant() {
+        let buy = QueuedOrder::new(1, "u".into(), "p".into(), QueuedOrderType::Buy, "diamond".into(), 5);
+        assert_eq!(buy.description(), "buy diamond 5");
+
+        let sell = QueuedOrder::new(2, "u".into(), "p".into(), QueuedOrderType::Sell, "iron".into(), 10);
+        assert_eq!(sell.description(), "sell iron 10");
+
+        let dep_some = QueuedOrder::new(
+            3, "u".into(), "p".into(),
+            QueuedOrderType::Deposit { amount: Some(1.5) }, "diamond".into(), 0,
+        );
+        assert_eq!(dep_some.description(), "deposit 1.50");
+
+        let dep_flex = QueuedOrder::new(
+            4, "u".into(), "p".into(),
+            QueuedOrderType::Deposit { amount: None }, "diamond".into(), 0,
+        );
+        assert_eq!(dep_flex.description(), "deposit (flexible)");
+
+        let wd_some = QueuedOrder::new(
+            5, "u".into(), "p".into(),
+            QueuedOrderType::Withdraw { amount: Some(2.25) }, "diamond".into(), 0,
+        );
+        assert_eq!(wd_some.description(), "withdraw 2.25");
+
+        let wd_full = QueuedOrder::new(
+            6, "u".into(), "p".into(),
+            QueuedOrderType::Withdraw { amount: None }, "diamond".into(), 0,
+        );
+        assert_eq!(wd_full.description(), "withdraw (full balance)");
+    }
+
+    #[test]
+    fn estimate_wait_crosses_second_minute_and_next_in_line_boundaries() {
+        let queue = OrderQueue::new();
+        assert_eq!(queue.estimate_wait(0), "next in line");
+        assert_eq!(queue.estimate_wait(1), "next in line");
+        // position 2 -> 1 ahead -> 30s, still sub-minute.
+        assert_eq!(queue.estimate_wait(2), "~30s");
+        // position 3 -> 2 ahead -> 60s, flips to minutes.
+        assert_eq!(queue.estimate_wait(3), "~1 min");
+        // position 5 -> 4 ahead -> 120s -> 2 min.
+        assert_eq!(queue.estimate_wait(5), "~2 min");
+    }
+
+    #[test]
+    fn default_matches_new() {
+        let a = OrderQueue::default();
+        let b = OrderQueue::new();
+        assert_eq!(a.len(), b.len());
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn load_returns_empty_when_file_missing() {
+        let dir = TmpDir::new("load-missing");
+        let path = dir.path("absent.json");
+        let q = OrderQueue::load_from(&path).unwrap();
+        assert!(q.is_empty());
+        assert_eq!(q.next_id, 1);
+    }
+
+    #[test]
+    fn save_and_load_round_trip_preserves_orders_and_next_id() {
+        let dir = TmpDir::new("roundtrip");
+        let path = dir.path("queue.json");
+
+        let mut queue = OrderQueue::new();
+        queue.orders.push_back(QueuedOrder::new(
+            42, "uuid-a".into(), "alice".into(), QueuedOrderType::Buy, "diamond".into(), 7,
+        ));
+        queue.orders.push_back(QueuedOrder::new(
+            43, "uuid-b".into(), "bob".into(),
+            QueuedOrderType::Deposit { amount: Some(1.5) }, "diamond".into(), 0,
+        ));
+        queue.orders.push_back(QueuedOrder::new(
+            44, "uuid-c".into(), "carol".into(),
+            QueuedOrderType::Withdraw { amount: None }, "diamond".into(), 0,
+        ));
+        queue.next_id = 45;
+
+        queue.save_to(&path).expect("save must succeed");
+
+        let loaded = OrderQueue::load_from(&path).expect("load must succeed");
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.next_id, 45);
+
+        let ids: Vec<u64> = loaded.orders.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![42, 43, 44]);
+
+        // Every variant shape survives the JSON boundary intact.
+        assert!(matches!(loaded.orders[0].order_type, QueuedOrderType::Buy));
+        assert!(matches!(
+            loaded.orders[1].order_type,
+            QueuedOrderType::Deposit { amount: Some(_) }
+        ));
+        assert!(matches!(
+            loaded.orders[2].order_type,
+            QueuedOrderType::Withdraw { amount: None }
+        ));
+
+        assert_eq!(loaded.orders[0].username, "alice");
+        assert_eq!(loaded.orders[0].item, "diamond");
+        assert_eq!(loaded.orders[0].quantity, 7);
+    }
+
+    #[test]
+    fn load_from_rejects_malformed_json_as_invalid_data() {
+        let dir = TmpDir::new("bad-json");
+        let path = dir.path("queue.json");
+        fs::write(&path, "{ this is not json").unwrap();
+        let err = OrderQueue::load_from(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

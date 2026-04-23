@@ -4,15 +4,11 @@
 //! These run inline on the Store task (no bot trade round-trip) and therefore
 //! live outside the queued-order path.
 
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::super::{Store, state, utils};
 use super::super::pricing;
 use crate::error::StoreError;
-
-// =========================================================================
-// Dispatcher entry points (called from handle_player_command)
-// =========================================================================
 
 pub(super) async fn handle_price(
     store: &mut Store,
@@ -30,7 +26,6 @@ pub(super) async fn handle_balance(
 ) -> Result<(), StoreError> {
     let target_name = target.unwrap_or(player_name);
 
-    debug!("Balance check requested by {} for {}", player_name, target_name);
     match get_user_balance_async(store, target_name).await {
         Ok(balance) => {
             let message = format!("{}'s balance: {:.2} diamonds", target_name, balance);
@@ -57,15 +52,13 @@ pub(super) async fn handle_pay(
     recipient: &str,
     amount: f64,
 ) -> Result<(), StoreError> {
-    info!(
-        "Processing payment: {} -> {} ({})",
-        player_name, recipient, amount
-    );
     match pay_async(store, player_name, recipient, amount).await {
         Ok(()) => {
             info!(
-                "Payment successful: {} paid {} to {}",
-                player_name, amount, recipient
+                payer = player_name,
+                payee = recipient,
+                amount,
+                "Payment completed"
             );
 
             let payee_message = format!(
@@ -78,7 +71,13 @@ pub(super) async fn handle_pay(
             utils::send_message_to_player(store, player_name, &payer_message).await
         }
         Err(e) => {
-            warn!("Payment failed: {} -> {}: {}", player_name, recipient, e);
+            warn!(
+                payer = player_name,
+                payee = recipient,
+                amount,
+                error = %e,
+                "Payment failed"
+            );
             utils::send_message_to_player(store, player_name, &e.to_string()).await
         }
     }
@@ -203,15 +202,11 @@ pub(super) async fn handle_help(
     handle_help_command(store, player_name, topic).await
 }
 
-// =========================================================================
-// Private helpers (moved verbatim from player.rs)
-// =========================================================================
-
-/// Handle the price command - shows buy/sell prices for an item
+/// Reports buy and sell quotes for `quantity` of `item` (default one stack).
 ///
-/// Prices are calculated using constant product AMM formula (x * y = k).
-/// The price depends on trade size (slippage), so we show the total cost/payout
-/// and average price per item for the requested quantity.
+/// Quotes come from the constant-product AMM (`x * y = k`) and so include
+/// slippage — the per-unit price depends on trade size. Both a total and an
+/// average per-item price are shown.
 async fn handle_price_command(
     store: &mut Store,
     player_name: &str,
@@ -274,7 +269,6 @@ async fn handle_price_command(
     }
 }
 
-/// Handle the status command - shows what the bot is currently doing
 async fn handle_status_command(
     store: &mut Store,
     player_name: &str,
@@ -313,7 +307,6 @@ async fn handle_status_command(
     utils::send_message_to_player(store, player_name, &status_msg).await
 }
 
-/// Handle the items command - lists available trading pairs with pagination
 async fn handle_items_command(
     store: &mut Store,
     player_name: &str,
@@ -362,7 +355,8 @@ async fn handle_items_command(
     utils::send_message_to_player(store, player_name, &message).await
 }
 
-/// Handle the help command - shows available commands and their usage
+/// Sends usage text for a single command, or (when `command` is `None`) the
+/// full command list. Operator-only commands are included only for operators.
 async fn handle_help_command(
     store: &mut Store,
     player_name: &str,
@@ -520,7 +514,6 @@ async fn handle_help_command(
     }
 }
 
-/// Get user balance asynchronously
 async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64, String> {
     state::assert_invariants(store, "pre-balance", false)?;
     let uuid = utils::resolve_user_uuid(username).await?;
@@ -532,11 +525,11 @@ async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64
     Ok(bal)
 }
 
-// =========================================================================
-// Public: payment between players
-// =========================================================================
-
-/// Handle payment between players
+/// Transfers `amount` diamonds from `payer_username` to `payee_username`.
+///
+/// The payer must already exist in `store.users`; the payee is auto-created
+/// if missing. Both usernames are refreshed from their UUIDs on each call so
+/// a rename propagates into the user record.
 pub async fn pay_async(
     store: &mut Store,
     payer_username: &str,
@@ -545,7 +538,12 @@ pub async fn pay_async(
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-pay", false)?;
     if !amount.is_finite() || amount <= 0.0 {
-        warn!("Invalid payment amount attempted: {}", amount);
+        warn!(
+            payer = payer_username,
+            payee = payee_username,
+            amount,
+            "Rejected payment: amount must be finite and positive"
+        );
         return Err(StoreError::ValidationError("Amount must be positive".to_string()));
     }
 
@@ -564,8 +562,11 @@ pub async fn pay_async(
     let payer_balance = store.expect_user(&payer_uuid, "pay/payer-balance")?.balance;
     if payer_balance < amount {
         warn!(
-            "Insufficient balance for payment: {} has {}, needs {}",
-            payer_username, payer_balance, amount
+            payer = payer_username,
+            payee = payee_username,
+            balance = payer_balance,
+            amount,
+            "Rejected payment: insufficient payer balance"
         );
         return Err(StoreError::ValidationError(format!(
             "Insufficient balance. Required: {}, Available: {}",
@@ -587,4 +588,91 @@ pub async fn pay_async(
 
     state::assert_invariants(store, "post-pay", true)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for branches that do not require a mock bot (i.e. they
+    //! return before any `send_message_to_player` call). The happy-path and
+    //! insufficient-balance branches of `pay_async` are covered in
+    //! `store::orders::tests`, where a mock bot is already wired up.
+
+    use super::*;
+    use crate::config::Config;
+    use crate::types::{Position, Storage};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    fn empty_store() -> Store {
+        let (tx, _rx) = mpsc::channel(1);
+        let config = Config {
+            position: Position { x: 0, y: 64, z: 0 },
+            fee: 0.125,
+            account_email: String::new(),
+            server_address: "test".to_string(),
+            buffer_chest_position: None,
+            trade_timeout_ms: 5_000,
+            pathfinding_timeout_ms: 5_000,
+            max_orders: 1000,
+            max_trades_in_memory: 1000,
+            autosave_interval_secs: 10,
+        };
+        Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), Storage::default())
+    }
+
+    #[tokio::test]
+    async fn pay_async_rejects_zero_amount() {
+        let mut store = empty_store();
+        let err = pay_async(&mut store, "Alice", "Bob", 0.0).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::ValidationError(ref m) if m.contains("positive")),
+            "expected ValidationError(positive), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_async_rejects_negative_amount() {
+        let mut store = empty_store();
+        let err = pay_async(&mut store, "Alice", "Bob", -1.0).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::ValidationError(ref m) if m.contains("positive")),
+            "expected ValidationError(positive), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_async_rejects_nan_amount() {
+        let mut store = empty_store();
+        let err = pay_async(&mut store, "Alice", "Bob", f64::NAN)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ValidationError(_)),
+            "expected ValidationError for NaN, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_async_rejects_infinite_amount() {
+        let mut store = empty_store();
+        let err = pay_async(&mut store, "Alice", "Bob", f64::INFINITY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::ValidationError(_)),
+            "expected ValidationError for infinity, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_async_rejects_unknown_payer() {
+        // No users in the store: the payer-not-found branch fires after the
+        // amount guard passes.
+        let mut store = empty_store();
+        let err = pay_async(&mut store, "Ghost", "Bob", 5.0).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::ValidationError(ref m) if m.contains("not found")),
+            "expected ValidationError(not found), got {err:?}"
+        );
+    }
 }

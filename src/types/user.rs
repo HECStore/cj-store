@@ -22,7 +22,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::fsutil::write_atomic;
 
@@ -32,8 +32,12 @@ use crate::fsutil::write_atomic;
 // cfg_attr below silences the test-only dead_code warnings without allowing
 // dead code in the production build.
 
-/// Global async HTTP client for Mojang API calls.
-/// Using a single client enables connection pooling and better performance.
+/// Hard timeout for a single Mojang UUID lookup. Referenced in the error
+/// message so a tuning change cannot make the log lie.
+const MOJANG_TIMEOUT_SECS: u64 = 10;
+
+/// Process-wide reqwest client for Mojang API calls. Singleton so connection
+/// pooling amortizes TLS handshakes across lookups for the lifetime of the bot.
 #[cfg_attr(test, allow(dead_code))]
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -41,7 +45,7 @@ static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(MOJANG_TIMEOUT_SECS))
             .build()
             .expect("Failed to create HTTP client")
     })
@@ -66,13 +70,13 @@ fn get_http_client() -> &'static reqwest::Client {
 /// See `README.md` "Player command interface" for command details.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
 pub struct User {
-    /// Hyphenated Mojang UUID (canonical identifier)
+    /// Hyphenated Mojang UUID — canonical identifier (survives username changes).
     pub uuid: String,
-    /// Last-seen username (updated on each interaction, can change)
+    /// Last-seen username; ephemeral, not an identity key.
     pub username: String,
-    /// Diamond balance (f64 for fractional support)
     pub balance: f64,
-    /// Operator flag: enables privileged commands (additem, removeitem, addcurrency, removecurrency)
+    /// `#[serde(default)]` so users from pre-operator-flag saves deserialize
+    /// as non-operators instead of failing the whole load.
     #[serde(default)]
     pub operator: bool,
 }
@@ -87,56 +91,50 @@ impl User {
     // Directory where all individual user files will be stored
     const USERS_DIR: &str = "data/users";
 
-    /// Resolves a Minecraft username to a Mojang UUID via the public API (async version).
-    ///
-    /// **API Endpoint**: `https://api.mojang.com/users/profiles/minecraft/{username}`
-    ///
-    /// **Returns**: Hyphenated UUID string (e.g., `550e8400-e29b-41d4-a716-446655440000`)
-    ///
-    /// **Error Cases**:
-    /// - HTTP 204: Player not found (username doesn't exist)
-    /// - Other HTTP errors: API failure
-    /// - Network errors: Connection issues
-    /// - Timeout: Request took longer than 10 seconds
-    ///
+    /// Resolves a Minecraft username to a hyphenated Mojang UUID via
+    /// `https://api.mojang.com/users/profiles/minecraft/{username}`.
+    /// HTTP 204 → player not found; other non-2xx or network errors → `Err`.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn get_uuid_async(username: &str) -> Result<String, String> {
-        let url = format!(
-            "https://api.mojang.com/users/profiles/minecraft/{}",
-            username
-        );
+        let url = format!("https://api.mojang.com/users/profiles/minecraft/{username}");
 
         let client = get_http_client();
         let response = client.get(&url).send().await.map_err(|e| {
             if e.is_timeout() {
-                format!("Mojang API timeout after 10s for username '{}'", username)
+                warn!("[Mojang] timeout after {MOJANG_TIMEOUT_SECS}s resolving '{username}'");
+                format!("Mojang API timeout after {MOJANG_TIMEOUT_SECS}s for username '{username}'")
             } else if e.is_connect() {
-                format!("Failed to connect to Mojang API: {}", e)
+                warn!("[Mojang] connect failed resolving '{username}': {e}");
+                format!("Failed to connect to Mojang API: {e}")
             } else {
-                format!("Mojang API request failed: {}", e)
+                warn!("[Mojang] request failed resolving '{username}': {e}");
+                format!("Mojang API request failed: {e}")
             }
         })?;
 
-        // Mojang API returns 204 No Content when player doesn't exist
         if response.status() == reqwest::StatusCode::NO_CONTENT {
-            return Err(format!("Player '{}' not found", username));
+            debug!("[Mojang] username '{username}' not found (204)");
+            return Err(format!("Player '{username}' not found"));
         }
 
         if !response.status().is_success() {
-            return Err(format!("Mojang API error for '{}': {}", username, response.status()));
+            let status = response.status();
+            warn!("[Mojang] non-success resolving '{username}': HTTP {status}");
+            return Err(format!("Mojang API error for '{username}': {status}"));
         }
 
         let mojang_response: MojangResponse = response.json().await.map_err(|e| {
-            format!("Failed to parse Mojang API response for '{}': {}", username, e)
+            warn!("[Mojang] malformed response for '{username}': {e}");
+            format!("Failed to parse Mojang API response for '{username}': {e}")
         })?;
 
-        // Mojang API returns UUID without hyphens; format it with hyphens
-        // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        // The length check is a guard against malformed responses before slicing,
-        // which would otherwise panic on non-32-char strings.
+        // Mojang returns a bare-hex UUID; hyphenate to the canonical
+        // xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. The length guard prevents
+        // the slicing below from panicking on malformed responses.
         let id = &mojang_response.id;
         if id.len() != 32 {
-            return Err(format!("Invalid UUID length from Mojang API: {}", id));
+            warn!("[Mojang] invalid UUID length for '{username}': got {} chars", id.len());
+            return Err(format!("Invalid UUID length from Mojang API: {id}"));
         }
         let formatted = format!(
             "{}-{}-{}-{}-{}",
@@ -147,49 +145,43 @@ impl User {
             &id[20..32]
         );
 
+        debug!("[Mojang] resolved '{username}' -> {formatted}");
         Ok(formatted)
     }
 
-    // Helper function to get the file path for a single user
     fn get_user_file_path(uuid: &str) -> PathBuf {
-        PathBuf::from(Self::USERS_DIR).join(format!("{}.json", uuid))
+        PathBuf::from(Self::USERS_DIR).join(format!("{uuid}.json"))
     }
 
-    /// Saves this single `User` instance to `data/users/{self.uuid}.json`.
-    /// Creates the 'data/users' directory if it doesn't exist.
-    ///
-    /// Uses `write_atomic` (temp file + rename) so a crash mid-write cannot
-    /// leave a partially written user file that would fail to deserialize.
+    /// Saves this single `User` to `data/users/{self.uuid}.json`, creating
+    /// the directory if needed. Uses `write_atomic` so a crash mid-write
+    /// cannot leave a partially written user file.
     pub fn save(&self) -> io::Result<()> {
         let path = Self::get_user_file_path(&self.uuid);
 
-        // Ensure the directory exists
         if let Some(parent_dir) = path.parent()
             && !parent_dir.exists() {
                 fs::create_dir_all(parent_dir)?;
             }
 
-        let json_str = serde_json::to_string_pretty(self)?; // Serialize the single User
+        let json_str = serde_json::to_string_pretty(self)?;
         write_atomic(&path, &json_str)?;
+        debug!("[User] saved {} (balance={}, operator={})", self.uuid, self.balance, self.operator);
         Ok(())
     }
 
-    /// Loads all `User`s by reading every JSON file in the `data/users/` directory.
-    /// It uses the internal deserialization logic for each file.
-    /// Files that cannot be deserialized are skipped with a warning.
-    /// If the directory does not exist, it returns an empty `HashMap<String, User>`.
+    /// Loads every `{uuid}.json` from the users directory. Malformed or
+    /// unreadable files are skipped with a `warn!` log that includes the path.
     pub fn load_all() -> io::Result<HashMap<String, Self>> {
         let dir_path = Path::new(Self::USERS_DIR);
         let mut users = HashMap::new();
 
         if !dir_path.exists() {
-            warn!(
-                "Users directory not found at {}. Returning an empty HashMap.",
-                dir_path.display()
-            );
+            info!("[User] users directory not found at {}, starting empty", dir_path.display());
             return Ok(HashMap::new());
         }
 
+        let mut skipped = 0usize;
         for entry in fs::read_dir(dir_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -201,16 +193,19 @@ impl User {
                             let uuid = user.uuid.clone();
                             users.insert(uuid, user);
                         }
-                        Err(e) => warn!(
-                            "Could not deserialize user from {}: {}",
-                            path.display(),
-                            e
-                        ),
+                        Err(e) => {
+                            skipped += 1;
+                            warn!("[User] skipping malformed {}: {e}", path.display());
+                        }
                     },
-                    Err(e) => warn!("Could not read file {}: {}", path.display(), e),
+                    Err(e) => {
+                        skipped += 1;
+                        warn!("[User] skipping unreadable {}: {e}", path.display());
+                    }
                 }
             }
         }
+        info!("[User] loaded {} users (skipped {})", users.len(), skipped);
         Ok(users)
     }
 
@@ -224,25 +219,22 @@ impl User {
     pub fn save_all(users: &HashMap<String, Self>) -> io::Result<()> {
         let dir_path = Path::new(Self::USERS_DIR);
 
-        // Ensure the directory exists
         if !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
         }
 
-        // Keep track of files that should exist after saving
+        // Filenames are keyed on `user.uuid` (not the HashMap key) so on-disk
+        // files always match the canonical identity inside the User struct,
+        // even if the two ever diverge.
         let mut expected_files = HashSet::new();
 
-        // Save each user individually using the individual user.save() method.
-        // Note: filenames are keyed on user.uuid (not the HashMap key) so that
-        // on-disk files always match the canonical identity stored inside the
-        // User struct, even if the two were ever to diverge.
         for user in users.values() {
             user.save()?;
             let filename = format!("{}.json", user.uuid);
             expected_files.insert(filename);
         }
 
-        // Remove any files that shouldn't exist anymore
+        let mut removed = 0usize;
         if dir_path.exists() {
             for entry in fs::read_dir(dir_path)? {
                 let entry = entry?;
@@ -251,10 +243,45 @@ impl User {
                     && let Some(filename) = path.file_name().and_then(|n| n.to_str())
                         && !expected_files.contains(filename) {
                             fs::remove_file(&path)?;
+                            removed += 1;
                         }
             }
         }
 
+        info!("[User] save_all: wrote {} users, cleaned {} orphan files", users.len(), removed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_file_path_uses_uuid_with_json_extension() {
+        let p = User::get_user_file_path("550e8400-e29b-41d4-a716-446655440000");
+        assert!(p.ends_with("550e8400-e29b-41d4-a716-446655440000.json"));
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_all_fields() {
+        let u = User {
+            uuid: "uuid-1".into(),
+            username: "alice".into(),
+            balance: 42.5,
+            operator: true,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        let back: User = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, u);
+    }
+
+    #[test]
+    fn operator_defaults_to_false_for_pre_flag_files() {
+        // Older saves predate the `operator` field. `#[serde(default)]` must
+        // keep them loading cleanly.
+        let json = r#"{"uuid":"u","username":"a","balance":1.0}"#;
+        let u: User = serde_json::from_str(json).unwrap();
+        assert!(!u.operator);
     }
 }

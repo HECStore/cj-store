@@ -1,4 +1,3 @@
 /target
 .cargo/config.toml
 /data
-.claude/

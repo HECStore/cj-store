@@ -103,10 +103,13 @@ EINTR on resize) is retried rather than killing the CLI.
 6. **Discover storage (scan)** — bot starts at the next unregistered id
    and walks the spiral, adding every valid node. Stops on the first
    missing/invalid position.
-7. **Remove node** — deletes `data/storage/{id}.json`. Destructive.
+7. **Remove node** — deletes `data/storage/{id}.json`. Destructive; a
+   `dialoguer::Confirm` prompt asks for confirmation before proceeding.
 8. **Add pair** — prompts for item + stack size {1, 16, 64}. Stocks start
    zero; seed via `additem` / `addcurrency`.
 9. **Remove pair** — warns if stock > 0. Cannot remove `diamond`.
+   Destructive; a `dialoguer::Confirm` prompt asks for confirmation
+   before proceeding.
 10. **View storage** — origin, node count, per-node chest summary.
 11. **View recent trades** — trade history, newest first (default last
     20; operator can type a custom count). Shows timestamp, type, amount,

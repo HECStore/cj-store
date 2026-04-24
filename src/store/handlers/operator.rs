@@ -255,6 +255,7 @@ pub async fn handle_additem_order(
         order_type: crate::types::order::OrderType::AddItem,
         item: ItemId::from_normalized(item.to_string()),
         amount: qty_i32,
+        currency_amount: 0.0,
         user_uuid: user_uuid.clone(),
     });
 
@@ -518,6 +519,7 @@ pub async fn handle_removeitem_order(
         order_type: crate::types::order::OrderType::RemoveItem,
         item: ItemId::from_normalized(item.to_string()),
         amount: qty_i32,
+        currency_amount: 0.0,
         user_uuid: user_uuid.clone(),
     });
 
@@ -593,6 +595,7 @@ pub async fn handle_add_currency(
         order_type: crate::types::order::OrderType::AddCurrency,
         item: ItemId::from_normalized(item.to_string()),
         amount: 0,
+        currency_amount: amount,
         user_uuid: user_uuid.clone(),
     });
 
@@ -681,6 +684,7 @@ pub async fn handle_remove_currency(
         order_type: crate::types::order::OrderType::RemoveCurrency,
         item: ItemId::from_normalized(item.to_string()),
         amount: 0,
+        currency_amount: amount,
         user_uuid: user_uuid.clone(),
     });
 

@@ -88,7 +88,11 @@ completion before any new inbound message is picked up. See
     │      continue                ── re-check queue before │
     │    }                            blocking on recv      │
     │                                                       │
-    │    msg = rx.recv().await    ── single blocking await  │
+    │    msg = select {                                     │
+    │      rx.recv() => m,    ── idle recv, cancel-safe     │
+    │      sleep(wake_after) => continue  ── wake for idle  │
+    │                                        cleanup/save   │
+    │    }                                                  │
     │    dispatch(msg)                                      │
     │                                                       │
     │    if dirty AND elapsed >= autosave_interval          │
@@ -99,11 +103,17 @@ completion before any new inbound message is picked up. See
 
 Cleanup is an elapsed-time check at the top of every iteration (not just
 post-message), so sustained order load cannot starve it via the PRIORITY 1
-`continue`. Autosave is an elapsed-time check on each post-message pass.
-Neither uses a separate tick channel. `tokio::select!` was deliberately
-avoided — cancelling an in-flight order's oneshot receivers mid-operation
-caused stuck trades; see the inline comment in
-[src/store/mod.rs](src/store/mod.rs) `Store::run`.
+`continue`. Autosave is an elapsed-time check at the top of every
+iteration *and* on each post-message pass, so a lingering `dirty = true`
+is still flushed during long idle periods. The idle-recv branch races
+`rx.recv()` against a `tokio::time::sleep(wake_after)` timer so the loop
+cannot park indefinitely while `dirty = true`; `wake_after` is the min
+of time-to-next-autosave and time-to-next-cleanup.
+
+Only the idle recv is raced against the timer — `process_next_order` is
+deliberately never cancellable, because cancelling an in-flight order's
+oneshot receivers mid-operation caused stuck trades. See the inline
+comment in [src/store/mod.rs](src/store/mod.rs) `Store::run`.
 
 Tick cadence:
 

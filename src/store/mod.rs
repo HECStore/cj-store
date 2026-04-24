@@ -19,7 +19,7 @@ pub mod state;
 pub mod trade_state;
 pub mod utils;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -50,6 +50,12 @@ pub struct Store {
     pub storage: Storage,
     /// Dirty flag: true if state changed since last save
     pub(crate) dirty: bool,
+    /// Per-user dirty set: UUIDs whose balance/operator changed since the
+    /// last successful save. `state::save` writes only these via
+    /// `User::save_dirty`, avoiding O(N) fsyncs per trade when one order
+    /// touches a single player. Mirrors the semantics of `self.dirty` but
+    /// at user granularity. Cleared on successful save.
+    pub(crate) dirty_users: HashSet<String>,
 
     /// Channel to send instructions to the bot
     pub(crate) bot_tx: mpsc::Sender<BotInstruction>,
@@ -154,11 +160,17 @@ impl Store {
             }
         }
 
-        // Load order queue from disk (persistent across restarts)
+        // Load order queue from disk (persistent across restarts).
+        // On corruption, `OrderQueue::load` renames the bad file to a
+        // `.corrupt-<stamp>` sidecar so the raw bytes survive for forensic
+        // recovery before the next `save()` overwrites it.
         let order_queue = match OrderQueue::load() {
             Ok(queue) => queue,
             Err(e) => {
-                warn!("Failed to load order queue, starting fresh: {}", e);
+                error!(
+                    "PENDING ORDERS LOST: failed to load order queue, starting fresh: {}",
+                    e
+                );
                 OrderQueue::new()
             }
         };
@@ -200,6 +212,7 @@ impl Store {
             trades,
             storage,
             dirty: needs_save, // Mark dirty if pairs were normalized (will save on first autosave)
+            dirty_users: HashSet::new(),
             bot_tx,
             order_queue,
             rate_limiter,
@@ -267,6 +280,21 @@ impl Store {
                 last_cleanup = tokio::time::Instant::now();
             }
 
+            // Idle autosave: if the loop has been sitting on `recv()` while a
+            // prior order left `dirty = true`, the message-branch debounced
+            // autosave never runs. The timer arm in PRIORITY 2 falls through
+            // to here so a lingering dirty flag is flushed on the configured
+            // cadence even with zero inbound traffic.
+            if self.dirty && last_save.elapsed() >= min_save_interval {
+                if let Err(e) = state::save(&self) {
+                    error!("[Store] Autosave failed: {}", e);
+                } else {
+                    last_save = tokio::time::Instant::now();
+                    self.dirty = false;
+                    self.dirty_users.clear();
+                }
+            }
+
             // PRIORITY 1: drain an order if one is waiting.
             if !self.processing_order && !self.order_queue.is_empty() {
                 debug!("[Store] Starting order processing (queue_len={})", self.order_queue.len());
@@ -307,6 +335,7 @@ impl Store {
                     } else {
                         last_save = tokio::time::Instant::now();
                         self.dirty = false;
+                        self.dirty_users.clear();
                     }
                 }
 
@@ -330,8 +359,28 @@ impl Store {
                 continue;
             }
 
-            // PRIORITY 2: block on the next incoming message.
-            let msg = store_rx.recv().await;
+            // PRIORITY 2: block on the next incoming message, but also wake
+            // on a timer so idle periods still get periodic cleanup and
+            // autosave flushes a lingering `dirty = true`. Without the timer
+            // arm, the loop parks indefinitely on `recv()` and "autosave every
+            // Ns" degrades to "autosave at most every Ns, and only if a message
+            // wakes us".
+            //
+            // Only the idle recv is raced against the timer — `process_next_order`
+            // is deliberately never cancellable (see the comment near the top
+            // of the loop about dropped oneshot receivers).
+            let time_to_autosave = min_save_interval.saturating_sub(last_save.elapsed());
+            let time_to_cleanup = cleanup_interval.saturating_sub(last_cleanup.elapsed());
+            let wake_after = std::cmp::min(time_to_autosave, time_to_cleanup);
+
+            let msg = tokio::select! {
+                m = store_rx.recv() => m,
+                _ = tokio::time::sleep(wake_after) => {
+                    // Fall through to the top of the loop so the cleanup and
+                    // autosave checks below get a chance to run.
+                    continue;
+                }
+            };
             match msg {
                 Some(message) => {
                     if self.dispatch_message(message, &mut min_save_interval).await {
@@ -346,6 +395,7 @@ impl Store {
                         } else {
                             last_save = tokio::time::Instant::now();
                             self.dirty = false;
+                            self.dirty_users.clear();
                         }
                     }
                 }
@@ -356,6 +406,10 @@ impl Store {
             }
         }
 
+        // Shutdown path: force a full user flush (not just `dirty_users`) so
+        // the on-disk snapshot is guaranteed to mirror the full in-memory map
+        // regardless of what the tracked dirty set happens to contain.
+        self.dirty_users.extend(self.users.keys().cloned());
         if let Err(e) = state::save(&self) {
             error!("[Store] Final save failed: {}", e);
         }
@@ -638,6 +692,7 @@ impl Store {
             trades: Vec::new(),
             storage,
             dirty: false,
+            dirty_users: HashSet::new(),
             bot_tx,
             order_queue: queue::OrderQueue::new(),
             rate_limiter: RateLimiter::new(),

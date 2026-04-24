@@ -50,6 +50,8 @@ pub struct Order {
     pub order_type: OrderType,
     pub item: crate::types::ItemId,
     pub amount: i32,
+    #[serde(default)]
+    pub currency_amount: f64,
     pub user_uuid: String,
 }
 
@@ -99,6 +101,7 @@ mod tests {
             order_type: OrderType::Buy,
             item: crate::types::ItemId::new("diamond").unwrap(),
             amount: i as i32,
+            currency_amount: 0.0,
             user_uuid: format!("u-{i}"),
         }
     }
@@ -144,5 +147,42 @@ mod tests {
         for i in 0..3u32 { q.push_back(make(i)); }
         assert!(q.len() <= 10);
         assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn currency_order_round_trip_preserves_currency_amount() {
+        // AddCurrency / RemoveCurrency carry the real magnitude in `currency_amount`
+        // while `amount` stays 0. Round-tripping through JSON must preserve both.
+        for (ot, mag) in [
+            (OrderType::AddCurrency, 1.0),
+            (OrderType::RemoveCurrency, 10_000.5),
+        ] {
+            let o = Order {
+                order_type: ot.clone(),
+                item: crate::types::ItemId::new("diamond").unwrap(),
+                amount: 0,
+                currency_amount: mag,
+                user_uuid: "op-1".to_string(),
+            };
+            let j = serde_json::to_string(&o).unwrap();
+            let back: Order = serde_json::from_str(&j).unwrap();
+            assert_eq!(back, o);
+            assert_eq!(back.currency_amount, mag);
+        }
+    }
+
+    #[test]
+    fn legacy_order_without_currency_amount_deserializes_to_zero() {
+        // Existing data/orders.json files predate the field; serde(default) must
+        // let them load with currency_amount = 0.0 rather than failing.
+        let legacy = r#"{
+            "order_type": "Buy",
+            "item": "diamond",
+            "amount": 5,
+            "user_uuid": "u-1"
+        }"#;
+        let o: Order = serde_json::from_str(legacy).unwrap();
+        assert_eq!(o.currency_amount, 0.0);
+        assert_eq!(o.amount, 5);
     }
 }

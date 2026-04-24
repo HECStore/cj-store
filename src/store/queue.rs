@@ -116,8 +116,32 @@ impl OrderQueue {
         }
 
         let contents = fs::read_to_string(path)?;
-        let queue_data: QueuePersist = serde_json::from_str(&contents)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let queue_data: QueuePersist = match serde_json::from_str(&contents) {
+            Ok(q) => q,
+            Err(e) => {
+                // Preserve the raw bytes on a timestamped sidecar before the
+                // caller falls back to an empty queue. Colons are stripped
+                // from the RFC3339 stamp because Windows (and some other
+                // filesystems) reject them in filenames.
+                let stamp = Utc::now().to_rfc3339().replace(':', "-");
+                let sidecar = {
+                    let mut os = path.as_os_str().to_os_string();
+                    os.push(format!(".corrupt-{}", stamp));
+                    std::path::PathBuf::from(os)
+                };
+                match fs::rename(path, &sidecar) {
+                    Ok(()) => error!(
+                        "[Queue] PENDING ORDERS LOST: corrupt queue file {:?} moved to {:?}; parse error: {}",
+                        path, sidecar, e
+                    ),
+                    Err(rename_err) => error!(
+                        "[Queue] PENDING ORDERS LOST: corrupt queue file {:?}; parse error: {}; failed to move to {:?}: {}",
+                        path, e, sidecar, rename_err
+                    ),
+                }
+                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        };
 
         info!(
             "[Queue] Loaded {} orders from {:?} (next_id={})",
@@ -641,5 +665,43 @@ mod tests {
         fs::write(&path, "{ this is not json").unwrap();
         let err = OrderQueue::load_from(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_from_moves_corrupt_file_to_timestamped_sidecar() {
+        let dir = TmpDir::new("bad-json-sidecar");
+        let path = dir.path("queue.json");
+        let bad_bytes = "{ this is not json";
+        fs::write(&path, bad_bytes).unwrap();
+
+        let err = OrderQueue::load_from(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // (a) A `.corrupt-*` sibling exists next to the original path.
+        let parent = path.parent().expect("path has parent");
+        let prefix = format!(
+            "{}.corrupt-",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        let mut sidecar_found: Option<std::path::PathBuf> = None;
+        for entry in fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                sidecar_found = Some(entry.path());
+                break;
+            }
+        }
+        let sidecar = sidecar_found.expect("expected a .corrupt-* sidecar next to queue.json");
+
+        // (b) The original path no longer contains the bad bytes (moved, not copied).
+        assert!(
+            !path.exists(),
+            "original queue.json should have been renamed away, not left in place"
+        );
+
+        // Sanity: the sidecar holds the exact bytes we wrote.
+        let preserved = fs::read_to_string(&sidecar).unwrap();
+        assert_eq!(preserved, bad_bytes);
     }
 }

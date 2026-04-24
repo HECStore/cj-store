@@ -8,7 +8,7 @@ use crate::types::ItemId;
 
 /// Validate that `item` is a syntactically valid Minecraft item name.
 ///
-/// Accepts alphanumerics plus `_` and `:` (the `:` allows the optional
+/// Accepts ASCII alphanumerics plus `_` and `:` (the `:` allows the optional
 /// `minecraft:` namespace prefix that `ItemId::new` strips). On error,
 /// returns a user-facing message suitable for direct chat reply.
 pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
@@ -21,9 +21,9 @@ pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
     }
 
     for c in item.chars() {
-        if !c.is_alphanumeric() && c != '_' && c != ':' {
+        if !c.is_ascii_alphanumeric() && c != '_' && c != ':' {
             return Err(format!(
-                "Item name contains invalid character '{}'. Use only letters, numbers, and underscores.",
+                "Item name contains invalid character '{}'. Use only ASCII letters, numbers, and underscores.",
                 c
             ));
         }
@@ -61,8 +61,8 @@ pub(crate) fn validate_quantity(quantity_str: &str, operation: &str) -> Result<u
     Ok(quantity)
 }
 
-/// Validate that `username` matches Minecraft's 3-16 character alphanumeric
-/// (plus underscore) convention.
+/// Validate that `username` matches Minecraft's 3-16 character ASCII
+/// alphanumeric (plus underscore) convention.
 pub(crate) fn validate_username(username: &str) -> Result<(), String> {
     if username.len() < 3 || username.len() > 16 {
         return Err(format!(
@@ -72,9 +72,9 @@ pub(crate) fn validate_username(username: &str) -> Result<(), String> {
     }
 
     for c in username.chars() {
-        if !c.is_alphanumeric() && c != '_' {
+        if !c.is_ascii_alphanumeric() && c != '_' {
             return Err(format!(
-                "Invalid username '{}'. Usernames contain only letters, numbers, and underscores.",
+                "Invalid username '{}'. Usernames contain only ASCII letters, numbers, and underscores.",
                 username
             ));
         }
@@ -148,6 +148,13 @@ mod tests {
     #[test]
     fn item_name_rejects_leading_whitespace() {
         assert!(validate_item_name(" cobblestone").is_err());
+    }
+
+    #[test]
+    fn item_name_rejects_cyrillic_lookalike() {
+        // Second 'o' is Cyrillic U+043E, which `is_alphanumeric` would accept
+        // but `is_ascii_alphanumeric` correctly rejects.
+        assert!(validate_item_name("diamоnd").is_err());
     }
 
     // ---- validate_quantity ------------------------------------------------
@@ -289,5 +296,12 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn username_rejects_cyrillic_lookalike() {
+        // The 's' is Cyrillic U+0441, which `is_alphanumeric` would accept
+        // but `is_ascii_alphanumeric` correctly rejects.
+        assert!(validate_username("Notсh_99").is_err());
     }
 }

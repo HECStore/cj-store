@@ -412,6 +412,7 @@ pub async fn handle_withdraw_balance_queued(
         user.username = player_name.to_owned();
     }
     store.dirty = true;
+    store.dirty_users.insert(user_uuid.clone());
     info!(
         uuid = %user_uuid,
         player = player_name,
@@ -424,6 +425,7 @@ pub async fn handle_withdraw_balance_queued(
         order_type: crate::types::order::OrderType::WithdrawBalance,
         item: ItemId::from_normalized("diamond".to_string()),
         amount: whole_diamonds,
+        currency_amount: 0.0,
         user_uuid: user_uuid.clone(),
     });
 

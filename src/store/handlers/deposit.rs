@@ -265,6 +265,7 @@ pub async fn handle_deposit_balance_queued(
         user.balance
     };
     store.dirty = true;
+    store.dirty_users.insert(user_uuid.clone());
 
     info!(
         uuid = %user_uuid,
@@ -278,6 +279,7 @@ pub async fn handle_deposit_balance_queued(
         order_type: crate::types::order::OrderType::DepositBalance,
         item: ItemId::from_normalized("diamond".to_string()),
         amount: diamonds_actually_received,
+        currency_amount: 0.0,
         user_uuid: user_uuid.clone(),
     });
 

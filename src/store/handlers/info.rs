@@ -585,6 +585,8 @@ pub async fn pay_async(
         payee.username = payee_username.to_owned();
     }
     store.dirty = true;
+    store.dirty_users.insert(payer_uuid.clone());
+    store.dirty_users.insert(payee_uuid.clone());
 
     state::assert_invariants(store, "post-pay", true)?;
     Ok(())

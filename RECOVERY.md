@@ -351,6 +351,38 @@ Don't just delete the file blindly, though:
 
 ---
 
+## 4a. Corrupted `data/queue.json`
+
+**Symptoms**
+
+- On startup the Store logs `PENDING ORDERS LOST: failed to load order
+  queue, starting fresh: …` at `error` level.
+- A file named `data/queue.json.corrupt-<RFC3339>` appears next to the
+  now-empty `data/queue.json`.
+- Players whose orders were queued before the restart see no evidence of
+  them; their queue positions are gone.
+
+**Fix**
+
+1. `OrderQueue::load_from` already moved the bad bytes out of the way
+   into `data/queue.json.corrupt-<stamp>` so they are not overwritten by
+   the next save. Open that sidecar to see what was queued.
+2. If the JSON is recoverable by eye (e.g. a trailing comma, a truncated
+   last entry), repair it and rename it back to `data/queue.json` **while
+   the bot is stopped**. On restart the queue is loaded as normal.
+3. If it is not recoverable, leave the sidecar in place as evidence and
+   whisper the affected players asking them to re-submit. Keep the
+   sidecar at least until every caller has re-queued; it is the only
+   surviving record of the lost IDs.
+4. Do not edit `data/queue.json` while the bot is running — writes are
+   atomic but a concurrent hand-edit will race the next autosave.
+
+**Why this can happen**: hand-edit typo, disk full during an atomic
+write (rare), or a half-synced backup restore that left the queue file
+mismatched with `data/trades/` and `data/users/`.
+
+---
+
 ## 5. Bot connection problems (operator action required)
 
 **"Failed to connect"**. Check `account_email` and `server_address` in

@@ -19,6 +19,7 @@ use tracing::{debug, warn};
 
 use super::super::command::{parse_command, Command};
 use super::super::{Store, utils};
+use super::validation::validate_username;
 use super::{buy, deposit, info, operator, sell, withdraw};
 use crate::error::StoreError;
 
@@ -34,6 +35,44 @@ pub async fn handle_player_command(
     player_name: &str,
     command: &str,
 ) -> Result<(), StoreError> {
+    // Validate the username shape BEFORE any Mojang I/O: an attacker who
+    // can make the bot see "X whispers: ..." chat lines would otherwise
+    // trigger an uncached HTTPS request to api.mojang.com for every garbage
+    // name they invent, and the URL interpolation is not percent-encoded.
+    if let Err(reason) = validate_username(player_name) {
+        debug!(
+            player = player_name,
+            command = command,
+            reason = %reason,
+            "Dropped whispered command from player with invalid username shape"
+        );
+        return Ok(());
+    }
+
+    // Cheap per-name rate-limit gate BEFORE the Mojang lookup. The real
+    // per-user limiter below is keyed by the resolved UUID, so without this
+    // gate a spammer could bypass the cooldown by whispering with many
+    // distinct fake-but-valid usernames — each one forces an uncached
+    // Mojang round-trip. Keyed by the lowercased raw name; since UUIDs are
+    // 36-char dashed strings, they cannot collide with the 3-16 char
+    // alphanumeric+underscore usernames that reach this point.
+    let name_key = player_name.to_lowercase();
+    if let Err(wait_duration) = store.rate_limiter.check(&name_key) {
+        let wait_secs = wait_duration.as_secs_f64();
+        let msg = if wait_secs < 1.0 {
+            format!("Please wait {:.1}s before sending another message.", wait_secs)
+        } else {
+            format!("Please wait {:.0}s before sending another message.", wait_secs.ceil())
+        };
+        debug!(
+            player = player_name,
+            command = command,
+            wait_ms = wait_duration.as_millis() as u64,
+            "Pre-resolve rate-limited whispered command; whispering cooldown notice without Mojang lookup"
+        );
+        return utils::send_message_to_player(store, player_name, &msg).await;
+    }
+
     let user_uuid = utils::resolve_user_uuid(player_name).await?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 

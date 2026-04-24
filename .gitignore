@@ -1,3 +1,25 @@
 /target
 .cargo/config.toml
 /data
+
+# Claude Code
+.claude/settings.local.json
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor backup/swap
+*.swp
+*~
+*.bak
+
+# Profiling artifacts
+flamegraph.svg
+perf.data*

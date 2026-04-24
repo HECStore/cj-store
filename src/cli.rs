@@ -8,7 +8,7 @@
 
 use crate::messages::{CliMessage, StoreMessage};
 use crate::types::TradeType;
-use dialoguer::{Input, Select};
+use dialoguer::{Confirm, Input, Select};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -353,6 +353,17 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
             .interact_text()
     });
 
+    let confirmed = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt(format!("Really remove node {}? This deletes data/storage/{}.json from disk.", node_id, node_id))
+            .default(false)
+            .interact()
+    });
+    if !confirmed {
+        println!("Cancelled.");
+        return;
+    }
+
     info!("[CLI] Requesting to remove node {}", node_id);
 
     let (response_tx, response_rx) = oneshot::channel();
@@ -434,6 +445,17 @@ fn remove_pair(store_tx: &mpsc::Sender<StoreMessage>) {
             .with_prompt("Enter item name to remove")
             .interact_text()
     });
+
+    let confirmed = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt(format!("Really remove pair '{}'?", item_name))
+            .default(false)
+            .interact()
+    });
+    if !confirmed {
+        println!("Cancelled.");
+        return;
+    }
 
     info!("[CLI] Requesting to remove pair for {}", item_name);
 

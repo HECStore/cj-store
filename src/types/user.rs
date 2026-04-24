@@ -216,7 +216,25 @@ impl User {
     /// The orphan cleanup pass makes the on-disk directory a faithful mirror
     /// of the in-memory map: users removed from the map are also deleted from
     /// disk, preventing stale state from being resurrected by `load_all`.
+    ///
+    /// Thin wrapper around `save_dirty` that treats every user as dirty;
+    /// used at shutdown and for the audit-repair path where the full state
+    /// must be flushed. Hot paths (per-order autosave) should use
+    /// `save_dirty` with a tracked dirty-set instead, to avoid O(N) fsyncs
+    /// per trade.
+    #[allow(dead_code)]
     pub fn save_all(users: &HashMap<String, Self>) -> io::Result<()> {
+        let all_keys: HashSet<String> = users.keys().cloned().collect();
+        Self::save_dirty(users, &all_keys)
+    }
+
+    /// Saves only the `User`s whose UUIDs appear in `dirty`, then runs the
+    /// orphan-cleanup pass against `users`' current keys so the on-disk
+    /// directory still mirrors the in-memory map.
+    ///
+    /// Skips persisting users that are in `dirty` but no longer present in
+    /// `users` — they'll be removed by the orphan sweep below.
+    pub fn save_dirty(users: &HashMap<String, Self>, dirty: &HashSet<String>) -> io::Result<()> {
         let dir_path = Path::new(Self::USERS_DIR);
 
         if !dir_path.exists() {
@@ -226,12 +244,16 @@ impl User {
         // Filenames are keyed on `user.uuid` (not the HashMap key) so on-disk
         // files always match the canonical identity inside the User struct,
         // even if the two ever diverge.
-        let mut expected_files = HashSet::new();
+        let mut expected_files = HashSet::with_capacity(users.len());
+        let mut written = 0usize;
 
-        for user in users.values() {
-            user.save()?;
+        for (key, user) in users.iter() {
             let filename = format!("{}.json", user.uuid);
             expected_files.insert(filename);
+            if dirty.contains(key) {
+                user.save()?;
+                written += 1;
+            }
         }
 
         let mut removed = 0usize;
@@ -248,7 +270,10 @@ impl User {
             }
         }
 
-        info!("[User] save_all: wrote {} users, cleaned {} orphan files", users.len(), removed);
+        info!(
+            "[User] save_dirty: wrote {} of {} users, cleaned {} orphan files",
+            written, users.len(), removed
+        );
         Ok(())
     }
 }

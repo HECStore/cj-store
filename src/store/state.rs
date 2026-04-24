@@ -69,13 +69,18 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
 /// Orders are truncated to `config.max_orders` during save; the rest are
 /// written in full. Returns the first I/O error encountered; partial progress
 /// may have been committed to disk (each type writes independently).
+///
+/// Users are written via `User::save_dirty` using the store's `dirty_users`
+/// set so only users whose balance/operator changed since the last save get
+/// rewritten + fsynced. The caller is responsible for clearing
+/// `store.dirty_users` after this returns `Ok(())`.
 pub fn save(store: &Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    debug!("saving pairs={} users={} orders={} trades={} nodes={}",
-        store.pairs.len(), store.users.len(), store.orders.len(),
-        store.trades.len(), store.storage.nodes.len());
+    debug!("saving pairs={} users={} (dirty={}) orders={} trades={} nodes={}",
+        store.pairs.len(), store.users.len(), store.dirty_users.len(),
+        store.orders.len(), store.trades.len(), store.storage.nodes.len());
 
     Pair::save_all(&store.pairs)?;
-    User::save_all(&store.users)?;
+    User::save_dirty(&store.users, &store.dirty_users)?;
     Order::save_all_with_limit(&store.orders, store.config.max_orders)?;
     Trade::save_all(&store.trades)?;
     store.storage.save().map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;

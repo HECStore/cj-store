@@ -16,6 +16,7 @@
 
 use std::fmt;
 use std::io;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -272,9 +273,7 @@ pub const TRADE_STATE_FILE: &str = "data/current_trade.json";
 
 /// Atomically write the current trade state to `TRADE_STATE_FILE`.
 pub fn persist(state: &TradeState) -> io::Result<()> {
-    let json = serde_json::to_string_pretty(state)
-        .map_err(io::Error::other)?;
-    crate::fsutil::write_atomic(TRADE_STATE_FILE, &json)
+    persist_to(Path::new(TRADE_STATE_FILE), state)
 }
 
 /// Load a persisted trade state if present.
@@ -283,7 +282,26 @@ pub fn persist(state: &TradeState) -> io::Result<()> {
 /// - `Ok(Some)` when an interrupted trade is found (crash-resume path).
 /// - `Err` on IO or deserialization failure.
 pub fn load_persisted() -> io::Result<Option<TradeState>> {
-    match std::fs::read_to_string(TRADE_STATE_FILE) {
+    load_persisted_from(Path::new(TRADE_STATE_FILE))
+}
+
+/// Remove the persisted trade state file. No-op if it doesn't exist.
+pub fn clear_persisted() -> io::Result<()> {
+    clear_persisted_from(Path::new(TRADE_STATE_FILE))
+}
+
+/// Path-parameterized persist, separated so tests can round-trip without
+/// touching the production `TRADE_STATE_FILE`.
+fn persist_to(path: &Path, state: &TradeState) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(state)
+        .map_err(io::Error::other)?;
+    crate::fsutil::write_atomic(path, &json)
+}
+
+/// Path-parameterized load, separated so tests can round-trip without
+/// touching the production `TRADE_STATE_FILE`.
+fn load_persisted_from(path: &Path) -> io::Result<Option<TradeState>> {
+    match std::fs::read_to_string(path) {
         Ok(content) => {
             let state: TradeState = serde_json::from_str(&content)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -294,9 +312,10 @@ pub fn load_persisted() -> io::Result<Option<TradeState>> {
     }
 }
 
-/// Remove the persisted trade state file. No-op if it doesn't exist.
-pub fn clear_persisted() -> io::Result<()> {
-    match std::fs::remove_file(TRADE_STATE_FILE) {
+/// Path-parameterized clear, separated so tests can round-trip without
+/// touching the production `TRADE_STATE_FILE`.
+fn clear_persisted_from(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -647,49 +666,78 @@ mod tests {
         }
     }
 
-    /// End-to-end crash-resume: persist mid-trade, load it back, confirm the
-    /// resumed state is equivalent to what was written, then clear.
-    /// Isolated from the shared data/ directory by redirecting through a
-    /// temp cwd so concurrent tests don't race on `TRADE_STATE_FILE`.
+    /// Scratch directory under the system temp dir, mirroring the pattern in
+    /// `queue::tests` so trade-state round-trip tests don't collide with each
+    /// other or the real `TRADE_STATE_FILE`.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "cj-store-trade-state-{}-{}",
+                name,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            Self(base)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// End-to-end crash-resume: persist mid-trade via `persist_to`, load back
+    /// via `load_persisted_from`, verify equivalence, then clear via
+    /// `clear_persisted_from` and confirm a second load returns `Ok(None)`.
+    /// Exercises the real `write_atomic`, `NotFound`-swallowing and file-IO
+    /// paths that the public wrappers delegate to.
     #[test]
-    fn persist_load_clear_roundtrip_survives_a_crash() {
-        // Serialize directly rather than touching the shared file so this
-        // test never trips over a real mid-flight trade state on disk.
+    fn persist_load_clear_roundtrip() {
+        let dir = TmpDir::new("roundtrip");
+        let path = dir.path("current_trade.json");
+
         let state = TradeState::new(sample_order())
             .begin_withdrawal(sample_transfers())
             .begin_trading();
 
-        let json = serde_json::to_string_pretty(&state).expect("serialize");
-        let decoded: TradeState = serde_json::from_str(&json).expect("deserialize");
+        persist_to(&path, &state).expect("persist must succeed");
 
-        assert_eq!(decoded.phase(), "trading");
-        assert_eq!(decoded.order().id, 1);
-        if let TradeState::Trading { withdrawn, .. } = &decoded {
-            assert_eq!(withdrawn.len(), 1, "rollback context must survive persist/load");
-        } else {
-            panic!("Expected Trading after roundtrip");
-        }
+        let loaded = load_persisted_from(&path)
+            .expect("load must succeed")
+            .expect("persisted state should be present");
+
+        assert_eq!(loaded.phase(), state.phase());
+        assert_eq!(loaded.order().id, state.order().id);
+        assert_eq!(loaded.order().username, state.order().username);
+
+        clear_persisted_from(&path).expect("clear must succeed");
+        assert!(
+            load_persisted_from(&path).expect("load after clear").is_none(),
+            "second load after clear must return Ok(None)"
+        );
     }
 
     #[test]
-    fn clear_persisted_is_idempotent_when_file_is_missing() {
-        // Point at a temp path that is guaranteed not to exist.
-        let tmp = std::env::temp_dir().join("cj_store_trade_state_missing_test.json");
-        let _ = std::fs::remove_file(&tmp);
-        // `clear_persisted` always operates on TRADE_STATE_FILE so we can't
-        // redirect it; instead verify the same NotFound-swallowing logic
-        // through the underlying fs call.
-        let result = std::fs::remove_file(&tmp);
-        assert!(matches!(result, Err(ref e) if e.kind() == io::ErrorKind::NotFound));
+    fn load_from_missing_file_returns_none() {
+        let dir = TmpDir::new("missing");
+        let path = dir.path("absent.json");
+        assert!(load_persisted_from(&path).expect("missing file is not an error").is_none());
     }
 
     #[test]
-    fn load_persisted_rejects_malformed_json_with_invalid_data() {
-        // Simulate the parse-failure branch without touching TRADE_STATE_FILE.
-        let malformed = "not valid json";
-        let err = serde_json::from_str::<TradeState>(malformed)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            .unwrap_err();
+    fn load_from_malformed_json_returns_err() {
+        let dir = TmpDir::new("malformed");
+        let path = dir.path("current_trade.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let err = load_persisted_from(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

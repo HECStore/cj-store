@@ -54,6 +54,7 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             if let Some(user) = store.users.get_mut(&uuid) {
                 user.operator = is_operator;
                 store.dirty = true;
+                store.dirty_users.insert(uuid.clone());
                 info!("[CLI-Store] Set operator={} for user {} ({})", is_operator, username_or_uuid, uuid);
                 let _ = respond_to.send(Ok(()));
             } else {

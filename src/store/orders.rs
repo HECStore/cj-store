@@ -499,15 +499,41 @@ pub async fn handle_buy_order(
             "[Buy] insufficient-payment",
         )
         .await;
-        if diamonds_received > 0 {
-            warn!(phase = "buy.payment_check", player = %player_name, diamonds_received, "Attempting to return diamonds after failed payment validation");
-        }
+        // The player effectively prepaid an under-quota deposit. Move the
+        // diamonds they did hand over into storage and credit their balance
+        // with the same amount so the partial payment is not silently lost.
+        let credited_suffix = if diamonds_received > 0 {
+            let rb = rollback::rollback_amount_to_storage(
+                store,
+                "diamond",
+                diamonds_received,
+                64,
+                "[Buy] insufficient-payment",
+            )
+            .await;
+            if rb.has_failures() {
+                warn!(
+                    phase = "buy.payment_check",
+                    player = %player_name,
+                    diamonds_received,
+                    operations_failed = rb.operations_failed,
+                    "Failed to deposit some received diamonds into storage after insufficient payment"
+                );
+            }
+            if let Some(u) = store.users.get_mut(&plan.user_uuid) {
+                u.balance += diamonds_received as f64;
+            }
+            store.dirty_users.insert(plan.user_uuid.clone());
+            format!(" Your {} diamonds have been credited to your balance.", diamonds_received)
+        } else {
+            String::new()
+        };
         return utils::send_message_to_player(
             store,
             player_name,
             &format!(
-                "Buy aborted: insufficient payment. You paid {} diamonds but need {:.2} total (your balance: {:.2}). Items rolled back.",
-                diamonds_received, plan.total_cost, current_balance
+                "Buy aborted: insufficient payment. You paid {} diamonds but need {:.2} total (your balance: {:.2}). Items rolled back.{}",
+                diamonds_received, plan.total_cost, current_balance, credited_suffix
             ),
         )
         .await;
@@ -556,6 +582,7 @@ pub async fn handle_buy_order(
     };
     store.expect_user_mut(&plan.user_uuid, "buy/commit-username")?.username = player_name.to_owned();
     store.dirty = true;
+    store.dirty_users.insert(plan.user_uuid.clone());
 
     let new_item_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "buy/commit-pair")?;
@@ -577,6 +604,7 @@ pub async fn handle_buy_order(
         order_type: crate::types::order::OrderType::Buy,
         item: ItemId::from_normalized(item.to_string()),
         amount: plan.qty_i32,
+        currency_amount: 0.0,
         user_uuid: plan.user_uuid.clone(),
     });
 
@@ -968,6 +996,7 @@ pub async fn handle_sell_order(
         user.username = player_name.to_owned();
     }
     store.dirty = true;
+    store.dirty_users.insert(plan.user_uuid.clone());
     let new_item_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "sell/commit-pair")?;
     pair.item_stock = new_item_stock;
@@ -988,6 +1017,7 @@ pub async fn handle_sell_order(
         order_type: crate::types::order::OrderType::Sell,
         item: ItemId::from_normalized(item.to_string()),
         amount: plan.qty_i32,
+        currency_amount: 0.0,
         user_uuid: plan.user_uuid.clone(),
     });
 
@@ -1578,6 +1608,109 @@ mod tests {
         // Reserve currency_stock went up by the paid cost.
         let pair_after = store.pairs.get("cobblestone").unwrap();
         assert!(pair_after.currency_stock > pair_currency_before);
+    }
+
+    /// Mock bot variant that returns fewer diamonds than the player was asked
+    /// to offer, simulating a partial-payment buy (`require_exact_amount=false`
+    /// allows the trade to go through even short).
+    fn spawn_mock_bot_underpay(mut rx: mpsc::Receiver<BotInstruction>, diamonds_returned: i32) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BotInstruction::Whisper { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    BotInstruction::InteractWithChestAndSync {
+                        target_chest,
+                        action,
+                        respond_to,
+                        ..
+                    } => {
+                        let (item, delta) = match action {
+                            crate::messages::ChestAction::Withdraw {
+                                item, amount, ..
+                            } => (item, -amount),
+                            crate::messages::ChestAction::Deposit {
+                                item, amount, ..
+                            } => (item, amount),
+                        };
+                        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                        let prior = target_chest.amounts.first().copied().unwrap_or(0);
+                        amounts[0] = (prior + delta).max(0);
+                        let _ = respond_to.send(Ok(ChestSyncReport {
+                            chest_id: target_chest.id,
+                            item,
+                            amounts,
+                        }));
+                    }
+                    BotInstruction::TradeWithPlayer {
+                        player_offers: items_player_must_give,
+                        respond_to,
+                        ..
+                    } => {
+                        // Player delivers `diamonds_returned` diamonds
+                        // regardless of what the bot requested, preserving
+                        // any non-diamond items the bot expected.
+                        let mut actual: Vec<TradeItem> = items_player_must_give
+                            .into_iter()
+                            .filter(|t| t.item != "diamond")
+                            .collect();
+                        if diamonds_returned > 0 {
+                            actual.push(TradeItem {
+                                item: "diamond".to_string(),
+                                amount: diamonds_returned,
+                            });
+                        }
+                        let _ = respond_to.send(Ok(actual));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn test_buy_insufficient_payment_credits_balance_and_stores_diamonds() {
+        // Buyer has zero balance and is asked to pay full cost in diamonds,
+        // but the mock bot simulates an under-quota payment. Verify the
+        // partial payment is NOT lost: diamonds land in storage AND are
+        // credited to the buyer's balance.
+        let diamonds_received = 3;
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot_underpay(rx, diamonds_received);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("ShortPayer", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        // Small reserves so buying even 1 unit costs several diamonds, well
+        // above `diamonds_received`.
+        let (k, p) = make_pair("cobblestone", 10, 200.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage("cobblestone", 10);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let diamond_stock_before = store.storage.total_item_amount("diamond");
+        assert_eq!(diamond_stock_before, 0);
+
+        let result = handle_buy_order(&mut store, "ShortPayer", "cobblestone", 1).await;
+        assert!(result.is_ok(), "handler should recover gracefully: {:?}", result);
+
+        // Diamond chest should now contain the partial payment.
+        let diamond_stock_after = store.storage.total_item_amount("diamond");
+        assert_eq!(
+            diamond_stock_after,
+            diamond_stock_before + diamonds_received,
+            "partial diamond payment must be deposited to storage"
+        );
+        // And the user's balance should have grown by the same amount.
+        assert_eq!(
+            store.users.get(&uuid).unwrap().balance,
+            diamonds_received as f64,
+            "partial diamond payment must be credited to the buyer's balance"
+        );
     }
 
     #[tokio::test]

@@ -209,6 +209,7 @@ option 11 ("View recent trades") without forcing a full rescan of
     "order_type": "Buy",
     "item": "cobblestone",
     "amount": 500,
+    "currency_amount": 0.0,
     "user_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
   }
 ]
@@ -218,6 +219,11 @@ option 11 ("View recent trades") without forcing a full rescan of
 "DepositBalance" | "WithdrawBalance" | "AddCurrency" | "RemoveCurrency"` —
 see [src/types/order.rs](src/types/order.rs). Only runtime tracking for
 the current session; historical records live in `data/trades/*.json`.
+
+`currency_amount` is the diamond-denominated value associated with the
+order; for `AddCurrency` / `RemoveCurrency` this is the real amount moved,
+and for all other variants it is `0.0`. The field has `#[serde(default)]`
+so older snapshots without it still load.
 
 ## `data/queue.json`
 
@@ -249,6 +255,11 @@ Pending orders waiting to be processed. Survives restarts. See
   variants on top of plain `"Buy"` / `"Sell"`.
 - `queued_at` is RFC 3339 UTC.
 - Length capped by `MAX_QUEUE_SIZE = 128` globally; 8 per user.
+- On corrupt-JSON load (`InvalidData`), `OrderQueue::load_from` renames the
+  bad file to `data/queue.json.corrupt-<RFC3339>` before starting with an
+  empty queue, so the raw bytes survive for forensic recovery instead of
+  being overwritten by the next `save()`. The Store logs this as an
+  `error!` with a `PENDING ORDERS LOST` marker.
 
 ## `data/journal.json`
 

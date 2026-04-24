@@ -258,25 +258,28 @@ mod tests {
     }
 
     #[test]
-    fn buy_and_sell_symmetric_around_mid_at_zero_fee() {
-        // At fee == 0 and equal reserves, the base-AMM cost to buy dx equals
-        // the payout for selling dx into the pool with reserves swapped —
-        // i.e. buy(x, y, dx) == sell(x', y, dx) where x' = x + 2*dx
-        // is the reflection that lines up denominators.
-        //
-        // Simpler symmetric identity we can check: for a tiny dx, buy and
-        // sell prices converge to the spot ratio y/x.
+    fn buy_and_sell_converge_to_spot_ratio_for_small_dx() {
+        // For dx << x and equal reserves, both buy cost and sell payout
+        // approach the spot ratio y/x = 1.0. This pins down the
+        // zero-fee small-trade limit of the AMM.
         let dx = 1;
         let buy = buy_cost_pure(10_000, 10_000.0, dx, 0.0).expect("buy");
         let sell = sell_payout_pure(10_000, 10_000.0, dx, 0.0).expect("sell");
-        // With dx << x, both approach y/x = 1.0 and differ by at most a few
-        // parts in 10_000.
         assert!((buy - 1.0).abs() < 1e-3, "buy {} not near 1.0", buy);
         assert!((sell - 1.0).abs() < 1e-3, "sell {} not near 1.0", sell);
-        // At fee == 0 the buy is marginally more expensive than the sell
-        // due to the AMM curve, not due to fees: buy denominator (x - dx)
-        // < sell denominator (x + dx).
-        assert!(buy > sell);
+    }
+
+    #[test]
+    fn buy_exceeds_sell_at_zero_fee_due_to_curve() {
+        // Even at fee == 0 the AMM curve produces a spread: the buy
+        // denominator (x - dx) is smaller than the sell denominator (x + dx),
+        // so buy is always marginally more expensive than sell. This is a
+        // pure curve effect, not a fee effect — verifies the spread
+        // survives fee == 0.
+        let dx = 1;
+        let buy = buy_cost_pure(10_000, 10_000.0, dx, 0.0).expect("buy");
+        let sell = sell_payout_pure(10_000, 10_000.0, dx, 0.0).expect("sell");
+        assert!(buy > sell, "expected buy {} > sell {}", buy, sell);
     }
 
     // -- the core invariants, exercised via the actual functions --------------

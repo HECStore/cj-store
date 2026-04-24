@@ -224,6 +224,11 @@ being popped from the queue but before reaching a terminal state.
   state file.
 - A player reports their last buy/sell "never finished" — no trade
   confirmation, no balance change, but items moved.
+- While the bot is still running, the log shows an error line
+  `Order processing exceeded watchdog; order is stuck.` — the outer
+  `ORDER_HARD_TIMEOUT_SECS` (15 min) guard fired because inner timeouts
+  never returned. The order remains marked as stuck; no automatic
+  recovery happens.
 
 > [!TIP]
 > If the *only* symptom is that the queue has stopped advancing (no

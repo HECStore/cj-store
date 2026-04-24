@@ -100,8 +100,13 @@ impl RateLimiter {
             // so the `elapsed >= required_cooldown` check below always passes on
             // the very first message; without this, a new user would be treated
             // as having "just messaged" at entry creation and be rejected.
+            // `checked_sub` guards against the (Windows/Linux-impossible but
+            // platform-allowed) case of `Instant` subtraction underflowing near
+            // process start; falling back to `now` means the first message would
+            // be rejected, which is preferable to a panic.
             let mut limit = UserRateLimit::new();
-            limit.last_message_time = now - Duration::from_secs(60);
+            let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
+            limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
             limit
         });
 
@@ -140,6 +145,15 @@ impl RateLimiter {
     /// exceed any legitimate cooldown window so no entry that is still
     /// throttling a user can be removed.
     pub fn cleanup_stale(&mut self, stale_threshold: Duration) {
+        // Enforce the "threshold must exceed max cooldown" contract: if violated,
+        // an actively-throttled spammer could be evicted and get a free reset.
+        debug_assert!(
+            stale_threshold >= Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS),
+            "cleanup_stale threshold ({:?}) must be >= RATE_LIMIT_MAX_COOLDOWN_MS ({}ms) \
+             to avoid evicting actively-throttled users",
+            stale_threshold,
+            RATE_LIMIT_MAX_COOLDOWN_MS,
+        );
         let now = Instant::now();
         let before = self.limits.len();
         self.limits.retain(|_, limit| {
@@ -325,6 +339,50 @@ mod tests {
         let _ = limiter.check("user2");
         limiter.cleanup_stale(Duration::from_secs(300));
         assert_eq!(limiter.len(), 2);
+    }
+
+    #[test]
+    fn cleanup_stale_preserves_actively_throttled_user() {
+        // Contract: `stale_threshold` must exceed any legitimate cooldown, so a
+        // user who is still within their escalating backoff window cannot be
+        // evicted (which would give them a free violation-count reset on the
+        // next message). This test locks in that contract with a realistic
+        // production-sized threshold.
+        let mut limiter = RateLimiter::new();
+        let _ = limiter.check("spammer");
+        // Force violations up to the cap, which pins `required_cooldown` at
+        // MAX_COOLDOWN (60s). The user is still actively throttled.
+        for _ in 0..20 {
+            let _ = limiter.check("spammer");
+        }
+        assert!(limiter.violations_for("spammer").unwrap() >= 20);
+
+        // Backdate the user most of the way through the 300s stale window,
+        // but keep them still within their 60s cooldown (impossible in wall
+        // time — this is a synthetic stress on the invariant).
+        assert!(limiter.backdate("spammer", Duration::from_secs(250)));
+
+        // With the production threshold (300s), the actively-throttled entry
+        // must survive: 250s elapsed < 300s threshold.
+        limiter.cleanup_stale(Duration::from_secs(
+            crate::constants::RATE_LIMIT_STALE_AFTER_SECS,
+        ));
+        assert_eq!(
+            limiter.violations_for("spammer"),
+            Some(20),
+            "actively-throttled user must survive cleanup when within threshold"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cleanup_stale threshold")]
+    #[cfg(debug_assertions)]
+    fn cleanup_stale_panics_in_debug_on_too_small_threshold() {
+        // A threshold smaller than MAX_COOLDOWN would let cleanup evict
+        // actively-throttled users. The debug_assert catches misuse.
+        let mut limiter = RateLimiter::new();
+        let _ = limiter.check("user1");
+        limiter.cleanup_stale(Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS - 1));
     }
 
     #[test]

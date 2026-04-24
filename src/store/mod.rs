@@ -254,10 +254,50 @@ impl Store {
                 }
             }
 
+            // Drop stale rate-limiter and UUID-cache entries so a long-running
+            // instance doesn't accumulate HashMap entries for users who never
+            // return. Run this at the top of every iteration — not just in the
+            // message branch — because under sustained order load the `continue`
+            // in PRIORITY 1 would otherwise starve cleanup indefinitely (the
+            // exact scenario where memory pressure is highest).
+            if last_cleanup.elapsed() >= cleanup_interval {
+                self.rate_limiter.cleanup_stale(rate_limit_stale_after);
+                utils::cleanup_uuid_cache();
+                debug!("[Store] Periodic cleanup completed");
+                last_cleanup = tokio::time::Instant::now();
+            }
+
             // PRIORITY 1: drain an order if one is waiting.
             if !self.processing_order && !self.order_queue.is_empty() {
                 debug!("[Store] Starting order processing (queue_len={})", self.order_queue.len());
-                self.process_next_order().await;
+
+                // Outer watchdog: inner operations have their own timeouts, but
+                // a lost channel response or future-deadlock could still wedge
+                // this future indefinitely. On timeout the future is dropped,
+                // which leaves `processing_order = true` and `current_trade`
+                // intact so the operator sees the order as stuck and can
+                // recover via `ClearStuckOrder`.
+                let order_watchdog = tokio::time::Duration::from_secs(
+                    crate::constants::ORDER_HARD_TIMEOUT_SECS,
+                );
+                match tokio::time::timeout(order_watchdog, self.process_next_order()).await {
+                    Ok(()) => {}
+                    Err(_) => {
+                        error!(
+                            timeout_secs = order_watchdog.as_secs(),
+                            "[Store] Order processing exceeded watchdog; order is stuck. \
+                             Operator must use 'Clear stuck order' (CLI option 15) to recover."
+                        );
+                        // Persist the interrupted trade so a crash-restart can
+                        // still see it, and so RECOVERY.md procedures apply.
+                        if let Some(trade) = &self.current_trade {
+                            if let Err(e) = trade_state::persist(trade) {
+                                warn!("[Store] Failed to persist interrupted trade: {}", e);
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                }
 
                 // Save eagerly after every order so trades and stock updates
                 // cannot be lost to a crash before the next debounced autosave.
@@ -270,6 +310,23 @@ impl Store {
                     }
                 }
 
+                // Between orders, non-blockingly drain any pending messages so
+                // operator Shutdown/ClearStuckOrder (and anything else) is not
+                // starved behind a long queue. Without this, a backlog of N
+                // orders forces Shutdown to wait N × order_time — up to ~64
+                // minutes at the 128-order cap.
+                let mut shutdown_requested = false;
+                while let Ok(message) = store_rx.try_recv() {
+                    if self.dispatch_message(message, &mut min_save_interval).await {
+                        shutdown_requested = true;
+                        break;
+                    }
+                }
+                if shutdown_requested {
+                    info!("[Store] Shutdown handled between orders, exiting main loop");
+                    break;
+                }
+
                 continue;
             }
 
@@ -277,27 +334,7 @@ impl Store {
             let msg = store_rx.recv().await;
             match msg {
                 Some(message) => {
-                    debug!("[Store] Received message: {:?}", std::mem::discriminant(&message));
-                    let is_shutdown = matches!(&message, StoreMessage::FromCli(crate::messages::CliMessage::Shutdown { .. }));
-
-                    match message {
-                        StoreMessage::FromBot(bot_msg) => {
-                            if let Err(e) = self.handle_bot_message(bot_msg).await {
-                                error!("Error handling bot message: {}", e);
-                            }
-                        }
-                        StoreMessage::FromCli(cli_msg) => {
-                            if let Err(e) = handlers::cli::handle_cli_message(&mut self, cli_msg).await {
-                                error!("[Store] Error handling CLI message: {}", e);
-                            }
-                        }
-                        StoreMessage::ReloadConfig(new_config) => {
-                            self.reload_config(new_config);
-                            min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
-                        }
-                    }
-
-                    if is_shutdown {
+                    if self.dispatch_message(message, &mut min_save_interval).await {
                         info!("[Store] Shutdown handled, exiting main loop");
                         break;
                     }
@@ -310,16 +347,6 @@ impl Store {
                             last_save = tokio::time::Instant::now();
                             self.dirty = false;
                         }
-                    }
-
-                    // Drop stale rate-limiter and UUID-cache entries so a
-                    // long-running instance doesn't accumulate HashMap entries
-                    // for users who never return.
-                    if last_cleanup.elapsed() >= cleanup_interval {
-                        self.rate_limiter.cleanup_stale(rate_limit_stale_after);
-                        utils::cleanup_uuid_cache();
-                        debug!("[Store] Periodic cleanup completed");
-                        last_cleanup = tokio::time::Instant::now();
                     }
                 }
                 None => {
@@ -334,6 +361,42 @@ impl Store {
         }
         drop(bot_tx);
         info!("[Store] Shutdown complete");
+    }
+
+    /// Dispatch a single `StoreMessage`. Returns `true` if the message was a
+    /// `Shutdown` and the caller should exit the main loop. Extracted so the
+    /// main loop can call it from both the blocking-recv branch and the
+    /// between-orders non-blocking drain branch.
+    async fn dispatch_message(
+        &mut self,
+        message: StoreMessage,
+        min_save_interval: &mut tokio::time::Duration,
+    ) -> bool {
+        debug!("[Store] Received message: {:?}", std::mem::discriminant(&message));
+        let is_shutdown = matches!(
+            &message,
+            StoreMessage::FromCli(crate::messages::CliMessage::Shutdown { .. })
+        );
+
+        match message {
+            StoreMessage::FromBot(bot_msg) => {
+                if let Err(e) = self.handle_bot_message(bot_msg).await {
+                    error!("Error handling bot message: {}", e);
+                }
+            }
+            StoreMessage::FromCli(cli_msg) => {
+                if let Err(e) = handlers::cli::handle_cli_message(self, cli_msg).await {
+                    error!("[Store] Error handling CLI message: {}", e);
+                }
+            }
+            StoreMessage::ReloadConfig(new_config) => {
+                self.reload_config(new_config);
+                *min_save_interval =
+                    tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
+            }
+        }
+
+        is_shutdown
     }
 
     /// Pops and executes the next queued order, holding `processing_order`

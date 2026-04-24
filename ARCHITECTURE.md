@@ -73,9 +73,18 @@ completion before any new inbound message is picked up. See
 ```text
     ┌───────────────────────────────────────────────────────┐
     │  loop {                                               │
+    │    if elapsed >= cleanup_interval                     │
+    │      prune_caches()          ── top of every iter so  │
+    │                                 sustained order load  │
+    │                                 can't starve cleanup  │
+    │                                                       │
     │    if queue non-empty AND !processing_order {         │
     │      process_next_order()    ── runs to completion,   │
     │      save_if_dirty()            no cancel points      │
+    │      while rx.try_recv().ok() ── non-blocking drain:  │
+    │        dispatch(msg)            Shutdown/ClearStuck   │
+    │                                 can't be starved by a │
+    │                                 long order backlog    │
     │      continue                ── re-check queue before │
     │    }                            blocking on recv      │
     │                                                       │
@@ -84,16 +93,17 @@ completion before any new inbound message is picked up. See
     │                                                       │
     │    if dirty AND elapsed >= autosave_interval          │
     │      save_if_dirty()                                  │
-    │    if elapsed >= cleanup_interval                     │
-    │      prune_caches()                                   │
     │  }                                                    │
     └───────────────────────────────────────────────────────┘
 ```
 
-Autosave and cleanup are elapsed-time checks on each post-message pass, not
-separate tick channels. `tokio::select!` was deliberately avoided — cancelling
-an in-flight order's oneshot receivers mid-operation caused stuck trades; see
-the inline comment in [src/store/mod.rs](src/store/mod.rs) `Store::run`.
+Cleanup is an elapsed-time check at the top of every iteration (not just
+post-message), so sustained order load cannot starve it via the PRIORITY 1
+`continue`. Autosave is an elapsed-time check on each post-message pass.
+Neither uses a separate tick channel. `tokio::select!` was deliberately
+avoided — cancelling an in-flight order's oneshot receivers mid-operation
+caused stuck trades; see the inline comment in
+[src/store/mod.rs](src/store/mod.rs) `Store::run`.
 
 Tick cadence:
 
@@ -534,6 +544,8 @@ cannot be traded — only loose items.
 | ------------------------ | ----------------------------- | ----------------------------------------------- |
 | `/trade` lifecycle       | `trade_timeout_ms` (45 s)     | One bound covers request → accept → exchange; trade cancelled, rollback attempted |
 | Pathfinding              | `pathfinding_timeout_ms` (60 s) | Navigation aborted, current action fails      |
+| Chest operation          | `CHEST_OP_TIMEOUT_SECS` (90 s) | Navigation / shulker I/O aborted, operation fails |
+| Whole order (outer watchdog) | `ORDER_HARD_TIMEOUT_SECS` (15 min) | `process_next_order` future dropped; `current_trade` is persisted and left in place so the operator sees the order as stuck and can recover via **Clear stuck order** (CLI option 15). Inner per-phase timeouts above should fire first; this is a last-resort guard against lost channel responses or future-deadlocks. |
 
 ### Trade GUI layout (9×6, 54 slots)
 

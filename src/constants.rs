@@ -168,6 +168,16 @@ pub const CLEANUP_INTERVAL_SECS: u64 = 3_600;
 /// cannot still be throttling a user when it is removed.
 pub const RATE_LIMIT_STALE_AFTER_SECS: u64 = 300;
 
+/// Outer watchdog on `Store::process_next_order` (seconds).
+/// Individual bot operations have their own timeouts (`TRADE_TIMEOUT_MS`,
+/// `CHEST_OP_TIMEOUT_SECS`, `PATHFINDING_TIMEOUT_MS`), but a bug, deadlock,
+/// or lost channel response could still wedge the outer future. A single
+/// multi-step order realistically completes well under 5 minutes; 15 minutes
+/// is generous enough that legitimate orders never trip this, while wedged
+/// orders eventually return control to the main loop so the operator's
+/// `ClearStuckOrder` CLI command can be received.
+pub const ORDER_HARD_TIMEOUT_SECS: u64 = 15 * 60;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,15 +3,15 @@
 //! ```text
 //!   Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
 //!                              │  └───────────────────►    ▲
-//!                              │    (skip Depositing when  │
-//!                              │     the payout goes       │
-//!                              │     straight to balance)  │
+//!                              │    (buys: no chest       │
+//!                              │     deposit, always       │
+//!                              │     skip Depositing)      │
 //!               ─────────────┴───────────┴──► RolledBack
 //! ```
 //!
-//! `Trading → Committed` is deliberately allowed: buys whose diamonds go
-//! straight to the user balance have no post-trade chest work and bypass
-//! `Depositing`. `commit()` therefore accepts either `Trading` or
+//! `Trading → Committed` is deliberately allowed: buys have no post-trade
+//! chest work (the bot only receives diamonds in a buy), so they always
+//! bypass `Depositing`. `commit()` therefore accepts either `Trading` or
 //! `Depositing` as its predecessor.
 
 use std::fmt;

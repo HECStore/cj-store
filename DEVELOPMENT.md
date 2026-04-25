@@ -29,12 +29,16 @@ architectural layer. They meet at the Store boundary.
 
 [src/error.rs](src/error.rs) defines a single enum that every handler,
 `execute_queued_order`, plan validator, `apply_chest_sync`, and
-`assert_invariants` returns. Variants: `ItemNotFound`, `UnknownPair`,
-`UnknownUser`, `InsufficientFunds`, `InsufficientStock`, `BotDisconnected`,
-`TradeTimeout`, `TradeRejected`, `BotError`, `ValidationError`, `ChestOp`,
-`PlanInfeasible`, `QueueFull`, `InvariantViolation`, `Io`. `From<String>`
-is implemented both directions so `?` still flows through the few
-remaining string-returning helpers.
+`assert_invariants` returns. See [src/error.rs](src/error.rs) for the
+canonical variant list; at time of writing the variants are
+`UnknownPair`, `UnknownUser`, `BotDisconnected`, `TradeTimeout`,
+`TradeRejected`, `BotError`, `ValidationError`, `ChestOp`,
+`InvariantViolation`, and `Io`. Only `From<StoreError> for String` is
+implemented (so handlers can stringify at the outermost whisper-pipeline
+boundary); the reverse direction is intentionally **not** implemented —
+auto-converting bare strings would silently collapse every legacy error
+into `ValidationError` and erase the typed-error work. String-returning
+helpers must be wrapped at their call sites with an explicit variant.
 
 ### Bot layer — `Result<T, String>`
 

@@ -4,6 +4,12 @@
 //!
 //! **Strategy**: Write to `*.tmp`, then rename to final file.
 //! On Windows, rename won't overwrite, so we remove destination first.
+//!
+//! **Note on directory durability**: On Unix the parent directory is fsynced
+//! after the rename so the directory entry itself survives a crash. On Windows
+//! the parent directory is intentionally NOT fsynced (Windows has no
+//! equivalent operation), so directory-entry durability there depends on the
+//! filesystem journal (e.g. NTFS) rather than an explicit flush from us.
 
 use std::fs;
 use std::io::{self, Write};
@@ -41,33 +47,25 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     let tmp_name = format!("{file_name}.tmp");
     let tmp_path = parent.join(&tmp_name);
 
-    let path_str = path.to_string_lossy();
-    let tmp_path_str = tmp_path.to_string_lossy();
-    if path_str.is_empty() || tmp_path_str.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Empty path: path={path:?}, tmp_path={tmp_path:?}")
-        ));
-    }
-
-    // sync_all forces the bytes and metadata out before rename — important on
-    // Windows so the rename sees a fully-flushed file.
+    // `sync_all` flushes file contents and metadata to disk so a power loss
+    // between the rename and any subsequent operation cannot leave a
+    // zero-length or partially-written destination after recovery — relevant
+    // on every platform; the Unix branch below additionally fsyncs the parent
+    // directory so the rename itself survives a crash.
     {
         let mut file = fs::File::create(&tmp_path)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
     }
 
-    if !tmp_path.exists() {
-        return Err(io::Error::other(
-            format!("Temp file was not created: {tmp_path:?}")
-        ));
-    }
-
     // On Windows, rename won't overwrite an existing file, so we must remove it first.
     // 5 attempts with exponential backoff gives ~150ms total wait (10+20+40+80),
     // which is enough for transient AV scans / indexer handles to release the file
     // without making the UI feel unresponsive.
+    // On Unix, `fs::rename` already atomically replaces an existing file, so
+    // pre-removing the destination would needlessly create a window where a
+    // concurrent reader sees `NotFound` instead of the old-or-new contents.
+    #[cfg(windows)]
     if path.exists() {
         for attempt in 0..5 {
             match fs::remove_file(path) {
@@ -234,6 +232,24 @@ mod tests {
         let bad = if bad.file_name().is_none() { bad } else { std::path::PathBuf::from("") };
         let err = write_atomic(&bad, "x").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn survives_stale_tmp_file() {
+        // A `.tmp` sibling left behind by a prior crash must not poison the
+        // next write: `write_atomic` overwrites the temp file in place via
+        // `File::create`, so a fresh write should produce the new contents
+        // and leave no `.tmp` sibling.
+        let dir = TmpDir::new("stale-tmp");
+        let target = dir.path("target.json");
+        let stale_tmp = dir.path("target.json.tmp");
+        fs::write(&stale_tmp, b"garbage from a prior crash").unwrap();
+        assert!(stale_tmp.exists());
+
+        write_atomic(&target, "fresh").unwrap();
+
+        assert_eq!(read_to_string(&target), "fresh");
+        assert!(!stale_tmp.exists(), "stale .tmp must be gone after successful write");
     }
 
     #[test]

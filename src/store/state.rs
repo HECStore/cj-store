@@ -250,7 +250,7 @@ pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Resu
         "invariant violation detected"
     );
     Err(StoreError::InvariantViolation(utils::fmt_issues(
-        &format!("Invariant violation ({})", context),
+        &format!("({})", context),
         &report.issues,
         8,
     )))

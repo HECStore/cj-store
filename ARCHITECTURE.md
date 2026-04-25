@@ -182,11 +182,11 @@ unrepresentable.
            └──────┬──────┘
                   │  /trade completed (or timeout -> RolledBack)
                   │
-                  ├─── no post-trade chest work needed ────┐
+                  ├─── buy orders skip Depositing ─────────┐
                   ▼                                        │
            ┌─────────────┐                                 │
-           │ Depositing  │  bot puts received items        │
-           └──────┬──────┘  back into storage              │
+           │ Depositing  │  sell orders only: bot puts     │
+           └──────┬──────┘  received items back to storage │
                   │  deposit ok                            │
                   ▼                                        ▼
            ┌─────────────┐          ┌──────────────┐
@@ -194,10 +194,11 @@ unrepresentable.
            └─────────────┘          └──────────────┘
 ```
 
-`Depositing` is optional — `Trading → Committed` is valid for trades whose
-payout goes straight to the user balance (e.g. buys where diamonds are
-credited to the ledger rather than written to a chest). `commit()` accepts
-either `Trading` or `Depositing` as the predecessor.
+`Depositing` is skipped unconditionally for **buy** orders — buys go
+`Trading → Committed` directly because the bot only *receives* diamonds in a
+buy and has no items to put back into chests. **Sell** orders always traverse
+`Depositing`. `commit()` accepts either `Trading` or `Depositing` as the
+predecessor.
 
 `TradeState` is mirrored to `data/current_trade.json` at every transition
 and cleared on a terminal state. On startup the Store looks for a leftover

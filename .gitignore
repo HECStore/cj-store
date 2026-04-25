@@ -1,5 +1,4 @@
 /target
-.cargo/config.toml
 /data
 
 # Claude Code
@@ -19,7 +18,18 @@ desktop.ini
 *.swp
 *~
 *.bak
+# Atomic-write leftovers (see src/fsutil.rs::write_atomic)
+*.tmp
+
+# Merge/patch artifacts
+*.orig
+*.rej
 
 # Profiling artifacts
 flamegraph.svg
 perf.data*
+
+# Rust tooling artifacts
+*.rs.bk
+*.profraw
+*.profdata

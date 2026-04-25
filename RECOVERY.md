@@ -51,21 +51,20 @@ working through any of them.
 
 **Trade phase ladder.** `TradeState` advances strictly forward. The
 common path is `Queued → Withdrawing → Trading → Depositing → Committed`,
-but **buy** orders whose surplus diamonds settle straight to the user's
-balance skip `Depositing` entirely (there are no items to put back into
-chests for a buy) and go `Trading → Committed` directly. Any non-terminal
-phase can transition to `RolledBack` on failure. See
+but **buy** orders always go `Trading → Committed` directly, skipping
+`Depositing` — there is nothing to put back into chests because the bot
+only *receives* diamonds in a buy. **Sell** orders always traverse
+`Depositing` so the bot can return the player's items to storage. Any
+non-terminal phase can transition to `RolledBack` on failure. See
 [src/store/trade_state.rs](src/store/trade_state.rs) for the source-of-truth
 state machine.
 
 ```
 Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
-                            │  └───────────────────►    ▲
-                            │    (buys: surplus         │
-                            │     diamonds go to        │
-                            │     balance, no chest     │
-                            │     deposit needed)       │
-            ─────────────┴───────────┴──► RolledBack (any non-terminal failure)
+                            │                          ▲
+                            └──────────────────────────┘   (buys skip Depositing)
+
+(any non-terminal state: Queued, Withdrawing, Trading, Depositing) ─► RolledBack
 ```
 
 ---
@@ -132,14 +131,14 @@ backup restore.
 
 The journal records one in-flight shulker operation at a time; it is
 cleared whenever the operation finishes. A non-empty file at startup means
-the previous run crashed mid chest I/O. Current behavior: the Store logs a
-loud warning and clears the file automatically (see
+the previous run crashed mid chest I/O. Current behavior: the Store logs an
+info-level notice and clears the file automatically (see
 [src/store/journal.rs](src/store/journal.rs)). The world state may be
 inconsistent — that's what this playbook is for.
 
 **Symptoms**
 
-- Startup log shows `[Journal] Leftover entry found: …`.
+- Startup log shows `[Journal] loaded leftover entry: op_id=… type=… chest_id=… slot=… state=…` (info level), followed by `[Journal] cleared leftover entry from "data/journal.json"` (info level). Both are emitted at `tracing::info!`, not `warn!`, so grep at info level (or unfiltered) — filtering by WARN/ERROR will hide them.
 - A shulker box is sitting on the station block instead of inside its
   chest.
 - A shulker box is in the bot's inventory on login.
@@ -230,8 +229,11 @@ confuse the next chest operation.
 
 **Prevention**: always exit via the CLI "Exit" menu. A graceful shutdown
 runs through the full disconnect sequence and never leaves in-flight
-shulkers. Ctrl-C from the terminal is not graceful and *will* cause this
-in about 5% of cases.
+shulkers. Ctrl-C from the terminal skips the disconnect sequence that
+returns held shulkers to chests, so if a chest op is in flight at that
+moment its shulker is left in the bot's inventory or on the station —
+exactly the situation this section recovers from. Always exit via the
+CLI "Exit" menu.
 
 ---
 

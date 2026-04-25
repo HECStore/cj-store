@@ -83,7 +83,7 @@ pub async fn handle_additem_order(
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
-        .map_err(|_| StoreError::BotError("Bot timed out waiting for trade completion".to_string()))?
+        .map_err(|_| StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000))?
         .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
     if let Err(err) = &trade_result {
         return utils::send_message_to_player(
@@ -377,7 +377,7 @@ pub async fn handle_removeitem_order(
 
         let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
             .await
-            .map_err(|_| StoreError::ChestOp("Bot timed out performing chest step".to_string()))?
+            .map_err(|_| StoreError::TradeTimeout(CHEST_OP_TIMEOUT_SECS))?
             .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
 
         match bot_result {
@@ -448,9 +448,9 @@ pub async fn handle_removeitem_order(
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
-        .map_err(|_| StoreError::BotError("Bot timed out waiting for trade completion".to_string()))?
+        .map_err(|_| StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000))?
         .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
-    
+
     if let Err(err) = &trade_result {
         warn!("[Removeitem] trade failed, rolling back to storage: operator={} item={} qty={} err={}",
             player_name, item, quantity, err);

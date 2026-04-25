@@ -243,9 +243,7 @@ pub async fn handle_withdraw_balance_queued(
                         timeout_secs = CHEST_OP_TIMEOUT_SECS,
                         "Withdraw: timed out waiting for bot chest operation"
                     );
-                    return Err(StoreError::ChestOp(
-                        "Bot timed out withdrawing diamonds from storage".to_string(),
-                    ));
+                    return Err(StoreError::TradeTimeout(CHEST_OP_TIMEOUT_SECS));
                 }
             };
 

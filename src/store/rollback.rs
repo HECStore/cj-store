@@ -27,7 +27,12 @@ use super::Store;
 /// bot's inventory and need operator attention.
 #[derive(Debug, Clone, Default)]
 pub struct RollbackResult {
-    /// Total items successfully returned to storage.
+    /// Total items *physically* returned to storage, credited as soon as the
+    /// bot confirms the deposit — even if the subsequent `apply_chest_sync`
+    /// errors and `operations_failed` is also incremented (the chest holds
+    /// the items, but the in-memory view has drifted and an operator must
+    /// reconcile). Timeout, channel-drop, and bot-error branches do NOT
+    /// credit this counter: physical state is unknown, so we don't claim it.
     pub items_returned: i32,
     /// Number of per-chest deposit steps that completed cleanly.
     pub operations_succeeded: usize,

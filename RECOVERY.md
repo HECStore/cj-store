@@ -49,12 +49,23 @@ working through any of them.
 | `ShulkerPickedUp`    | In the bot's inventory again after items were transferred                    |
 | `ShulkerReplaced`    | Back in its chest slot; the journal entry was about to be cleared            |
 
-**Trade phase ladder.** `TradeState` advances strictly forward; any two
-adjacent phases are at most one crash apart:
+**Trade phase ladder.** `TradeState` advances strictly forward. The
+common path is `Queued → Withdrawing → Trading → Depositing → Committed`,
+but **buy** orders whose surplus diamonds settle straight to the user's
+balance skip `Depositing` entirely (there are no items to put back into
+chests for a buy) and go `Trading → Committed` directly. Any non-terminal
+phase can transition to `RolledBack` on failure. See
+[src/store/trade_state.rs](src/store/trade_state.rs) for the source-of-truth
+state machine.
 
 ```
-Queued → Withdrawing → Trading → Depositing → Committed
-                                               └── RolledBack (any failure)
+Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
+                            │  └───────────────────►    ▲
+                            │    (buys: surplus         │
+                            │     diamonds go to        │
+                            │     balance, no chest     │
+                            │     deposit needed)       │
+            ─────────────┴───────────┴──► RolledBack (any non-terminal failure)
 ```
 
 ---
@@ -93,9 +104,20 @@ Queued → Withdrawing → Trading → Depositing → Committed
      around the last price quote).
 4. If the file is unfixable, delete it. The pair will be gone on next
    startup; operators can recreate it via CLI menu option 8 "Add pair",
-   which sets both stocks to zero. Zero-stock pairs will refuse all
-   buys/sells, so expect to also use `additem` / `addcurrency` operator
-   whispers to seed stock before players can trade.
+   which sets both stocks to zero. A pair with zero `item_stock` will
+   refuse buys, and a pair with zero `currency_stock` will refuse sells:
+   the AMM price formula has no defined value when the relevant reserve
+   is empty, so the order is rejected up front with the message
+   `Item 'X' is not available for trading (no stock or reserves).` (this
+   exact wording is sent for both buys and sells; see
+   [src/store/orders.rs](src/store/orders.rs) `validate_and_plan_buy` /
+   `validate_and_plan_sell`). A separate fallback message,
+   `Internal error: computed price is invalid.` (or
+   `Internal error: computed payout is invalid.` for sells), fires when
+   the cost/payout calculation returns a non-finite or ≤ 0 value despite
+   non-zero reserves — that is *not* the zero-stock path. Either way,
+   expect to use `additem` / `addcurrency` operator whispers to seed
+   stock before players can trade.
 5. Restart the bot. Watch the log for `Loaded N pairs`.
 6. In the CLI, run `audit-state` to cross-check that pair stocks match the
    chest totals.
@@ -238,6 +260,7 @@ being popped from the queue but before reaching a terminal state.
 > per-phase procedure below only when items, balances, or reserves
 > need manual reconciliation.
 
+<a id="commit-math"></a>
 **Commit math.** Every committed order mutates pair reserves and user
 balance deterministically. Use this table to reconstruct what a crashed
 commit *would* have done; each phase-subsection below refers back to it.
@@ -296,7 +319,7 @@ bot's inventory — reach for player reports only if that's ambiguous.
      its chest slot.
    - is missing (and the player, if online, now has those items) → the
      trade **confirmed** before the crash. Treat as committed: apply the
-     [Commit math table](#4-interrupted-datacurrent_tradejson) for the
+     [Commit math table](#commit-math) for the
      order's type. (Note: storage counts were *not* synced back after the
      crash, so run `audit-state` after restart.)
 3. **Only if step 2 is ambiguous**, contact the affected player. If they
@@ -317,7 +340,7 @@ multiple chest ops.
 3. Go into the world, find any shulkers on the station / in the bot /
    on the floor near the destination chest, and put them in the chest
    slot named by the relevant plan entry.
-4. Manually mirror the commit using the [Commit math table](#4-interrupted-datacurrent_tradejson)
+4. Manually mirror the commit using the [Commit math table](#commit-math)
    at the top of this section — apply the row for this order's type to
    `data/pairs/<item>.json` and `data/users/<uuid>.json`.
 5. Append a manual entry to `data/trades/<now>.json` matching the
@@ -338,12 +361,23 @@ Don't just delete the file blindly, though:
 
 1. Stop the bot.
 2. Open `data/current_trade.json`. Note the `order` body (item, quantity,
-   user, order type).
-3. For `Committed`: verify `pair.item_stock`, `pair.currency_stock`, and
-   the user's `balance` match the [Commit math table](#4-interrupted-datacurrent_tradejson).
-   If they don't match — the crash landed *between* the state change and
-   the file delete but somehow skipped the ledger write — follow the
-   `Depositing` procedure to reconcile.
+   user, `order_type`).
+3. For `Committed`: branch on `order.order_type`, because buys and sells
+   take different paths to this terminal state:
+   - **`Buy` orders.** Items already changed hands during the `Trading`
+     GUI exchange (the player handed over diamonds, the bot handed over
+     items). There was **no** `Depositing` phase — buys go straight
+     `Trading → Committed` (see the trade phase ladder above). Reconcile
+     `pair.item_stock`, `pair.currency_stock`, and `user.balance` against
+     the [Commit math table](#commit-math) and stop there. **Do not**
+     follow the `Depositing` procedure — there are no chest deposit
+     operations to undo, redo, or look for.
+   - **`Sell` orders.** Sells always traverse `Depositing` before
+     `Committed` (the bot must put the items the player sold into
+     storage chests). Verify the [Commit math table](#commit-math) row
+     for `Sell`; if reconciliation is needed (counts disagree, audit
+     reports drift), follow the [Phase: `Depositing`](#phase-depositing)
+     procedure to find any stray shulkers and mirror the commit.
 4. For `RolledBack`: verify the ledger is *unchanged* (no pair or
    balance update for this order), and that no stray shulker is in the
    bot's inventory or on the station (section 3 if there is).

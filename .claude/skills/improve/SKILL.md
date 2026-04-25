@@ -50,7 +50,7 @@ The `dry` token may appear before, between, or after the numeric args — `/impr
 4. **Execute** the plan: dispatch fixer subagents for each accepted improvement. Batch improvements whose file sets are provably disjoint into parallel waves; run anything that might touch overlapping files serially. (Skipped when dry mode is on.)
 5. After execution, run a **drift-reconciliation sweep** to bring everything that references the edited files back into sync — in either direction (code ↔ docs, code ↔ configs, schemas, examples, CI, etc.). Skipped when dry mode is on, or when Step 4 edited no files. Then report results to the user.
 
-Do not wait for all spotters before launching adversaries. Eager spawning is a hard requirement whenever K ≥ 1 (when K = 0 there are no adversaries, so this rule is vacuous).
+Do not wait for all spotters before launching adversaries. Eager spawning is a hard requirement whenever K ≥ 1 and the spotter returned a parseable report (when K = 0, or when the spotter was malformed and its adversaries are skipped per the malformed-output rule, this rule is moot for that tuple).
 
 ---
 
@@ -88,7 +88,7 @@ In a single message, call the Agent tool **N times** with `subagent_type: genera
 > - several smaller independent changes if you find a handful of unrelated nits/wins,
 > - or a mix of one big and a few small.
 >
-> **Quality over quantity.** Do not pad to hit a number. If only one thing is worth changing, propose only one. If five distinct things are worth changing, propose five. Each proposal will be applied by a separate fixer subagent later. **List proposals in the order you'd want them applied** — earlier numbered proposals are scheduled in earlier execution waves, so later siblings run against the post-edit state of earlier ones. Make each proposal robust to the others succeeding, failing, or being deemed obsolete; don't write proposal 3 in a way that strictly requires proposals 1 and 2 to both have landed.
+> **Quality over quantity.** Do not pad to hit a number. If only one thing is worth changing, propose only one. If five distinct things are worth changing, propose five. Each proposal will be applied by a separate fixer subagent later. **List proposals in the order you'd want them applied** — earlier numbered proposals are scheduled no later than later ones (a later proposal may co-execute with an earlier sibling in the same wave when their FILES are disjoint, but it will never run *before* an earlier one). Make each proposal robust to the others succeeding, failing, being deemed obsolete, or running concurrently; don't write proposal 3 in a way that strictly requires proposals 1 and 2 to both have already landed.
 >
 > Return EXACTLY this format and nothing else:
 >
@@ -129,8 +129,9 @@ Skip this step entirely if K = 0 — go directly to Step 3 and treat each of the
 
 You will receive a notification each time a background spotter finishes. The instant a spotter's report arrives:
 
-- In your **next turn**, send a single message with **K Agent calls** (parallel, all `run_in_background: true`) for that report.
-- Continue handling other spotter notifications as they come in. Do NOT batch — interleave eagerly.
+- If the spotter is **malformed** (per the Hard rule), do NOT spawn its adversaries — without a TARGET_AREA they have nothing to read against. Treat the tuple as `PROPOSALS: none` with zero expected adversary returns and continue.
+- Otherwise, in your **next turn**, send a single message with **K Agent calls** (parallel, all `run_in_background: true`) for that report.
+- Continue handling other spotter notifications as they come in. Do NOT batch by *waiting* for more spotters — but if multiple spotter completions land in the same turn (e.g. several finished while you were dispatching), pack their adversary calls together: one outgoing message with all their K-per-spotter Agent calls. That's still eager (no spotter is held back) and saves outgoing turns.
 
 Each adversary reviews the spotter's *entire list* (1 to ~5 proposals) and gets the same prompt independently (each adversary also receives its own freshly-generated unique SEED of 8 random English words — distinct from every other subagent in the run, no explanation given to the subagent):
 
@@ -163,7 +164,7 @@ Each adversary reviews the spotter's *entire list* (1 to ~5 proposals) and gets 
 > VERDICT: <one of: confirm | refine | replace | reject>
 > SEVERITY: <your adjusted severity>
 > CATEGORY: <your adjusted category>
-> FILES: <your adjusted file list>
+> FILES: <your adjusted file list; for reject, write "none">
 > CHANGE: <your adjusted concrete change — may confirm, refine, or replace; for reject, write "none">
 > RATIONALE: <1-3 sentences. What the original missed or got wrong. Why your proposal is more accurate. For reject, explain why no real issue exists.>
 >
@@ -192,14 +193,14 @@ Each adversary reviews the spotter's *entire list* (1 to ~5 proposals) and gets 
 > Rules:
 > - You MUST emit one ADJUSTED block for every spotter proposal (`ORIGINAL_REF: 1` through `ORIGINAL_REF: <last>`), in the same numeric order. Skipping a proposal is not allowed — if you have nothing to add, vote `confirm`.
 > - Additions are optional. Use them sparingly — only when the omission is genuinely worth surfacing. Do not pad.
-> - If the spotter's report was `PROPOSALS: none`, you may still add `ORIGINAL_REF: new` blocks if you spot something they missed; otherwise return `TARGET_AREA: <same>` followed by `ADJUSTMENTS: none`.
+> - If the spotter's report was `PROPOSALS: none`, the regular "one ADJUSTED block per spotter proposal" rule is vacuous (there are no spotter proposals). You may still add `ORIGINAL_REF: new` blocks if you spot something the spotter missed in the same target area. If you have nothing to add either, return `TARGET_AREA: <same>` followed by `ADJUSTMENTS: none` and nothing else.
 > - No rubber-stamping — only `confirm` when after genuine adversarial scrutiny you still agree.
 
 Adversaries run independently; when K ≥ 2 they may disagree with each other, which is fine.
 
 ## Step 3 — Synthesis: build the prioritized improvement plan
 
-Once every original has all its adversarial adjustments back (N tuples; each tuple = one spotter list + K adversary lists; total proposal count is variable), build the plan.
+Once every tuple has resolved — defined as: every spotter has either returned (with proposals or `PROPOSALS: none`) or been declared malformed, AND every adversary that was actually spawned has returned (with adjustments or been declared malformed) — build the plan. (When K = 0, or when a spotter was malformed and its adversaries were skipped, the "all adversaries returned" check is vacuously satisfied for those tuples.)
 
 ### 3a. Collect
 
@@ -209,7 +210,7 @@ Gather every CHANGE from every PROPOSAL block (in spotter reports) and every ADJ
 
 For each spotter proposal in each tuple, look at the K adversaries' ADJUSTED blocks that reference it by `ORIGINAL_REF: <its number>`. Verdict counting reads the raw adversary outputs (every ADJUSTED block, including rejects whose CHANGE was filtered to "none" in 3a), not the post-3a candidate set. Then, before any cross-tuple merging, the verdicts decide what survives from that proposal:
 
-- **Strict-majority reject** (> half of the K reviewing adversaries voted `reject`): drop everything tied to that proposal in this tuple — the spotter's CHANGE plus every adversary `confirm` / `refine` / `replace` CHANGE for the same `ORIGINAL_REF`. (K = 2 → 2 of 2; K = 3 → ≥ 2; K = 4 → ≥ 3.) Adversary additions on the same tuple (`ORIGINAL_REF: new`) are independent and survive — they aren't tied to the rejected proposal. The dropped change may still resurface from a *different* tuple's spotter or adversary that independently surfaced the same fix — 3c handles that.
+- **Strict-majority reject** (> half of the K reviewing adversaries voted `reject`): drop everything tied to that proposal in this tuple — the spotter's CHANGE plus every adversary `confirm` / `refine` / `replace` CHANGE for the same `ORIGINAL_REF`. Threshold is `floor(K/2) + 1` rejects: K = 1 → 1 of 1; K = 2 → 2 of 2; K = 3 → ≥ 2; K = 4 → ≥ 3; K = 5 → ≥ 3; etc. Adversary additions on the same tuple (`ORIGINAL_REF: new`) are independent and survive — they aren't tied to the rejected proposal. The dropped change may still resurface from a *different* tuple's spotter or adversary that independently surfaced the same fix — 3c handles that.
 - **Otherwise the proposal survives**, and the per-adversary verdicts shape what the surviving candidate looks like:
   - `confirm` — the adversary vouches for the spotter's CHANGE. Their block joins the spotter's into one logical candidate (multiplicity counts both distinct agents). The spotter's wording is kept.
   - `refine` — the adversary agrees there's a real issue but proposes a refined fix. Their block joins the spotter's into one logical candidate (multiplicity counts both). The adversary's wording supersedes the spotter's. When verdicts on the same proposal are mixed (`confirm` + `refine`), keep the refined wording and surface the disagreement in the plan.
@@ -223,6 +224,7 @@ Group the surviving candidates (spotter proposals, adversary refines/replaces, a
 
 - **Automatic intra-tuple grouping** (no judgment call): a spotter `PROPOSAL N` and every adversary `ADJUSTED` block with `ORIGINAL_REF: N` from the *same tuple* whose verdict is `confirm` or `refine` are by definition the same logical candidate — group them automatically. Cross-tuple grouping, and matching `replace` / adv-add CHANGEs against unrelated candidates, still requires judgment (same file(s) + same semantic edit).
 - Prefer the most specific / concrete wording (with the refine-supersedes-confirm rule from 3b already applied within each automatic intra-tuple group).
+- **Merge FILES lists by union, not by replacement.** When two grouped candidates declared different FILES, take the union — under-declaring loses coverage and forces fixer `partial`/`blocked`, while over-declaring at most causes the wave packer to conservatively serialize an extra fixer pair, which is the cheap failure mode. Drop exact duplicates; do not deduplicate paths that only differ in casing or trailing slashes (treat them as separate paths and let the fixer normalize).
 - Track **multiplicity** as the number of *distinct source agents* (e.g., `tuple-3-spotter`, `tuple-3-adv-A`, `tuple-7-adv-B`) that contributed a CHANGE to this group. The same agent contributing two CHANGE entries (e.g., a spotter who emitted two proposals that turned out to overlap) counts once, not twice. High multiplicity is strong signal.
 - Resolve severity/category conflicts by taking the **most severe** severity any non-rejected agent assigned (a single "critical" outranks three "low"s).
 - A candidate that was rejected on one tuple but confirmed on another survives — the independent confirmation is what matters. The rejecting tuple's reject does NOT reduce multiplicity of the merged group; only contributing agents count.
@@ -234,7 +236,12 @@ Assign each surviving candidate to one of:
 - **P0 — Do now.** Severity critical or high AND multiplicity ≥ 2 (corroborated by at least two distinct agents — typically the spotter plus a confirming or refining adversary, or two independent spotters surfacing the same fix). Correctness/security issues with corroboration live here by default. When K ≥ 1, multiplicity ≥ 2 is automatic for any spotter proposal that any adversary confirmed or refined (the spotter's CHANGE and the adversary's CHANGE merge under 3c into one group with two distinct agents).
 - **P1 — Do in this sweep.** Severity critical or high that didn't clear the P0 bar (a single agent surfaced it without independent corroboration), or severity medium. Clear, concrete, low-regression-risk changes.
 - **P2 — Do if cheap.** Severity low or nit. Cosmetic/taste cleanups land here.
-- **Skip.** Rejected by adversaries, or the adversary's replacement is also in the plan and supersedes it, or the proposal is vague after consolidation.
+- **Skip.** Any of:
+  - the proposal is too vague after consolidation to write a fixer prompt for, or
+  - an adversary's `replace` candidate for the same area is also in the plan and clearly supersedes this one (executing both would be redundant or conflicting), or
+  - the candidate is a *spotter* proposal that had at least one adversary review it (i.e. K ≥ 1 and the adversaries weren't all malformed) and every adversary that DID review it voted `replace` or `reject` (no single `confirm` or `refine`). The replace candidates from the same proposal proceed normally; the spotter's own CHANGE lands at Skip because the adversaries collectively said "real issue but not this fix" yet didn't reach strict-majority reject — the surviving replace(s) are the better candidate(s) to execute. (Does not apply when K = 0, since there were no peer reviews; does not apply when every adversary on the tuple was malformed, since no peer actually weighed in.)
+  
+  (Strict-majority adversary rejects don't reach 3d — they were dropped at 3b.)
 
 When K = 0 there are no adversaries to provide corroboration, so the only path to multiplicity ≥ 2 is two independent spotters surfacing the same fix — which is rare. Most K = 0 candidates therefore land at P1 or below; that's the trade-off for skipping adversarial review.
 
@@ -249,12 +256,12 @@ Before any execution, print the plan. Up to three sections, in order (the middle
 
 `Source` is one of:
 - `spotter` for the spotter's own proposals — `Original severity` is the spotter's severity, adv-verdict columns show each adversary's verdict for this proposal,
-- `adv-A:rep` / `adv-B:rep` / … for adversary `replace` candidates — the letter identifies which adversary; that adversary becomes the sole agent vouching for this candidate, so `Original severity` carries the adversary's severity and the adv-verdict columns are blank,
+- `adv-A:rep` / `adv-B:rep` / … for adversary `replace` candidates — the letter identifies which adversary surfaced the replace; the adv-verdict columns are blank for this row (no adversaries voted on the replace as such — it inherits multiplicity solely from any cross-tuple dedup matches that 3c may have produced), and `Original severity` carries the adversary's severity,
 - `adv-A:add` / `adv-B:add` / … for adversary additions — same blank-verdict-column rule and same severity convention.
 
 The `Prop #` column is `1`, `2`, … for spotter rows; `A:rep1`, `A:rep2`, …, `B:rep1`, … for adversary replaces (the digit echoes the spotter `ORIGINAL_REF` that was replaced); `A:new1`, `A:new2`, `B:new1`, … for adversary additions (sequential within each adversary's contributions on that tuple). When a tuple has multiple candidates, render them as consecutive rows sharing the tuple number. `Final status` is one of: `→ P0`, `→ P1`, `→ P2`, `→ Skip`, or `→ merged with <tuple>.<prop#>` (when deduped into another row). When K = 0, drop the adv-verdict columns from the table header — there are no adversaries to display, and the only row source is `spotter`.
 
-**Notable disagreements** — 3–5 bullets on the most interesting cases where adversaries changed the outcome materially (downgraded a proposal, replaced it with a better fix, rejected a confident spotter, surfaced something the spotter missed, or disagreed with each other when K ≥ 2). One line each. Omit when K = 0.
+**Notable disagreements** — up to ~5 bullets on the most interesting cases where adversaries changed the outcome materially (downgraded a proposal, replaced it with a better fix, rejected a confident spotter, surfaced something the spotter missed, or disagreed with each other when K ≥ 2). One line each. Render fewer if there are fewer notable cases; omit the section entirely if there are none, and omit when K = 0.
 
 **The plan** — three lists (P0, P1, P2) of improvements to execute. Each bullet has: severity, category, file(s), a one-line description, and a `(flagged by M agents)` parenthetical when M ≥ 2. Skip any empty priority group. Example:
 
@@ -267,7 +274,7 @@ The `Prop #` column is `1`, `2`, … for spotter rows; `A:rep1`, `A:rep2`, …, 
 > **P2 — Do if cheap**
 > - **[nit / style]** [src/error.rs:12-18](src/error.rs#L12-L18) — collapse the three near-identical `From` impls with a macro
 
-If no candidates survived, print `_No actionable improvements surfaced in this sample._` and stop.
+If no candidates survived synthesis, OR every surviving candidate was assigned `Skip` priority in 3d (i.e. P0+P1+P2 are all empty), print `_No actionable improvements surfaced in this sample — re-run /improve for a different sample._` and stop.
 
 **If dry mode is on, stop here.** Do not execute anything. Remind the user that `/improve` without `dry` would execute this plan, BUT that re-running `/improve` produces a different probabilistic sample — so running `/improve` again after `/improve dry` will not reproduce the exact same plan, it will sample afresh. If they want *this* specific plan applied, they should act on it now (and can run `/improve dry` again later for a new set of candidates).
 
@@ -275,7 +282,7 @@ If no candidates survived, print `_No actionable improvements surfaced in this s
 
 ## Step 4 — Execute the plan
 
-Execute **P0 and P1** improvements by default. Execute **P2** too unless the union of all `FILES` paths across P0+P1 candidates already exceeds ~10 distinct paths (count distinct file paths, not summed list lengths) — in which case skip the P2 fixers, mark the P2 items as deferred so they appear in the final report's "Obsolete / blocked / skipped / deferred" section, and invite the user to re-run. This keeps any single sweep's blast radius bounded.
+Execute **P0 and P1** improvements by default. Execute **P2** too unless the union of all `FILES` paths across **P0+P1+P2** candidates would exceed ~10 distinct paths (count distinct file paths, not summed list lengths) — in which case skip the P2 fixers, mark the P2 items as deferred so they appear in the final report's "Not landed → Deferred" sub-bucket (Step 6), and invite the user to re-run. The threshold is on the *total* would-be blast radius, not just P0+P1, so a sweep with a small P0+P1 but a sprawling P2 still defers; the goal is a bounded sweep, not a bounded P0+P1 with an unbounded tail.
 
 ### 4a. Group for parallel execution
 
@@ -283,17 +290,17 @@ For each improvement to execute, you already have its `FILES` list from the prop
 
 Algorithm (greedy, good enough):
 
-1. Within each priority bucket, partition candidates into **peer-checked** (spotter proposals, plus adversary `confirm` / `refine` / `replace` reports — every one of which had at least one peer reading the target) and **adv-add** (`ORIGINAL_REF: new` additions, vouched for by exactly one agent). An `ORIGINAL_REF: new` candidate whose multiplicity after 3c dedup is ≥ 2 (multiple agents independently surfaced it) is promoted from the adv-add bucket to the peer-checked bucket — corroborating multiplicity is itself a form of peer review of the FILES list. (For sort purposes such a promoted candidate adopts the originating tuple of one of its surfacing agents, e.g. the lowest-numbered tuple it appears in.)
+1. Within each priority bucket, partition candidates into **peer-checked** (spotter proposals, plus adversary `confirm` / `refine` / `replace` reports — every one of which had at least one peer reading the target) and **adv-add** (`ORIGINAL_REF: new` additions, vouched for by exactly one agent). An `ORIGINAL_REF: new` candidate whose multiplicity after 3c dedup is ≥ 2 (multiple agents independently surfaced it) is promoted from the adv-add bucket to the peer-checked bucket — corroborating multiplicity is itself a form of peer review of the FILES list. **Promoted candidate's adopted identity for sort purposes:** pick the lowest-numbered tuple the candidate appears in; within that tuple, pick the surfacing adversary with the lowest letter (A before B); within that adversary, use the lowest addition-index. This gives a deterministic `(tuple, adversary-letter, addition-index)` triple even though the candidate spans multiple originating agents.
 2. Sort peer-checked candidates by the lexicographic key `(tuple, spotter-proposal-number, candidate-kind, adversary-letter, addition-index)` ascending, where:
    - `tuple` = the originating tuple, or, for *promoted* adv-adds (multiplicity ≥ 2 after dedup), the lowest-numbered tuple that surfaced it (per step 1).
    - `spotter-proposal-number` = the `ORIGINAL_REF` for spotter proposals and adversary `replace` candidates; `∞` for promoted adv-adds (which have no spotter ref).
    - `candidate-kind` orders `spotter` (0) < `adv-replace` (1) < `promoted-adv-add` (2). This breaks the tie when a spotter proposal and an adversary `replace` of that same proposal share the same `(tuple, ORIGINAL_REF)` — the spotter goes first, then any `replace` candidates trail it.
    - `adversary-letter` and `addition-index` are only meaningful for `adv-replace` and `promoted-adv-add` rows; ignore them for spotter rows.
    
-   Effect: siblings from the same tuple appear in the spotter's listed order; an adversary `replace` candidate immediately follows the spotter proposal it replaces; promoted adv-adds trail at the end of their adopted tuple. Sort the remaining (non-promoted) adv-add candidates by `(tuple, adversary-letter, addition-index-within-adversary)` so additions from the same adversary stay grouped and adversary letters break ties between tuples. Both sorts are stable; no other secondary heuristic (file count, severity within bucket, etc.) is applied.
-3. **Phase A** — pack peer-checked candidates into waves: walk the sorted list and add each candidate to the earliest existing wave whose union of files has no intersection with this candidate's files. If no wave fits, open a new wave.
-4. **Phase B (run after Phase A waves complete)** — pack adv-add candidates into trailing waves using the same rule. Adv-add fixers run *after* every peer-checked fixer in the same priority bucket has landed, so the working tree is at its most-edited state when they execute. This maximizes the chance an adv-add with a misjudged FILES list either lands cleanly or detects `STATUS: obsolete`, instead of clobbering an earlier peer-checked edit.
-5. **Cross-bucket execution order**: process priority buckets sequentially — all P0 waves (Phase A then Phase B) run to completion before any P1 wave starts; all P1 waves before any P2 wave. The full execution chain is therefore P0-A → P0-B → P1-A → P1-B → P2-A → P2-B, skipping any empty (bucket, phase) slot. Wave numbers are continuous across the chain (so the user sees "wave 1, 2, 3, …" without resets between phases or buckets).
+   Effect: siblings from the same tuple appear in the spotter's listed order; an adversary `replace` candidate immediately follows the spotter proposal it replaces; promoted adv-adds trail at the end of their adopted tuple. Sort the remaining (non-promoted) adv-add candidates by `(tuple, adversary-letter, addition-index-within-adversary)` so within each tuple the additions are grouped by adversary, and within each adversary they appear in the order that adversary surfaced them. Both sorts are stable; no other secondary heuristic (file count, severity within bucket, etc.) is applied. **Cross-merged candidates** (a 3c group whose contributors include both a spotter proposal and adv-add(s) from elsewhere) inherit the spotter contributor's sort identity — the spotter's `(tuple, prop_num, 0, _, _)` always sorts earlier than any adv-add identity, so this is just "use the lowest sort key among contributors" and is automatic.
+3. **Phase A** — pack peer-checked candidates into waves: walk the sorted list and add each candidate to the earliest existing wave **within this same (bucket, phase) slot** whose union of files has no intersection with this candidate's files. If no wave fits, open a new wave.
+4. **Phase B (run after Phase A waves complete)** — pack adv-add candidates into trailing waves using the same rule, again restricted to the current (bucket, phase) slot's wave set (Phase B candidates never join a Phase A wave, even when files would be disjoint, because Phase A is conceptually already done by the time Phase B runs). Adv-add fixers run *after* every peer-checked fixer in the same priority bucket has landed, so the working tree is at its most-edited state when they execute. This maximizes the chance an adv-add with a misjudged FILES list either lands cleanly or detects `STATUS: obsolete`, instead of clobbering an earlier peer-checked edit.
+5. **Cross-bucket execution order**: process priority buckets sequentially — all P0 waves (Phase A then Phase B) run to completion before any P1 wave starts; all P1 waves before any P2 wave. The full execution chain is therefore P0-A → P0-B → P1-A → P1-B → P2-A → P2-B, skipping any empty (bucket, phase) slot. Each (bucket, phase) slot is its own packing problem — never merge waves across slots. Wave numbers are continuous across the chain for display purposes only (so the user sees "wave 1, 2, 3, …" without resets between phases or buckets), but the packer must not consider waves outside the current slot when deciding placement.
 6. **Same-tuple siblings** (informational): two proposals from the same spotter that share any file are automatically separated by the disjointness check (different waves). Even when their FILES are disjoint, the numeric-order sort above guarantees PROPOSAL N never lands in a wave earlier than PROPOSAL N-1 from the same tuple — preserving the sequence the spotter intended. (When their FILES are disjoint they may end up co-packed in the *same* wave; this is fine because disjoint files cannot interfere, and the spotter prompt requires every proposal be robust to its siblings not having landed.)
 7. **Brand-new files** (informational): a path in FILES that does not yet exist is treated like any other entry — two fixers both creating the *same* new path collide, two fixers creating different new paths do not. Fixers never touch files outside their declared FILES list, so any module registration (imports, `mod` declarations, index entries) that a new file needs is either already in FILES (fine), or will be handled by the Step 5 drift sweep after the fixer returns `STATUS: partial`.
 
@@ -408,21 +415,21 @@ After execution and the drift-reconciliation sweep finish, print a tight summary
 
 ### Executed
 
-A table: one row per improvement that was attempted, with columns `#`, `Priority`, `Target`, `Status`, `Files edited`.
+A table: one row per improvement whose fixer was dispatched **and returned a parseable report** (`done`, `partial`, `obsolete`, or `blocked`), with columns `#`, `Priority`, `Target`, `Status`, `Files edited`. Improvements whose fixer output was malformed are NOT listed here — they appear only in "Not landed → Malformed" below.
 
-### Obsolete / blocked / skipped / deferred
+### Not landed
 
-Bulleted list of anything the plan included but execution didn't complete. One line each. Three categories:
+Bulleted list of anything the plan included but execution didn't complete. One line each. Three sub-buckets, each rendered with its own mini-heading; omit any sub-bucket that has zero entries:
 
 - **Obsolete / blocked**: a fixer was dispatched but couldn't apply the change. Quote the reason from the fixer's `SUMMARY`.
-- **Deferred**: P2 items intentionally not dispatched because P0+P1 already exceeded the ~10-distinct-files threshold (per Step 4). These can be picked up by re-running `/improve`.
-- **Malformed**: any subagent (spotter, adversary, fixer, drift) whose output couldn't be parsed and was treated as empty per the malformed-output rule. List one line per dropped subagent — bucket and role only, no reproduction of the garbled output.
+- **Deferred**: P2 items intentionally not dispatched because including them would have pushed the union of `FILES` paths across P0+P1+P2 above the ~10-distinct-files threshold (per Step 4). These can be picked up by re-running `/improve`.
+- **Malformed**: any subagent (spotter, adversary, fixer, drift) whose output couldn't be parsed and was treated as empty per the malformed-output rule. List one line per dropped subagent — role and target/improvement only, no reproduction of the garbled output.
 
-Omit any category that has zero entries.
+(Note: 3d-`Skip` candidates — proposals that didn't survive synthesis at all — appear only in the per-proposal overview rendered back in Step 3e and are NOT re-listed here, since they were never part of the executed plan.)
 
 ### Drift reconciled
 
-Bulleted list of every file touched by the Step 5 sweep (code, docs, configs, schemas, anything), each with a short note on what was reconciled. If the sweep ran but found nothing to reconcile, state that explicitly. If the sweep did not run (no files edited in Step 4), omit this section.
+Bulleted list of every file touched by the Step 5 sweep (code, docs, configs, schemas, anything), each with a short note on what was reconciled. If the sweep ran but found nothing to reconcile, state that explicitly. If the drift sweep itself was malformed (treated as `FILES_UPDATED: none, UNRESOLVED: drift sweep failed` per the malformed-output rule), state that explicitly here too — distinguish "swept and found nothing" from "sweep failed" so the user knows to review cross-file consistency manually. If the sweep did not run (no files edited in Step 4), omit this section.
 
 ### Unresolved
 
@@ -454,12 +461,12 @@ One sentence: `_This was a random sample, not a complete pass — re-run /improv
 - **Fixers locate by symbol, not by line.** Earlier fixers in the same sweep may have shifted lines, renamed symbols, or moved code. Every fixer re-reads its declared FILES fresh and locates its target by symbol/intent, not by the line numbers the proposal text mentioned.
 - **When in doubt, prefer `STATUS: partial`.** A partial status with honest `FOLLOWUPS` lets the drift sweep finish the job; a `done` status that silently under-edited ships broken state.
 - **Drift reconciliation is mandatory.** Whenever Step 4 edited at least one file, run the Step 5 drift sweep. Drift is bidirectional — do not skip just because "only docs changed" or "only code changed." Fixers are forbidden from touching undeclared files, so Step 5 is the only place cross-file reconciliation happens.
-- **SEED salt.** Every subagent prompt — every spotter, every adversary, every fixer, and the drift dispatch — must begin with a `SEED:` line containing 8 freshly-generated random English words, space-separated. Each subagent across the entire run must receive a *different* set of 8 words; do not reuse seeds across spotters, across adversaries, across fixers, between any of the four agent types, or between sweeps. Do not explain the field's purpose to subagents and do not reference it elsewhere in the prompt.
+- **SEED salt.** Every subagent prompt — every spotter, every adversary, every fixer, and the drift dispatch — must begin with a `SEED:` line containing 8 freshly-generated random English words, space-separated. Each subagent **within a single run** must receive a *different* set of 8 words; do not reuse seeds across spotters, across adversaries, across fixers, or between any of the four agent types. (Cross-run uniqueness is not enforceable since prior seeds aren't tracked, but with 8 random words the collision probability is negligible.) Do not explain the field's purpose to subagents and do not reference it elsewhere in the prompt.
 - **Don't pre-fetch** code for spotters or adversaries. They do their own reading; that's part of the sample.
 - **Treat malformed subagent output as empty.** A probabilistic sweep with many subagents will occasionally see one return output that doesn't match the declared format, errors out, or never completes. Treat that subagent's contribution as if it produced nothing for that step:
-  - Spotter: treat as `PROPOSALS: none` for that tuple (still spawn its K adversaries — they may emit `ORIGINAL_REF: new` additions).
-  - Adversary: treat as no ADJUSTED blocks (the spotter's proposals lose one reviewer for verdict-counting; the strict-majority threshold remains `> half of K`).
-  - Fixer: treat as `STATUS: blocked, FILES_EDITED: none` and assume nothing was edited (do NOT trust any partial edits the working tree may show from a crashed fixer — verify by reading the declared FILES if you need certainty).
+  - Spotter: treat as `PROPOSALS: none` for that tuple **and skip its K adversaries** — without a TARGET_AREA to anchor on, adversaries have no target to read and no spotter list to review, so spawning them is a waste. A spotter that emits a TARGET_AREA but whose individual PROPOSAL blocks are partially garbled (e.g. one block missing FILES) drops *only those broken proposals*, not the whole report — preserve the parseable ones and let adversaries still spawn against the readable list.
+  - Adversary: treat as no ADJUSTED blocks (the spotter's proposals lose one reviewer for verdict-counting; the strict-majority threshold remains `> half of K` — using the original K as denominator, not "K minus malformed", so a malformed adversary makes rejects *harder*, which is the conservative direction). An ADJUSTED block whose `ORIGINAL_REF` references a non-existent spotter proposal is dropped on its own (orphaned); it does not invalidate the rest of the adversary's report.
+  - Fixer: treat as `STATUS: blocked, FILES_EDITED: none` and assume nothing was edited (do NOT trust any partial edits the working tree may show from a crashed fixer — verify by reading the declared FILES if you need certainty). Also treat the report as malformed if it's *internally inconsistent*: `STATUS: done` with `FILES_EDITED: none`, `STATUS: obsolete` with non-empty `FILES_EDITED`, `STATUS: blocked` with non-empty `FILES_EDITED`, or `FILES_EDITED` containing any path **outside the declared FILES list**. For the "out-of-scope path" case specifically, intersect `FILES_EDITED` with the declared `FILES` before passing to the drift sweep (so the drift sweep doesn't lock in unintended files as authoritative), and surface a one-liner in "Malformed" naming the rogue paths so the user can review and revert them in the working tree.
   - Drift subagent: treat as `FILES_UPDATED: none, UNRESOLVED: drift sweep failed`.
   
   Never block the rest of the sweep on a single malformed reply. Surface each dropped subagent under the final report's "Malformed" bucket (one line: `<role> for <target/improvement>`) so the user sees what was lost.

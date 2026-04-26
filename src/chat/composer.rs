@@ -244,6 +244,10 @@ pub struct ComposerRun {
     /// Total input + output tokens across all iterations.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens added to the prompt cache across all iterations.
+    pub cache_creation_input_tokens: u64,
+    /// Tokens served from the prompt cache across all iterations.
+    pub cache_read_input_tokens: u64,
     /// Number of `update_self_memory` tool calls dispatched in this run.
     /// The orchestrator increments `state.update_self_memory_today`
     /// by this amount on success.
@@ -269,22 +273,59 @@ pub async fn run_loop(
     tool_ctx: &crate::chat::tools::ToolContext<'_>,
     max_iterations: u32,
     use_extended_cache: bool,
+    rate_limiter: Option<&crate::chat::client::RateLimiter>,
 ) -> Result<ComposerRun, String> {
     let mut req = initial_request;
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+    let mut cache_creation_input_tokens = 0u64;
+    let mut cache_read_input_tokens = 0u64;
     let mut iterations = 0u32;
     let mut update_self_memory_calls = 0u32;
     let mut web_fetch_calls = 0u32;
 
     loop {
         iterations += 1;
+        if let Some(limiter) = rate_limiter {
+            // Estimate weight as the cumulative system+user byte size /
+            // ~4 chars-per-token; more precise than a hardcoded 4_000.
+            let est_input: u64 = req
+                .system
+                .iter()
+                .map(|b| match b {
+                    crate::chat::client::SystemBlock::Text { text, .. } => text.len() as u64,
+                })
+                .sum::<u64>()
+                + req
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .map(|cb| match cb {
+                        crate::chat::client::ContentBlock::Text { text, .. } => {
+                            text.len() as u64
+                        }
+                        crate::chat::client::ContentBlock::ToolResult { content, .. } => {
+                            content.len() as u64
+                        }
+                        crate::chat::client::ContentBlock::ToolUse { .. } => 64,
+                    })
+                    .sum::<u64>();
+            let est_tokens = (est_input / 4).max(1) as u32;
+            limiter
+                .acquire(est_tokens)
+                .await
+                .map_err(|e| format!("composer rate limited: {e}"))?;
+        }
         let resp: CreateMessageResponse =
             crate::chat::client::call_with_retry(api_key, &req, use_extended_cache)
                 .await
                 .map_err(|e| format!("composer call failed: {e}"))?;
         input_tokens = input_tokens.saturating_add(resp.usage.input_tokens);
         output_tokens = output_tokens.saturating_add(resp.usage.output_tokens);
+        cache_creation_input_tokens =
+            cache_creation_input_tokens.saturating_add(resp.usage.cache_creation_input_tokens);
+        cache_read_input_tokens =
+            cache_read_input_tokens.saturating_add(resp.usage.cache_read_input_tokens);
 
         if is_terminal_turn(&resp.content) {
             let reply = extract_text_reply(&resp.content);
@@ -294,6 +335,8 @@ pub async fn run_loop(
                 hit_cap: false,
                 input_tokens,
                 output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
                 update_self_memory_calls,
                 web_fetch_calls,
             });
@@ -308,16 +351,25 @@ pub async fn run_loop(
                 hit_cap: true,
                 input_tokens,
                 output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
                 update_self_memory_calls,
                 web_fetch_calls,
             });
         }
 
         // Dispatch every tool_use block in this turn, build a single
-        // user-turn ContentBlock list with tool_result entries.
+        // user-turn ContentBlock list with tool_result entries. Anthropic
+        // server-side tools (web_search_*) are dispatched by Anthropic
+        // itself — emitting a tool_result for them locally would confuse
+        // the API, so we skip dispatch and let the API fold the real
+        // result into the next assistant turn on its own.
         let mut tool_results: Vec<crate::chat::client::ContentBlock> = Vec::new();
         for block in &resp.content {
             if let crate::chat::client::ContentBlock::ToolUse { id, name, input } = block {
+                if crate::chat::client::is_server_side_tool(name) {
+                    continue;
+                }
                 let (text, is_err) = crate::chat::tools::dispatch(name, input, tool_ctx).await;
                 if !is_err {
                     if name == "update_self_memory" {
@@ -342,6 +394,8 @@ pub async fn run_loop(
                 hit_cap: false,
                 input_tokens,
                 output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
                 update_self_memory_calls,
                 web_fetch_calls,
             });

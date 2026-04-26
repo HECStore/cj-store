@@ -6,8 +6,6 @@
 //! [`recheck_after_sleep`] gate, then sends via `BotInstruction::SendChat`
 //! / `Whisper`.
 
-use std::time::Instant;
-
 /// Outcome of [`recheck_after_sleep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendDecision {
@@ -155,12 +153,6 @@ pub fn lowercase_first_per_sentence(reply: &str) -> String {
         }
     }
     out
-}
-
-/// Return `Instant::now()`. Test seam — most callers thread their own
-/// `Instant` through but the chat task uses this directly.
-pub fn now() -> Instant {
-    Instant::now()
 }
 
 /// CHAT.md / CON4 — probabilistic skip even when the classifier says

@@ -59,9 +59,6 @@ pub enum UrlError {
     BadHost,
     /// Generic parse error — URL did not look like an http(s) URL.
     BadFormat,
-    /// Hostname or IP literal explicitly resolves to / equals a known
-    /// metadata or internal-network address.
-    Denied,
 }
 
 /// Validate a URL string first three bullets. Performs

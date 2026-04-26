@@ -245,6 +245,10 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
                 s.last_composer_call_usd
             );
             println!("web_fetches today: {}", s.web_fetches_today);
+            println!(
+                "classifier active senders: {}",
+                s.classifier_active_senders
+            );
             println!("====================\n");
         }
         Err(_) => println!("Chat task did not respond."),

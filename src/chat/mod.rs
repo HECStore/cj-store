@@ -63,6 +63,9 @@ pub struct ChatStatusReport {
     pub last_composer_call_at: Option<String>,
     pub last_composer_call_usd: f64,
     pub web_fetches_today: u32,
+    /// Number of senders currently tracked in the classifier per-sender
+    /// counter — operator-visible measure of the active classifier load.
+    pub classifier_active_senders: usize,
 }
 
 /// Run the chat task.
@@ -138,9 +141,11 @@ pub async fn chat_task(
     if !persona_name.is_empty() {
         persona_nicknames.insert(0, persona_name.clone());
     }
+    let mut persona_lowercase_default = persona::declares_lowercase_default(&persona_body);
     info!(
         bot_persona = %persona_name,
         nicknames = ?persona_nicknames,
+        lowercase_default = persona_lowercase_default,
         "[Chat] persona loaded"
     );
 
@@ -203,6 +208,19 @@ pub async fn chat_task(
     // Track replies sent in the trailing 60 s for max_replies_per_minute.
     let mut recent_bot_send_times: VecDeque<Instant> = VecDeque::with_capacity(8);
     let mut last_bot_send_at: Option<Instant> = None;
+    // Per-model client-side RPM/ITPM rate limiters. CHAT.md prevents 429
+    // spirals from eating the retry budget by blocking briefly on the
+    // local bucket before the actual HTTPS round-trip.
+    let composer_limiter = client::RateLimiter::new(
+        config.composer_rpm_max,
+        config.composer_itpm_max,
+        config.rate_limit_wait_max_secs,
+    );
+    let classifier_limiter = client::RateLimiter::new(
+        config.classifier_rpm_max,
+        config.classifier_itpm_max,
+        config.rate_limit_wait_max_secs,
+    );
 
     loop {
         tokio::select! {
@@ -249,13 +267,24 @@ pub async fn chat_task(
                             moderation_backoff_until: runtime_state.moderation_backoff_until.clone(),
                             model_404_backoff_until: runtime_state.model_404_backoff_until.clone(),
                             persona_regen_cooldown_until: runtime_state.persona_regen_cooldown_until.clone(),
-                            last_persona_regenerated_at: None,
+                            last_persona_regenerated_at: runtime_state
+                                .last_persona_regenerated_at
+                                .clone(),
                             pending_adjustments_count: pending_count,
-                            uuid_resolve_queue_depth: 0,
+                            uuid_resolve_queue_depth: runtime_state
+                                .uuid_resolve_queue_depth,
                             critical_section_active: in_critical_section.load(Ordering::Acquire),
-                            last_composer_call_at: None,
-                            last_composer_call_usd: 0.0,
-                            web_fetches_today: 0,
+                            last_composer_call_at: runtime_state
+                                .last_composer_call
+                                .as_ref()
+                                .map(|c| c.at_utc.clone()),
+                            last_composer_call_usd: runtime_state
+                                .last_composer_call
+                                .as_ref()
+                                .map(|c| c.usd)
+                                .unwrap_or(0.0),
+                            web_fetches_today: runtime_state.web_fetches_today,
+                            classifier_active_senders: classifier_counter.active_senders(),
                         };
                         let _ = respond_to.send(report);
                     }
@@ -389,19 +418,26 @@ pub async fn chat_task(
                         };
                         let _ = respond_to.send(result);
                     }
-                    Some(ChatCommand::ReplayEvent { event_ts: _, respond_to }) => {
-                        // Phase 8 polish: rebuild the system prompt that
-                        // would have been sent for the given event_ts. The
-                        // PromptSnapshot machinery exists; we just need a
-                        // history line lookup. Stub for now.
-                        let _ = respond_to.send(Err("replay event not yet implemented".to_string()));
+                    Some(ChatCommand::ReplayEvent { event_ts, respond_to }) => {
+                        // CHAT.md `Chat: replay event <ts>` — re-render the
+                        // system prompt that WOULD be sent for the given
+                        // historical event timestamp. Pure local replay; no
+                        // API call, no token cost. Useful for "why did the
+                        // bot say (or not say) that?" diagnostics.
+                        let result = build_replay_prompt(
+                            &event_ts,
+                            &persona_body,
+                        )
+                        .await;
+                        let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::ResetPlayerMemory { username, respond_to }) => {
-                        // Resolve username → UUID via mojang, then delete
+                        // Resolve username → UUID via the local index
+                        // first, falling back to Mojang. Delete
                         // `data/chat/players/<uuid>.md`. The orchestrator
                         // owns this rather than the tools layer because
                         // the tools layer is sender-bound.
-                        let result = match crate::mojang::resolve_user_uuid(&username).await {
+                        let result = match resolve_username_via_index_or_mojang(&username).await {
                             Ok(uuid) => {
                                 let path = memory::player_file_path(&uuid);
                                 if path.exists() {
@@ -415,7 +451,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::DumpPlayerMemory { username, respond_to }) => {
-                        let result = match crate::mojang::resolve_user_uuid(&username).await {
+                        let result = match resolve_username_via_index_or_mojang(&username).await {
                             Ok(uuid) => {
                                 let path = memory::player_file_path(&uuid);
                                 std::fs::read_to_string(&path).map_err(|e| e.to_string())
@@ -424,11 +460,11 @@ pub async fn chat_task(
                         };
                         let _ = respond_to.send(result);
                     }
-                    Some(ChatCommand::SetOperatorTrust { username, set, reason: _, respond_to }) => {
+                    Some(ChatCommand::SetOperatorTrust { username, set, reason, respond_to }) => {
                         // CHAT.md — write/clear `## Trust: 3` in the player
-                        // file. Full audit-log + sanity print + trust3_expires_at
-                        // is Phase 8 polish; the core toggle works today.
-                        let result = match crate::mojang::resolve_user_uuid(&username).await {
+                        // file and append an entry to operator_audit.jsonl
+                        // so trust toggles are auditable after the fact.
+                        let result = match resolve_username_via_index_or_mojang(&username).await {
                             Ok(uuid) => {
                                 memory::ensure_player_file(&uuid, &username)
                                     .map_err(|e| e.to_string())
@@ -462,6 +498,13 @@ pub async fn chat_task(
                                         };
                                         crate::fsutil::write_atomic(&path, &new_body)
                                             .map_err(|e| e.to_string())
+                                    })
+                                    .inspect(|_| {
+                                        // CHAT.md operator-audit ledger.
+                                        // We do not block on the write —
+                                        // this is best-effort.
+                                        let action = if set { "set_trust3" } else { "clear_trust3" };
+                                        write_operator_audit(action, &username, &uuid, &reason);
                                     })
                             }
                             Err(e) => Err(e),
@@ -499,6 +542,13 @@ pub async fn chat_task(
                                 if let Some(name) = persona::extract_name(&persona_body) {
                                     persona_nicknames.insert(0, name);
                                 }
+                                persona_lowercase_default =
+                                    persona::declares_lowercase_default(&persona_body);
+                                runtime_state.last_persona_regenerated_at =
+                                    Some(state::iso_utc(chrono::Utc::now()));
+                                if let Err(e) = runtime_state.save() {
+                                    warn!(error = %e, "[Chat] state save failed after persona regen");
+                                }
                                 Ok(())
                             }
                             Err(e) => Err(e.to_string()),
@@ -509,15 +559,21 @@ pub async fn chat_task(
                         // CHAT.md — purge per-player file. Full
                         // history-JSONL scrub is Phase 8 polish; the
                         // user-facing GDPR handle is the per-player file
-                        // delete.
-                        let result = match crate::mojang::resolve_user_uuid(&username).await {
+                        // delete. The action is recorded to the operator
+                        // audit ledger so a later compliance review can
+                        // confirm the deletion happened.
+                        let result = match resolve_username_via_index_or_mojang(&username).await {
                             Ok(uuid) => {
                                 let path = memory::player_file_path(&uuid);
-                                if path.exists() {
+                                let outcome = if path.exists() {
                                     std::fs::remove_file(&path).map_err(|e| e.to_string())
                                 } else {
                                     Ok(())
+                                };
+                                if outcome.is_ok() {
+                                    write_operator_audit("forget_player", &username, &uuid, "");
                                 }
+                                outcome
                             }
                             Err(e) => Err(e),
                         };
@@ -594,9 +650,8 @@ pub async fn chat_task(
                                 config.reflection_min_distinct_senders,
                             );
                             if trigger {
-                                runtime_state.last_reflection_at = Some(
-                                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                );
+                                runtime_state.last_reflection_at =
+                                    Some(state::iso_utc(chrono::Utc::now()));
                                 let validator = reflection::MultiAxisValidator {
                                     min_distinct_triggers: config.reflection_min_distinct_triggers as usize,
                                     min_distinct_senders: config.reflection_min_distinct_senders as usize,
@@ -662,6 +717,7 @@ pub async fn chat_task(
                             &bot_username,
                             &persona_body,
                             &persona_nicknames,
+                            persona_lowercase_default,
                             &common_words,
                             &blocklist,
                             &system_senders_re,
@@ -675,6 +731,8 @@ pub async fn chat_task(
                             &mut last_bot_send_at,
                             &in_critical_section,
                             &bot_tx,
+                            &composer_limiter,
+                            &classifier_limiter,
                         ).await;
                         if let Err(e) = process_result {
                             warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
@@ -716,6 +774,7 @@ pub async fn chat_task(
                                 &bot_username,
                                 &persona_body,
                                 &persona_nicknames,
+                                persona_lowercase_default,
                                 &common_words,
                                 &blocklist,
                                 &system_senders_re,
@@ -729,6 +788,8 @@ pub async fn chat_task(
                                 &mut last_bot_send_at,
                                 &in_critical_section,
                                 &bot_tx,
+                                &composer_limiter,
+                                &classifier_limiter,
                             )
                             .await;
                         }
@@ -740,6 +801,11 @@ pub async fn chat_task(
                         let cutoff_speakers = Instant::now()
                             - Duration::from_secs(config.recent_speaker_secs as u64);
                         recent_speakers.retain(|_, t| *t >= cutoff_speakers);
+                        // Prune the classifier per-sender counter the same
+                        // way — its own `record_and_check` only prunes the
+                        // entries it touches, so a sender who left the
+                        // server still occupies a slot until pruned here.
+                        classifier_counter.prune(Instant::now());
 
                         // Persist runtime state after each event so token
                         // counters survive a crash.
@@ -784,6 +850,7 @@ async fn process_event(
     bot_username: &Arc<RwLock<Option<String>>>,
     persona_body: &str,
     persona_nicknames: &[String],
+    persona_lowercase_default: bool,
     common_words: &[String],
     blocklist: &std::collections::HashSet<String>,
     system_senders_re: &[String],
@@ -797,6 +864,8 @@ async fn process_event(
     last_bot_send_at: &mut Option<Instant>,
     in_critical_section: &Arc<AtomicBool>,
     bot_tx: &mpsc::Sender<BotInstruction>,
+    composer_limiter: &client::RateLimiter,
+    classifier_limiter: &client::RateLimiter,
 ) -> Result<(), String> {
     let now = Instant::now();
     // Resolve bot's live username — refuse to act if unknown.
@@ -823,9 +892,10 @@ async fn process_event(
         // Check moderation patterns on system-pseudo-sender lines that
         // address the bot — that's how server mods announce mutes/bans.
         if moderation_patterns.is_moderation_event(&event.content) {
-            let until = (chrono::Utc::now()
-                + chrono::Duration::seconds(config.moderation_backoff_secs as i64))
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let until = state::iso_utc(
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(config.moderation_backoff_secs as i64),
+            );
             warn!(
                 until = %until,
                 trigger = %event.content,
@@ -870,8 +940,12 @@ async fn process_event(
     }
 
     // blocklist short-circuit — operator-managed allow-list of
-    // names/UUIDs to ignore entirely.
-    if blocklist.contains(&event.sender.to_lowercase()) {
+    // names/UUIDs to ignore entirely. We don't have the sender's UUID
+    // resolved at this point in the pipeline (resolution happens later,
+    // when the composer is about to be called) so we pass `None`. UUID
+    // entries in the blocklist still work for any sender we resolved
+    // earlier; the username check is the common path.
+    if conversation::SpamGuard::is_blocklisted(&event.sender.to_lowercase(), None, blocklist) {
         decisions::write(
             &decisions::DecisionRecord::new("pre_filter_skip")
                 .with_sender(&event.sender)
@@ -987,16 +1061,53 @@ async fn process_event(
     let started = Instant::now();
     let started_day = state::capture_today_utc();
     let history_slice = recent_history_slice_blocking(30).await;
+    // Honor the runtime extended-cache flag — once the API has rejected
+    // the beta header the static auto-demotes to 5 min, but we also want
+    // request shapes to match so subsequent calls don't keep emitting a
+    // `1h` ttl field that the client has to strip on the way out.
+    let cache_ttl = if client::extended_cache_available() {
+        client::CacheTtl::Ephemeral1Hour
+    } else {
+        client::CacheTtl::Ephemeral5Min
+    };
     let classifier_req = classifier::build_request(
         &config.classifier_model,
         &persona_summary(persona_body),
         &read_adjustments_or_empty(),
         &history_slice,
         event,
-        client::CacheTtl::Ephemeral1Hour,
+        cache_ttl,
     );
+    // Local rate limiter — burns the wait budget before the network call so
+    // 429 spirals from the API never reach us. Token estimate is the same
+    // input estimate used for the pre-flight cap check.
+    if let Err(e) = classifier_limiter
+        .acquire(estimated_classifier_input as u32)
+        .await
+    {
+        decisions::write(
+            &decisions::DecisionRecord::new("classifier_skip")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason(format!("local_rate_limit: {e}")),
+        );
+        return Ok(());
+    }
     let resp = match client::call_with_retry(api_key, &classifier_req, true).await {
         Ok(r) => r,
+        Err(client::ClientError::ModelNotFound { model }) => {
+            // Engage the 1-hour self-disable so subsequent classifier
+            // dispatches short-circuit rather than re-hitting the API.
+            runtime_state.model_404_backoff_until =
+                Some(client::model_404_backoff_until_now_plus_1h());
+            decisions::write(
+                &decisions::DecisionRecord::new("classifier_error")
+                    .with_sender(&event.sender)
+                    .with_event_ts(event.recv_at)
+                    .with_reason(format!("model_not_found: {model}; engaging 1h backoff")),
+            );
+            return Ok(());
+        }
         Err(e) => {
             decisions::write(
                 &decisions::DecisionRecord::new("classifier_error")
@@ -1035,6 +1146,10 @@ async fn process_event(
             .with_event_ts(event.recv_at)
             .with_latency(started.elapsed().as_millis() as u64)
             .with_tokens(resp.usage.input_tokens, resp.usage.output_tokens, usd)
+            .with_cache_tokens(
+                resp.usage.cache_creation_input_tokens,
+                resp.usage.cache_read_input_tokens,
+            )
             .extra("respond", serde_json::Value::from(verdict.respond))
             .extra("confidence", serde_json::Value::from(verdict.confidence))
             .extra("reason", serde_json::Value::from(verdict.reason.clone()))
@@ -1156,7 +1271,7 @@ async fn process_event(
         &snapshot,
         user_content,
         tools::tool_definitions(config.web_search_enabled, config.web_fetch_enabled),
-        client::CacheTtl::Ephemeral1Hour,
+        cache_ttl,
     );
 
     // Tool context — drives every per-tool gate (sender binding, USD
@@ -1186,11 +1301,19 @@ async fn process_event(
         &tool_ctx,
         config.composer_max_tool_iterations,
         true,
+        Some(composer_limiter),
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
+            // Composer surface for ModelNotFound is a string error wrapping
+            // ClientError::ModelNotFound. Detect and engage the 1-hour
+            // backoff so subsequent dispatches skip until the timer clears.
+            if e.contains("model not found") {
+                runtime_state.model_404_backoff_until =
+                    Some(client::model_404_backoff_until_now_plus_1h());
+            }
             decisions::write(
                 &decisions::DecisionRecord::new("composer_error")
                     .with_sender(&event.sender)
@@ -1206,7 +1329,7 @@ async fn process_event(
 
     // Update Chat: status surfacing of the latest call.
     runtime_state.last_composer_call = Some(state::LastCallSummary {
-        at_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        at_utc: state::iso_utc(chrono::Utc::now()),
         usd: composer_usd,
         input_tokens: run.input_tokens,
         output_tokens: run.output_tokens,
@@ -1231,6 +1354,7 @@ async fn process_event(
             .with_event_ts(event.recv_at)
             .with_latency(started.elapsed().as_millis() as u64)
             .with_tokens(run.input_tokens, run.output_tokens, composer_usd)
+            .with_cache_tokens(run.cache_creation_input_tokens, run.cache_read_input_tokens)
             .extra("iterations", serde_json::Value::from(run.iterations))
             .extra("hit_cap", serde_json::Value::from(run.hit_cap))
             .extra("had_text_reply", serde_json::Value::from(run.reply.is_some())),
@@ -1240,6 +1364,15 @@ async fn process_event(
         return Ok(());
     };
     let reply = pacing::strip_ai_tells(&reply);
+    // Apply persona-driven capitalization habit (CHAT.md): a persona that
+    // self-describes as lowercase-by-default lowercases every
+    // sentence-initial alphabetic character. Mid-sentence proper nouns are
+    // preserved.
+    let reply = if persona_lowercase_default {
+        pacing::lowercase_first_per_sentence(&reply)
+    } else {
+        reply
+    };
     let reply = pacing::truncate_to_chat_limit(&reply, config.composer_max_chars as usize);
     if reply.trim().is_empty() {
         return Ok(());
@@ -1348,6 +1481,139 @@ async fn process_event(
         }
     }
     Ok(())
+}
+
+/// Replay the system prompt that WOULD have been sent for a historical
+/// event timestamp. Local-only — no API call. Searches today's and the
+/// preceding day's history JSONL for a record whose `ts` field matches
+/// `event_ts` (string-equal, RFC3339), reconstructs a [`PromptSnapshot`]
+/// from the live persona / memory / adjustments, and renders the system
+/// prompt that the composer would have built.
+async fn build_replay_prompt(
+    event_ts: &str,
+    persona_body: &str,
+) -> Result<String, String> {
+    // Walk recent history files newest-first looking for the record.
+    let event_ts_owned = event_ts.to_string();
+    let found_line = tokio::task::spawn_blocking(move || -> Option<String> {
+        for d in 0..7i64 {
+            let day = (chrono::Utc::now() - chrono::Duration::days(d))
+                .format("%Y-%m-%d")
+                .to_string();
+            let path = std::path::Path::new(history::HISTORY_DIR)
+                .join(format!("{day}.jsonl"));
+            let body = match std::fs::read_to_string(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            for line in body.lines() {
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+                if ts == event_ts_owned {
+                    return Some(line.to_string());
+                }
+            }
+        }
+        None
+    })
+    .await
+    .map_err(|e| format!("history scan join: {e}"))?;
+    let line = found_line.ok_or_else(|| {
+        format!("no history record found for ts={event_ts}")
+    })?;
+    let v: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| format!("history line parse: {e}"))?;
+    let sender = v
+        .get("sender")
+        .and_then(|x| x.as_str())
+        .unwrap_or("<unknown>")
+        .to_string();
+    let content = v
+        .get("content")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let nonce = composer::fresh_nonce();
+    let snapshot = composer::PromptSnapshot {
+        static_rules: composer::static_rules_text(&nonce),
+        persona: persona_body.to_string(),
+        memory_md: read_global_or_empty(),
+        adjustments_md: read_adjustments_or_empty(),
+        player_memory: None,
+        history_slice: recent_history_slice_blocking(30).await,
+    };
+    let mut out = String::new();
+    out.push_str("=== REPLAY ===\n");
+    out.push_str(&format!("event_ts: {event_ts}\nsender: {sender}\ncontent: {content}\n"));
+    out.push_str("\n--- system blocks ---\n\n");
+    for (i, block) in [
+        ("static_rules", snapshot.static_rules.as_str()),
+        ("persona", snapshot.persona.as_str()),
+        ("memory_md", snapshot.memory_md.as_str()),
+        ("adjustments_md", snapshot.adjustments_md.as_str()),
+        ("history_slice", snapshot.history_slice.as_str()),
+    ]
+    .iter()
+    .enumerate()
+    {
+        out.push_str(&format!("[block {} — {}]\n{}\n\n", i, block.0, block.1));
+    }
+    Ok(out)
+}
+
+/// Append a single record to `data/chat/operator_audit.jsonl`. Used by
+/// Trust-3 toggles and `forget_player` so a later compliance review can
+/// confirm what the operator did and why. Best-effort — failures are
+/// logged but never bubble up to the CLI.
+fn write_operator_audit(action: &str, username: &str, uuid: &str, reason: &str) {
+    use std::io::Write;
+    let entry = serde_json::json!({
+        "ts": state::iso_utc(chrono::Utc::now()),
+        "action": action,
+        "username": username,
+        "uuid": uuid,
+        "reason": reason,
+    });
+    let path = std::path::Path::new(memory::CHAT_DIR).join("operator_audit.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let line = match serde_json::to_string(&entry) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "[Chat] operator_audit serialize failed");
+            return;
+        }
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{line}") {
+                warn!(error = %e, path = %path.display(), "[Chat] operator_audit append failed");
+            }
+        }
+        Err(e) => warn!(error = %e, path = %path.display(), "[Chat] operator_audit open failed"),
+    }
+}
+
+/// Resolve `username` → `uuid` via the local `_index.json` first, falling
+/// back to a Mojang lookup if the index is cold. Avoids burning the
+/// Mojang rate limit when an operator runs CLI commands against players
+/// the bot already knows. Best-effort — index-load failures fall through
+/// to the network call rather than aborting.
+async fn resolve_username_via_index_or_mojang(username: &str) -> Result<String, String> {
+    if let Ok(idx) = memory::load_or_rebuild_index()
+        && let Some(uuid) = idx.lookup(username)
+    {
+        return Ok(uuid.to_string());
+    }
+    crate::mojang::resolve_user_uuid(username).await
 }
 
 /// Cheap deterministic-process-RNG returning a value in [0.0, 1.0).

@@ -79,6 +79,9 @@ pub fn empty_player_template(username: &str, uuid: &str, today: &str) -> String 
 /// caller does not need to thread a date through. Returns `Ok(())`
 /// regardless of whether a new file was created — callers that need the
 /// distinction should `path.exists()`-check first.
+///
+/// On a fresh-create, also patches `_index.json` so a subsequent username
+/// → UUID lookup hits the index without requiring a full rebuild.
 pub fn ensure_player_file(uuid: &str, username: &str) -> io::Result<()> {
     let path = player_file_path(uuid);
     if path.exists() {
@@ -90,6 +93,14 @@ pub fn ensure_player_file(uuid: &str, username: &str) -> io::Result<()> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let body = empty_player_template(username, uuid, &today);
     write_atomic(&path, &body)?;
+    // Best-effort index patch — failures are logged but never bubble up
+    // because the index is derivable from the players dir.
+    if let Ok(mut idx) = load_or_rebuild_index() {
+        idx.insert(username, uuid);
+        if let Err(e) = save_index(&idx) {
+            warn!(error = %e, "failed to persist _index.json after ensure_player_file");
+        }
+    }
     debug!(uuid = uuid, username = username, "created new per-player file");
     Ok(())
 }
@@ -102,14 +113,6 @@ pub fn read_player(uuid: &str) -> io::Result<Option<String>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
-}
-
-/// Replace a per-player file in full via [`write_atomic`]. Direct calls
-/// from the composer go through `update_player_memory` (Phase 5) which
-/// adds section allow-lists, dedup, and cap enforcement; this helper is
-/// the underlying durable write.
-pub fn write_player(uuid: &str, body: &str) -> io::Result<()> {
-    write_atomic(player_file_path(uuid), body)
 }
 
 /// Read `memory.md` (the global memory file). Missing → empty string.

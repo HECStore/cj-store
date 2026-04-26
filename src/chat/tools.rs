@@ -527,9 +527,9 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
 
     // Bootstrap the file if needed BEFORE canonicalization so the
-    // players dir is guaranteed to exist on disk. Username goes from
-    // the index map; if not present, fall back to "unknown" — the
-    // bot's own observation will refresh it later.
+    // players dir is guaranteed to exist on disk. The index is keyed
+    // username → UUID, so the reverse lookup is an iter-find: the index
+    // is small (one entry per known player) so this is fine.
     let username = crate::chat::memory::load_or_rebuild_index()
         .ok()
         .and_then(|idx| {
@@ -554,11 +554,22 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     let with_section = ensure_section(&body, section);
     let new_body = append_bullet_to_section(&with_section, section, &safe_bullet, &ctx.today);
 
-    // CHAT.md: explicit cap-error so the model can re-plan instead
-    // of silently growing the file. Summarization is the orchestrator's
-    // job — the tool itself never invokes Haiku.
+    // CHAT.md: explicit cap-error so the model can re-plan instead of
+    // silently growing the file. Summarization is the orchestrator's job
+    // — the tool itself never invokes Haiku. The cap-plus-25 % gate
+    // ([`crate::chat::memory::should_summarize_player_file`]) is the
+    // documented threshold for triggering the summarization pass.
     if new_body.len() > ctx.player_memory_max_bytes as usize {
-        return Err("player memory at cap; summarization rate-limited".to_string());
+        let summarize_recommended = crate::chat::memory::should_summarize_player_file(
+            new_body.len(),
+            ctx.player_memory_max_bytes as usize,
+        );
+        let reason = if summarize_recommended {
+            "player memory at cap (>125%); summarization rate-limited"
+        } else {
+            "player memory at cap; summarization rate-limited"
+        };
+        return Err(reason.to_string());
     }
 
     crate::fsutil::write_atomic(&path, &new_body)

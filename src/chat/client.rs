@@ -38,17 +38,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-/// Tool names whose dispatch is owned by the Anthropic API itself (server-side
-/// tools). Local dispatchers must NOT attempt to handle these — the API will
-/// fold the result into the next assistant message. Currently only
-/// `web_search_*` is server-side; if Anthropic adds more, extend this list.
-pub const WEB_SEARCH_TOOL_NAME_PREFIX: &str = "web_search";
-
 /// True if the named tool is dispatched by the Anthropic API (server-side)
-/// rather than by our local dispatcher. Local dispatchers must return a
-/// "no local handler" sentinel for these instead of erroring.
+/// rather than by our local dispatcher. The composer's tool-use loop must
+/// skip emitting a local `tool_result` for these — the API folds the real
+/// result into the next assistant message itself. Currently only
+/// `web_search_*` is server-side; if Anthropic adds more, extend the
+/// match below.
 pub fn is_server_side_tool(name: &str) -> bool {
-    name.starts_with(WEB_SEARCH_TOOL_NAME_PREFIX)
+    name.starts_with("web_search")
 }
 
 /// Runtime flag controlling whether the 1-hour ephemeral cache TTL beta is
@@ -126,11 +123,6 @@ impl CacheTtl {
             CacheTtl::Ephemeral5Min => None,
             CacheTtl::Ephemeral1Hour => Some("1h"),
         }
-    }
-
-    /// Whether this TTL choice requires the beta header.
-    pub fn needs_extended_beta(self) -> bool {
-        matches!(self, CacheTtl::Ephemeral1Hour)
     }
 }
 
@@ -220,7 +212,12 @@ pub struct Tool {
 
 // ---- Response types -----------------------------------------------------
 
+/// Anthropic Messages API response. `id`/`model`/`role`/`stop_reason` are
+/// parsed for completeness (they round-trip through the response decoder
+/// and surface in error logs when something is wrong) but the chat task
+/// only acts on `content` and `usage`.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct CreateMessageResponse {
     pub id: String,
     pub model: String,
@@ -876,13 +873,11 @@ mod tests {
     #[test]
     fn cache_ttl_5min_omits_ttl_field() {
         assert!(CacheTtl::Ephemeral5Min.as_ttl_field().is_none());
-        assert!(!CacheTtl::Ephemeral5Min.needs_extended_beta());
     }
 
     #[test]
-    fn cache_ttl_1hour_emits_1h_and_needs_beta() {
+    fn cache_ttl_1hour_emits_1h_field() {
         assert_eq!(CacheTtl::Ephemeral1Hour.as_ttl_field(), Some("1h"));
-        assert!(CacheTtl::Ephemeral1Hour.needs_extended_beta());
     }
 
     #[test]

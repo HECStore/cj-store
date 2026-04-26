@@ -160,87 +160,6 @@ pub fn is_direct_address(content: &str, bare_word_eligible_names: &[String]) -> 
     false
 }
 
-/// Direct-address check with common-words downgrade. Mirrors
-/// the implementation in
-/// [`crate::chat::conversation::is_direct_address_with_common_words`];
-/// the duplication is intentional so the orchestrator can flip the
-/// classifier path over without taking a cross-module dependency.
-///
-/// Behavior:
-/// - For nicknames NOT in `common_words`: a whole-word match anywhere
-///   in the message counts as direct address.
-/// - For nicknames in `common_words` (Sky, Steve, Alex, etc.): the
-///   match is downgraded — only counts if the name STARTS the message
-///   (followed by space/punct/EOL) or appears in `@<name>` form.
-pub fn is_direct_address_v2(
-    content: &str,
-    nicknames: &[String],
-    common_words: &[String],
-) -> bool {
-    let lower = content.to_lowercase();
-    let common_set: std::collections::HashSet<String> =
-        common_words.iter().map(|w| w.to_lowercase()).collect();
-    for nick in nicknames {
-        if nick.is_empty() {
-            continue;
-        }
-        let n_lower = nick.to_lowercase();
-        if !common_set.contains(&n_lower) {
-            // Standard whole-word ASCII-boundary match.
-            if has_word_match_v2(&lower, &n_lower) {
-                return true;
-            }
-        } else {
-            // Downgraded: must start the message OR be `@`-prefixed.
-            if lower.starts_with(&n_lower) {
-                let after = lower.as_bytes().get(n_lower.len()).copied();
-                let boundary = matches!(
-                    after,
-                    None | Some(b' ')
-                        | Some(b',')
-                        | Some(b':')
-                        | Some(b';')
-                        | Some(b'!')
-                        | Some(b'?')
-                        | Some(b'.')
-                );
-                if boundary {
-                    return true;
-                }
-            }
-            let needle = format!("@{n_lower}");
-            if lower.contains(&needle) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Whole-word case-insensitive ASCII-boundary substring match. Local
-/// duplicate of `conversation::has_word_match` so this module stays
-/// self-contained for [`is_direct_address_v2`].
-fn has_word_match_v2(lower: &str, name: &str) -> bool {
-    let bytes = lower.as_bytes();
-    let nb = name.as_bytes();
-    if nb.is_empty() {
-        return false;
-    }
-    let mut i = 0;
-    while i + nb.len() <= bytes.len() {
-        if &bytes[i..i + nb.len()] == nb {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let after_ok =
-                i + nb.len() == bytes.len() || !bytes[i + nb.len()].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
 /// Decide whether to dispatch the event to the classifier.
 ///
 /// Returns [`GateVerdict::Classify`] only when ALL of the following hold:
@@ -336,39 +255,6 @@ pub struct AiCallout {
     pub detected: bool,
     #[serde(default)]
     pub trigger: String,
-}
-
-/// System prompt the classifier sees. Wrapped together with the
-/// adjustments block in the snapshot the caller passes in (CHAT.md:
-/// "cache breakpoint here" on adjustments).
-///
-/// Note: this single-string variant is kept for back-compat with any
-/// caller that wants the combined text. The CHAT.md-correct path is
-/// [`system_prompt_blocks`], which returns the persona and adjustments
-/// as TWO separate blocks so the caller can place a `cache_control:
-/// ephemeral` marker on the adjustments block alone.
-pub fn system_prompt(persona_summary: &str, adjustments_md: &str) -> String {
-    format!(
-        "You are a chat-classifier for a Minecraft bot. Decide whether the bot \
-         should reply to the most recent message. Output STRICT JSON with this \
-         shape and nothing else:\n\
-         \n\
-         {{\n  \"respond\": <true|false>,\n  \"confidence\": <0.0-1.0>,\n  \
-         \"reason\": \"<short explanation>\",\n  \"urgency\": \"<low|med|high>\",\n  \
-         \"ai_callout\": {{\"detected\": <true|false>, \"trigger\": \"<verbatim quote if true>\"}}\n}}\n\
-         \n\
-         Guidance:\n\
-         - The bot stays in character (see persona summary). It is OK to stay \
-           silent on most messages — humans don't reply to everything.\n\
-         - Set ai_callout.detected = true ONLY when a player accuses the bot of \
-           being AI / scripted / a robot. Quote the exact trigger.\n\
-         - Confidence reflects how sure you are about responding/not — not how \
-           important the topic is.\n\
-         \n\
-         === Persona summary ===\n{persona_summary}\n\
-         \n\
-         === Adjustments (style lessons learned) ===\n{adjustments_md}",
-    )
 }
 
 /// Two-block system prompt for the classifier. Returns
@@ -956,65 +842,6 @@ mod tests {
                 assert!(cache_control.is_some());
             }
         }
-    }
-
-    // ---- is_direct_address_v2 -------------------------------------------
-
-    #[test]
-    fn classifier_is_direct_address_v2_admits_normal_nickname() {
-        let nicks = vec!["TradeBot".to_string()];
-        assert!(is_direct_address_v2(
-            "hey TradeBot, how are you",
-            &nicks,
-            &[],
-        ));
-        assert!(is_direct_address_v2("@tradebot ping", &nicks, &[]));
-    }
-
-    #[test]
-    fn classifier_is_direct_address_v2_downgrades_common_word() {
-        // "Sky" is a common English word; mid-sentence mention should
-        // NOT count as direct address.
-        let nicks = vec!["Sky".to_string()];
-        let common = vec!["sky".to_string()];
-        assert!(!is_direct_address_v2(
-            "the sky is blue today",
-            &nicks,
-            &common,
-        ));
-    }
-
-    #[test]
-    fn classifier_is_direct_address_v2_admits_common_word_at_start() {
-        // Same word at start of message DOES count.
-        let nicks = vec!["Sky".to_string()];
-        let common = vec!["sky".to_string()];
-        assert!(is_direct_address_v2("Sky, what's up", &nicks, &common));
-        assert!(is_direct_address_v2("sky: hello", &nicks, &common));
-        assert!(is_direct_address_v2("sky", &nicks, &common));
-    }
-
-    #[test]
-    fn classifier_is_direct_address_v2_admits_common_word_with_at_prefix() {
-        // `@Sky` always counts even if `sky` is a common word.
-        let nicks = vec!["Sky".to_string()];
-        let common = vec!["sky".to_string()];
-        assert!(is_direct_address_v2(
-            "look at @Sky over there",
-            &nicks,
-            &common,
-        ));
-    }
-
-    #[test]
-    fn classifier_is_direct_address_v2_does_not_match_substring() {
-        // `TradeBot` must not match inside `tradeboth`.
-        let nicks = vec!["TradeBot".to_string()];
-        assert!(!is_direct_address_v2(
-            "tradeboth options please",
-            &nicks,
-            &[],
-        ));
     }
 
     #[test]

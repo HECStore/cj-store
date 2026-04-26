@@ -120,7 +120,10 @@ pub fn route_whisper(
         Some(t) => t.to_lowercase(),
         None => return WhisperRoute::Drop,
     };
-    if command_prefixes.iter().any(|p| p.eq_ignore_ascii_case(&first_token)) {
+    if command_prefixes
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&first_token))
+    {
         return WhisperRoute::Store;
     }
 
@@ -202,9 +205,7 @@ fn levenshtein(a: &[u8], b: &[u8]) -> usize {
         cur[0] = i + 1;
         for (j, &cb) in b.iter().enumerate() {
             let cost = if ca.eq_ignore_ascii_case(&cb) { 0 } else { 1 };
-            cur[j + 1] = (cur[j] + 1)
-                .min(prev[j + 1] + 1)
-                .min(prev[j] + cost);
+            cur[j + 1] = (cur[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -226,7 +227,10 @@ pub enum ChannelClass {
     OpenChat,
     /// Two senders dominate the window with at least 2 transitions
     /// between them; the bot stays silent unless directly addressed.
-    Dyad { speaker_a: String, speaker_b: String },
+    Dyad {
+        speaker_a: String,
+        speaker_b: String,
+    },
     /// Window is too small to classify (fewer than 8 entries) and
     /// nothing else matches; default to open-chat behavior (no
     /// suppression).
@@ -430,11 +434,7 @@ pub fn load_blocklist(path: &str) -> std::collections::HashSet<String> {
 ///   stripped and treated as a "starts with" anchor for the common case.
 /// - `exact_lines` (from `data/chat/system_senders.txt`): exact-match
 ///   list, evaluated with case-sensitive equality.
-pub fn is_system_pseudo_sender(
-    name: &str,
-    regex_lines: &[String],
-    exact_lines: &[String],
-) -> bool {
+pub fn is_system_pseudo_sender(name: &str, regex_lines: &[String], exact_lines: &[String]) -> bool {
     // Mojang shape gate.
     let shape_ok = name.len() >= 3
         && name.len() <= 16
@@ -544,8 +544,13 @@ pub fn is_direct_address_with_common_words(
                 let next = rest.as_bytes().first().copied();
                 let boundary = matches!(
                     next,
-                    None | Some(b' ') | Some(b',') | Some(b':') | Some(b';')
-                        | Some(b'!') | Some(b'?') | Some(b'.')
+                    None | Some(b' ')
+                        | Some(b',')
+                        | Some(b':')
+                        | Some(b';')
+                        | Some(b'!')
+                        | Some(b'?')
+                        | Some(b'.')
                 );
                 if boundary {
                     return true;
@@ -684,9 +689,18 @@ mod tests {
 
     #[test]
     fn sigil_only_messages_are_dropped() {
-        assert_eq!(route_whisper("!", true, false, &default_prefixes(), 2), WhisperRoute::Drop);
-        assert_eq!(route_whisper("//", true, false, &default_prefixes(), 2), WhisperRoute::Drop);
-        assert_eq!(route_whisper("/!/", true, false, &default_prefixes(), 2), WhisperRoute::Drop);
+        assert_eq!(
+            route_whisper("!", true, false, &default_prefixes(), 2),
+            WhisperRoute::Drop
+        );
+        assert_eq!(
+            route_whisper("//", true, false, &default_prefixes(), 2),
+            WhisperRoute::Drop
+        );
+        assert_eq!(
+            route_whisper("/!/", true, false, &default_prefixes(), 2),
+            WhisperRoute::Drop
+        );
     }
 
     // ---- multi-sigil rule (Rule 4) ----------------------------------------
@@ -735,7 +749,11 @@ mod tests {
         let p = default_prefixes();
         for alias in &["b", "s", "d", "w", "p", "bal", "h", "q", "c"] {
             let r = route_whisper(&format!("{alias} cobblestone 1"), true, false, &p, 2);
-            assert_eq!(r, WhisperRoute::Store, "alias {alias} should route to store");
+            assert_eq!(
+                r,
+                WhisperRoute::Store,
+                "alias {alias} should route to store"
+            );
         }
     }
 
@@ -751,7 +769,11 @@ mod tests {
         let p = default_prefixes();
         for verb in &["additem", "removeitem", "addcurrency", "removecurrency"] {
             let r = route_whisper(&format!("{verb} diamond 1"), true, false, &p, 2);
-            assert_eq!(r, WhisperRoute::Store, "operator verb {verb} should route to store");
+            assert_eq!(
+                r,
+                WhisperRoute::Store,
+                "operator verb {verb} should route to store"
+            );
         }
     }
 
@@ -789,7 +811,13 @@ mod tests {
 
     #[test]
     fn freeform_message_with_no_typo_routes_to_chat() {
-        let r = route_whisper("hello friend how are you", true, false, &default_prefixes(), 2);
+        let r = route_whisper(
+            "hello friend how are you",
+            true,
+            false,
+            &default_prefixes(),
+            2,
+        );
         assert_eq!(r, WhisperRoute::Chat);
     }
 
@@ -840,13 +868,35 @@ mod tests {
         let p = default_prefixes();
         let p_lower: Vec<String> = p.iter().map(|s| s.to_lowercase()).collect();
         let parser_verbs = [
-            "buy", "b", "sell", "s",
-            "deposit", "d", "withdraw", "w",
-            "price", "p", "balance", "bal", "pay",
-            "items", "queue", "q", "cancel", "c",
-            "status", "help", "h",
-            "additem", "ai", "removeitem", "ri",
-            "addcurrency", "ac", "removecurrency", "rc",
+            "buy",
+            "b",
+            "sell",
+            "s",
+            "deposit",
+            "d",
+            "withdraw",
+            "w",
+            "price",
+            "p",
+            "balance",
+            "bal",
+            "pay",
+            "items",
+            "queue",
+            "q",
+            "cancel",
+            "c",
+            "status",
+            "help",
+            "h",
+            "additem",
+            "ai",
+            "removeitem",
+            "ri",
+            "addcurrency",
+            "ac",
+            "removecurrency",
+            "rc",
         ];
         for v in parser_verbs {
             assert!(
@@ -920,7 +970,10 @@ mod tests {
             ev("B", "8"),
         ];
         match classify_window(&w) {
-            ChannelClass::Dyad { speaker_a, speaker_b } => {
+            ChannelClass::Dyad {
+                speaker_a,
+                speaker_b,
+            } => {
                 let names = [speaker_a.as_str(), speaker_b.as_str()];
                 assert!(names.contains(&"A") && names.contains(&"B"));
             }
@@ -959,7 +1012,13 @@ mod tests {
         // 5 msgs cap, 30s window. Each event has clearly different
         // content (no near-duplicate gate) so we test the rate-limit
         // path in isolation.
-        let texts = ["hi", "what's up", "did you trade today", "ok bye now", "actually wait"];
+        let texts = [
+            "hi",
+            "what's up",
+            "did you trade today",
+            "ok bye now",
+            "actually wait",
+        ];
         for t in texts {
             let event = ev("Alice", t);
             assert!(!g.record(&event, 5, 30, 300, now));
@@ -1060,10 +1119,7 @@ mod tests {
     #[test]
     fn levenshtein_ratio_high_for_near_duplicates() {
         // 23 vs 24 chars, 1 char different → ratio ~0.96.
-        let r = levenshtein_ratio(
-            "the diamond price is now",
-            "the diamond price is now!",
-        );
+        let r = levenshtein_ratio("the diamond price is now", "the diamond price is now!");
         assert!(r > 0.9, "got {r}");
     }
 

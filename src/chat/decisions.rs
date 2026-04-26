@@ -47,6 +47,13 @@ pub struct DecisionRecord {
     /// USD estimate for this call only (not cumulative).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usd: Option<f64>,
+    /// Tokens added to the cache by this call (Anthropic charges 25 %
+    /// extra for these; useful for cache-hit-rate triage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Tokens served from the cache (90 % cheaper than full input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
     /// Open-ended map for kind-specific fields.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -64,6 +71,8 @@ impl DecisionRecord {
             input_tokens: None,
             output_tokens: None,
             usd: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -92,6 +101,19 @@ impl DecisionRecord {
         self.input_tokens = Some(input);
         self.output_tokens = Some(output);
         self.usd = Some(usd);
+        self
+    }
+
+    /// Attach cache-side token counts to the record. Both fields are
+    /// emitted only when nonzero so quiet entries stay terse in the
+    /// decisions log.
+    pub fn with_cache_tokens(mut self, creation: u64, read: u64) -> Self {
+        if creation > 0 {
+            self.cache_creation_input_tokens = Some(creation);
+        }
+        if read > 0 {
+            self.cache_read_input_tokens = Some(read);
+        }
         self
     }
 

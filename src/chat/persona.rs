@@ -225,7 +225,7 @@ pub async fn generate(
     common_words: &[String],
 ) -> Result<String, String> {
     use crate::chat::client::{
-        CacheTtl, ContentBlock, CreateMessageRequest, Message, Role, SystemBlock,
+        ContentBlock, CreateMessageRequest, Message, Role, SystemBlock,
     };
 
     validate_seed(seed)?;
@@ -346,6 +346,21 @@ pub fn extract_name(persona_body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// True if the persona declares `Capitalization: lowercase-by-default`
+/// (CHAT.md pacing post-process). When set, the pacing layer lowercases
+/// the first alphabetic character of every sentence so the bot matches
+/// the persona's typing habits — humans who default to lowercase don't
+/// suddenly start sentences with caps.
+pub fn declares_lowercase_default(persona_body: &str) -> bool {
+    for line in persona_body.lines() {
+        let trimmed = line.trim_start_matches('-').trim();
+        if let Some(rest) = trimmed.strip_prefix("Capitalization:") {
+            return rest.trim().eq_ignore_ascii_case("lowercase-by-default");
+        }
+    }
+    false
 }
 
 /// Extract the `Nicknames:` line from the persona body, returning the
@@ -486,6 +501,29 @@ mod tests {
     fn extract_name_returns_none_when_missing() {
         let body = "no heading here\nmore text";
         assert!(extract_name(body).is_none());
+    }
+
+    #[test]
+    fn declares_lowercase_default_detects_marker_line() {
+        let body = "# Steve\n- Capitalization: lowercase-by-default\n";
+        assert!(declares_lowercase_default(body));
+    }
+
+    #[test]
+    fn declares_lowercase_default_returns_false_for_other_modes() {
+        assert!(!declares_lowercase_default("- Capitalization: sentence-case"));
+        assert!(!declares_lowercase_default("- Capitalization: mixed"));
+        assert!(!declares_lowercase_default(""));
+    }
+
+    #[test]
+    fn declares_lowercase_default_matches_case_insensitively() {
+        // The persona file is HTML-escaped before going into the prompt,
+        // but the CAPITALIZATION value itself is free-form text. Be
+        // tolerant of casing on the value.
+        assert!(declares_lowercase_default(
+            "- Capitalization: LOWERCASE-BY-DEFAULT"
+        ));
     }
 
     #[test]

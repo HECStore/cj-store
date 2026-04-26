@@ -142,8 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // exclusively so the bot's `try_send` lands in a single,
             // dedicated drainer (PLAN §2.2). The skeleton drains and
             // discards; Phase 2 adds the JSONL writer.
-            let history_handle =
-                tokio::spawn(crate::chat::history_writer_task(history_rx));
+            let history_handle = tokio::spawn(crate::chat::history_writer_task(
+                history_rx,
+                chat_config.enabled,
+            ));
 
             // Spawn the chat task with PANIC ISOLATION (PLAN §2.5 A1).
             // A panic inside chat_task must not tear down the trade bot —
@@ -170,12 +172,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             // Bot task — pass chat-side channels via `BotChannels`.
+            // `chat_cmd_tx` is `Some(...)` only when chat is enabled, so
+            // trade-only operators never carry a dangling sender (PLAN §2.4).
+            let bot_chat_cmd_tx = if chat_config.enabled {
+                Some(chat_cmd_tx.clone())
+            } else {
+                None
+            };
             let bot_channels = crate::bot::BotChannels {
                 chat_events_tx: chat_events_tx.clone(),
                 history_tx,
                 bot_username,
                 chat_config: chat_config.clone(),
                 in_critical_section,
+                chat_cmd_tx: bot_chat_cmd_tx,
             };
             // Local spawn: Azalea's bot_task is !Send.
             let bot_handle = tokio::task::spawn_local(crate::bot::bot_task(

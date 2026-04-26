@@ -418,6 +418,15 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
             .await
             .map_err(|e| format!("fetch failed: {e}"))?;
 
+        // Operator-visible log of every hop (initial + each redirect).
+        // Deliberately host+status only — never path/query, so secrets
+        // embedded in URLs cannot leak via logs.
+        tracing::info!(
+            host = %host_str,
+            status = resp.status().as_u16(),
+            "[Chat] web_fetch"
+        );
+
         let status = resp.status();
         // Manual redirect handling — extract Location, re-validate.
         if status.is_redirection() {

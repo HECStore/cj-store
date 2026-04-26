@@ -33,10 +33,33 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ChatConfig;
 use crate::messages::{
-    BotInstruction, BotMessage, ChatEvent, ChatEventKind, ChestAction, ChestSyncReport,
-    StoreMessage,
+    BotInstruction, BotMessage, ChatCommand, ChatEvent, ChatEventKind, ChestAction,
+    ChestSyncReport, StoreMessage,
 };
 use crate::types::Position;
+
+/// RAII guard for the §2.2 / §4.8 ADV4 `in_critical_section` flag.
+///
+/// Set the flag on construction, clear it on drop. Using a guard instead
+/// of explicit `store(false)` calls means we cannot leak a "stuck true"
+/// flag through an early `?` return or a panic — every exit path runs
+/// `Drop::drop` and clears the flag.
+struct CriticalGuard<'a>(&'a AtomicBool);
+
+impl<'a> CriticalGuard<'a> {
+    /// Set the flag and return a guard. The flag is cleared when the
+    /// returned guard is dropped (success, error, panic — all the same).
+    fn enter(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for CriticalGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Component)]
 pub struct BotState {
@@ -138,6 +161,10 @@ pub struct Bot {
     /// or chest IO is in flight. Read-only by chat (chat task gets a
     /// clone of the same `Arc` and observes via `.load()` only).
     pub in_critical_section: Arc<AtomicBool>,
+    /// Optional command channel into chat. `None` when chat is disabled
+    /// (trade-only operator). Used today only to fire
+    /// `ChatCommand::BotDisconnected` on `Event::Disconnect` (PLAN §2.4).
+    pub chat_cmd_tx: Option<mpsc::Sender<ChatCommand>>,
 }
 
 /// Channels and shared state passed from `main` into [`bot_task`].
@@ -150,6 +177,15 @@ pub struct BotChannels {
     pub bot_username: Arc<RwLock<Option<String>>>,
     pub chat_config: Arc<ChatConfig>,
     pub in_critical_section: Arc<AtomicBool>,
+    /// Optional command channel back into the chat task.
+    ///
+    /// `None` for trade-only operators (no chat task running). When
+    /// populated, the bot uses it to signal in-flight cancellation —
+    /// today the only signal is `ChatCommand::BotDisconnected`, sent on
+    /// `Event::Disconnect` so the chat task can cancel any composer call
+    /// that would land at a now-disconnected client (PLAN §2.4 in-flight
+    /// cancellation).
+    pub chat_cmd_tx: Option<mpsc::Sender<ChatCommand>>,
 }
 
 impl Bot {
@@ -189,6 +225,7 @@ impl Bot {
             chat_config: channels.chat_config,
             history_drops: Arc::new(parking_lot::Mutex::new(0)),
             in_critical_section: channels.in_critical_section,
+            chat_cmd_tx: channels.chat_cmd_tx,
         })
     }
 
@@ -323,6 +360,13 @@ pub async fn bot_task(
     let max_backoff = tokio::time::Duration::from_secs(60);
     // Initialize last_attempt in the past so the first reconnect check can fire immediately.
     let mut last_attempt = tokio::time::Instant::now() - backoff;
+    // Edge-detect connect→disconnect transitions so we fire
+    // `ChatCommand::BotDisconnected` exactly once per drop (PLAN §2.4
+    // in-flight cancellation). The event handler clears `bot.client` from
+    // `Event::Disconnect` but doesn't itself own `chat_cmd_tx`; the tick
+    // loop is the only place with both visibility into the transition
+    // and the channel handle.
+    let mut was_connected = false;
 
     // Main event loop (+ periodic reconnect checks)
     'outer: loop {
@@ -334,6 +378,19 @@ pub async fn bot_task(
                 }
 
                 let disconnected = bot.client.read().await.is_none();
+                // Fire BotDisconnected on the connect→disconnect edge,
+                // not every tick — chat would otherwise see the same
+                // signal once per second while we wait for reconnect.
+                if was_connected && disconnected
+                    && let Some(tx) = &bot.chat_cmd_tx
+                    && let Err(e) = tx.try_send(ChatCommand::BotDisconnected)
+                {
+                    debug!(
+                        "[Bot] BotDisconnected signal not delivered to chat: {} (chat task may be down)",
+                        e
+                    );
+                }
+                was_connected = !disconnected;
                 if disconnected && last_attempt.elapsed() >= backoff {
                     info!("Bot appears disconnected; attempting reconnect");
                     last_attempt = tokio::time::Instant::now();
@@ -433,6 +490,12 @@ pub async fn bot_task(
                 debug!("[Bot] Chest interaction: chest={} action={:?}", target_chest.id, action);
 
                 let op_start = std::time::Instant::now();
+
+                // PLAN §2.2 / §4.8 ADV4: bracket chest IO so chat suppresses
+                // public chat and defers whispers while we're walking
+                // chests / shuffling shulkers. Cleared on every exit
+                // path via the guard's Drop.
+                let _critical = CriticalGuard::enter(&bot.in_critical_section);
 
                 let result: Result<ChestSyncReport, String> = match navigation::go_to_chest(&bot, &target_chest, &node_position).await {
                     Err(e) => {
@@ -570,6 +633,11 @@ pub async fn bot_task(
                 info!("[Bot] Trade with {}: bot_offers={:?} player_offers={:?}", target_username, bot_offers, player_offers);
 
                 let trade_start = std::time::Instant::now();
+                // PLAN §2.2 / §4.8 ADV4: bracket the entire trade
+                // (including any chest-walk inside `execute_trade_with_player`)
+                // so chat treats it as a single critical section. The guard's
+                // Drop fires on success, error, and panic alike.
+                let _critical = CriticalGuard::enter(&bot.in_critical_section);
                 let result = trade::execute_trade_with_player(
                     &bot,
                     &target_username,

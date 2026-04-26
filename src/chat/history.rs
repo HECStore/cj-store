@@ -216,7 +216,23 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// never block forward progress on a single bad write. If disk space is
 /// exhausted the failures will be loud and recurring — the operator
 /// playbook (PLAN §14) covers this.
-pub async fn writer_task(mut history_rx: mpsc::Receiver<ChatEvent>) {
+///
+/// **Disabled-chat fast path (PLAN §2.5).** When `chat_enabled` is false
+/// the task drains the channel silently — no JSONL files are created on
+/// disk for trade-only operators. Senders never see a `try_send` failure
+/// (the receiver stays alive) but nothing reaches the filesystem.
+///
+// TODO(integrator): adjust `main.rs` callsite to forward `chat_config.enabled`
+// here so trade-only operators don't accumulate plaintext chat history.
+pub async fn writer_task(mut history_rx: mpsc::Receiver<ChatEvent>, chat_enabled: bool) {
+    if !chat_enabled {
+        info!("[ChatHistory] chat disabled — writer task draining silently, no on-disk history");
+        // Drain so producers' `try_send` calls keep succeeding; we just
+        // discard every event. Exits when the sender is dropped.
+        while history_rx.recv().await.is_some() {}
+        info!("[ChatHistory] history channel closed (chat disabled), writer task exiting");
+        return;
+    }
     info!("[ChatHistory] writer task starting (path: {})", HISTORY_DIR);
     while let Some(event) = history_rx.recv().await {
         let line = encode_event(&event, /* is_bot */ false);
@@ -317,6 +333,34 @@ mod tests {
         let s = p.to_string_lossy();
         assert!(s.ends_with("2024-01-15.jsonl"), "got: {s}");
         assert!(s.contains("history"));
+    }
+
+    #[tokio::test]
+    async fn writer_task_drains_silently_when_disabled() {
+        // PLAN §2.5: when chat is disabled the writer task must drain
+        // events without creating any on-disk files. We can't easily
+        // observe "no files created" against the real `data/chat/history`
+        // path (other tests/processes may write there), so we observe the
+        // task's externally-visible behavior instead: events are accepted
+        // (try_send succeeds, the receiver stays live), and the task
+        // returns promptly once the sender is dropped.
+        let (tx, rx) = mpsc::channel::<ChatEvent>(8);
+        let handle = tokio::spawn(writer_task(rx, /* chat_enabled */ false));
+
+        // Push a handful of events. If the task were running the enabled
+        // body, these would still succeed but each would also trigger a
+        // disk write. With chat_enabled=false we simply drain and discard.
+        for i in 0..5 {
+            tx.try_send(fixed_event(&format!("evt-{i}")))
+                .expect("try_send should succeed against the live drain task");
+        }
+        drop(tx);
+
+        // Bound the wait so a regression that hangs the task surfaces as
+        // a test timeout rather than a process-wide hang.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(res.is_ok(), "writer_task should exit promptly after sender drop");
+        res.unwrap().expect("writer_task should not panic");
     }
 
     #[tokio::test]

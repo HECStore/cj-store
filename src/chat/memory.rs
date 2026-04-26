@@ -19,7 +19,7 @@
 //! `_index.json` rebuild. Tools that wrap these functions (with section
 //! allow-lists, dedup, cap enforcement) arrive in Phase 5.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,11 @@ pub fn player_file_path(uuid: &str) -> PathBuf {
 /// The empty per-player schema (PLAN §5.2). New files are bootstrapped
 /// with this content so [`update_player_memory`] can append into named
 /// sections without first creating them.
+///
+/// The `## Trust: <level>` heading is anchored so [`has_operator_trust3`]
+/// can detect operator-granted Trust 3 by exact-string match. New files
+/// start at Trust 0; promotion to higher tiers is derived at runtime via
+/// [`compute_trust`].
 pub fn empty_player_template(username: &str, uuid: &str, today: &str) -> String {
     format!(
         "# {username}\n\
@@ -54,7 +59,7 @@ pub fn empty_player_template(username: &str, uuid: &str, today: &str) -> String 
          - First seen: {today}\n\
          - Last seen: {today}\n\
          \n\
-         ## Trust\n\
+         ## Trust: 0\n\
          <derived; see compute_trust>\n\
          \n\
          ## Stated preferences\n\
@@ -67,17 +72,26 @@ pub fn empty_player_template(username: &str, uuid: &str, today: &str) -> String 
     )
 }
 
-/// Bootstrap a per-player file if it doesn't exist. Returns `Ok(true)` if
-/// a new file was created, `Ok(false)` if it already existed.
-pub fn ensure_player_file(uuid: &str, username: &str, today: &str) -> io::Result<bool> {
+/// Idempotently create `players/<uuid>.md` with the empty schema if it
+/// doesn't already exist. PLAN §5.5 "new-player file initialization".
+///
+/// Today's UTC date is read internally via `chrono::Utc::now()` so the
+/// caller does not need to thread a date through. Returns `Ok(())`
+/// regardless of whether a new file was created — callers that need the
+/// distinction should `path.exists()`-check first.
+pub fn ensure_player_file(uuid: &str, username: &str) -> io::Result<()> {
     let path = player_file_path(uuid);
     if path.exists() {
-        return Ok(false);
+        return Ok(());
     }
-    let body = empty_player_template(username, uuid, today);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let body = empty_player_template(username, uuid, &today);
     write_atomic(&path, &body)?;
     debug!(uuid = uuid, username = username, "created new per-player file");
-    Ok(true)
+    Ok(())
 }
 
 /// Read a per-player file. Returns `Ok(None)` if the file is missing.
@@ -212,6 +226,122 @@ pub fn save_index(idx: &PlayerIndex) -> io::Result<()> {
     Ok(())
 }
 
+// ===== Trust ladder (PLAN §5.2) ============================================
+
+/// Trust level derived from the per-player file plus history JSONLs. PLAN §5.2:
+///
+/// - 0  if interactions < 3 OR distinct_days < 2 (or spam-cooldown active)
+/// - 1  if interactions >= 3 AND distinct_days >= 2 AND no spam cooldown
+/// - 2  if interactions >= 20 AND distinct_days >= 7 AND no spam cooldown
+/// - 3  ONLY if the per-player file's heading line matches `^## Trust: 3$`
+///         (exact, anchored) AND any `trust3_expires_at` timestamp is in
+///         the future. Operator-granted; never auto-derived.
+///
+/// "Interaction" = a `bot_out` JSONL record where the bot replied to a
+/// message from this player (or a whisper exchanged with this player).
+/// Spam-suppressed events do NOT count.
+pub fn compute_trust(
+    player_md: &str,
+    interactions: u32,
+    distinct_days: u32,
+    spam_cooldown_recent: bool,
+) -> u8 {
+    if has_operator_trust3(player_md) && !operator_trust3_expired(player_md) {
+        return 3;
+    }
+    if spam_cooldown_recent {
+        return 0;
+    }
+    if interactions >= 20 && distinct_days >= 7 {
+        return 2;
+    }
+    if interactions >= 3 && distinct_days >= 2 {
+        return 1;
+    }
+    0
+}
+
+/// True iff the file has a heading line `## Trust: 3` matched as the whole
+/// trimmed line (defends against forged `Trust: 3` smuggled inside a
+/// bullet body — see [`crate::chat::tools::sanitize_bullet`]).
+pub fn has_operator_trust3(player_md: &str) -> bool {
+    player_md.lines().any(|l| l.trim_end() == "## Trust: 3")
+}
+
+/// True if a `trust3_expires_at: <ISO-UTC>` line exists AND its timestamp
+/// is in the past (operator-granted Trust 3 has lapsed). Absence of the
+/// line means "never expires" — returns false.
+pub fn operator_trust3_expired(player_md: &str) -> bool {
+    for line in player_md.lines() {
+        if let Some(rest) = line.trim().strip_prefix("trust3_expires_at:") {
+            let s = rest.trim();
+            if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+                return t.with_timezone(&chrono::Utc) < chrono::Utc::now();
+            }
+        }
+    }
+    false
+}
+
+/// Count `bot_out` history records that are replies-to-this-player or
+/// whispers-with-this-player, across the most recent N UTC days. Returns
+/// `(interactions, distinct_days_count)`. Used by [`compute_trust`] to
+/// derive Trust 1/2.
+///
+/// Records are JSON lines under `<history_dir>/<YYYY-MM-DD>.jsonl`. A
+/// record matches if its `target_uuid` equals `target_uuid`, OR its
+/// `target` field equals `target_username_lc` (case-insensitive). The
+/// `kind` must be `bot_out` exactly — `bot_chat`/`bot_whisper` are not
+/// counted here unless they carry the literal `bot_out` kind.
+pub fn count_interactions_for_uuid(
+    history_dir: &Path,
+    target_uuid: &str,
+    target_username_lc: &str,
+    days_back: u32,
+) -> (u32, u32) {
+    let mut interactions = 0u32;
+    let mut days: HashSet<String> = HashSet::new();
+    let today = chrono::Utc::now().date_naive();
+    for d in 0..days_back as i64 {
+        let date = today - chrono::Duration::days(d);
+        let path = history_dir.join(format!("{}.jsonl", date.format("%Y-%m-%d")));
+        let body = match fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        for line in body.lines() {
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+            if kind != "bot_out" {
+                continue;
+            }
+            let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
+            let target_uuid_field = v
+                .get("target_uuid")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if target_uuid_field == target_uuid
+                || target.eq_ignore_ascii_case(target_username_lc)
+            {
+                interactions += 1;
+                days.insert(date.format("%Y-%m-%d").to_string());
+            }
+        }
+    }
+    (interactions, days.len() as u32)
+}
+
+/// Returns true iff `current_file_bytes` exceeds `cap_bytes` by more than
+/// 25 % (PLAN §5.5: only summarize when threshold-plus-margin to avoid
+/// thrash near the boundary). At/below 125 % of cap → false; strictly
+/// above → true.
+pub fn should_summarize_player_file(current_file_bytes: usize, cap_bytes: usize) -> bool {
+    current_file_bytes * 100 > cap_bytes * 125
+}
+
 /// Load the index from disk. On corruption or version mismatch the file
 /// is renamed `<orig>.corrupt-<UTC>` and a fresh rebuild is run; the
 /// original bytes are retained for forensic inspection (PLAN §3.3).
@@ -278,7 +408,7 @@ mod tests {
         assert!(s.starts_with("# Steve\n"));
         for header in [
             "## Identity",
-            "## Trust",
+            "## Trust: 0",
             "## Stated preferences",
             "## Inferred",
             "## Topics & history",
@@ -342,5 +472,175 @@ mod tests {
         // (any contents); use `is_empty()` only when not present.
         let s = read_global_memory().unwrap();
         let _ = s; // no panic = sufficient
+    }
+
+    // ===== Trust ladder ===================================================
+
+    #[test]
+    fn compute_trust_zero_for_low_interactions() {
+        // < 3 interactions → 0 regardless of distinct_days.
+        let md = "# Steve\n\n## Trust: 0\n";
+        assert_eq!(compute_trust(md, 0, 0, false), 0);
+        assert_eq!(compute_trust(md, 2, 5, false), 0);
+        // < 2 distinct days → 0 even with many interactions.
+        assert_eq!(compute_trust(md, 100, 1, false), 0);
+    }
+
+    #[test]
+    fn compute_trust_one_at_minimum_thresholds() {
+        let md = "# Steve\n\n## Trust: 0\n";
+        assert_eq!(compute_trust(md, 3, 2, false), 1);
+        assert_eq!(compute_trust(md, 19, 6, false), 1);
+    }
+
+    #[test]
+    fn compute_trust_two_at_higher_thresholds() {
+        let md = "# Steve\n\n## Trust: 0\n";
+        assert_eq!(compute_trust(md, 20, 7, false), 2);
+        assert_eq!(compute_trust(md, 100, 30, false), 2);
+    }
+
+    #[test]
+    fn compute_trust_three_only_via_operator_anchored_heading() {
+        // Anchored: only when the line is exactly `## Trust: 3`.
+        let md_op = "# Steve\n\n## Identity\n\n## Trust: 3\n- bullet\n";
+        assert_eq!(compute_trust(md_op, 0, 0, false), 3);
+        // A bullet body containing `Trust: 3` does NOT promote.
+        let md_smuggled = "# Steve\n\n## Trust: 0\n- some note: Trust: 3 maybe\n";
+        assert_eq!(compute_trust(md_smuggled, 100, 30, false), 2);
+    }
+
+    #[test]
+    fn compute_trust_spam_cooldown_drops_to_zero() {
+        let md = "# Steve\n\n## Trust: 0\n";
+        // Without operator Trust 3, an active spam cooldown forces 0.
+        assert_eq!(compute_trust(md, 100, 30, true), 0);
+        // Operator Trust 3 is NOT overridden by spam cooldown.
+        let md_op = "# Steve\n\n## Trust: 3\n";
+        assert_eq!(compute_trust(md_op, 0, 0, true), 3);
+    }
+
+    #[test]
+    fn has_operator_trust3_anchored_only() {
+        assert!(has_operator_trust3("## Trust: 3"));
+        assert!(has_operator_trust3("# Steve\n\n## Trust: 3\n"));
+        // Trailing whitespace is tolerated (trim_end).
+        assert!(has_operator_trust3("## Trust: 3   \n"));
+        // Leading content before the marker on the same line MUST not match.
+        assert!(!has_operator_trust3("- bullet ## Trust: 3"));
+        // Smuggled inside a bullet body — must NOT match.
+        assert!(!has_operator_trust3("- foo: Trust: 3 stuff"));
+        // Wrong level.
+        assert!(!has_operator_trust3("## Trust: 2"));
+        // Different leading-hash count.
+        assert!(!has_operator_trust3("# Trust: 3"));
+        assert!(!has_operator_trust3("### Trust: 3"));
+    }
+
+    #[test]
+    fn operator_trust3_expired_past_timestamp() {
+        let md = "# Steve\n\n## Trust: 3\ntrust3_expires_at: 2000-01-01T00:00:00Z\n";
+        assert!(operator_trust3_expired(md));
+    }
+
+    #[test]
+    fn operator_trust3_expired_future_timestamp() {
+        let md = "# Steve\n\n## Trust: 3\ntrust3_expires_at: 2999-01-01T00:00:00Z\n";
+        assert!(!operator_trust3_expired(md));
+    }
+
+    #[test]
+    fn operator_trust3_expired_no_marker_means_no_expiry() {
+        // Absence of the marker → "never expires" → returns false.
+        let md = "# Steve\n\n## Trust: 3\n";
+        assert!(!operator_trust3_expired(md));
+    }
+
+    #[test]
+    fn operator_trust3_expired_unparseable_timestamp_treated_as_no_marker() {
+        let md = "# Steve\n\n## Trust: 3\ntrust3_expires_at: not-a-date\n";
+        assert!(!operator_trust3_expired(md));
+    }
+
+    #[test]
+    fn should_summarize_player_file_at_or_below_125_percent_is_false() {
+        // Cap = 4096; 125 % = 5120. Equal-to or below MUST not trigger.
+        assert!(!should_summarize_player_file(4096, 4096));
+        assert!(!should_summarize_player_file(5120, 4096));
+        assert!(!should_summarize_player_file(0, 4096));
+    }
+
+    #[test]
+    fn should_summarize_player_file_strictly_above_125_percent_is_true() {
+        // Cap = 4096; 125 % = 5120. Strictly above triggers.
+        assert!(should_summarize_player_file(5121, 4096));
+        assert!(should_summarize_player_file(8192, 4096));
+    }
+
+    #[test]
+    fn count_interactions_returns_zero_for_missing_dir() {
+        // Use a directory we just created and leave empty.
+        let scratch = Scratch::new("count-empty");
+        let dir = scratch.0.join("missing-history");
+        let (i, d) = count_interactions_for_uuid(
+            &dir,
+            "11111111-2222-3333-4444-555555555555",
+            "steve",
+            7,
+        );
+        assert_eq!((i, d), (0, 0));
+    }
+
+    #[test]
+    fn count_interactions_matches_uuid_and_username_and_skips_other_kinds() {
+        let scratch = Scratch::new("count-history");
+        let history = scratch.0.join("history");
+        fs::create_dir_all(&history).unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        let target_uuid = "11111111-2222-3333-4444-555555555555";
+
+        // Today's file: 2 matching bot_out + 1 non-matching kind.
+        let today_path = history.join(format!("{}.jsonl", today.format("%Y-%m-%d")));
+        let today_body = format!(
+            "{}\n{}\n{}\n",
+            // Match by target_uuid.
+            serde_json::json!({
+                "kind": "bot_out",
+                "target": "Other",
+                "target_uuid": target_uuid,
+            }),
+            // Match by target username (case-insensitive).
+            serde_json::json!({
+                "kind": "bot_out",
+                "target": "STEVE",
+                "target_uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            }),
+            // Wrong kind — must not count.
+            serde_json::json!({
+                "kind": "public",
+                "target": "Steve",
+                "target_uuid": target_uuid,
+            }),
+        );
+        fs::write(&today_path, today_body).unwrap();
+
+        // Yesterday's file: 1 matching record.
+        let yest_path =
+            history.join(format!("{}.jsonl", yesterday.format("%Y-%m-%d")));
+        let yest_body = format!(
+            "{}\n",
+            serde_json::json!({
+                "kind": "bot_out",
+                "target": "Steve",
+                "target_uuid": target_uuid,
+            }),
+        );
+        fs::write(&yest_path, yest_body).unwrap();
+
+        let (i, d) =
+            count_interactions_for_uuid(&history, target_uuid, "steve", 7);
+        assert_eq!(i, 3);
+        assert_eq!(d, 2);
     }
 }

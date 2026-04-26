@@ -102,6 +102,132 @@ pub struct ChatConfig {
     pub classifier_per_sender_per_minute: u32,
     #[serde(default = "default_chat_classifier_min_confidence")]
     pub classifier_min_confidence: f32,
+    #[serde(default = "default_chat_classifier_context_messages")]
+    pub classifier_context_messages: u32,
+
+    /// `(start_hour_utc, end_hour_utc)`; both in `[0, 24)`. Wrap-around
+    /// when `start > end` (overnight). `start == end` is treated as
+    /// "always on" (same as `None`).
+    #[serde(default)]
+    pub active_hours_utc: Option<(u32, u32)>,
+
+    // Pacing
+    #[serde(default = "default_chat_min_silence_secs")]
+    pub min_silence_secs: u32,
+    #[serde(default = "default_chat_max_replies_per_minute")]
+    pub max_replies_per_minute: u32,
+    #[serde(default = "default_chat_typing_delay_base_ms")]
+    pub typing_delay_base_ms: u32,
+    #[serde(default = "default_chat_typing_delay_per_char_ms")]
+    pub typing_delay_per_char_ms: u32,
+    #[serde(default = "default_chat_typing_delay_jitter_ms")]
+    pub typing_delay_jitter_ms: u32,
+    #[serde(default = "default_chat_typing_delay_floor_ms")]
+    pub typing_delay_floor_ms: u32,
+    #[serde(default = "default_chat_typing_delay_max_ms")]
+    pub typing_delay_max_ms: u32,
+    #[serde(default = "default_chat_lurk_probability")]
+    pub lurk_probability: f32,
+
+    // Memory growth
+    #[serde(default = "default_chat_adjustments_max_bullets")]
+    pub adjustments_max_bullets: u32,
+    #[serde(default = "default_chat_player_memory_max_bytes")]
+    pub player_memory_max_bytes: u32,
+    #[serde(default = "default_chat_update_bullet_max_chars")]
+    pub update_bullet_max_chars: u32,
+    #[serde(default = "default_chat_update_self_memory_max_per_day")]
+    pub update_self_memory_max_per_day: u32,
+    #[serde(default = "default_chat_memory_max_inferred_bullets")]
+    pub memory_max_inferred_bullets: u32,
+
+    // Rate limiter (PLAN §7 P12)
+    #[serde(default = "default_chat_composer_rpm_max")]
+    pub composer_rpm_max: u32,
+    #[serde(default = "default_chat_classifier_rpm_max")]
+    pub classifier_rpm_max: u32,
+    #[serde(default = "default_chat_composer_itpm_max")]
+    pub composer_itpm_max: u32,
+    #[serde(default = "default_chat_classifier_itpm_max")]
+    pub classifier_itpm_max: u32,
+    #[serde(default = "default_chat_rate_limit_wait_max_secs")]
+    pub rate_limit_wait_max_secs: u32,
+
+    // web_fetch / web_search
+    #[serde(default = "default_chat_web_fetch_max_bytes")]
+    pub web_fetch_max_bytes: u32,
+    #[serde(default = "default_chat_web_fetch_daily_max")]
+    pub web_fetch_daily_max: u32,
+    #[serde(default)]
+    pub web_fetch_enabled: bool,
+    #[serde(default = "default_chat_web_search_enabled")]
+    pub web_search_enabled: bool,
+
+    // Cross-player firewall
+    #[serde(default)]
+    pub cross_player_reads: bool,
+
+    // Reflection
+    #[serde(default = "default_chat_reflection_max_pending")]
+    pub reflection_max_pending: u32,
+    #[serde(default = "default_chat_reflection_idle_trigger_secs")]
+    pub reflection_idle_trigger_secs: u32,
+    #[serde(default = "default_chat_reflection_min_interval_secs")]
+    pub reflection_min_interval_secs: u32,
+    #[serde(default = "default_chat_reflection_min_distinct_senders")]
+    pub reflection_min_distinct_senders: u32,
+    #[serde(default = "default_chat_reflection_min_distinct_triggers")]
+    pub reflection_min_distinct_triggers: u32,
+
+    // History / JSONL caps
+    #[serde(default = "default_chat_tools_history_max_bytes")]
+    pub tools_history_max_bytes: u32,
+    #[serde(default = "default_chat_history_max_line_bytes")]
+    pub history_max_line_bytes: u32,
+
+    // Trust-3 / archives
+    #[serde(default = "default_chat_trust3_max_days")]
+    pub trust3_max_days: u32,
+    #[serde(default = "default_chat_persona_archive_max")]
+    pub persona_archive_max: u32,
+    #[serde(default = "default_chat_archive_max_bytes")]
+    pub archive_max_bytes: u32,
+
+    // UUID resolution
+    #[serde(default = "default_chat_uuid_resolve_queue_max")]
+    pub uuid_resolve_queue_max: u32,
+
+    // Composer context windows
+    #[serde(default = "default_chat_composer_context_messages")]
+    pub composer_context_messages: u32,
+    #[serde(default = "default_chat_composer_max_tool_iterations")]
+    pub composer_max_tool_iterations: u32,
+    #[serde(default = "default_chat_composer_max_chars")]
+    pub composer_max_chars: u32,
+
+    // Spam
+    #[serde(default = "default_chat_spam_msgs_per_window")]
+    pub spam_msgs_per_window: u32,
+    #[serde(default = "default_chat_spam_window_secs")]
+    pub spam_window_secs: u32,
+    #[serde(default = "default_chat_spam_cooldown_secs")]
+    pub spam_cooldown_secs: u32,
+
+    // History / tools
+    #[serde(default = "default_chat_history_search_max_days")]
+    pub history_search_max_days: u32,
+    #[serde(default = "default_chat_history_retention_days")]
+    pub history_retention_days: u32,
+    #[serde(default = "default_chat_decisions_retention_days")]
+    pub decisions_retention_days: u32,
+    #[serde(default = "default_chat_hash_uuids_in_decisions")]
+    pub hash_uuids_in_decisions: bool,
+
+    // Backoffs
+    #[serde(default = "default_chat_moderation_backoff_secs")]
+    pub moderation_backoff_secs: u32,
+    #[serde(default = "default_chat_persona_regen_cooldown_secs")]
+    pub persona_regen_cooldown_secs: u32,
 }
 
 impl Default for ChatConfig {
@@ -124,6 +250,54 @@ impl Default for ChatConfig {
             classifier_sample_rate: default_chat_classifier_sample_rate(),
             classifier_per_sender_per_minute: default_chat_classifier_per_sender_per_minute(),
             classifier_min_confidence: default_chat_classifier_min_confidence(),
+            classifier_context_messages: default_chat_classifier_context_messages(),
+            active_hours_utc: None,
+            min_silence_secs: default_chat_min_silence_secs(),
+            max_replies_per_minute: default_chat_max_replies_per_minute(),
+            typing_delay_base_ms: default_chat_typing_delay_base_ms(),
+            typing_delay_per_char_ms: default_chat_typing_delay_per_char_ms(),
+            typing_delay_jitter_ms: default_chat_typing_delay_jitter_ms(),
+            typing_delay_floor_ms: default_chat_typing_delay_floor_ms(),
+            typing_delay_max_ms: default_chat_typing_delay_max_ms(),
+            lurk_probability: default_chat_lurk_probability(),
+            adjustments_max_bullets: default_chat_adjustments_max_bullets(),
+            player_memory_max_bytes: default_chat_player_memory_max_bytes(),
+            update_bullet_max_chars: default_chat_update_bullet_max_chars(),
+            update_self_memory_max_per_day: default_chat_update_self_memory_max_per_day(),
+            memory_max_inferred_bullets: default_chat_memory_max_inferred_bullets(),
+            composer_rpm_max: default_chat_composer_rpm_max(),
+            classifier_rpm_max: default_chat_classifier_rpm_max(),
+            composer_itpm_max: default_chat_composer_itpm_max(),
+            classifier_itpm_max: default_chat_classifier_itpm_max(),
+            rate_limit_wait_max_secs: default_chat_rate_limit_wait_max_secs(),
+            web_fetch_max_bytes: default_chat_web_fetch_max_bytes(),
+            web_fetch_daily_max: default_chat_web_fetch_daily_max(),
+            web_fetch_enabled: false,
+            web_search_enabled: default_chat_web_search_enabled(),
+            cross_player_reads: false,
+            reflection_max_pending: default_chat_reflection_max_pending(),
+            reflection_idle_trigger_secs: default_chat_reflection_idle_trigger_secs(),
+            reflection_min_interval_secs: default_chat_reflection_min_interval_secs(),
+            reflection_min_distinct_senders: default_chat_reflection_min_distinct_senders(),
+            reflection_min_distinct_triggers: default_chat_reflection_min_distinct_triggers(),
+            tools_history_max_bytes: default_chat_tools_history_max_bytes(),
+            history_max_line_bytes: default_chat_history_max_line_bytes(),
+            trust3_max_days: default_chat_trust3_max_days(),
+            persona_archive_max: default_chat_persona_archive_max(),
+            archive_max_bytes: default_chat_archive_max_bytes(),
+            uuid_resolve_queue_max: default_chat_uuid_resolve_queue_max(),
+            composer_context_messages: default_chat_composer_context_messages(),
+            composer_max_tool_iterations: default_chat_composer_max_tool_iterations(),
+            composer_max_chars: default_chat_composer_max_chars(),
+            spam_msgs_per_window: default_chat_spam_msgs_per_window(),
+            spam_window_secs: default_chat_spam_window_secs(),
+            spam_cooldown_secs: default_chat_spam_cooldown_secs(),
+            history_search_max_days: default_chat_history_search_max_days(),
+            history_retention_days: default_chat_history_retention_days(),
+            decisions_retention_days: default_chat_decisions_retention_days(),
+            hash_uuids_in_decisions: default_chat_hash_uuids_in_decisions(),
+            moderation_backoff_secs: default_chat_moderation_backoff_secs(),
+            persona_regen_cooldown_secs: default_chat_persona_regen_cooldown_secs(),
         }
     }
 }
@@ -142,6 +316,51 @@ fn default_chat_recent_speaker_secs() -> u32 { 600 }
 fn default_chat_classifier_sample_rate() -> f32 { 0.5 }
 fn default_chat_classifier_per_sender_per_minute() -> u32 { 3 }
 fn default_chat_classifier_min_confidence() -> f32 { 0.6 }
+fn default_chat_classifier_context_messages() -> u32 { 30 }
+fn default_chat_min_silence_secs() -> u32 { 6 }
+fn default_chat_max_replies_per_minute() -> u32 { 4 }
+fn default_chat_typing_delay_base_ms() -> u32 { 800 }
+fn default_chat_typing_delay_per_char_ms() -> u32 { 60 }
+fn default_chat_typing_delay_jitter_ms() -> u32 { 250 }
+fn default_chat_typing_delay_floor_ms() -> u32 { 400 }
+fn default_chat_typing_delay_max_ms() -> u32 { 12_000 }
+fn default_chat_lurk_probability() -> f32 { 0.15 }
+fn default_chat_adjustments_max_bullets() -> u32 { 50 }
+fn default_chat_player_memory_max_bytes() -> u32 { 4096 }
+fn default_chat_update_bullet_max_chars() -> u32 { 280 }
+fn default_chat_update_self_memory_max_per_day() -> u32 { 3 }
+fn default_chat_memory_max_inferred_bullets() -> u32 { 30 }
+fn default_chat_composer_rpm_max() -> u32 { 20 }
+fn default_chat_classifier_rpm_max() -> u32 { 40 }
+fn default_chat_composer_itpm_max() -> u32 { 25_000 }
+fn default_chat_classifier_itpm_max() -> u32 { 40_000 }
+fn default_chat_rate_limit_wait_max_secs() -> u32 { 5 }
+fn default_chat_web_fetch_max_bytes() -> u32 { 262_144 }
+fn default_chat_web_fetch_daily_max() -> u32 { 50 }
+fn default_chat_web_search_enabled() -> bool { true }
+fn default_chat_reflection_max_pending() -> u32 { 5 }
+fn default_chat_reflection_idle_trigger_secs() -> u32 { 900 }
+fn default_chat_reflection_min_interval_secs() -> u32 { 3600 }
+fn default_chat_reflection_min_distinct_senders() -> u32 { 3 }
+fn default_chat_reflection_min_distinct_triggers() -> u32 { 3 }
+fn default_chat_tools_history_max_bytes() -> u32 { 32_768 }
+fn default_chat_history_max_line_bytes() -> u32 { 65_536 }
+fn default_chat_trust3_max_days() -> u32 { 30 }
+fn default_chat_persona_archive_max() -> u32 { 10 }
+fn default_chat_archive_max_bytes() -> u32 { 1_048_576 }
+fn default_chat_uuid_resolve_queue_max() -> u32 { 1024 }
+fn default_chat_composer_context_messages() -> u32 { 60 }
+fn default_chat_composer_max_tool_iterations() -> u32 { 5 }
+fn default_chat_composer_max_chars() -> u32 { 240 }
+fn default_chat_spam_msgs_per_window() -> u32 { 5 }
+fn default_chat_spam_window_secs() -> u32 { 30 }
+fn default_chat_spam_cooldown_secs() -> u32 { 300 }
+fn default_chat_history_search_max_days() -> u32 { 14 }
+fn default_chat_history_retention_days() -> u32 { 30 }
+fn default_chat_decisions_retention_days() -> u32 { 30 }
+fn default_chat_hash_uuids_in_decisions() -> bool { true }
+fn default_chat_moderation_backoff_secs() -> u32 { 86_400 }
+fn default_chat_persona_regen_cooldown_secs() -> u32 { 86_400 }
 
 impl ChatConfig {
     /// Validate the chat-config invariants. Returns a single human-readable
@@ -199,11 +418,76 @@ impl ChatConfig {
             ));
         }
 
+        if !(0.0..=1.0).contains(&self.lurk_probability) {
+            errors.push(format!(
+                "lurk_probability must be in [0.0, 1.0] (got {})",
+                self.lurk_probability
+            ));
+        }
+        if self.composer_max_chars > 240 {
+            errors.push(format!(
+                "composer_max_chars must be <= 240 (got {})",
+                self.composer_max_chars
+            ));
+        }
+        if self.min_silence_secs == 0 {
+            errors.push("min_silence_secs must be >= 1".to_string());
+        }
+        if self.typing_delay_base_ms == 0 {
+            errors.push("typing_delay_base_ms must be > 0".to_string());
+        }
+        if self.typing_delay_max_ms == 0 {
+            errors.push("typing_delay_max_ms must be > 0".to_string());
+        }
+        if self.spam_window_secs == 0 {
+            errors.push("spam_window_secs must be > 0".to_string());
+        }
+        if self.spam_cooldown_secs == 0 {
+            errors.push("spam_cooldown_secs must be > 0".to_string());
+        }
+        if self.recent_speaker_secs == 0 {
+            errors.push("recent_speaker_secs must be > 0".to_string());
+        }
+        if self.rate_limit_wait_max_secs == 0 {
+            errors.push("rate_limit_wait_max_secs must be > 0".to_string());
+        }
+        if self.composer_max_tool_iterations == 0 {
+            errors.push("composer_max_tool_iterations must be > 0".to_string());
+        }
+        if self.daily_input_token_cap == 0 {
+            errors.push("daily_input_token_cap must be > 0".to_string());
+        }
+        if self.daily_output_token_cap == 0 {
+            errors.push("daily_output_token_cap must be > 0".to_string());
+        }
+        if self.daily_classifier_token_cap == 0 {
+            errors.push("daily_classifier_token_cap must be > 0".to_string());
+        }
+        if let Some((start, end)) = self.active_hours_utc
+            && (start >= 24 || end >= 24) {
+            errors.push(format!(
+                "active_hours_utc components must be in [0, 24) (got {start}, {end})"
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors.join("; "))
         }
+    }
+}
+
+/// Whether the active-hours window includes the given UTC hour. Returns
+/// `true` for `None` (always on), `start == end` (always on), the
+/// non-wrap case (`start <= h < end`), and the wrap case (`h >= start`
+/// OR `h < end`).
+pub fn within_active_hours_utc(active_hours_utc: Option<(u32, u32)>, hour_utc: u32) -> bool {
+    match active_hours_utc {
+        None => true,
+        Some((s, e)) if s == e => true,
+        Some((s, e)) if s < e => hour_utc >= s && hour_utc < e,
+        Some((s, e)) => hour_utc >= s || hour_utc < e, // wrap-around
     }
 }
 fn default_chat_command_prefixes() -> Vec<String> {

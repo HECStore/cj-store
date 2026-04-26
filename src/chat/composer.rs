@@ -244,6 +244,14 @@ pub struct ComposerRun {
     /// Total input + output tokens across all iterations.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Number of `update_self_memory` tool calls dispatched in this run.
+    /// The orchestrator increments `state.update_self_memory_today`
+    /// by this amount on success (PLAN §5.1 ADV3).
+    pub update_self_memory_calls: u32,
+    /// Number of `web_fetch` tool calls dispatched in this run.
+    /// The orchestrator increments `state.web_fetches_today` by this
+    /// amount on success (PLAN §6.1 daily budget).
+    pub web_fetch_calls: u32,
 }
 
 /// Drive the composer's tool-use loop. Calls Anthropic, dispatches any
@@ -266,6 +274,8 @@ pub async fn run_loop(
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut iterations = 0u32;
+    let mut update_self_memory_calls = 0u32;
+    let mut web_fetch_calls = 0u32;
 
     loop {
         iterations += 1;
@@ -284,6 +294,8 @@ pub async fn run_loop(
                 hit_cap: false,
                 input_tokens,
                 output_tokens,
+                update_self_memory_calls,
+                web_fetch_calls,
             });
         }
 
@@ -296,6 +308,8 @@ pub async fn run_loop(
                 hit_cap: true,
                 input_tokens,
                 output_tokens,
+                update_self_memory_calls,
+                web_fetch_calls,
             });
         }
 
@@ -305,6 +319,13 @@ pub async fn run_loop(
         for block in &resp.content {
             if let crate::chat::client::ContentBlock::ToolUse { id, name, input } = block {
                 let (text, is_err) = crate::chat::tools::dispatch(name, input, tool_ctx).await;
+                if !is_err {
+                    if name == "update_self_memory" {
+                        update_self_memory_calls += 1;
+                    } else if name == "web_fetch" {
+                        web_fetch_calls += 1;
+                    }
+                }
                 tool_results.push(crate::chat::client::ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: text,
@@ -321,6 +342,8 @@ pub async fn run_loop(
                 hit_cap: false,
                 input_tokens,
                 output_tokens,
+                update_self_memory_calls,
+                web_fetch_calls,
             });
         }
 
@@ -468,6 +491,65 @@ mod tests {
             CacheTtl::Ephemeral1Hour,
         );
         assert_eq!(req.system.len(), 6);
+    }
+
+    #[test]
+    fn composer_includes_player_memory_block_when_present() {
+        // PLAN §4.3 P5: the per-player memory block must be emitted
+        // when present (caller decides — directly addressed or sender
+        // Trust >= 1).
+        let snap = PromptSnapshot {
+            static_rules: "rules".into(),
+            persona: "persona".into(),
+            memory_md: "mem".into(),
+            adjustments_md: "adj".into(),
+            player_memory: Some("PLAYER_MEMORY_MARKER".into()),
+            history_slice: "hist".into(),
+        };
+        let req = build_request(
+            "model".to_string(),
+            100,
+            None,
+            &snap,
+            vec![],
+            vec![],
+            CacheTtl::Ephemeral5Min,
+        );
+        // 6 blocks: rules, persona, memory, adjustments, player, history.
+        assert_eq!(req.system.len(), 6);
+        let any_has_marker = req.system.iter().any(|b| match b {
+            SystemBlock::Text { text, .. } => text.contains("PLAYER_MEMORY_MARKER"),
+        });
+        assert!(any_has_marker, "player memory block must be emitted");
+    }
+
+    #[test]
+    fn composer_omits_player_memory_block_when_none() {
+        // When `player_memory` is None the block is skipped entirely;
+        // PLAN §4.3 P5 — passing comments don't need memory context.
+        let snap = PromptSnapshot {
+            static_rules: "rules".into(),
+            persona: "persona".into(),
+            memory_md: "mem".into(),
+            adjustments_md: "adj".into(),
+            player_memory: None,
+            history_slice: "hist".into(),
+        };
+        let req = build_request(
+            "model".to_string(),
+            100,
+            None,
+            &snap,
+            vec![],
+            vec![],
+            CacheTtl::Ephemeral5Min,
+        );
+        // 5 blocks: rules, persona, memory, adjustments, history.
+        assert_eq!(req.system.len(), 5);
+        let any_has_marker = req.system.iter().any(|b| match b {
+            SystemBlock::Text { text, .. } => text.contains("PLAYER_MEMORY_MARKER"),
+        });
+        assert!(!any_has_marker);
     }
 
     #[test]

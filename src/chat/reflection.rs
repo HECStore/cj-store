@@ -177,6 +177,85 @@ fn longest_common_substring_len(a: &str, b: &str) -> usize {
     best
 }
 
+// ===== Trigger gates (PLAN §4.7) ===========================================
+
+/// True if it has been at least `min_interval_secs` since the last
+/// reflection pass. `last_reflection_at` is ISO-UTC (RFC3339); `None`
+/// means "never run" and is treated as "interval elapsed".
+///
+/// Unparseable timestamps are also treated as "elapsed" so a corrupt
+/// state file can't permanently lock the reflection pass off.
+pub fn min_interval_elapsed(
+    last_reflection_at: Option<&str>,
+    min_interval_secs: u32,
+) -> bool {
+    let Some(s) = last_reflection_at else {
+        return true;
+    };
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) else {
+        return true;
+    };
+    let then = t.with_timezone(&chrono::Utc);
+    let now = chrono::Utc::now();
+    (now - then).num_seconds() >= min_interval_secs as i64
+}
+
+/// True if pending count >= `max_pending` AND distinct senders in
+/// pending >= `min_distinct_senders`. PLAN §4.7 size-cap auto-trigger:
+/// once the pending file fills up, fire a reflection pass even if
+/// `min_interval_secs` hasn't elapsed — but only when we have at
+/// least the minimum diversity of senders (a single griefer flooding
+/// pending shouldn't trip the trigger alone).
+pub fn should_trigger_size_cap(
+    pending: &[PendingEntry],
+    max_pending: u32,
+    min_distinct_senders: u32,
+) -> bool {
+    if (pending.len() as u32) < max_pending {
+        return false;
+    }
+    let mut senders: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in pending {
+        senders.insert(p.sender.as_str());
+    }
+    senders.len() as u32 >= min_distinct_senders
+}
+
+/// True if `pending` is non-empty AND chat has been idle (no composer
+/// call) for at least `idle_trigger_secs` AND distinct senders meet
+/// the floor. PLAN §4.7 idle-window auto-trigger.
+///
+/// `last_composer_at` is RFC3339-UTC; `None` (never called) is treated
+/// as "idle".
+pub fn should_trigger_idle(
+    pending: &[PendingEntry],
+    last_composer_at: Option<&str>,
+    idle_trigger_secs: u32,
+    min_distinct_senders: u32,
+) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let mut senders: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in pending {
+        senders.insert(p.sender.as_str());
+    }
+    if (senders.len() as u32) < min_distinct_senders {
+        return false;
+    }
+    match last_composer_at {
+        None => true,
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(t) => {
+                let then = t.with_timezone(&chrono::Utc);
+                let now = chrono::Utc::now();
+                (now - then).num_seconds() >= idle_trigger_secs as i64
+            }
+            Err(_) => true,
+        },
+    }
+}
+
 // ===== Pass orchestration ==================================================
 
 pub const PENDING_FILE: &str = "data/chat/pending_adjustments.jsonl";
@@ -609,6 +688,108 @@ mod tests {
         // process-shared path). The function returns Ok in both branches
         // and must not panic.
         let _ = read_pending().unwrap();
+    }
+
+    // ---- trigger gates --------------------------------------------------
+
+    #[test]
+    fn min_interval_elapsed_none_returns_true() {
+        // No prior reflection — always allowed.
+        assert!(min_interval_elapsed(None, 3600));
+    }
+
+    #[test]
+    fn min_interval_elapsed_unparseable_returns_true() {
+        // Corrupt state — fail-open so the pass can recover.
+        assert!(min_interval_elapsed(Some("not-a-timestamp"), 3600));
+    }
+
+    #[test]
+    fn min_interval_elapsed_recent_returns_false() {
+        let now = chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(!min_interval_elapsed(Some(&now), 3600));
+    }
+
+    #[test]
+    fn min_interval_elapsed_old_returns_true() {
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(7200))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(min_interval_elapsed(Some(&old), 3600));
+    }
+
+    #[test]
+    fn should_trigger_size_cap_below_cap_is_false() {
+        let entries = vec![
+            pending("a", "Alice", "2026-01-01"),
+            pending("b", "Bob", "2026-01-02"),
+        ];
+        assert!(!should_trigger_size_cap(&entries, 5, 2));
+    }
+
+    #[test]
+    fn should_trigger_size_cap_at_cap_with_distinct_senders_is_true() {
+        let entries = vec![
+            pending("a", "Alice", "2026-01-01"),
+            pending("b", "Bob", "2026-01-02"),
+            pending("c", "Carol", "2026-01-03"),
+        ];
+        assert!(should_trigger_size_cap(&entries, 3, 3));
+    }
+
+    #[test]
+    fn should_trigger_size_cap_at_cap_without_diversity_is_false() {
+        // 3 entries, all from one sender — capped but no diversity.
+        let entries = vec![
+            pending("a", "Alice", "2026-01-01"),
+            pending("b", "Alice", "2026-01-02"),
+            pending("c", "Alice", "2026-01-03"),
+        ];
+        assert!(!should_trigger_size_cap(&entries, 3, 2));
+    }
+
+    #[test]
+    fn should_trigger_idle_empty_pending_is_false() {
+        // Nothing to reflect on.
+        assert!(!should_trigger_idle(&[], None, 600, 1));
+    }
+
+    #[test]
+    fn should_trigger_idle_diversity_floor_blocks() {
+        let entries = vec![pending("a", "Alice", "2026-01-01")];
+        // min_distinct_senders=2 unmet → no trigger even though chat is idle.
+        assert!(!should_trigger_idle(&entries, None, 600, 2));
+    }
+
+    #[test]
+    fn should_trigger_idle_no_composer_call_means_idle() {
+        let entries = vec![
+            pending("a", "Alice", "2026-01-01"),
+            pending("b", "Bob", "2026-01-02"),
+        ];
+        assert!(should_trigger_idle(&entries, None, 600, 2));
+    }
+
+    #[test]
+    fn should_trigger_idle_recent_composer_blocks() {
+        let entries = vec![
+            pending("a", "Alice", "2026-01-01"),
+            pending("b", "Bob", "2026-01-02"),
+        ];
+        let now = chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(!should_trigger_idle(&entries, Some(&now), 600, 2));
+    }
+
+    #[test]
+    fn should_trigger_idle_old_composer_admits() {
+        let entries = vec![
+            pending("a", "Alice", "2026-01-01"),
+            pending("b", "Bob", "2026-01-02"),
+        ];
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(1200))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(should_trigger_idle(&entries, Some(&old), 600, 2));
     }
 
     #[test]

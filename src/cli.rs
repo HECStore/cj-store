@@ -80,6 +80,10 @@ pub fn cli_task(
             "Clear stuck order",
         ];
         if chat_enabled {
+            // PLAN §10: full set of operator-facing chat actions. The label
+            // strings are the dispatch keys in the match below — keep them
+            // in sync. "Chat: show token spend today" reuses the same
+            // status snapshot but renders a tokens-only view.
             options.push("Chat: status");
             options.push("Chat: pause");
             options.push("Chat: resume");
@@ -87,6 +91,15 @@ pub fn cli_task(
             options.push("Chat: clear moderation backoff");
             options.push("Chat: run retention sweep");
             options.push("Chat: run reflection now");
+            options.push("Chat: show today's decision log (last N)");
+            options.push("Chat: show token spend today");
+            options.push("Chat: replay event <event_ts>");
+            options.push("Chat: reset player memory <username>");
+            options.push("Chat: dump player memory <username>");
+            options.push("Chat: set operator trust <username>");
+            options.push("Chat: clear operator trust <username>");
+            options.push("Chat: regenerate persona");
+            options.push("Chat: forget player <username>");
         }
         options.push("Exit");
         let selection = with_retry("Failed to read selection", || {
@@ -124,6 +137,15 @@ pub fn cli_task(
             "Chat: clear moderation backoff" => chat_clear_moderation(chat_tx.as_ref()),
             "Chat: run retention sweep" => chat_run_sweep(chat_tx.as_ref()),
             "Chat: run reflection now" => chat_run_reflection(chat_tx.as_ref()),
+            "Chat: show today's decision log (last N)" => chat_show_decision_log(chat_tx.as_ref()),
+            "Chat: show token spend today" => chat_show_token_spend(chat_tx.as_ref()),
+            "Chat: replay event <event_ts>" => chat_replay_event(chat_tx.as_ref()),
+            "Chat: reset player memory <username>" => chat_reset_player_memory(chat_tx.as_ref()),
+            "Chat: dump player memory <username>" => chat_dump_player_memory(chat_tx.as_ref()),
+            "Chat: set operator trust <username>" => chat_set_operator_trust(chat_tx.as_ref(), true),
+            "Chat: clear operator trust <username>" => chat_set_operator_trust(chat_tx.as_ref(), false),
+            "Chat: regenerate persona" => chat_regenerate_persona(chat_tx.as_ref()),
+            "Chat: forget player <username>" => chat_forget_player(chat_tx.as_ref()),
             "Exit" => {
                 info!("[CLI] Initiating graceful shutdown");
                 // Tell chat to drain in-flight work first; ignore failures
@@ -202,8 +224,337 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
                 "moderation backoff: {}",
                 s.moderation_backoff_until.as_deref().unwrap_or("<none>")
             );
+            println!(
+                "model-404 backoff:  {}",
+                s.model_404_backoff_until.as_deref().unwrap_or("<none>")
+            );
+            println!(
+                "persona regen cooldown: {}",
+                s.persona_regen_cooldown_until.as_deref().unwrap_or("<none>")
+            );
+            println!(
+                "last persona regen: {}",
+                s.last_persona_regenerated_at.as_deref().unwrap_or("<never>")
+            );
+            println!("pending_adjustments: {}", s.pending_adjustments_count);
+            println!("uuid_resolve_queue depth: {}", s.uuid_resolve_queue_depth);
+            println!("in_critical_section: {}", s.critical_section_active);
+            println!(
+                "last composer call: {} (${:.4})",
+                s.last_composer_call_at.as_deref().unwrap_or("<never>"),
+                s.last_composer_call_usd
+            );
+            println!("web_fetches today: {}", s.web_fetches_today);
             println!("====================\n");
         }
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Tokens-only view of `ChatCommand::Status`. Same RPC under the hood
+/// — a separate menu entry keeps the high-frequency operator question
+/// ("am I burning the API budget?") one keystroke away from a noisy
+/// full status dump.
+fn chat_show_token_spend(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct.blocking_send(ChatCommand::Status { respond_to: resp_tx }).is_err() {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(s) => {
+            println!("\n=== Chat token spend today ===");
+            println!(
+                "composer:   in={} out={}",
+                s.composer_input_today, s.composer_output_today
+            );
+            println!(
+                "classifier: in={} out={}",
+                s.classifier_input_today, s.classifier_output_today
+            );
+            println!(
+                "estimated:  ${:.4} / ${:.2} cap",
+                s.estimated_usd_today, s.usd_cap
+            );
+            println!("==============================\n");
+        }
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Show the last N entries of today's decision log. Default N=50 mirrors
+/// the typical "what just happened?" troubleshooting window.
+fn chat_show_decision_log(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let last_n: usize = with_retry("Failed to read N", || {
+        Input::new()
+            .with_prompt("How many decision-log entries to show")
+            .default(50_usize)
+            .interact_text()
+    });
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::ShowDecisionLog { last_n, respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(lines)) => {
+            if lines.is_empty() {
+                println!("No decision-log entries today.");
+            } else {
+                println!("\n=== Decision log (last {}) ===", lines.len());
+                for line in lines {
+                    println!("{}", line);
+                }
+                println!("====================\n");
+            }
+        }
+        Ok(Err(e)) => println!("Failed to read decision log: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Re-run a single past chat decision against the current persona/memory
+/// for offline diagnosis. The `event_ts` is a freeform string the chat
+/// module resolves to a row in today's history.
+fn chat_replay_event(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let event_ts: String = with_retry("Failed to read event_ts", || {
+        Input::new()
+            .with_prompt("Enter event_ts (timestamp string from history)")
+            .interact_text()
+    });
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::ReplayEvent { event_ts: event_ts.clone(), respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(out)) => {
+            println!("\n=== Replay of {event_ts} ===");
+            println!("{out}");
+            println!("====================\n");
+        }
+        Ok(Err(e)) => println!("Replay failed: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Wipe a single player's memory file. Confirmed once — destructive but
+/// scoped to one player, so a single confirm matches the §10 prompt
+/// discipline.
+fn chat_reset_player_memory(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let username: String = with_retry("Failed to read username", || {
+        Input::new()
+            .with_prompt("Enter player username to reset")
+            .interact_text()
+    });
+    let confirmed = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt(format!("Really reset memory for '{}'? This wipes their per-player memory file.", username))
+            .default(false)
+            .interact()
+    });
+    if !confirmed {
+        println!("Cancelled.");
+        return;
+    }
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::ResetPlayerMemory { username: username.clone(), respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(())) => println!("Memory for '{username}' reset."),
+        Ok(Err(e)) => println!("Reset failed: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Print a player's current memory contents (read-only).
+fn chat_dump_player_memory(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let username: String = with_retry("Failed to read username", || {
+        Input::new()
+            .with_prompt("Enter player username to dump")
+            .interact_text()
+    });
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::DumpPlayerMemory { username: username.clone(), respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(contents)) => {
+            println!("\n=== Memory for {username} ===");
+            println!("{contents}");
+            println!("====================\n");
+        }
+        Ok(Err(e)) => println!("Dump failed: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Set or clear the operator-trust bit for a player. The single helper
+/// powers both menu entries via the `set` argument so the prompt flow
+/// stays identical (only the verb in the confirmation changes).
+fn chat_set_operator_trust(chat_tx: Option<&mpsc::Sender<ChatCommand>>, set: bool) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let username: String = with_retry("Failed to read username", || {
+        Input::new()
+            .with_prompt("Enter player username")
+            .interact_text()
+    });
+    let reason: String = with_retry("Failed to read reason", || {
+        Input::new()
+            .with_prompt("Reason (free text, recorded in audit log)")
+            .interact_text()
+    });
+    let verb = if set { "GRANT" } else { "REVOKE" };
+    let confirmed = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt(format!("{verb} operator trust for '{}'?", username))
+            .default(false)
+            .interact()
+    });
+    if !confirmed {
+        println!("Cancelled.");
+        return;
+    }
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::SetOperatorTrust {
+            username: username.clone(),
+            set,
+            reason,
+            respond_to: resp_tx,
+        })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(())) => println!(
+            "Operator trust for '{username}' is now {}.",
+            if set { "GRANTED" } else { "REVOKED" }
+        ),
+        Ok(Err(e)) => println!("Failed: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Regenerate the bot's persona file. Confirmed once because it
+/// overwrites the active persona — recoverable from the persona archive
+/// but still a behavior-changing action.
+fn chat_regenerate_persona(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let confirmed = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt("Really regenerate the persona? Active persona will be archived and replaced.")
+            .default(false)
+            .interact()
+    });
+    if !confirmed {
+        println!("Cancelled.");
+        return;
+    }
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::RegeneratePersona { respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(())) => println!("Persona regenerated."),
+        Ok(Err(e)) => println!("Regeneration failed: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+/// Forget a player entirely (memory + audit traces). Double-confirmed —
+/// this is the most destructive chat action exposed to the CLI, so the
+/// second prompt forces the operator to retype the username.
+fn chat_forget_player(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let username: String = with_retry("Failed to read username", || {
+        Input::new()
+            .with_prompt("Enter player username to FORGET (irreversible)")
+            .interact_text()
+    });
+    let confirmed1 = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt(format!("Really forget '{}'? Removes all chat-side traces of this player.", username))
+            .default(false)
+            .interact()
+    });
+    if !confirmed1 {
+        println!("Cancelled.");
+        return;
+    }
+    // Second confirmation: the operator must retype the username, not
+    // just press Enter. Defeats the muscle-memory "yes, yes, yes" that a
+    // single boolean confirm couldn't catch.
+    let retyped: String = with_retry("Failed to read username", || {
+        Input::new()
+            .with_prompt(format!("Type '{}' again to confirm", username))
+            .interact_text()
+    });
+    if retyped.trim() != username.trim() {
+        println!("Username mismatch — cancelled.");
+        return;
+    }
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::ForgetPlayer { username: username.clone(), respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(())) => println!("Player '{username}' forgotten."),
+        Ok(Err(e)) => println!("Forget failed: {e}"),
         Err(_) => println!("Chat task did not respond."),
     }
 }

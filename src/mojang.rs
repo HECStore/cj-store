@@ -91,6 +91,24 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
     }
 }
 
+/// Sync, cache-only UUID lookup. Returns `None` on miss or stale entry —
+/// the caller decides whether to fall back to an async fetch. Used by
+/// the chat task's reflection trust function, which runs synchronously
+/// inside an async block and can't `await` a network call without
+/// distorting the surrounding state.
+pub fn lookup_cached_uuid(username: &str) -> Option<String> {
+    let key = username.to_lowercase();
+    let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
+    let cache = uuid_cache().lock();
+    cache.get(&key).and_then(|(uuid, ts)| {
+        if ts.elapsed() < ttl {
+            Some(uuid.clone())
+        } else {
+            None
+        }
+    })
+}
+
 /// Drop UUID cache entries older than [`UUID_CACHE_TTL_SECS`].
 ///
 /// Stale entries never serve a cache hit (the TTL check in [`resolve_user_uuid`]

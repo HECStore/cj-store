@@ -308,15 +308,18 @@ fn sweep_rotated_archive(
         let Some(file_date) = parse_compact_utc_stamp(stamp) else {
             continue;
         };
-        if days_between(file_date, today) > retain_days as i64
-            && let Err(e) = fs::remove_file(&path)
-        {
-            warn!(path = %path.display(), error = %e, "archive delete failed");
-            continue;
-        } else if let Some(d) = Some(file_date)
-            && days_between(d, today) > retain_days as i64
-        {
-            *out += 1;
+        if days_between(file_date, today) > retain_days as i64 {
+            // PLAN §11 OPS8: increment the counter ONLY on a successful
+            // delete. A failed delete logs a warn and leaves the counter
+            // alone so retention reports stay honest.
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    *out += 1;
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "archive delete failed");
+                }
+            }
         }
     }
 }
@@ -350,6 +353,20 @@ pub fn sweep_due_today(last_sweep_day: Option<&str>) -> Option<String> {
         None
     } else {
         Some(today)
+    }
+}
+
+/// True iff the retention sweep has not yet run today (UTC). Used by
+/// the chat orchestrator to fire the sweep "first event each new UTC
+/// day" (PLAN §11). This is the boolean-shape sibling of
+/// [`sweep_due_today`]; callers that just need a yes/no gate prefer
+/// this, callers that also want the new "today" string prefer
+/// `sweep_due_today`.
+pub fn should_run_today(last_sweep_day: Option<&str>) -> bool {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    match last_sweep_day {
+        None => true,
+        Some(d) => d != today,
     }
 }
 
@@ -603,6 +620,67 @@ mod tests {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let v = sweep_due_today(Some(&today));
         assert!(v.is_none());
+    }
+
+    // ---- should_run_today ----------------------------------------------
+
+    #[test]
+    fn should_run_today_none_returns_true() {
+        // Never swept — must run.
+        assert!(should_run_today(None));
+    }
+
+    #[test]
+    fn should_run_today_today_returns_false() {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(!should_run_today(Some(&today)));
+    }
+
+    #[test]
+    fn should_run_today_yesterday_returns_true() {
+        let yesterday = (Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(should_run_today(Some(&yesterday)));
+    }
+
+    // ---- sweep_rotated_archive counter ---------------------------------
+
+    #[test]
+    fn sweep_rotated_archive_increments_counter_on_successful_delete() {
+        // Lay down a stale dated archive and assert the counter ticks
+        // from 0 to 1 after the sweep removes it.
+        let s = ChatScratch::new("archive-counter");
+        let stale = s.0.join("adjustments.archive.20260101T000000Z.md");
+        touch(&stale, "old archive");
+        let cfg = SweepConfig {
+            chat_dir: s.0.clone(),
+            history_retention_days: 30,
+            decisions_retention_days: 30,
+            persona_archive_max: 10,
+            today: today_at(2026, 4, 26),
+        };
+        let r = run_sweep(&cfg);
+        assert_eq!(r.markdown_archives_deleted, 1);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn sweep_rotated_archive_keeps_recent_files() {
+        // Recent archive (within retention) — must NOT be deleted nor counted.
+        let s = ChatScratch::new("archive-recent");
+        let recent = s.0.join("memory.archive.20260420T000000Z.md");
+        touch(&recent, "recent archive");
+        let cfg = SweepConfig {
+            chat_dir: s.0.clone(),
+            history_retention_days: 30,
+            decisions_retention_days: 30,
+            persona_archive_max: 10,
+            today: today_at(2026, 4, 26),
+        };
+        let r = run_sweep(&cfg);
+        assert_eq!(r.markdown_archives_deleted, 0);
+        assert!(recent.exists());
     }
 
     // ---- empty / missing dirs ------------------------------------------

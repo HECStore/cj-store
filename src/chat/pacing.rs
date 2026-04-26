@@ -163,6 +163,46 @@ pub fn now() -> Instant {
     Instant::now()
 }
 
+/// PLAN §4.1 / CON4 — probabilistic skip even when the classifier says
+/// "respond". Real players miss messages they could reply to. The caller
+/// MUST bypass this for direct-address events; this function does not
+/// know about that gate.
+///
+/// `rng_unit` returns a uniform `[0.0, 1.0)` draw; `lurk_probability` is
+/// clamped defensively into the same range.
+pub fn roll_lurk_skip(lurk_probability: f32, rng_unit: &mut impl FnMut() -> f32) -> bool {
+    let p = lurk_probability.clamp(0.0, 1.0);
+    let r = (rng_unit)().clamp(0.0, 1.0);
+    r < p
+}
+
+/// PLAN §4.1 — active-hours gate. Returns true if the current UTC hour
+/// is within the configured active-hours window. `None` = always on.
+/// The matching helper `crate::config::within_active_hours_utc` lives
+/// in config.rs so the validator can reuse it.
+pub fn within_active_hours_now(active_hours_utc: Option<(u32, u32)>) -> bool {
+    use chrono::Timelike;
+    let hour = chrono::Utc::now().hour();
+    crate::config::within_active_hours_utc(active_hours_utc, hour)
+}
+
+/// PLAN §4.8 — Gaussian-jittered typing delay. Box-Muller transform
+/// from two uniform draws on [0, 1). `u1` is clamped away from 0 to
+/// keep `ln(u1)` finite. Returns a milliseconds offset (signed) — the
+/// caller adds this to the deterministic base+per_char delay before
+/// clamping to the floor/max. Uniform RNG is supplied by the caller so
+/// tests can pin determinism.
+pub fn gaussian_jitter_ms(
+    mean_ms: i32,
+    sigma_ms: u32,
+    rng_unit: &mut impl FnMut() -> f32,
+) -> i32 {
+    let u1 = (rng_unit)().clamp(1e-6, 1.0);
+    let u2 = (rng_unit)().clamp(0.0, 1.0);
+    let z = (-2.0_f32 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
+    mean_ms + (z * sigma_ms as f32) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

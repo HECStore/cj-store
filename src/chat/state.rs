@@ -18,6 +18,7 @@
 //! clock-jump-safe (a backward jump won't reset) because we compare
 //! calendar days, not durations.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -78,6 +79,64 @@ pub struct ChatState {
     /// Number of history events dropped today by the publisher-side
     /// `try_send` path (PLAN §2.2 ADV11).
     pub history_drops_today: u64,
+    /// Web-fetch calls made today; gate for `chat.web_fetch_daily_max`.
+    /// Reset at the same daily boundary as the token meter.
+    #[serde(default)]
+    pub web_fetches_today: u32,
+    /// PLAN §3.2 — per-sender spam-meter snapshot. Persisted on every
+    /// state save so cooldowns survive restarts.
+    #[serde(default)]
+    pub spam_meter_snapshot: BTreeMap<String, SpamSnapshot>,
+    /// PLAN §3.2 — UUID -> ISO UTC of the last bot reply to the player.
+    /// Used by the trust ladder and "active speaker" gating.
+    #[serde(default)]
+    pub last_replied_at_per_player: BTreeMap<String, String>,
+    /// PLAN §3.2 — depth of the background UUID-resolve queue. Surfaced
+    /// in `Chat: status`.
+    #[serde(default)]
+    pub uuid_resolve_queue_depth: u32,
+    /// PLAN §11 — day (YYYY-MM-DD UTC) the retention sweep last fired.
+    /// Used by the "first event each new UTC day" auto-trigger.
+    #[serde(default)]
+    pub last_sweep_day: Option<String>,
+    /// PLAN §4.7 — last reflection pass start time (ISO UTC). Used to
+    /// enforce `reflection_min_interval_secs`.
+    #[serde(default)]
+    pub last_reflection_at: Option<String>,
+    /// PLAN §5.1 ADV3 — bullets queued today by `update_self_memory`.
+    /// Bounded by `chat.update_self_memory_max_per_day`.
+    #[serde(default)]
+    pub update_self_memory_today: u32,
+    /// Snapshot of the last composer call — `Chat: status` displays
+    /// this so operators can see the latest cost without grepping
+    /// the decision log.
+    #[serde(default)]
+    pub last_composer_call: Option<LastCallSummary>,
+    /// Last persona regeneration timestamp (ISO UTC). Surfaced in
+    /// `Chat: status`.
+    #[serde(default)]
+    pub last_persona_regenerated_at: Option<String>,
+}
+
+/// Per-sender spam-meter snapshot stored in `state.json`. The runtime
+/// `SpamGuard` re-hydrates from this on startup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpamSnapshot {
+    /// Recent message receipt timestamps as ISO UTC.
+    #[serde(default)]
+    pub msgs: Vec<String>,
+    /// ISO UTC when the cooldown ends, if active.
+    #[serde(default)]
+    pub cooldown_until: Option<String>,
+}
+
+/// Snapshot of a single API call for `Chat: status`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LastCallSummary {
+    pub at_utc: String,
+    pub usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl Default for ChatState {
@@ -93,6 +152,15 @@ impl Default for ChatState {
             model_404_backoff_until: None,
             persona_regen_cooldown_until: None,
             history_drops_today: 0,
+            web_fetches_today: 0,
+            spam_meter_snapshot: BTreeMap::new(),
+            last_replied_at_per_player: BTreeMap::new(),
+            uuid_resolve_queue_depth: 0,
+            last_sweep_day: None,
+            last_reflection_at: None,
+            update_self_memory_today: 0,
+            last_composer_call: None,
+            last_persona_regenerated_at: None,
         }
     }
 }
@@ -155,6 +223,8 @@ impl ChatState {
             );
             self.tokens_today = TokensToday::default();
             self.history_drops_today = 0;
+            self.web_fetches_today = 0;
+            self.update_self_memory_today = 0;
             self.last_meter_day_utc = today.to_string();
         }
     }

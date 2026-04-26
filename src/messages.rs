@@ -82,6 +82,51 @@ pub enum ChatCommand {
     RunReflection {
         respond_to: oneshot::Sender<Result<crate::chat::reflection::ReflectionOutcome, String>>,
     },
+    /// Bot disconnected from the server — chat task should cancel any
+    /// in-flight composer call (PLAN §2.4 in-flight cancellation). Sent
+    /// by the bot's `Event::Disconnect` handler.
+    BotDisconnected,
+    /// Show the last `last_n` decision-log lines (most recent UTC day).
+    ShowDecisionLog {
+        last_n: usize,
+        respond_to: oneshot::Sender<Result<Vec<String>, String>>,
+    },
+    /// Re-render the system prompt that would have been sent for a given
+    /// historical event timestamp. Pure local replay; no API call.
+    ReplayEvent {
+        event_ts: String,
+        respond_to: oneshot::Sender<Result<String, String>>,
+    },
+    /// Reset (delete) one player's per-player memory file.
+    ResetPlayerMemory {
+        username: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    /// Print one player's per-player memory file contents.
+    DumpPlayerMemory {
+        username: String,
+        respond_to: oneshot::Sender<Result<String, String>>,
+    },
+    /// Set or clear operator-managed `Trust: 3`. `set = false` clears,
+    /// `set = true` writes the heading and `trust3_expires_at` line.
+    SetOperatorTrust {
+        username: String,
+        set: bool,
+        reason: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    /// Regenerate `persona.md` from `persona.seed`. Honors a 24h
+    /// cooldown stored in `state.persona_regen_cooldown_until`.
+    RegeneratePersona {
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    /// "Right to be forgotten": purge a player's UUID from per-player
+    /// file, history JSONL records, decisions JSONL records, and UUID
+    /// overlay sidecars; logs the action to `operator_audit.jsonl`.
+    ForgetPlayer {
+        username: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Type of queued order for the order queue system.

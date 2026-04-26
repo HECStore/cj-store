@@ -392,6 +392,239 @@ impl SpamGuard {
     }
 }
 
+/// Read a text file as one line per element. Empty file or missing
+/// file returns an empty Vec — operator-extensible config files (e.g.
+/// `data/chat/system_senders.txt`) are optional by design.
+pub fn load_lines_or_empty(path: &str) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Operator-managed blocklist load (`data/chat/blocklist.txt`).
+/// Comments starting with `#` and blank lines are skipped; entries are
+/// lowercased so callers can match `name.to_lowercase()`.
+pub fn load_blocklist(path: &str) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// PLAN §4.6 — system-pseudo-sender filter. Returns true if the sender
+/// is clearly automated (server broadcast, console plugin, etc.) and
+/// should not trigger a chat-AI response.
+///
+/// Rules:
+/// - The Mojang username shape `^[A-Za-z0-9_]{3,16}$` is required;
+///   anything else (`[Server]`, `[CONSOLE]`, etc.) is a pseudo-sender.
+/// - `regex_lines` (from `data/chat/system_senders_re.txt`): treated
+///   as substring patterns here. We avoid pulling in the `regex` crate
+///   for a defense-in-depth filter — the operator can list literal
+///   prefixes and we check substring containment. A `^` prefix is
+///   stripped and treated as a "starts with" anchor for the common case.
+/// - `exact_lines` (from `data/chat/system_senders.txt`): exact-match
+///   list, evaluated with case-sensitive equality.
+pub fn is_system_pseudo_sender(
+    name: &str,
+    regex_lines: &[String],
+    exact_lines: &[String],
+) -> bool {
+    // Mojang shape gate (§4.6).
+    let shape_ok = name.len() >= 3
+        && name.len() <= 16
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !shape_ok {
+        return true;
+    }
+    // Exact-list match.
+    if exact_lines.iter().any(|n| n.trim() == name) {
+        return true;
+    }
+    // Operator regex list — degraded to substring/prefix matching so
+    // the chat module doesn't take a runtime regex dependency for what
+    // is, in practice, a small list of literal names.
+    for raw in regex_lines {
+        let p = raw.trim();
+        if p.is_empty() || p.starts_with('#') {
+            continue;
+        }
+        if let Some(stripped) = p.strip_prefix('^') {
+            if let Some(stripped) = stripped.strip_suffix('$') {
+                if name == stripped {
+                    return true;
+                }
+            } else if name.starts_with(stripped) {
+                return true;
+            }
+        } else if name.contains(p) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pre-loaded moderation patterns. PLAN §4.6 S16: when ANY pattern
+/// matches a chat line addressed at the bot, the bot enters a long
+/// backoff. Patterns are loaded with the bot username interpolated so
+/// the default seeds match the live identity.
+pub struct ModerationPatterns {
+    /// Lower-cased pattern strings. We use substring containment for
+    /// the same reason as `is_system_pseudo_sender` — keeps the chat
+    /// module dependency-light.
+    patterns: Vec<String>,
+}
+
+impl ModerationPatterns {
+    /// Load operator-managed patterns from `path` plus the built-in
+    /// seeds. The `bot_username` is lower-cased and interpolated into
+    /// the `[Mod] X -> bot` default; operator entries can include the
+    /// literal `<bot_username>` placeholder which is replaced before
+    /// matching.
+    pub fn load_with_defaults(path: &str, bot_username: &str) -> Self {
+        let bot_lc = bot_username.to_lowercase();
+        let mut patterns: Vec<String> = vec![
+            "you have been muted".to_string(),
+            "you have been banned".to_string(),
+            "you have been temporarily banned".to_string(),
+            "you have been temp banned".to_string(),
+            format!("[mod] -> {bot_lc}"),
+            format!("[mod] whispers to {bot_lc}"),
+            format!("[moderator] -> {bot_lc}"),
+            format!("[moderator] whispers to {bot_lc}"),
+        ];
+        for raw in load_lines_or_empty(path) {
+            let l = raw.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            patterns.push(l.replace("<bot_username>", &bot_lc).to_lowercase());
+        }
+        Self { patterns }
+    }
+
+    /// True if any pattern matches (case-insensitive substring).
+    pub fn is_moderation_event(&self, content: &str) -> bool {
+        let lc = content.to_lowercase();
+        self.patterns.iter().any(|p| lc.contains(p))
+    }
+}
+
+/// PLAN §4.4 — direct-address detection with the common-words downgrade.
+/// When the bot's nickname is in the operator's `common_words.txt`
+/// (e.g. a persona named "Sky" on a server that says "the sky is nice"),
+/// a bare-word match is downgraded: it requires the name to start the
+/// message OR be `@`-prefixed. Names not in the common-words list use
+/// whole-word matching as before.
+pub fn is_direct_address_with_common_words(
+    content: &str,
+    nicknames: &[String],
+    common_words: &[String],
+) -> bool {
+    let lower = content.to_lowercase();
+    let common_set: std::collections::HashSet<String> =
+        common_words.iter().map(|w| w.to_lowercase()).collect();
+    for nick in nicknames {
+        if nick.is_empty() {
+            continue;
+        }
+        let n_lower = nick.to_lowercase();
+        if !common_set.contains(&n_lower) {
+            if has_whole_word(&lower, &n_lower) {
+                return true;
+            }
+        } else {
+            // Downgraded path.
+            if let Some(rest) = lower.strip_prefix(&n_lower) {
+                let next = rest.as_bytes().first().copied();
+                let boundary = matches!(
+                    next,
+                    None | Some(b' ') | Some(b',') | Some(b':') | Some(b';')
+                        | Some(b'!') | Some(b'?') | Some(b'.')
+                );
+                if boundary {
+                    return true;
+                }
+            }
+            let needle = format!("@{n_lower}");
+            if lower.contains(&needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_whole_word(lower: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = lower.as_bytes();
+    let nb = name.as_bytes();
+    let mut i = 0;
+    while i + nb.len() <= bytes.len() {
+        if &bytes[i..i + nb.len()] == nb {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_ok =
+                i + nb.len() == bytes.len() || !bytes[i + nb.len()].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// PLAN §4.4 — reply heuristic. Returns true if `content` looks like
+/// it's threaded at a non-self, non-bot speaker — meaning the bot
+/// should stay silent unless it IS that addressee.
+///
+/// Triggers:
+/// - `@<name>` in the first 16 chars where `<name>` is a recent
+///   non-self speaker not in `common_words`.
+/// - Starts with `<name>,`, `<name>:`, or `<name> ` where `<name>` is
+///   the most recent non-self speaker AND not in `common_words`.
+pub fn is_reply_to_other_speaker(
+    content: &str,
+    bot_username: &str,
+    recent_speakers: &[String], // most-recent first
+    common_words: &[String],
+) -> bool {
+    let lower = content.to_lowercase();
+    let common_set: std::collections::HashSet<String> =
+        common_words.iter().map(|w| w.to_lowercase()).collect();
+    let candidates: Vec<String> = recent_speakers
+        .iter()
+        .filter(|n| !n.eq_ignore_ascii_case(bot_username))
+        .map(|n| n.to_lowercase())
+        .filter(|n| !common_set.contains(n))
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    let head = &lower[..lower.len().min(16)];
+    for name in &candidates {
+        let needle = format!("@{name}");
+        if head.contains(&needle) {
+            return true;
+        }
+    }
+    if let Some(first) = candidates.first()
+        && (lower.starts_with(&format!("{first},"))
+            || lower.starts_with(&format!("{first}:"))
+            || lower.starts_with(&format!("{first} ")))
+    {
+        return true;
+    }
+    false
+}
+
 /// Levenshtein ratio in [0.0, 1.0]: 1.0 means identical, 0.0 means
 /// completely different. Defined as `1 - dist / max(len_a, len_b)`.
 pub fn levenshtein_ratio(a: &str, b: &str) -> f64 {

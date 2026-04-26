@@ -328,11 +328,15 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
         },
         Tool {
             name: "read_today_history".to_string(),
-            description: "Read today's chat history JSONL, capped at 32 KB. Most recent first.".to_string(),
+            description: "Read today's chat history JSONL, capped at 32 KB. Most recent first. Optionally paginate with `since_event_ts` (ISO-UTC) to only return records strictly newer than that timestamp.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "limit_lines": {"type": "integer", "default": 200}
+                    "limit_lines": {"type": "integer", "default": 200},
+                    "since_event_ts": {
+                        "type": "string",
+                        "description": "ISO-UTC timestamp; only records with `ts` strictly greater are returned."
+                    }
                 },
                 "required": []
             }),
@@ -398,6 +402,23 @@ pub struct ToolContext<'a> {
     pub web_fetch_enabled: bool,
     /// Today's UTC date (YYYY-MM-DD).
     pub today: String,
+    /// Per-player file byte cap (PLAN §5.5 default 4 KB). Enforced inside
+    /// [`update_player_memory`] — exceeding it returns an explicit error
+    /// so the model can re-plan rather than silently growing the file.
+    pub player_memory_max_bytes: u32,
+    /// PLAN §5.1 ADV3 — bullets queued today by `update_self_memory`.
+    /// Read by the tool to enforce the daily cap; the orchestrator
+    /// increments the matching state.json counter after a successful
+    /// invocation (the tool does not mutate state.json directly).
+    pub update_self_memory_today: u32,
+    /// PLAN §5.1 ADV3 — daily cap for `update_self_memory` invocations.
+    pub update_self_memory_max_per_day: u32,
+    /// PLAN §6.1 — `web_fetch` calls already made today. Read by the
+    /// tool to enforce the daily budget; the orchestrator increments
+    /// the matching state.json counter after a successful fetch.
+    pub web_fetches_today: u32,
+    /// PLAN §6.1 — `web_fetch` daily budget cap.
+    pub web_fetch_daily_max: u32,
 }
 
 /// Dispatch one tool_use block from the model. Returns the textual
@@ -437,6 +458,21 @@ async fn read_my_memory() -> Result<String, String> {
         .map_err(|e| format!("read_global_memory: {e}"))
 }
 
+/// Resolve the per-player file path AFTER `validate_uuid`, with the
+/// canonical-parent gate engaged (PLAN §6 S5). On a fresh chat install
+/// the players dir may not exist yet, so we create it before
+/// canonicalization — `resolve_player_path` requires `players_dir` to
+/// exist on disk in order to canonicalize.
+fn resolve_player_path_runtime(uuid: &str) -> Result<PathBuf, String> {
+    let players_dir = std::path::Path::new(crate::chat::memory::PLAYERS_DIR);
+    if !players_dir.exists()
+        && let Err(e) = std::fs::create_dir_all(players_dir)
+    {
+        return Err(format!("create players dir: {e}"));
+    }
+    resolve_player_path(uuid, players_dir)
+}
+
 async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
     let uuid_arg = input.get("uuid").and_then(|v| v.as_str());
     let username_arg = input.get("username").and_then(|v| v.as_str());
@@ -455,9 +491,14 @@ async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
     if matches!(auth, ReadAuthorization::Denied) {
         return Err("access denied (cross-player reads disabled)".to_string());
     }
-    match crate::chat::memory::read_player(&target_uuid) {
-        Ok(Some(body)) => Ok(body),
-        Ok(None) => Ok(String::new()),
+    // PLAN §6 S5: canonicalize before reading. Path-traversal UUIDs would
+    // already have been rejected by `validate_uuid`; this is the second
+    // line of defense, ensuring the parent dir is exactly the configured
+    // players dir even if a future change loosens UUID validation.
+    let path = resolve_player_path_runtime(&target_uuid)?;
+    match std::fs::read_to_string(&path) {
+        Ok(body) => Ok(body),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(format!("read_player: {e}")),
     }
 }
@@ -485,9 +526,10 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     }
     let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
 
-    // Bootstrap the file if needed. Username goes from the index map;
-    // if not present, fall back to "unknown" — the bot's own
-    // observation will refresh it later.
+    // Bootstrap the file if needed BEFORE canonicalization so the
+    // players dir is guaranteed to exist on disk. Username goes from
+    // the index map; if not present, fall back to "unknown" — the
+    // bot's own observation will refresh it later.
     let username = crate::chat::memory::load_or_rebuild_index()
         .ok()
         .and_then(|idx| {
@@ -497,33 +539,150 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
                 .map(|(k, _)| k.clone())
         })
         .unwrap_or_else(|| "unknown".to_string());
-    crate::chat::memory::ensure_player_file(uuid, &username, &ctx.today)
+    crate::chat::memory::ensure_player_file(uuid, &username)
         .map_err(|e| format!("ensure_player_file: {e}"))?;
 
-    let body = crate::chat::memory::read_player(uuid)
-        .map_err(|e| format!("read_player: {e}"))?
-        .unwrap_or_default();
+    // PLAN §6 S5: canonicalize before writing. Returns Err("path escapes
+    // ...") if anything resolves outside the players dir.
+    let path = resolve_player_path_runtime(uuid)?;
+
+    let body = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read_player: {e}")),
+    };
     let with_section = ensure_section(&body, section);
     let new_body = append_bullet_to_section(&with_section, section, &safe_bullet, &ctx.today);
-    crate::chat::memory::write_player(uuid, &new_body)
+
+    // PLAN §5.5 C12: explicit cap-error so the model can re-plan instead
+    // of silently growing the file. Summarization is the orchestrator's
+    // job — the tool itself never invokes Haiku.
+    if new_body.len() > ctx.player_memory_max_bytes as usize {
+        return Err("player memory at cap; summarization rate-limited".to_string());
+    }
+
+    crate::fsutil::write_atomic(&path, &new_body)
         .map_err(|e| format!("write_player: {e}"))?;
     Ok(format!("appended to '{section}'"))
 }
 
+/// On-disk path for the self-memory staging file. Each successful
+/// `update_self_memory` call appends one record here; a separate
+/// reflection pass (out of scope for this tool) graduates them into
+/// `memory.md` after operator review (PLAN §5.1 ADV3).
+pub const PENDING_SELF_MEMORY_FILE: &str = "data/chat/pending_self_memory.jsonl";
+
+/// One record appended to `data/chat/pending_self_memory.jsonl`. Modeled
+/// on the existing `pending_adjustments.jsonl` shape.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingSelfMemoryRecord<'a> {
+    ts: String,
+    bullet: &'a str,
+    day_utc: String,
+}
+
+/// Levenshtein-ratio threshold above which a candidate bullet is treated
+/// as a near-duplicate of an existing one (PLAN §5.1 ADV3 dedup gate).
+const SELF_MEMORY_DEDUP_RATIO: f64 = 0.85;
+
+/// Return every existing self-memory bullet we should compare against
+/// when deduplicating: lines from the pending file plus dated bullets
+/// already under `## Inferred` in `memory.md`.
+fn collect_existing_self_bullets(pending_path: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(body) = std::fs::read_to_string(pending_path) {
+        for line in body.lines() {
+            if let Ok(rec) = serde_json::from_str::<PendingSelfMemoryRecord<'_>>(line) {
+                out.push(rec.bullet.to_string());
+            }
+        }
+    }
+    if let Ok(global) = crate::chat::memory::read_global_memory() {
+        let mut in_inferred = false;
+        for line in global.lines() {
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("## ") {
+                in_inferred = trimmed == "## Inferred";
+                continue;
+            }
+            if in_inferred && let Some(rest) = trimmed.strip_prefix("- ") {
+                // Lines have shape `- <date>: <bullet>` (see
+                // `append_bullet_to_section`). Strip the `<date>: ` prefix
+                // when present so dedup compares the bullet body itself.
+                let body = rest.split_once(": ").map(|(_, b)| b).unwrap_or(rest);
+                out.push(body.to_string());
+            }
+        }
+    }
+    out
+}
+
 async fn update_self_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    update_self_memory_at_path(
+        input,
+        ctx,
+        std::path::Path::new(PENDING_SELF_MEMORY_FILE),
+    )
+}
+
+/// Inner helper exposed at module level so tests can redirect the
+/// staging file to a temp location. Does NOT mutate `state.json`; the
+/// orchestrator increments `update_self_memory_today` after a successful
+/// invocation (PLAN §5.1 ADV3 contract).
+fn update_self_memory_at_path(
+    input: &Value,
+    ctx: &ToolContext<'_>,
+    pending_path: &std::path::Path,
+) -> Result<String, String> {
     let bullet = input
         .get("bullet")
         .and_then(|v| v.as_str())
         .ok_or("bullet is required")?;
-    let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
 
-    let body = crate::chat::memory::read_global_memory()
-        .map_err(|e| format!("read_global_memory: {e}"))?;
-    let with_section = ensure_section(&body, "Inferred");
-    let new_body = append_bullet_to_section(&with_section, "Inferred", &safe_bullet, &ctx.today);
-    crate::fsutil::write_atomic(crate::chat::memory::GLOBAL_MEMORY, &new_body)
-        .map_err(|e| format!("write memory.md: {e}"))?;
-    Ok("appended to '## Inferred' in memory.md".to_string())
+    // PLAN §5.1 ADV3 — daily cap. Tool is read-only against state.json;
+    // the orchestrator bumps the counter on Ok.
+    if ctx.update_self_memory_today >= ctx.update_self_memory_max_per_day {
+        return Err("daily limit reached".to_string());
+    }
+
+    let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars)
+        .map_err(str::to_string)?;
+
+    // PLAN §5.1 ADV3 — Levenshtein-ratio dedup against the pending file
+    // plus the live `## Inferred` section.
+    let existing = collect_existing_self_bullets(pending_path);
+    for prev in &existing {
+        if crate::chat::conversation::levenshtein_ratio(prev, &safe_bullet)
+            >= SELF_MEMORY_DEDUP_RATIO
+        {
+            return Err("near-duplicate of an existing self-memory bullet".to_string());
+        }
+    }
+
+    // Append, do NOT touch memory.md directly — the staging file is the
+    // record of intent; an out-of-band reflection pass graduates entries
+    // after operator review.
+    if let Some(parent) = pending_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create staging dir: {e}"))?;
+    }
+    let rec = PendingSelfMemoryRecord {
+        ts: chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        bullet: &safe_bullet,
+        day_utc: ctx.today.clone(),
+    };
+    let line =
+        serde_json::to_string(&rec).map_err(|e| format!("serialize pending: {e}"))?;
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pending_path)
+        .map_err(|e| format!("open pending: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| format!("append pending: {e}"))?;
+    f.flush().map_err(|e| format!("flush pending: {e}"))?;
+
+    Ok("queued in pending_self_memory.jsonl".to_string())
 }
 
 async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
@@ -532,6 +691,13 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         .and_then(|v| v.as_u64())
         .unwrap_or(200) as usize;
     let limit_lines = limit_lines.min(500);
+    // Optional pagination cursor (PLAN §6). ISO-UTC timestamps are
+    // string-comparable (zero-padded year-first format), so we filter by
+    // direct string-`>` against each record's `ts`/`recv_at`/`event_ts`.
+    let since_event_ts = input
+        .get("since_event_ts")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let today = chrono::Utc::now().format("%Y-%m-%d");
     let path = std::path::Path::new(crate::chat::history::HISTORY_DIR)
         .join(format!("{today}.jsonl"));
@@ -540,8 +706,31 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(format!("read today's history: {e}")),
     };
-    // Most recent first, capped by both line count and byte count.
-    let mut lines: Vec<&str> = contents.lines().rev().take(limit_lines).collect();
+    // Filter by `since_event_ts` first (oldest-first scan is fine — we
+    // re-reverse below), then take the most-recent `limit_lines`. The
+    // 32 KB byte cap from `ctx.history_max_bytes` continues to apply.
+    let filtered: Vec<&str> = if let Some(since) = since_event_ts.as_deref() {
+        contents
+            .lines()
+            .filter(|line| {
+                // Parse just enough JSON to find the timestamp field.
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let ts = v
+                    .get("ts")
+                    .or_else(|| v.get("recv_at"))
+                    .or_else(|| v.get("event_ts"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                ts > since
+            })
+            .collect()
+    } else {
+        contents.lines().collect()
+    };
+    let mut lines: Vec<&str> = filtered.into_iter().rev().take(limit_lines).collect();
     let mut out = String::new();
     let mut bytes = 0usize;
     let mut truncated = false;
@@ -637,6 +826,18 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
 }
 
 async fn web_fetch_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    // PLAN §6.1 — daily budget gate. Rendered as an Ok tool_result with
+    // an `error` field (rather than an Err) so the model can read the
+    // reason and re-plan, matching how Anthropic-side server errors are
+    // surfaced. The orchestrator increments `web_fetches_today` after a
+    // successful (non-rate-limited) fetch.
+    if ctx.web_fetches_today >= ctx.web_fetch_daily_max {
+        return Ok(json!({
+            "error": "rate limited",
+            "reason": "web_fetch daily budget exhausted",
+        })
+        .to_string());
+    }
     let url = input
         .get("url")
         .and_then(|v| v.as_str())
@@ -899,5 +1100,218 @@ mod tests {
         );
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // ---- runtime canonicalization gate (BLOCKER-level fix) -------------
+
+    fn test_ctx<'a>(sender_uuid: &'a str) -> ToolContext<'a> {
+        ToolContext {
+            sender_uuid,
+            cross_player_reads: false,
+            history_max_bytes: 32_768,
+            update_bullet_max_chars: 280,
+            history_search_max_days: 7,
+            web_fetch_max_bytes: 262_144,
+            web_fetch_enabled: false,
+            today: "2026-04-26".to_string(),
+            player_memory_max_bytes: 4096,
+            update_self_memory_today: 0,
+            update_self_memory_max_per_day: 3,
+            web_fetches_today: 0,
+            web_fetch_daily_max: 50,
+        }
+    }
+
+    #[test]
+    fn read_player_memory_rejects_path_traversal() {
+        // PLAN §6 S5: any UUID containing `../` or path separators must be
+        // rejected at the `validate_uuid` gate before any disk access.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        let input = json!({"uuid": "../../etc/passwd"});
+        let res = rt.block_on(read_player_memory_tool(&input, &ctx));
+        assert!(res.is_err(), "expected error, got: {res:?}");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("uuid") || msg.contains("hyphenated"),
+            "unexpected error: {msg}",
+        );
+
+        // Also reject UUID-shaped strings with embedded separators.
+        let input2 = json!({"uuid": "11111111-2222-3333-4444-555555555555/foo"});
+        let res2 = rt.block_on(read_player_memory_tool(&input2, &ctx));
+        assert!(res2.is_err(), "expected error, got: {res2:?}");
+    }
+
+    // ---- update_player_memory cap --------------------------------------
+
+    #[test]
+    fn update_player_memory_at_cap_returns_explicit_error() {
+        // PLAN §5.5 C12: writes that would push the file past
+        // `player_memory_max_bytes` return an explicit error so the
+        // model can re-plan rather than silently growing the file.
+        // Drive the gate via a tiny cap that any append crosses.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // Use a unique sentinel UUID so this test doesn't collide with a
+        // real player file. The test creates and removes the file under
+        // the real `data/chat/players/` dir — best effort cleanup at the
+        // end. This is consistent with the existing test conventions.
+        let uuid = "00000000-0000-0000-0000-cccccccccccc";
+        let mut ctx = test_ctx(uuid);
+        ctx.player_memory_max_bytes = 1; // any append exceeds this.
+        let input = json!({
+            "uuid": uuid,
+            "section": "Inferred",
+            "bullet": "this is a normal bullet",
+        });
+        let res = rt.block_on(update_player_memory_tool(&input, &ctx));
+        // Cleanup — best effort. The bootstrap path may have created
+        // `data/chat/players/<uuid>.md`.
+        let _ = std::fs::remove_file(crate::chat::memory::player_file_path(uuid));
+        assert!(res.is_err(), "expected error, got: {res:?}");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("at cap") && msg.contains("rate-limited"),
+            "unexpected error: {msg}",
+        );
+    }
+
+    // ---- update_self_memory ADV3 controls ------------------------------
+
+    #[test]
+    fn update_self_memory_daily_cap_enforced() {
+        let mut ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        ctx.update_self_memory_today = 3;
+        ctx.update_self_memory_max_per_day = 3;
+        let input = json!({"bullet": "something to remember"});
+        let pending = std::env::temp_dir().join(format!(
+            "cj-store-pending-{}-cap.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pending);
+        let res = update_self_memory_at_path(&input, &ctx, &pending);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "daily limit reached");
+        // The pending file MUST not have been created.
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn update_self_memory_writes_to_pending_not_live() {
+        let ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        let input = json!({"bullet": "operator likes brevity"});
+        let pending = std::env::temp_dir().join(format!(
+            "cj-store-pending-{}-{}-write.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        ));
+        let _ = std::fs::remove_file(&pending);
+
+        let res = update_self_memory_at_path(&input, &ctx, &pending);
+        assert!(res.is_ok(), "expected ok, got: {res:?}");
+
+        let body = std::fs::read_to_string(&pending).unwrap();
+        // One newline-terminated JSONL record.
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["bullet"], "operator likes brevity");
+        assert_eq!(v["day_utc"], "2026-04-26");
+        assert!(v.get("ts").is_some());
+
+        let _ = std::fs::remove_file(&pending);
+    }
+
+    #[test]
+    fn update_self_memory_dedup_rejects_near_duplicate() {
+        let ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        let pending = std::env::temp_dir().join(format!(
+            "cj-store-pending-{}-{}-dedup.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        ));
+        let _ = std::fs::remove_file(&pending);
+
+        // Seed the pending file with one bullet.
+        let first = json!({"bullet": "operator prefers brief replies"});
+        update_self_memory_at_path(&first, &ctx, &pending).unwrap();
+
+        // A near-duplicate (one-character delta) must be rejected.
+        let second = json!({"bullet": "operator prefers brief reply"});
+        let res = update_self_memory_at_path(&second, &ctx, &pending);
+        assert!(res.is_err(), "expected dedup err, got: {res:?}");
+        let msg = res.unwrap_err();
+        assert!(msg.contains("near-duplicate"), "unexpected: {msg}");
+
+        // An unrelated bullet should still pass.
+        let third = json!({"bullet": "remembers the chest at -100,64,200"});
+        assert!(update_self_memory_at_path(&third, &ctx, &pending).is_ok());
+
+        let _ = std::fs::remove_file(&pending);
+    }
+
+    // ---- read_today_history pagination ---------------------------------
+
+    #[test]
+    fn read_today_history_paginates_via_since_ts() {
+        // We exercise the in-memory pagination logic by inlining the
+        // filter step here. The full tool reads from
+        // `data/chat/history/<today>.jsonl` which we cannot rebind from
+        // this scope, so we test the behavior via the substrate: the
+        // filter should keep only records strictly newer than the
+        // cursor.
+        let lines = vec![
+            r#"{"ts":"2026-04-26T10:00:00Z","kind":"public","sender":"A","content":"hi"}"#,
+            r#"{"ts":"2026-04-26T11:00:00Z","kind":"public","sender":"B","content":"hi"}"#,
+            r#"{"ts":"2026-04-26T12:00:00Z","kind":"public","sender":"C","content":"hi"}"#,
+        ];
+        let since = "2026-04-26T10:30:00Z";
+        let kept: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                let ts = v
+                    .get("ts")
+                    .or_else(|| v.get("recv_at"))
+                    .or_else(|| v.get("event_ts"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                ts > since
+            })
+            .collect();
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0].contains("11:00:00"));
+        assert!(kept[1].contains("12:00:00"));
+    }
+
+    // ---- web_fetch daily budget ----------------------------------------
+
+    #[test]
+    fn web_fetch_daily_budget_returns_rate_limited() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        ctx.web_fetches_today = 50;
+        ctx.web_fetch_daily_max = 50;
+        ctx.web_fetch_enabled = true;
+        let input = json!({"url": "https://example.com/"});
+        let res = rt.block_on(web_fetch_tool(&input, &ctx));
+        // Spec: rate-limit returns Ok(json{...}) so the model sees a
+        // non-error tool_result with an `error` field.
+        let body = res.expect("rate-limit path must return Ok");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "rate limited");
+        assert!(
+            v["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("web_fetch daily budget exhausted")
+        );
     }
 }

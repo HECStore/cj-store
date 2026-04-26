@@ -5,7 +5,7 @@
 //! which decides whether an incoming whisper goes to the Store
 //! (command-shaped) or to the chat module (freeform).
 //!
-//! See `PLAN.md` §2.3 — the routing rules are written there in plain English
+//! See CHAT.md — the routing rules are written there in plain English
 //! and this module is the executable mirror. The accompanying tests pin every
 //! rule.
 //!
@@ -26,13 +26,13 @@ pub enum WhisperRoute {
     /// Freeform text — forward to the chat module. Only reachable when
     /// `chat.enabled == true` and `chat.dry_run == false`; otherwise the
     /// router falls back to [`WhisperRoute::Store`] so existing trade-bot
-    /// UX is preserved (PLAN §2.3 rule 1).
+    /// UX is preserved.
     Chat,
 }
 
 /// Normalize a whisper for routing.
 ///
-/// Performs the §2.3 / S9 normalization steps (NFKC is approximated as
+/// Performs the / S9 normalization steps (NFKC is approximated as
 /// identity here — pure-ASCII whisper traffic dominates Minecraft, and
 /// pulling in a Unicode-normalization crate is deferred until we have a
 /// concrete attack to defend against). We DO collapse internal whitespace
@@ -79,7 +79,7 @@ fn normalize(content: &str) -> String {
 /// Levenshtein distance ≤ `typo_max_distance` of any prefix, route to Store
 /// so the parser's "Unknown command" hint reaches the player.
 ///
-/// **Order of rules is load-bearing** — see PLAN §2.3.
+/// **Order of rules is load-bearing** — see CHAT.md
 pub fn route_whisper(
     content: &str,
     chat_enabled: bool,
@@ -211,7 +211,7 @@ fn levenshtein(a: &[u8], b: &[u8]) -> usize {
     prev[n]
 }
 
-// ===== Dyad / open-chat detection (PLAN §4.4) ==============================
+// ===== Dyad / open-chat detection ==============================
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -234,7 +234,7 @@ pub enum ChannelClass {
 }
 
 /// Classify the recent N events as open-chat, dyad, or
-/// not-enough-data per PLAN §4.4.
+/// not-enough-data.
 ///
 /// `window` is expected to be the last 8 events for the channel, in
 /// arrival order.
@@ -281,7 +281,7 @@ pub fn classify_window(window: &[ChatEvent]) -> ChannelClass {
     }
 }
 
-// ===== Spam guard (PLAN §4.5) ==============================================
+// ===== Spam guard ==============================================
 
 /// Per-sender sliding-window message counter. Drops old entries lazily
 /// on each `record`. Suppression is binary (suppressed or not); the
@@ -416,7 +416,7 @@ pub fn load_blocklist(path: &str) -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
-/// PLAN §4.6 — system-pseudo-sender filter. Returns true if the sender
+/// CHAT.md — system-pseudo-sender filter. Returns true if the sender
 /// is clearly automated (server broadcast, console plugin, etc.) and
 /// should not trigger a chat-AI response.
 ///
@@ -435,7 +435,7 @@ pub fn is_system_pseudo_sender(
     regex_lines: &[String],
     exact_lines: &[String],
 ) -> bool {
-    // Mojang shape gate (§4.6).
+    // Mojang shape gate.
     let shape_ok = name.len() >= 3
         && name.len() <= 16
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -469,7 +469,7 @@ pub fn is_system_pseudo_sender(
     false
 }
 
-/// Pre-loaded moderation patterns. PLAN §4.6 S16: when ANY pattern
+/// Pre-loaded moderation patterns. CHAT.md: when ANY pattern
 /// matches a chat line addressed at the bot, the bot enters a long
 /// backoff. Patterns are loaded with the bot username interpolated so
 /// the default seeds match the live identity.
@@ -515,7 +515,7 @@ impl ModerationPatterns {
     }
 }
 
-/// PLAN §4.4 — direct-address detection with the common-words downgrade.
+/// CHAT.md — direct-address detection with the common-words downgrade.
 /// When the bot's nickname is in the operator's `common_words.txt`
 /// (e.g. a persona named "Sky" on a server that says "the sky is nice"),
 /// a bare-word match is downgraded: it requires the name to start the
@@ -581,7 +581,7 @@ fn has_whole_word(lower: &str, name: &str) -> bool {
     false
 }
 
-/// PLAN §4.4 — reply heuristic. Returns true if `content` looks like
+/// CHAT.md — reply heuristic. Returns true if `content` looks like
 /// it's threaded at a non-self, non-bot speaker — meaning the bot
 /// should stay silent unless it IS that addressee.
 ///
@@ -934,7 +934,7 @@ mod tests {
         // Wait that's 9 entries — let's do 7 As + 1 B.
         let mut w = vec![ev("A", "x"); 7];
         w.push(ev("B", "x"));
-        // Only 1 transition between A and B; PLAN §4.4 requires ≥ 2.
+        // Only 1 transition between A and B; CHAT.md requires ≥ 2.
         assert_eq!(classify_window(&w), ChannelClass::OpenChat);
     }
 

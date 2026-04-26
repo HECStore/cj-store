@@ -1,7 +1,7 @@
 //! Per-model price table loaded from `data/chat/pricing.json`.
 //!
 //! Decoupling pricing from the binary means changes to Anthropic rates can
-//! land via an operator config edit instead of a code release (PLAN §7).
+//! land via an operator config edit instead of a code release.
 //! Defaults live here and are written to disk on first run if the file is
 //! missing.
 //!
@@ -48,7 +48,7 @@ impl PricingTable {
     /// list prices that operators are expected to override; the file
     /// header explicitly invites that. Sourced as of late-2025 published
     /// rates; if these are wrong on day-one they are wrong by a small
-    /// constant factor and the daily USD cap (PLAN §7 OPS4) is the real
+    /// constant factor and the daily USD cap is the real
     /// safety net.
     pub fn default_table() -> Self {
         let mut rates = HashMap::new();

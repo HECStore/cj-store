@@ -1,7 +1,7 @@
 //! Daily decision JSONL — `data/chat/decisions/<UTC-date>.jsonl`.
 //!
 //! Every classifier verdict, every composer call, and every skip/drop
-//! reason is recorded here. PLAN §11: "Non-negotiable for debugging
+//! reason is recorded here. CHAT.md: "Non-negotiable for debugging
 //! and auditing leaks."
 //!
 //! Single-process append-only: the chat task is the only writer.

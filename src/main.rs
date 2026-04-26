@@ -110,8 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (store_tx, store_rx) = mpsc::channel::<StoreMessage>(128);
             let (bot_tx, bot_rx) = mpsc::channel::<BotInstruction>(128);
 
-            // Chat-side channels (PLAN §2.5). Constructed in main so each
-            // task gets the right end. Capacities follow PLAN: 2048 for the
+            // Chat-side channels. Constructed in main so each
+            // task gets the right end. Capacities follow CHAT.md: 2048 for the
             // broadcast (absorb burst loads, A3) and 4096 for the history
             // mpsc (history is best-effort, never blocking — A3 + ADV11).
             let (chat_events_tx, _chat_events_rx_root) =
@@ -140,14 +140,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Spawn the chat history writer task. Owns `history_rx`
             // exclusively so the bot's `try_send` lands in a single,
-            // dedicated drainer (PLAN §2.2). The skeleton drains and
+            // dedicated drainer. The skeleton drains and
             // discards; Phase 2 adds the JSONL writer.
             let history_handle = tokio::spawn(crate::chat::history_writer_task(
                 history_rx,
                 chat_config.enabled,
             ));
 
-            // Spawn the chat task with PANIC ISOLATION (PLAN §2.5 A1).
+            // Spawn the chat task with PANIC ISOLATION.
             // A panic inside chat_task must not tear down the trade bot —
             // the inner `tokio::spawn` catches the JoinError and we always
             // return Ok from the outer wrapper.
@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Bot task — pass chat-side channels via `BotChannels`.
             // `chat_cmd_tx` is `Some(...)` only when chat is enabled, so
-            // trade-only operators never carry a dangling sender (PLAN §2.4).
+            // trade-only operators never carry a dangling sender.
             let bot_chat_cmd_tx = if chat_config.enabled {
                 Some(chat_cmd_tx.clone())
             } else {

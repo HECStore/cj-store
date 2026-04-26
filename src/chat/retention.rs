@@ -1,5 +1,5 @@
 //! Retention sweep — deletes old chat history / decision JSONL files
-//! and rotated archives (PLAN §11 OPS8).
+//! and rotated archives.
 //!
 //! Runs at chat-task startup AND at the first event observed each new
 //! UTC day. The same retention sweep prunes:
@@ -97,7 +97,7 @@ pub fn run_sweep(config: &SweepConfig) -> SweepReport {
     }
 
     // Rotated `pending_adjustments.<UTC>.jsonl`. Date pattern is
-    // `YYYYMMDDTHHMMSSZ` per PLAN.
+    // `YYYYMMDDTHHMMSSZ`.
     sweep_rotated_pending(
         &config.chat_dir,
         "pending_adjustments",
@@ -113,7 +113,7 @@ pub fn run_sweep(config: &SweepConfig) -> SweepReport {
         &mut r.pending_self_memory_deleted,
     );
 
-    // Persona archives — pruned by COUNT, not age (PLAN OPS8).
+    // Persona archives — pruned by COUNT, not age.
     sweep_persona_archives(
         &config.chat_dir,
         config.persona_archive_max,
@@ -238,7 +238,7 @@ fn sweep_rotated_pending(
     }
 }
 
-/// Persona archives are pruned by COUNT (PLAN OPS8). Files are named
+/// Persona archives are pruned by COUNT. Files are named
 /// `persona.md.<YYYYMMDDTHHMMSSZ>`. Keep the `max` newest.
 fn sweep_persona_archives(chat_dir: &Path, max: u32, out: &mut usize) {
     let entries = match fs::read_dir(chat_dir) {
@@ -309,7 +309,7 @@ fn sweep_rotated_archive(
             continue;
         };
         if days_between(file_date, today) > retain_days as i64 {
-            // PLAN §11 OPS8: increment the counter ONLY on a successful
+            // CHAT.md: increment the counter ONLY on a successful
             // delete. A failed delete logs a warn and leaves the counter
             // alone so retention reports stay honest.
             match fs::remove_file(&path) {
@@ -332,7 +332,7 @@ pub fn parse_date_str(s: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Parse `YYYYMMDDTHHMMSSZ` (compact UTC ISO-8601 form used by archive
-/// filenames; PLAN §10).
+/// filenames; CHAT.md).
 pub fn parse_compact_utc_stamp(s: &str) -> Option<DateTime<Utc>> {
     let dt = chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ").ok()?;
     Some(DateTime::from_naive_utc_and_offset(dt, Utc))
@@ -358,7 +358,7 @@ pub fn sweep_due_today(last_sweep_day: Option<&str>) -> Option<String> {
 
 /// True iff the retention sweep has not yet run today (UTC). Used by
 /// the chat orchestrator to fire the sweep "first event each new UTC
-/// day" (PLAN §11). This is the boolean-shape sibling of
+/// day". This is the boolean-shape sibling of
 /// [`sweep_due_today`]; callers that just need a yes/no gate prefer
 /// this, callers that also want the new "today" string prefer
 /// `sweep_due_today`.

@@ -46,13 +46,13 @@ pub struct Config {
 
     /// Chat AI module configuration. Defaults disable the module entirely so
     /// existing operators are unaffected; see [`ChatConfig`] for the full
-    /// schema. The full plan documented in `PLAN.md` (§9) lists every knob;
+    /// schema. The full plan documented in CHAT.md lists every knob;
     /// this skeleton only includes the fields needed for the wiring phase.
     #[serde(default)]
     pub chat: ChatConfig,
 }
 
-/// Chat module configuration. Disabled by default. See `PLAN.md` §9 for
+/// Chat module configuration. Disabled by default. See CHAT.md for
 /// the full design and field-by-field rationale; every knob defaults to
 /// the value documented in the plan.
 ///
@@ -141,7 +141,7 @@ pub struct ChatConfig {
     #[serde(default = "default_chat_memory_max_inferred_bullets")]
     pub memory_max_inferred_bullets: u32,
 
-    // Rate limiter (PLAN §7 P12)
+    // Rate limiter
     #[serde(default = "default_chat_composer_rpm_max")]
     pub composer_rpm_max: u32,
     #[serde(default = "default_chat_classifier_rpm_max")]
@@ -372,9 +372,9 @@ impl ChatConfig {
     ///
     /// - `enabled = true` requires a non-empty `persona_seed` AND the seed
     ///   must pass [`crate::chat::persona::validate_seed`]'s rejection list
-    ///   (PLAN §5.3 ADV8).
+    ///.
     /// - `daily_dollar_cap_usd > 30.0` requires `acknowledge_high_spend = true`
-    ///   (PLAN §7 OPS4).
+    ///.
     /// - `classifier_sample_rate` and `classifier_min_confidence` in [0,1].
     /// - `command_typo_max_distance` in [0, 4].
     pub fn validate(&self) -> Result<(), String> {

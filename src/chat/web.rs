@@ -1,4 +1,4 @@
-//! Web tools — `web_fetch` with hardened SSRF defenses (PLAN §6.1).
+//! Web tools — `web_fetch` with hardened SSRF defenses.
 //!
 //! The two pieces with security weight live here as pure functions so
 //! they're trivially testable:
@@ -64,7 +64,7 @@ pub enum UrlError {
     Denied,
 }
 
-/// Validate a URL string per PLAN §6.1 first three bullets. Performs
+/// Validate a URL string first three bullets. Performs
 /// no DNS resolution; the resolved-IP deny-list runs in
 /// [`is_denied_ip`] after `tokio::net::lookup_host` (or the custom
 /// resolver) returns.
@@ -244,7 +244,7 @@ fn looks_like_hostname(s: &str) -> bool {
     true
 }
 
-/// IP deny-list per PLAN §6.1. Returns `true` if the resolved IP MUST
+/// IP deny-list. Returns `true` if the resolved IP MUST
 /// be rejected before connecting.
 pub fn is_denied_ip(ip: IpAddr) -> bool {
     match ip {
@@ -324,7 +324,7 @@ fn is_denied_ipv6(ip: Ipv6Addr) -> bool {
 /// Hostnames the deny-list must reject regardless of resolution. The
 /// most common is GCP's metadata DNS name, which resolves to
 /// 169.254.169.254 (already in the IP deny-list) — but a hostile
-/// resolver could lie. PLAN §6.1.
+/// resolver could lie. CHAT.md
 pub fn is_denied_hostname(hostname: &str) -> bool {
     let lc = hostname.to_lowercase();
     matches!(
@@ -475,7 +475,7 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
                 Err(e) => return Err(format!("body chunk error: {e}")),
             }
         }
-        // PLAN §6: plain-text-only — strip HTML tags before returning.
+        // CHAT.md: plain-text-only — strip HTML tags before returning.
         let text = String::from_utf8_lossy(&body_bytes).to_string();
         return Ok(strip_html_tags(&text));
     }

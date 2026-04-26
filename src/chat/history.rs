@@ -3,11 +3,11 @@
 //!
 //! Files live at `data/chat/history/<UTC-date>.jsonl` and are append-only.
 //! Each line is a single JSON object describing one observed event. The
-//! writer task is the only writer to its files (PLAN §3) — single-process
+//! writer task is the only writer to its files — single-process
 //! atomicity is sufficient because each `write_all` is one syscall and both
 //! Linux and NTFS commit it atomically at typical chat-line sizes.
 //!
-//! ## Field-level truncation (PLAN §3 C10)
+//! ## Field-level truncation
 //!
 //! We never truncate the serialized line itself — cutting mid-UTF-8 or
 //! mid-string-escape would produce unparseable JSON and break every
@@ -43,7 +43,7 @@ pub const HISTORY_DIR: &str = "data/chat/history";
 const CONTENT_MAX_BYTES: usize = 4096;
 
 /// Whole-line ceiling. Above this, the record is replaced by a sentinel.
-/// Aligned with PLAN §3's `history.max_line_bytes` default.
+/// Aligned with CHAT.md's `history.max_line_bytes` default.
 const LINE_MAX_BYTES: usize = 64 * 1024;
 
 /// Serialized JSON shape of one history record. Kept private — external
@@ -58,7 +58,7 @@ struct HistoryRecord<'a> {
     kind: &'a str,
     sender: &'a str,
     content: &'a str,
-    /// Marker that this record was emitted by the bot itself (PLAN §2.4 C3).
+    /// Marker that this record was emitted by the bot itself.
     /// Lets later searches attribute lines to the bot even when they were
     /// observed during the pre-Init window where username comparison is
     /// unreliable.
@@ -161,7 +161,7 @@ fn encode_with_kind(event: &ChatEvent, kind: &str, is_bot: bool) -> String {
     line
 }
 
-/// Synchronously append a "bot_out" record (PLAN §2.4 C3 `is_bot`
+/// Synchronously append a "bot_out" record (CHAT.md `is_bot`
 /// tagging). Called from the chat task whenever it sends chat or a
 /// whisper. The kind is recorded as `bot_chat` / `bot_whisper`
 /// distinctly so log readers can filter.
@@ -209,15 +209,15 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// and persists them to `data/chat/history/<UTC-date>.jsonl`.
 ///
 /// **Single writer.** Owns the `history_rx` exclusively — the bot's
-/// `try_send` is the only producer (PLAN §2.2). On `history_rx` close
+/// `try_send` is the only producer. On `history_rx` close
 /// the task drains any buffered events then exits.
 ///
 /// **Failure handling.** A failed append logs an error and continues; we
 /// never block forward progress on a single bad write. If disk space is
 /// exhausted the failures will be loud and recurring — the operator
-/// playbook (PLAN §14) covers this.
+/// playbook covers this.
 ///
-/// **Disabled-chat fast path (PLAN §2.5).** When `chat_enabled` is false
+/// **Disabled-chat fast path.** When `chat_enabled` is false
 /// the task drains the channel silently — no JSONL files are created on
 /// disk for trade-only operators. Senders never see a `try_send` failure
 /// (the receiver stays alive) but nothing reaches the filesystem.
@@ -337,7 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_task_drains_silently_when_disabled() {
-        // PLAN §2.5: when chat is disabled the writer task must drain
+        // CHAT.md: when chat is disabled the writer task must drain
         // events without creating any on-disk files. We can't easily
         // observe "no files created" against the real `data/chat/history`
         // path (other tests/processes may write there), so we observe the

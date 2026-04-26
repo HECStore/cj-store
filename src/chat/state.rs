@@ -6,9 +6,9 @@
 //! mutation. **Operator-editable when the chat task is stopped. NOT
 //! LLM-writable through any tool.**
 //!
-//! See PLAN §3.2 for the schema and §7 for the token-meter semantics.
+//! See CHAT.md for the schema and for the token-meter semantics.
 //!
-//! ## Token-meter daily reset (PLAN §7 C9)
+//! ## Token-meter daily reset
 //!
 //! Lazy reset, in-flight attribution: every increment compares
 //! `last_meter_day_utc` against today's UTC date and zeros counters
@@ -65,7 +65,7 @@ pub struct ChatState {
     pub last_meter_day_utc: String,
     pub tokens_today: TokensToday,
     /// Last-known bot username; used as a tentative self-echo filter for
-    /// events that arrived during the pre-Init window (PLAN §2.4 C3).
+    /// events that arrived during the pre-Init window.
     pub last_known_bot_username: Option<String>,
     /// Operator-set pause flag. The chat task observes this at the top of
     /// the decision pipeline and short-circuits when set.
@@ -77,33 +77,33 @@ pub struct ChatState {
     pub model_404_backoff_until: Option<String>,
     pub persona_regen_cooldown_until: Option<String>,
     /// Number of history events dropped today by the publisher-side
-    /// `try_send` path (PLAN §2.2 ADV11).
+    /// `try_send` path.
     pub history_drops_today: u64,
     /// Web-fetch calls made today; gate for `chat.web_fetch_daily_max`.
     /// Reset at the same daily boundary as the token meter.
     #[serde(default)]
     pub web_fetches_today: u32,
-    /// PLAN §3.2 — per-sender spam-meter snapshot. Persisted on every
+    /// CHAT.md — per-sender spam-meter snapshot. Persisted on every
     /// state save so cooldowns survive restarts.
     #[serde(default)]
     pub spam_meter_snapshot: BTreeMap<String, SpamSnapshot>,
-    /// PLAN §3.2 — UUID -> ISO UTC of the last bot reply to the player.
+    /// CHAT.md — UUID -> ISO UTC of the last bot reply to the player.
     /// Used by the trust ladder and "active speaker" gating.
     #[serde(default)]
     pub last_replied_at_per_player: BTreeMap<String, String>,
-    /// PLAN §3.2 — depth of the background UUID-resolve queue. Surfaced
+    /// CHAT.md — depth of the background UUID-resolve queue. Surfaced
     /// in `Chat: status`.
     #[serde(default)]
     pub uuid_resolve_queue_depth: u32,
-    /// PLAN §11 — day (YYYY-MM-DD UTC) the retention sweep last fired.
+    /// CHAT.md — day (YYYY-MM-DD UTC) the retention sweep last fired.
     /// Used by the "first event each new UTC day" auto-trigger.
     #[serde(default)]
     pub last_sweep_day: Option<String>,
-    /// PLAN §4.7 — last reflection pass start time (ISO UTC). Used to
+    /// CHAT.md — last reflection pass start time (ISO UTC). Used to
     /// enforce `reflection_min_interval_secs`.
     #[serde(default)]
     pub last_reflection_at: Option<String>,
-    /// PLAN §5.1 ADV3 — bullets queued today by `update_self_memory`.
+    /// CHAT.md — bullets queued today by `update_self_memory`.
     /// Bounded by `chat.update_self_memory_max_per_day`.
     #[serde(default)]
     pub update_self_memory_today: u32,
@@ -241,7 +241,7 @@ impl ChatState {
         estimated_usd_added: f64,
         config: &crate::config::ChatConfig,
     ) -> CapVerdict {
-        // USD cap trips first if it's the more conservative one (PLAN §7 OPS4).
+        // USD cap trips first if it's the more conservative one.
         let new_usd = self.tokens_today.estimated_usd + estimated_usd_added;
         if new_usd > config.daily_dollar_cap_usd {
             return CapVerdict::UsdCap;
@@ -279,7 +279,7 @@ impl ChatState {
                     .classifier_output
                     .saturating_add(output_tokens),
             );
-        // The classifier cap is on combined I+O tokens (PLAN §4.2.3).
+        // The classifier cap is on combined I+O tokens.
         if new_total > config.daily_classifier_token_cap {
             return CapVerdict::ClassifierCap;
         }
@@ -287,7 +287,7 @@ impl ChatState {
     }
 
     /// Record a composer call's actual usage. Rolls the meter to today
-    /// FIRST (lazy reset, PLAN §7 C9), then increments. Pass the day the
+    /// FIRST (lazy reset, CHAT.md), then increments. Pass the day the
     /// call **started** as `started_day_utc` so usage is attributed
     /// correctly even if the day rolled over during the call.
     pub fn record_composer(
@@ -325,7 +325,7 @@ impl ChatState {
     }
 }
 
-/// Snapshot of "today UTC" used at call dispatch time (PLAN §7 C9).
+/// Snapshot of "today UTC" used at call dispatch time.
 pub fn capture_today_utc() -> String {
     today_utc()
 }
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn roll_to_day_does_not_reset_on_backward_jump() {
-        // Monotonic-clock-jump safety (PLAN §7 C9): "today" going backward
+        // Monotonic-clock-jump safety: "today" going backward
         // should NOT reset counters. We model this by passing a yesterday
         // string when state's last_meter_day_utc is today.
         let mut s = ChatState::default();
@@ -396,7 +396,7 @@ mod tests {
         // The protection is "compare calendar days, not durations":
         // there is no underflow risk regardless of direction. Document
         // the actual behavior here so future readers don't mistake the
-        // PLAN comment for a stronger guarantee than it provides.
+        // CHAT.md comment for a stronger guarantee than it provides.
         s.roll_to_day("2025-01-01");
         assert_eq!(s.tokens_today, TokensToday::default());
         assert_eq!(s.last_meter_day_utc, "2025-01-01");
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn record_composer_attributes_to_started_day() {
-        // PLAN §7 C9: tokens count against the day the call STARTED, not
+        // CHAT.md: tokens count against the day the call STARTED, not
         // finished. If the dispatch day was yesterday, recording today
         // should not zero counters.
         let mut s = ChatState::default();

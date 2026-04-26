@@ -1,6 +1,6 @@
 //! Classifier — fast "should I respond?" pre-filter.
 //!
-//! ## Two-stage design (PLAN §4.2)
+//! ## Two-stage design
 //!
 //! **Stage A — deterministic pre-classifier gate** ([`classifier_gate`]).
 //! Runs before any Haiku call, on every event. Decides whether the event
@@ -40,7 +40,7 @@ pub enum SkipReason {
     PreClassifierSkip,
     /// Heuristic gate passed but the per-call sample rate rolled "skip".
     SampleRate,
-    /// Per-sender per-minute classifier cap exhausted (PLAN §4.2.1 S8).
+    /// Per-sender per-minute classifier cap exhausted.
     PerSenderCap,
     /// Sender is currently spam-suppressed (closes the classifier-DoS hole).
     SpamSuppressed,
@@ -121,7 +121,7 @@ pub fn is_question_shaped(content: &str) -> bool {
 /// `bot_username`/nickname (caller passes the candidate names).
 ///
 /// `bare_word_eligible_names` is the set of names where a bare-word match
-/// counts as direct address. PLAN §4.4 calls out the dictionary downgrade
+/// counts as direct address. CHAT.md calls out the dictionary downgrade
 /// for bot names that are also common English words (Sky, Steve, Alex);
 /// callers must filter that list before passing it in. Phase 1 callers
 /// pass just the live `bot_username`; Phase 6 will broaden to nicknames
@@ -160,7 +160,7 @@ pub fn is_direct_address(content: &str, bare_word_eligible_names: &[String]) -> 
     false
 }
 
-/// Direct-address check with common-words downgrade (PLAN §4.4). Mirrors
+/// Direct-address check with common-words downgrade. Mirrors
 /// the implementation in
 /// [`crate::chat::conversation::is_direct_address_with_common_words`];
 /// the duplication is intentional so the orchestrator can flip the
@@ -241,7 +241,7 @@ fn has_word_match_v2(lower: &str, name: &str) -> bool {
     false
 }
 
-/// Decide whether to dispatch the event to the classifier (PLAN §4.2.1).
+/// Decide whether to dispatch the event to the classifier.
 ///
 /// Returns [`GateVerdict::Classify`] only when ALL of the following hold:
 ///
@@ -257,7 +257,7 @@ fn has_word_match_v2(lower: &str, name: &str) -> bool {
 /// has interacted in the last `recent_speaker_secs`.
 ///
 /// `spam_suppressed` short-circuits the gate when the sender is currently
-/// in spam cooldown (PLAN §4.2.1).
+/// in spam cooldown.
 #[allow(clippy::too_many_arguments)]
 pub fn classifier_gate(
     event: &ChatEvent,
@@ -274,7 +274,7 @@ pub fn classifier_gate(
         return GateVerdict::Skip(SkipReason::SpamSuppressed);
     }
     // Self-echo guard — the caller is expected to filter these earlier
-    // (PLAN §4.1), but a defensive check here shaves a wasted classifier
+    //, but a defensive check here shaves a wasted classifier
     // call if the upstream filter ever regresses.
     if let Some(bot) = bot_username
         && event.sender.eq_ignore_ascii_case(bot)
@@ -302,7 +302,7 @@ pub fn classifier_gate(
         return GateVerdict::Skip(SkipReason::PerSenderCap);
     }
 
-    // Sample rate — bypassed for direct addresses (PLAN §4.4: direct
+    // Sample rate — bypassed for direct addresses (CHAT.md: direct
     // addresses bypass dyad/silence guards; same spirit applies here so
     // we don't accidentally drop a "@bot, you online?").
     if !directly_addressed
@@ -319,7 +319,7 @@ pub fn classifier_gate(
 
 use serde::Deserialize;
 
-/// Strict-shape verdict the classifier returns. PLAN §4.2.2.
+/// Strict-shape verdict the classifier returns. CHAT.md
 #[derive(Debug, Clone, Deserialize)]
 pub struct Verdict {
     pub respond: bool,
@@ -339,11 +339,11 @@ pub struct AiCallout {
 }
 
 /// System prompt the classifier sees. Wrapped together with the
-/// adjustments block in the snapshot the caller passes in (PLAN §4.2.2:
+/// adjustments block in the snapshot the caller passes in (CHAT.md:
 /// "cache breakpoint here" on adjustments).
 ///
 /// Note: this single-string variant is kept for back-compat with any
-/// caller that wants the combined text. The PLAN-correct path is
+/// caller that wants the combined text. The CHAT.md-correct path is
 /// [`system_prompt_blocks`], which returns the persona and adjustments
 /// as TWO separate blocks so the caller can place a `cache_control:
 /// ephemeral` marker on the adjustments block alone.
@@ -371,7 +371,7 @@ pub fn system_prompt(persona_summary: &str, adjustments_md: &str) -> String {
     )
 }
 
-/// Two-block system prompt for the classifier (PLAN §4.2.2). Returns
+/// Two-block system prompt for the classifier. Returns
 /// `(persona_block, adjustments_block)`. The CALLER places `cache_control:
 /// ephemeral` on the *adjustments* block (block 2); persona is uncached.
 ///
@@ -406,14 +406,14 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
 }
 
 /// Build the classifier request. `history_slice` is the trailing N
-/// chat lines (PLAN: default 30); `event` is the new message under
+/// chat lines; `event` is the new message under
 /// consideration. The adjustments block carries a cache-control marker
-/// so the prefix is cached across calls (PLAN §4.2.2 P2).
+/// so the prefix is cached across calls.
 ///
 /// The system prompt is laid out as THREE blocks:
 ///
 /// 1. Persona summary — uncached (block boundary, no cache_control).
-/// 2. Adjustments — `cache_control: ephemeral`. PLAN §4.2.2 places the
+/// 2. Adjustments — `cache_control: ephemeral`. CHAT.md places the
 ///    cache breakpoint here so reflection-pass writes to adjustments.md
 ///    invalidate only the adjustments-onward prefix (the persona block
 ///    is implicitly cached by being before the breakpoint).
@@ -511,7 +511,7 @@ pub fn parse_verdict(text: &str) -> Result<Verdict, String> {
 }
 
 /// Append a pending-adjustment entry to `data/chat/pending_adjustments.jsonl`.
-/// PLAN §4.7. Errors are logged but never raised — pending writes are
+/// CHAT.mdrrors are logged but never raised — pending writes are
 /// best-effort and recoverable from history.
 pub fn write_pending_adjustment(
     trigger: &str,
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn self_echo_short_circuits_to_skip() {
-        // Defensive duplicate of §4.1 self-echo filter.
+        // Defensive duplicate of self-echo filter.
         let event = ev("any message", "TradeBot");
         let mut counter = PerSenderCounter::new();
         let v = classifier_gate(
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn classifier_two_blocks_have_cache_control_only_on_adjustments() {
-        // PLAN §4.2.2: persona and adjustments are TWO distinct system
+        // CHAT.md: persona and adjustments are TWO distinct system
         // blocks, with the cache breakpoint placed on the adjustments
         // block alone.
         let event = ev("hi", "Alice");
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn whisper_event_bypasses_sample_rate_gate() {
-        // PLAN §4.2.1: sample rate applies to public-chat events; whispers
+        // CHAT.md: sample rate applies to public-chat events; whispers
         // are always classifier-evaluated.
         let mut event = ev("hi friend", "Alice");
         event.kind = ChatEventKind::Whisper;

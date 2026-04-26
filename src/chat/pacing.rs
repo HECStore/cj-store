@@ -1,5 +1,5 @@
 //! Pacing — typing-delay computation, AI-tell stripping, post-sleep
-//! recheck (PLAN §4.8).
+//! recheck.
 //!
 //! Pure utilities. The chat task glues these together with an actual
 //! `tokio::time::sleep` between [`compute_typing_delay`] and the
@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-/// Outcome of [`recheck_after_sleep`] (PLAN §4.8 step 6).
+/// Outcome of [`recheck_after_sleep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendDecision {
     /// All gates pass — send the reply.
@@ -34,7 +34,7 @@ pub enum SendDecision {
 /// already drawn — caller multiplies by sigma_ms before this. Decoupling
 /// the sample lets us test the clamp without an RNG dependency.
 ///
-/// PLAN §4.8 step 4:
+/// CHAT.md step 4:
 /// `delay = clamp(base + per_char * len + jitter, floor, max)`.
 pub fn compute_typing_delay(
     reply_chars: usize,
@@ -50,7 +50,7 @@ pub fn compute_typing_delay(
 }
 
 /// Decide whether to send a reply after the typing-delay sleep
-/// (PLAN §4.8 step 6).
+///.
 ///
 /// `direct_address` indicates whether the reply is to a directly-
 /// addressed event; CON5 exempts these from the `min_silence_secs` gate
@@ -89,7 +89,7 @@ pub fn recheck_after_sleep(
     SendDecision::Send
 }
 
-/// Built-in seed AI-tells. PLAN §4.8 step 1.
+/// Built-in seed AI-tells. CHAT.md step 1.
 ///
 /// Operator-managed `data/chat/strip_patterns.txt` extends this list at
 /// runtime (added in Phase 8). The seed below is the always-on baseline.
@@ -102,7 +102,7 @@ pub const BUILT_IN_AI_TELLS: &[&str] = &[
     "language model",
 ];
 
-/// Strip AI tells, smart quotes, and em-dashes (PLAN §4.8 step 1).
+/// Strip AI tells, smart quotes, and em-dashes.
 ///
 /// This is a literal-substring strip — nothing fancy. Operators who want
 /// regex matching extend `strip_patterns.txt` (Phase 8).
@@ -124,7 +124,7 @@ pub fn strip_ai_tells(reply: &str) -> String {
     out
 }
 
-/// Truncate a reply to the Minecraft chat limit (PLAN §4.8 step 2).
+/// Truncate a reply to the Minecraft chat limit.
 /// `max_chars` defaults to 240 (256 server cap with margin for the
 /// username prefix).
 pub fn truncate_to_chat_limit(reply: &str, max_chars: usize) -> String {
@@ -134,7 +134,7 @@ pub fn truncate_to_chat_limit(reply: &str, max_chars: usize) -> String {
     reply.chars().take(max_chars).collect()
 }
 
-/// Apply persona-driven lowercase-first-character rule (PLAN §4.8
+/// Apply persona-driven lowercase-first-character rule (CHAT.md
 /// step 1, last bullet).
 pub fn lowercase_first_per_sentence(reply: &str) -> String {
     let mut out = String::with_capacity(reply.len());
@@ -163,7 +163,7 @@ pub fn now() -> Instant {
     Instant::now()
 }
 
-/// PLAN §4.1 / CON4 — probabilistic skip even when the classifier says
+/// CHAT.md / CON4 — probabilistic skip even when the classifier says
 /// "respond". Real players miss messages they could reply to. The caller
 /// MUST bypass this for direct-address events; this function does not
 /// know about that gate.
@@ -176,7 +176,7 @@ pub fn roll_lurk_skip(lurk_probability: f32, rng_unit: &mut impl FnMut() -> f32)
     r < p
 }
 
-/// PLAN §4.1 — active-hours gate. Returns true if the current UTC hour
+/// CHAT.md — active-hours gate. Returns true if the current UTC hour
 /// is within the configured active-hours window. `None` = always on.
 /// The matching helper `crate::config::within_active_hours_utc` lives
 /// in config.rs so the validator can reuse it.
@@ -186,7 +186,7 @@ pub fn within_active_hours_now(active_hours_utc: Option<(u32, u32)>) -> bool {
     crate::config::within_active_hours_utc(active_hours_utc, hour)
 }
 
-/// PLAN §4.8 — Gaussian-jittered typing delay. Box-Muller transform
+/// CHAT.md — Gaussian-jittered typing delay. Box-Muller transform
 /// from two uniform draws on [0, 1). `u1` is clamped away from 0 to
 /// keep `ln(u1)` finite. Returns a milliseconds offset (signed) — the
 /// caller adds this to the deterministic base+per_char delay before

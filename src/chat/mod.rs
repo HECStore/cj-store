@@ -1,6 +1,6 @@
 //! # Chat module — natural-language chat AI
 //!
-//! Disabled by default behind `chat.enabled = false`. See `PLAN.md` for the
+//! Disabled by default behind `chat.enabled = false`. See CHAT.md for the
 //! full design. This Phase 1 skeleton wires up:
 //! - [`ChatEvent`](crate::messages::ChatEvent) broadcast subscription.
 //! - [`ChatCommand`](crate::messages::ChatCommand) command channel.
@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::ChatConfig;
 use crate::messages::{BotInstruction, ChatCommand, ChatEvent, ChatEventKind};
 
-/// Snapshot returned by `Chat: status` (PLAN §10 OPS3). Operator-facing
+/// Snapshot returned by `Chat: status`. Operator-facing
 /// — keep field names stable.
 #[derive(Debug, Clone, Default)]
 pub struct ChatStatusReport {
@@ -53,7 +53,7 @@ pub struct ChatStatusReport {
     pub usd_cap: f64,
     pub history_drops_today: u64,
     pub moderation_backoff_until: Option<String>,
-    /// PLAN §10 — operator-facing fields filled by chat orchestrator.
+    /// CHAT.md — operator-facing fields filled by chat orchestrator.
     pub model_404_backoff_until: Option<String>,
     pub persona_regen_cooldown_until: Option<String>,
     pub last_persona_regenerated_at: Option<String>,
@@ -144,7 +144,7 @@ pub async fn chat_task(
         "[Chat] persona loaded"
     );
 
-    // PLAN §7 OPS4: print the daily ceiling at startup so operators can
+    // CHAT.md: print the daily ceiling at startup so operators can
     // see what they're spending without doing the math from token rates.
     info!("[Chat] {}", client::format_daily_ceiling_log_line(&config, &pricing));
 
@@ -175,7 +175,7 @@ pub async fn chat_task(
         }
     };
 
-    // Run the retention sweep on startup (PLAN §11).
+    // Run the retention sweep on startup.
     if let Some(today) = retention::sweep_due_today(None) {
         let cfg = retention::SweepConfig {
             chat_dir: PathBuf::from(memory::CHAT_DIR),
@@ -310,7 +310,7 @@ pub async fn chat_task(
                         // Operator-triggered runs use a permissive
                         // validator: distinct-senders/triggers checks
                         // are bypassed (they apply to auto-triggered
-                        // runs only — see PLAN §4.7).
+                        // runs only — see CHAT.md).
                         let validator = reflection::MultiAxisValidator {
                             min_distinct_triggers: 1,
                             min_distinct_senders: 1,
@@ -363,7 +363,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::BotDisconnected) => {
-                        // PLAN §2.4 in-flight cancellation. Today the
+                        // CHAT.md in-flight cancellation. Today the
                         // composer call is sequential and short; just log
                         // the signal — the actual CancellationToken plumbing
                         // arrives in a follow-up. The signal remains useful
@@ -425,7 +425,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::SetOperatorTrust { username, set, reason: _, respond_to }) => {
-                        // PLAN §10 — write/clear `## Trust: 3` in the player
+                        // CHAT.md — write/clear `## Trust: 3` in the player
                         // file. Full audit-log + sanity print + trust3_expires_at
                         // is Phase 8 polish; the core toggle works today.
                         let result = match crate::mojang::resolve_user_uuid(&username).await {
@@ -469,13 +469,13 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::RegeneratePersona { respond_to }) => {
-                        // PLAN §10 — regenerate persona, archive prior, set
+                        // CHAT.md — regenerate persona, archive prior, set
                         // 24h cooldown. Full archive rotation is in
                         // `persona::regenerate`; we just call it.
                         // Archive prior persona body before regenerate.
                         // `persona::generate` overwrites persona.md atomically;
                         // we rotate the prior file with a UTC timestamp so
-                        // hand-edits aren't lost (PLAN §10).
+                        // hand-edits aren't lost.
                         let now_stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
                         let archive_path = std::path::Path::new(memory::CHAT_DIR)
                             .join(format!("persona.md.{now_stamp}"));
@@ -506,7 +506,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::ForgetPlayer { username, respond_to }) => {
-                        // PLAN §10 / §11 — purge per-player file. Full
+                        // CHAT.md — purge per-player file. Full
                         // history-JSONL scrub is Phase 8 polish; the
                         // user-facing GDPR handle is the per-player file
                         // delete.
@@ -544,7 +544,7 @@ pub async fn chat_task(
                         window.push_back(event.clone());
 
                         // Persist `last_known_bot_username` on every transition
-                        // (PLAN §2.4 C3). Cheap — the read returns immediately
+                        //. Cheap — the read returns immediately
                         // because the lock is rarely contended in the chat
                         // task's hot path.
                         let live = bot_username.read().await.clone();
@@ -552,7 +552,7 @@ pub async fn chat_task(
                             runtime_state.last_known_bot_username = live;
                         }
 
-                        // PLAN §11 — fire the retention sweep on the first
+                        // CHAT.md — fire the retention sweep on the first
                         // event of each new UTC day, in addition to startup.
                         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
                         if retention::should_run_today(runtime_state.last_sweep_day.as_deref()) {
@@ -568,7 +568,7 @@ pub async fn chat_task(
                             runtime_state.last_sweep_day = Some(today.clone());
                         }
 
-                        // PLAN §4.7 — auto-trigger reflection when the
+                        // CHAT.md — auto-trigger reflection when the
                         // pending file's size cap or idle window is met.
                         // Only the size-cap branch is wired here; the idle
                         // branch fires on each event (cheap check) when
@@ -604,7 +604,7 @@ pub async fn chat_task(
                                 };
                                 // Trust function: looks up the per-player file
                                 // and computes derived trust. Auto-triggered
-                                // runs require Trust >= 1 per PLAN §4.7.
+                                // runs require Trust >= 1.
                                 let history_dir = std::path::Path::new(history::HISTORY_DIR);
                                 let trust_for_sender = |sender: &str| -> u8 {
                                     // Cache-only lookup: avoid stalling the
@@ -650,7 +650,7 @@ pub async fn chat_task(
                         }
 
                         // Process the live event, then drain any events
-                        // accumulated during composer execution (PLAN §4.3
+                        // accumulated during composer execution (CHAT.md
                         // concurrent-message policy). Priority order in the
                         // drain: most-recent direct-address > most-recent.
                         let process_result = process_event(
@@ -682,7 +682,7 @@ pub async fn chat_task(
 
                         // Drain any backlog accumulated during the (slow)
                         // composer call. Pick by priority and process in
-                        // priority order (PLAN §4.3 C8).
+                        // priority order.
                         let mut backlog: Vec<ChatEvent> = Vec::new();
                         while let Ok(ev) = chat_events_rx.try_recv() {
                             backlog.push(ev);
@@ -748,7 +748,7 @@ pub async fn chat_task(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // PLAN §2.2: handle Lagged explicitly — durable
+                        // CHAT.md: handle Lagged explicitly — durable
                         // history is on the publisher side, so a lag here
                         // only delays decision logic, not persistence.
                         warn!(lagged = n, "[Chat] broadcast lag (events dropped from decision pipeline; durable history unaffected)");
@@ -799,7 +799,7 @@ async fn process_event(
     bot_tx: &mpsc::Sender<BotInstruction>,
 ) -> Result<(), String> {
     let now = Instant::now();
-    // Resolve bot's live username — refuse to act if unknown (PLAN §2.4).
+    // Resolve bot's live username — refuse to act if unknown.
     let bot_name = bot_username.read().await.clone();
     let Some(bot_name) = bot_name else {
         decisions::write(
@@ -811,12 +811,12 @@ async fn process_event(
         return Ok(());
     };
 
-    // §4.1 self-echo guard.
+    // self-echo guard.
     if event.sender.eq_ignore_ascii_case(&bot_name) {
         return Ok(());
     }
 
-    // §4.6 system pseudo-sender filter — automated lines never trigger
+    // system pseudo-sender filter — automated lines never trigger
     // a response (but they were already written to history by the
     // publisher). Cheap, runs before any LLM-cost path.
     if conversation::is_system_pseudo_sender(&event.sender, system_senders_re, system_senders_exact) {
@@ -842,7 +842,7 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.6 moderation backoff — silently observe while in backoff.
+    // moderation backoff — silently observe while in backoff.
     if let Some(ref until) = runtime_state.moderation_backoff_until
         && let Ok(t) = chrono::DateTime::parse_from_rfc3339(until)
         && t.with_timezone(&chrono::Utc) > chrono::Utc::now()
@@ -856,7 +856,7 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.1 active-hours gate (public events only — DMs are always
+    // active-hours gate (public events only — DMs are always
     // answered when the bot is connected and the operator hasn't
     // paused).
     if event.kind == ChatEventKind::Public && !pacing::within_active_hours_now(config.active_hours_utc) {
@@ -869,7 +869,7 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.5 blocklist short-circuit — operator-managed allow-list of
+    // blocklist short-circuit — operator-managed allow-list of
     // names/UUIDs to ignore entirely.
     if blocklist.contains(&event.sender.to_lowercase()) {
         decisions::write(
@@ -881,7 +881,7 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.5 spam guard. Record + check, all knobs from config now
+    // spam guard. Record + check, all knobs from config now
     // (no more 5/30/300 hardcodes).
     let _ = spam_guard.record(
         event,
@@ -892,14 +892,14 @@ async fn process_event(
     );
     let spam_suppressed = spam_guard.is_suppressed(&event.sender, now);
 
-    // §4.4 direct-address detection — common-words downgrade enforced.
+    // direct-address detection — common-words downgrade enforced.
     let directly_addressed = conversation::is_direct_address_with_common_words(
         &event.content,
         persona_nicknames,
         common_words,
     );
 
-    // §4.4 reply-to-other-speaker heuristic. If the message looks like
+    // reply-to-other-speaker heuristic. If the message looks like
     // it's threaded at someone else (and the bot isn't the addressee),
     // stay silent unless directly addressed.
     if !directly_addressed {
@@ -925,7 +925,7 @@ async fn process_event(
         }
     }
 
-    // §4.4 dyad suppression: if the channel is currently dominated by
+    // dyad suppression: if the channel is currently dominated by
     // two non-bot speakers, stay silent unless directly addressed.
     let window_slice: Vec<ChatEvent> = window.iter().cloned().collect();
     let class = conversation::classify_window(&window_slice);
@@ -939,7 +939,7 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.2 classifier gate.
+    // classifier gate.
     let recent_speaker = recent_speakers
         .get(&event.sender)
         .is_some_and(|t| now.duration_since(*t).as_secs() < config.recent_speaker_secs as u64);
@@ -1054,9 +1054,9 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.1 / CON4 lurk skip — applied AFTER classifier said respond,
+    // / CON4 lurk skip — applied AFTER classifier said respond,
     // BEFORE composer dispatch. Bypassed for direct-address events
-    // (PLAN explicitly: real players miss messages but always answer
+    // (CHAT.md explicitly: real players miss messages but always answer
     // when called by name).
     if !directly_addressed {
         let mut rng_unit = rand_unit_f32;
@@ -1071,7 +1071,7 @@ async fn process_event(
         }
     }
 
-    // §7 model-404 backoff — short-circuit composer if a recent 404
+    // model-404 backoff — short-circuit composer if a recent 404
     // tripped the per-model self-disable.
     if client::is_model_404_backed_off(runtime_state.model_404_backoff_until.as_deref()) {
         decisions::write(
@@ -1103,7 +1103,7 @@ async fn process_event(
         return Ok(());
     }
 
-    // §4.3 P5 — load per-player memory block when directly addressed
+    // — load per-player memory block when directly addressed
     // OR sender Trust ≥ 1. Resolve the sender's UUID, ensure the file
     // exists, and read it. Trust is computed from the per-player file
     // + history JSONLs.
@@ -1246,7 +1246,7 @@ async fn process_event(
     }
 
     // Pacing — typing delay then post-sleep recheck. Use the proper
-    // Box-Muller Gaussian (PLAN §4.8); every pacing knob now config-driven.
+    // Box-Muller Gaussian; every pacing knob now config-driven.
     let mut rng_unit = rand_unit_f32;
     let jitter_ms = pacing::gaussian_jitter_ms(0, config.typing_delay_jitter_ms, &mut rng_unit);
     let delay = pacing::compute_typing_delay(

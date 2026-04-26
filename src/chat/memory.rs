@@ -1,6 +1,6 @@
 //! Per-player and global memory files.
 //!
-//! Markdown is the chosen format (PLAN §3.3): human-editable, easy to grep,
+//! Markdown is the chosen format: human-editable, easy to grep,
 //! and the LLM produces structured Markdown natively without serialization
 //! friction.
 //!
@@ -36,12 +36,12 @@ pub const ADJUSTMENTS: &str = "data/chat/adjustments.md";
 pub const PLAYER_INDEX: &str = "data/chat/players/_index.json";
 
 /// Construct the on-disk path for a per-player file. UUIDs are validated
-/// at the tool boundary (PLAN §6 S5); this function trusts its input.
+/// at the tool boundary; this function trusts its input.
 pub fn player_file_path(uuid: &str) -> PathBuf {
     PathBuf::from(PLAYERS_DIR).join(format!("{uuid}.md"))
 }
 
-/// The empty per-player schema (PLAN §5.2). New files are bootstrapped
+/// The empty per-player schema. New files are bootstrapped
 /// with this content so [`update_player_memory`] can append into named
 /// sections without first creating them.
 ///
@@ -73,7 +73,7 @@ pub fn empty_player_template(username: &str, uuid: &str, today: &str) -> String 
 }
 
 /// Idempotently create `players/<uuid>.md` with the empty schema if it
-/// doesn't already exist. PLAN §5.5 "new-player file initialization".
+/// doesn't already exist. CHAT.md "new-player file initialization".
 ///
 /// Today's UTC date is read internally via `chrono::Utc::now()` so the
 /// caller does not need to thread a date through. Returns `Ok(())`
@@ -163,7 +163,7 @@ impl PlayerIndex {
 
 /// Rebuild the player index from the contents of `data/chat/players/`.
 ///
-/// PLAN §3.3 calls this out explicitly: `_index.json` is a derived map,
+/// CHAT.md calls this out explicitly: `_index.json` is a derived map,
 /// not authoritative state. Corruption is recoverable by deletion; this
 /// function is the rebuild path used at chat-task startup.
 ///
@@ -226,9 +226,9 @@ pub fn save_index(idx: &PlayerIndex) -> io::Result<()> {
     Ok(())
 }
 
-// ===== Trust ladder (PLAN §5.2) ============================================
+// ===== Trust ladder ============================================
 
-/// Trust level derived from the per-player file plus history JSONLs. PLAN §5.2:
+/// Trust level derived from the per-player file plus history JSONLs. CHAT.md:
 ///
 /// - 0  if interactions < 3 OR distinct_days < 2 (or spam-cooldown active)
 /// - 1  if interactions >= 3 AND distinct_days >= 2 AND no spam cooldown
@@ -335,7 +335,7 @@ pub fn count_interactions_for_uuid(
 }
 
 /// Returns true iff `current_file_bytes` exceeds `cap_bytes` by more than
-/// 25 % (PLAN §5.5: only summarize when threshold-plus-margin to avoid
+/// 25 % (CHAT.md: only summarize when threshold-plus-margin to avoid
 /// thrash near the boundary). At/below 125 % of cap → false; strictly
 /// above → true.
 pub fn should_summarize_player_file(current_file_bytes: usize, cap_bytes: usize) -> bool {
@@ -344,7 +344,7 @@ pub fn should_summarize_player_file(current_file_bytes: usize, cap_bytes: usize)
 
 /// Load the index from disk. On corruption or version mismatch the file
 /// is renamed `<orig>.corrupt-<UTC>` and a fresh rebuild is run; the
-/// original bytes are retained for forensic inspection (PLAN §3.3).
+/// original bytes are retained for forensic inspection.
 pub fn load_or_rebuild_index() -> io::Result<PlayerIndex> {
     let path = Path::new(PLAYER_INDEX);
     if !path.exists() {

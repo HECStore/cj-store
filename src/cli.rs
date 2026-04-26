@@ -61,7 +61,7 @@ pub fn cli_task(
     loop {
         // Indices in the match below are positional — adding/removing an entry
         // shifts every case after it. Chat entries appear only when chat is
-        // enabled (PLAN §10).
+        // enabled.
         let mut options: Vec<&str> = vec![
             "Get user balances",
             "Get pairs",
@@ -80,7 +80,7 @@ pub fn cli_task(
             "Clear stuck order",
         ];
         if chat_enabled {
-            // PLAN §10: full set of operator-facing chat actions. The label
+            // CHAT.md: full set of operator-facing chat actions. The label
             // strings are the dispatch keys in the match below — keep them
             // in sync. "Chat: show token spend today" reuses the same
             // status snapshot but renders a tokens-only view.
@@ -357,7 +357,7 @@ fn chat_replay_event(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
 }
 
 /// Wipe a single player's memory file. Confirmed once — destructive but
-/// scoped to one player, so a single confirm matches the §10 prompt
+/// scoped to one player, so a single confirm matches the prompt
 /// discipline.
 fn chat_reset_player_memory(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     let Some(ct) = chat_tx else {

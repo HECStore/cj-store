@@ -38,7 +38,7 @@ use crate::messages::{
 };
 use crate::types::Position;
 
-/// RAII guard for the §2.2 / §4.8 ADV4 `in_critical_section` flag.
+/// RAII guard for the `in_critical_section` flag.
 ///
 /// Set the flag on construction, clear it on drop. Using a guard instead
 /// of explicit `store(false)` calls means we cannot leak a "stuck true"
@@ -70,22 +70,22 @@ pub struct BotState {
     pub connecting: Arc<AtomicBool>,
     /// Typed chat-event broadcast — separate from the legacy `chat_tx`
     /// (which trade.rs subscribes to for trade-failure detection). Chat
-    /// events are published to BOTH; see PLAN §2.2 for why splitting is
+    /// events are published to BOTH; see CHAT.md for why splitting is
     /// load-bearing.
     pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
-    /// Mpsc to the dedicated history writer task (PLAN §2.2 ADV11). Used
+    /// Mpsc to the dedicated history writer task. Used
     /// with `try_send`, never `await`, so a hostile flood cannot block
     /// `bot_task`.
     pub history_tx: mpsc::Sender<ChatEvent>,
     /// Live Minecraft username, populated on `Event::Init` and cleared on
-    /// `Event::Disconnect`. Read-only by chat (PLAN §2.4).
+    /// `Event::Disconnect`. Read-only by chat.
     pub bot_username: Arc<RwLock<Option<String>>>,
     /// Snapshot of chat config — `chat.enabled`, `chat.dry_run`,
     /// `chat.command_prefixes`, `chat.command_typo_max_distance` are
     /// consulted by the whisper router. Held in an `Arc` so per-event
     /// reads are zero-cost.
     pub chat_config: Arc<ChatConfig>,
-    /// History-drop counter for the §2.2 try_send path. Incremented when
+    /// History-drop counter for the try_send path. Incremented when
     /// the history mpsc is full and an event is dropped. Wrapped in
     /// `parking_lot::Mutex` (vs atomic) so the future "1 warn per minute"
     /// rate-limit logic can read+update both the counter and a timestamp
@@ -144,12 +144,12 @@ pub struct Bot {
     /// detect — and an operator can reconcile — any operation that was
     /// mid-flight at the moment of a crash.
     pub journal: crate::store::journal::SharedJournal,
-    /// Typed chat-event broadcast (PLAN §2.2). The bot publishes parsed
+    /// Typed chat-event broadcast. The bot publishes parsed
     /// chat lines here for chat_task to consume.
     pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
-    /// Mpsc to the chat history writer (PLAN §2.2). `try_send` only.
+    /// Mpsc to the chat history writer. `try_send` only.
     pub history_tx: mpsc::Sender<ChatEvent>,
-    /// Live Minecraft username (PLAN §2.4). `None` while disconnected or
+    /// Live Minecraft username. `None` while disconnected or
     /// pre-Init.
     pub bot_username: Arc<RwLock<Option<String>>>,
     /// Snapshot of chat config; held in `Arc` so the whisper router and
@@ -157,13 +157,13 @@ pub struct Bot {
     pub chat_config: Arc<ChatConfig>,
     /// History-drop counter (see `BotState::history_drops`).
     pub history_drops: Arc<parking_lot::Mutex<u64>>,
-    /// Critical-section gate (PLAN §2.2 / §4.8 ADV4). Set while a trade
+    /// Critical-section gate. Set while a trade
     /// or chest IO is in flight. Read-only by chat (chat task gets a
     /// clone of the same `Arc` and observes via `.load()` only).
     pub in_critical_section: Arc<AtomicBool>,
     /// Optional command channel into chat. `None` when chat is disabled
     /// (trade-only operator). Used today only to fire
-    /// `ChatCommand::BotDisconnected` on `Event::Disconnect` (PLAN §2.4).
+    /// `ChatCommand::BotDisconnected` on `Event::Disconnect`.
     pub chat_cmd_tx: Option<mpsc::Sender<ChatCommand>>,
 }
 
@@ -183,7 +183,7 @@ pub struct BotChannels {
     /// populated, the bot uses it to signal in-flight cancellation —
     /// today the only signal is `ChatCommand::BotDisconnected`, sent on
     /// `Event::Disconnect` so the chat task can cancel any composer call
-    /// that would land at a now-disconnected client (PLAN §2.4 in-flight
+    /// that would land at a now-disconnected client (CHAT.md in-flight
     /// cancellation).
     pub chat_cmd_tx: Option<mpsc::Sender<ChatCommand>>,
 }
@@ -361,7 +361,7 @@ pub async fn bot_task(
     // Initialize last_attempt in the past so the first reconnect check can fire immediately.
     let mut last_attempt = tokio::time::Instant::now() - backoff;
     // Edge-detect connect→disconnect transitions so we fire
-    // `ChatCommand::BotDisconnected` exactly once per drop (PLAN §2.4
+    // `ChatCommand::BotDisconnected` exactly once per drop (CHAT.md
     // in-flight cancellation). The event handler clears `bot.client` from
     // `Event::Disconnect` but doesn't itself own `chat_cmd_tx`; the tick
     // loop is the only place with both visibility into the transition
@@ -442,7 +442,7 @@ pub async fn bot_task(
             } => {
                 let result = bot.send_whisper(&target, &message).await;
                 // Tag bot output to history so tool-time history searches
-                // can attribute messages back to the bot (PLAN §2.4 C3).
+                // can attribute messages back to the bot.
                 if result.is_ok()
                     && let Some(name) = bot.bot_username.read().await.as_ref()
                 {
@@ -461,7 +461,7 @@ pub async fn bot_task(
                 }
             }
             BotInstruction::SendChat { content, respond_to } => {
-                // The chat module is responsible for the §2.2
+                // The chat module is responsible for the
                 // critical-section gate and pacing limits — by the time a
                 // SendChat reaches here, those checks have already run. The
                 // bot layer is a dumb wire: send what it's given, ack the
@@ -491,7 +491,7 @@ pub async fn bot_task(
 
                 let op_start = std::time::Instant::now();
 
-                // PLAN §2.2 / §4.8 ADV4: bracket chest IO so chat suppresses
+                // CHAT.md: bracket chest IO so chat suppresses
                 // public chat and defers whispers while we're walking
                 // chests / shuffling shulkers. Cleared on every exit
                 // path via the guard's Drop.
@@ -633,7 +633,7 @@ pub async fn bot_task(
                 info!("[Bot] Trade with {}: bot_offers={:?} player_offers={:?}", target_username, bot_offers, player_offers);
 
                 let trade_start = std::time::Instant::now();
-                // PLAN §2.2 / §4.8 ADV4: bracket the entire trade
+                // CHAT.md: bracket the entire trade
                 // (including any chest-walk inside `execute_trade_with_player`)
                 // so chat treats it as a single critical section. The guard's
                 // Drop fires on success, error, and panic alike.
@@ -896,7 +896,7 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             state.connected = true;
             *state.client.write().await = Some(client.clone());
             state.connecting.store(false, Ordering::SeqCst);
-            // PLAN §2.4: populate bot_username from the Mojang account
+            // CHAT.md: populate bot_username from the Mojang account
             // profile once login completes. The chat module observes this
             // and refuses to compose until it is `Some(_)`.
             let username = client.profile().name.clone();
@@ -921,10 +921,10 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             }
 
             // Step 1: legacy chat_tx publish FIRST — trade-failure
-            // detection in trade.rs is latency-sensitive (PLAN §2.2).
+            // detection in trade.rs is latency-sensitive.
             let _ = state.chat_tx.send(message_text);
 
-            // Step 2: history try_send (durable logging path, PLAN §2.2 ADV11).
+            // Step 2: history try_send (durable logging path, CHAT.md).
             if let Some(ref p) = parsed {
                 let event = ChatEvent {
                     kind: p.kind,
@@ -959,7 +959,7 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             // Step 4: whisper router. If chat is disabled or this is a
             // command-shaped whisper, forward to Store; otherwise the
             // chat module owns the response (and we don't pipe to Store
-            // to avoid the §2.3 "Unknown command" double-reply).
+            // to avoid the "Unknown command" double-reply).
             if let Some(p) = parsed
                 && p.kind == ChatEventKind::Whisper
                 && let Some(store_tx) = &state.store_tx
@@ -1012,7 +1012,7 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             let disconnect_time = std::time::Instant::now();
             state.connected = false;
             *state.client.write().await = None;
-            // PLAN §2.4: clear bot_username so chat refuses to compose under
+            // CHAT.md: clear bot_username so chat refuses to compose under
             // a stale identity during the reconnect window.
             *state.bot_username.write().await = None;
             state.connecting.store(false, Ordering::SeqCst);

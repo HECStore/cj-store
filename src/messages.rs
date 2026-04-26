@@ -43,19 +43,19 @@ pub enum ChatEventKind {
 ///
 /// The chat module's command channel is intentionally separate from
 /// `StoreMessage` / `BotInstruction` so the Store remains ignorant of chat —
-/// see PLAN §2.5 / §10.
+/// see CHAT.md
 #[derive(Debug)]
 pub enum ChatCommand {
     /// Graceful shutdown: chat task drains in-flight work and returns.
     Shutdown {
         ack: oneshot::Sender<()>,
     },
-    /// Snapshot of runtime state for the operator (PLAN §10
+    /// Snapshot of runtime state for the operator (CHAT.md
     /// `Chat: status`).
     Status {
         respond_to: oneshot::Sender<crate::chat::ChatStatusReport>,
     },
-    /// Toggle runtime pause flag (PLAN §10 `Chat: pause/resume`).
+    /// Toggle runtime pause flag.
     SetPaused {
         paused: bool,
         respond_to: oneshot::Sender<()>,
@@ -66,7 +66,7 @@ pub enum ChatCommand {
         dry_run: bool,
         respond_to: oneshot::Sender<()>,
     },
-    /// Clear moderation backoff (PLAN §10
+    /// Clear moderation backoff (CHAT.md
     /// `Chat: resume after moderation backoff`).
     ClearModerationBackoff {
         respond_to: oneshot::Sender<()>,
@@ -76,14 +76,14 @@ pub enum ChatCommand {
     RunRetentionSweep {
         respond_to: oneshot::Sender<crate::chat::retention::SweepReport>,
     },
-    /// Run the AI-call-out reflection pass on demand (PLAN §10
+    /// Run the AI-call-out reflection pass on demand (CHAT.md
     /// `Chat: run reflection now`). Reads `pending_adjustments.jsonl`,
     /// asks Haiku to paraphrase, validates, appends to `adjustments.md`.
     RunReflection {
         respond_to: oneshot::Sender<Result<crate::chat::reflection::ReflectionOutcome, String>>,
     },
     /// Bot disconnected from the server — chat task should cancel any
-    /// in-flight composer call (PLAN §2.4 in-flight cancellation). Sent
+    /// in-flight composer call. Sent
     /// by the bot's `Event::Disconnect` handler.
     BotDisconnected,
     /// Show the last `last_n` decision-log lines (most recent UTC day).

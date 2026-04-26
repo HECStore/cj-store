@@ -1,14 +1,14 @@
 //! Reflection pass — distills `pending_adjustments.jsonl` into bullets
-//! for `adjustments.md`. PLAN §4.7.
+//! for `adjustments.md`. CHAT.md
 //!
 //! ## Two-stage poisoning defense
 //!
 //! 1. The classifier writes call-out signals to
 //!    `data/chat/pending_adjustments.jsonl` (one JSON line per detection).
 //! 2. A separate, lower-frequency reflection pass — running on Haiku per
-//!    PLAN §4.7 P9 — reads the pending file, paraphrases the lessons,
+//! CHAT.md — reads the pending file, paraphrases the lessons,
 //!    and writes them to `adjustments.md`. Each candidate lesson is run
-//!    through [`MultiAxisValidator`] (PLAN §4.7 ADV2 + ADV12) before
+//! through [`MultiAxisValidator`] before
 //!    being admitted.
 //!
 //! Phase 6 lands the file format (serde) and the validator. The actual
@@ -28,12 +28,12 @@ pub struct PendingEntry {
     pub ts: String,
     /// Verbatim quote from the player. Wrapped in nonce-tagged
     /// `<untrusted_chat_*>` markers before being shown to the
-    /// reflection model (PLAN §4.7 S2).
+    /// reflection model.
     pub trigger: String,
     /// Sender's username at observation time.
     pub sender: String,
     /// Sender's UUID at observation time. Optional because UUID
-    /// resolution is lazy (PLAN §3.1).
+    /// resolution is lazy.
     #[serde(default)]
     pub sender_uuid: Option<String>,
     /// UTC date the entry was observed (YYYY-MM-DD). Used by the
@@ -53,7 +53,7 @@ pub struct LessonCandidate<'a> {
     /// this batch.
     pub source_entries: &'a [&'a PendingEntry],
     /// Per-sender Trust score, computed by [`crate::chat::tools`]
-    /// helpers from history. Trust < 1 triggers the §ADV12 quality
+    /// helpers from history. Trust < 1 triggers the quality
     /// failure.
     pub trust_for_sender: &'a (dyn Fn(&str) -> u8 + Sync),
 }
@@ -68,15 +68,15 @@ pub enum LessonVerdict {
     NotEnoughDistinctTriggers,
     /// Fewer than `min_distinct_senders` distinct senders cited.
     NotEnoughDistinctSenders,
-    /// At least one contributing sender has Trust < 1 (PLAN §ADV12).
+    /// At least one contributing sender has Trust < 1.
     LowTrustSender { sender: String },
 }
 
-/// Multi-axis lesson validator (PLAN §4.7 ADV2 + ADV12).
+/// Multi-axis lesson validator.
 pub struct MultiAxisValidator {
     pub min_distinct_triggers: usize,
     pub min_distinct_senders: usize,
-    /// Substring-overlap percentage threshold (0.0–1.0). PLAN: 0.40.
+    /// Substring-overlap percentage threshold (0.0–1.0). CHAT.md: 0.40.
     pub substring_overlap_threshold: f64,
 }
 
@@ -177,7 +177,7 @@ fn longest_common_substring_len(a: &str, b: &str) -> usize {
     best
 }
 
-// ===== Trigger gates (PLAN §4.7) ===========================================
+// ===== Trigger gates ===========================================
 
 /// True if it has been at least `min_interval_secs` since the last
 /// reflection pass. `last_reflection_at` is ISO-UTC (RFC3339); `None`
@@ -201,7 +201,7 @@ pub fn min_interval_elapsed(
 }
 
 /// True if pending count >= `max_pending` AND distinct senders in
-/// pending >= `min_distinct_senders`. PLAN §4.7 size-cap auto-trigger:
+/// pending >= `min_distinct_senders`. CHAT.md size-cap auto-trigger:
 /// once the pending file fills up, fire a reflection pass even if
 /// `min_interval_secs` hasn't elapsed — but only when we have at
 /// least the minimum diversity of senders (a single griefer flooding
@@ -223,7 +223,7 @@ pub fn should_trigger_size_cap(
 
 /// True if `pending` is non-empty AND chat has been idle (no composer
 /// call) for at least `idle_trigger_secs` AND distinct senders meet
-/// the floor. PLAN §4.7 idle-window auto-trigger.
+/// the floor. CHAT.md idle-window auto-trigger.
 ///
 /// `last_composer_at` is RFC3339-UTC; `None` (never called) is treated
 /// as "idle".
@@ -295,7 +295,7 @@ pub fn read_pending() -> std::io::Result<Vec<PendingEntry>> {
 }
 
 /// After a successful pass, atomically rotate the pending file out of
-/// the way so a fresh batch starts empty (PLAN §4.7 C17 crash-recovery
+/// the way so a fresh batch starts empty (CHAT.md crash-recovery
 /// shape: rename to `pending_adjustments.<UTC>.jsonl`).
 pub fn rotate_pending() -> std::io::Result<()> {
     let p = std::path::Path::new(PENDING_FILE);
@@ -314,7 +314,7 @@ pub fn rotate_pending() -> std::io::Result<()> {
 /// and rotate the pending file.
 ///
 /// `trust_for_sender` lets the caller plug in their derived-Trust
-/// computation (Phase 5/§5.2). For a fresh deployment with no
+/// computation (Phase 5). For a fresh deployment with no
 /// historical interactions, every sender is Trust 0 and the validator
 /// will reject everything — that's the intended behavior.
 pub async fn run_pass(
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn rejects_when_lesson_copies_trigger_content() {
-        // Lesson is mostly trigger text — naive copy. PLAN §ADV2.
+        // Lesson is mostly trigger text — naive copy. CHAT.md.
         let entries = vec![
             pending("don't use em-dashes ever again", "Alice", "2026-01-01"),
             pending("sound like a bot", "Bob", "2026-01-02"),

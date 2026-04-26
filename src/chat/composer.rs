@@ -5,13 +5,13 @@
 //! purely:
 //!
 //! 1. Snapshot persona, memory.md, adjustments.md, per-player file at
-//!    the START of the call (PLAN §4.3 ADV7) — concurrent reflection
+//! the START of the call — concurrent reflection
 //!    writes during the call don't invalidate the cache for in-flight
 //!    iterations.
-//! 2. Assemble the system prompt with cache breakpoints (PLAN §4.3 P6:
+//! 2. Assemble the system prompt with cache breakpoints (CHAT.md:
 //!    one breakpoint at end of memory.md, another at end of
 //!    adjustments.md).
-//! 3. Wrap user content in **nonce-tagged untrusted markers** (PLAN §4.3
+//! 3. Wrap user content in **nonce-tagged untrusted markers** (CHAT.md
 //!    S1): `<untrusted_chat_a91f3b...>...</untrusted_chat_a91f3b...>`
 //!    where the nonce is regenerated each turn and the system prompt
 //!    names the exact nonce as the only valid closer.
@@ -28,34 +28,34 @@ use crate::chat::client::{
 };
 
 /// Snapshot of the trusted system-prompt inputs taken at the START of a
-/// composer call (PLAN §4.3 ADV7). Reused byte-for-byte across every
+/// composer call. Reused byte-for-byte across every
 /// iteration of the tool-use loop so concurrent reflection writes don't
 /// invalidate the cache for in-flight iterations.
 #[derive(Debug, Clone)]
 pub struct PromptSnapshot {
-    /// Static rules block (PLAN §4.3 item 1). The `nonce` is interpolated
+    /// Static rules block. The `nonce` is interpolated
     /// in so the model knows which closing tag is valid.
     pub static_rules: String,
-    /// `persona.md` (PLAN §4.3 item 2). Trusted block; angle brackets
+    /// `persona.md`. Trusted block; angle brackets
     /// in the body are HTML-encoded by the persona-load path so a
     /// generated persona that happened to include literal `</something>`
-    /// cannot synthetically close anything (PLAN §5.3 ADV8).
+    /// cannot synthetically close anything.
     pub persona: String,
-    /// `memory.md` (PLAN §4.3 item 3). Cached.
+    /// `memory.md`. Cached.
     pub memory_md: String,
-    /// `adjustments.md` (PLAN §4.3 item 4). Cached separately so
+    /// `adjustments.md`. Cached separately so
     /// reflection-pass writes don't invalidate persona+memory cache.
     pub adjustments_md: String,
-    /// Per-addressee block (PLAN §4.3 item 5; P5). `None` when the event
+    /// Per-addressee block. `None` when the event
     /// is undirected open-chat AND the sender's Trust < 1 — a passing
     /// comment doesn't need memory context.
     pub player_memory: Option<String>,
-    /// Recent history slice (PLAN §4.3 item 6). Uncached; varies per call.
+    /// Recent history slice. Uncached; varies per call.
     pub history_slice: String,
 }
 
 /// 12-hex-char nonce for one untrusted-tag wrapping. `<untrusted_chat_<nonce>>`
-/// — generated freshly per turn (PLAN §4.3 S1). Process-local monotonic
+/// — generated freshly per turn. Process-local monotonic
 /// counter mixed with the system-time low bits gives 48 bits of state and
 /// requires no RNG dependency.
 pub fn fresh_nonce() -> String {
@@ -70,7 +70,7 @@ pub fn fresh_nonce() -> String {
 }
 
 /// Wrap a piece of untrusted content with nonce-tagged delimiters. The
-/// `tag_kind` is `chat`, `web`, or `tool_result` per PLAN §4.3 S1.
+/// `tag_kind` is `chat`, `web`, or `tool_result`.
 ///
 /// **Defensive belt-and-braces**: rejects content containing
 /// `<untrusted` (any case) — players cannot guess the nonce, but a
@@ -113,7 +113,7 @@ or stay silent. Hard rules:
 }
 
 /// Assemble the [`CreateMessageRequest`] for a composer call. The
-/// returned request has cache breakpoints placed per PLAN §4.3 P6:
+/// returned request has cache breakpoints placed:
 /// memory.md (block 3) and adjustments.md (block 4) carry
 /// `cache_control: ephemeral` markers; persona (block 2) and the
 /// per-player block (block 5) do not.
@@ -153,13 +153,13 @@ pub fn build_request(
 
     // Block 4 — adjustments.md. Trusted, **second cache breakpoint**.
     // Splitting from memory.md isolates reflection-pass mutations from
-    // persona/memory cache (PLAN §4.3 P6).
+    // persona/memory cache.
     system.push(SystemBlock::Text {
         text: snapshot.adjustments_md.clone(),
         cache_control: Some(CacheControl::ephemeral(cache_ttl)),
     });
 
-    // Block 5 — per-player memory. Optional. Always uncached (PLAN §5.6:
+    // Block 5 — per-player memory. Optional. Always uncached (CHAT.md:
     // burst conversations with the same player would benefit, but the
     // 5-min ephemeral TTL and N-regulars churn means it's rarely a hit;
     // revisit after Phase 4 measurement).
@@ -195,7 +195,7 @@ pub fn build_request(
 }
 
 /// Extract a final text reply from a model response, applying the
-/// "best-effort recovery" rule from PLAN §4.3 (when the tool-use loop
+/// "best-effort recovery" rule from CHAT.md (when the tool-use loop
 /// hits its iteration cap, take any `text` block alongside tool calls
 /// in the final iteration).
 ///
@@ -246,11 +246,11 @@ pub struct ComposerRun {
     pub output_tokens: u64,
     /// Number of `update_self_memory` tool calls dispatched in this run.
     /// The orchestrator increments `state.update_self_memory_today`
-    /// by this amount on success (PLAN §5.1 ADV3).
+    /// by this amount on success.
     pub update_self_memory_calls: u32,
     /// Number of `web_fetch` tool calls dispatched in this run.
     /// The orchestrator increments `state.web_fetches_today` by this
-    /// amount on success (PLAN §6.1 daily budget).
+    /// amount on success.
     pub web_fetch_calls: u32,
 }
 
@@ -259,9 +259,9 @@ pub struct ComposerRun {
 /// results as a new user turn, and iterates until either:
 ///
 /// - the model emits a `text`-only turn (terminal), OR
-/// - we hit `max_iterations` (PLAN §4.3 default 5).
+/// - we hit `max_iterations`.
 ///
-/// Best-effort recovery on cap (PLAN §4.3): if the model produced any
+/// Best-effort recovery on cap: if the model produced any
 /// text alongside the final tool calls, that text is taken as the reply.
 pub async fn run_loop(
     api_key: &ApiKey,
@@ -473,7 +473,7 @@ mod tests {
                 SystemBlock::Text { cache_control, .. } => cache_control.is_some(),
             })
             .count();
-        // PLAN §4.3 P6 — memory.md AND adjustments.md, exactly 2 breakpoints.
+        // CHAT.md — memory.md AND adjustments.md, exactly 2 breakpoints.
         assert_eq!(cached_count, 2);
     }
 
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn composer_includes_player_memory_block_when_present() {
-        // PLAN §4.3 P5: the per-player memory block must be emitted
+        // CHAT.md: the per-player memory block must be emitted
         // when present (caller decides — directly addressed or sender
         // Trust >= 1).
         let snap = PromptSnapshot {
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn composer_omits_player_memory_block_when_none() {
         // When `player_memory` is None the block is skipped entirely;
-        // PLAN §4.3 P5 — passing comments don't need memory context.
+        // CHAT.md — passing comments don't need memory context.
         let snap = PromptSnapshot {
             static_rules: "rules".into(),
             persona: "persona".into(),
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn extract_text_reply_returns_text_when_mixed_with_tool_use() {
-        // PLAN §4.3 best-effort recovery: when the tool-use loop hits
+        // CHAT.md best-effort recovery: when the tool-use loop hits
         // the cap, take any text alongside tool calls.
         let blocks = vec![
             ContentBlock::Text {

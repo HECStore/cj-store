@@ -4,14 +4,14 @@
 //! body assembly, retry policy, and response parsing live here. The rest
 //! of the chat module never talks to `reqwest` directly.
 //!
-//! ## Secret hygiene (PLAN §7 S13)
+//! ## Secret hygiene
 //!
 //! API keys are wrapped in [`ApiKey`], a hand-rolled newtype whose
 //! `Debug` impl prints `***` and which is never serialized. The request
 //! URL is logged but not the headers; on error paths only `status` and a
 //! sanitized message reach the log.
 //!
-//! ## Retry policy (PLAN §7)
+//! ## Retry policy
 //!
 //! Exponential backoff on `429`, `500`, `502`, `503`, `504`, capped at
 //! 3 attempts, total wall-clock budget 30 s. Other errors fail fast.
@@ -19,7 +19,7 @@
 //! for 1 hour, then retry once (the 1-hour timer lives in
 //! [`ChatState::model_404_backoff_until`](crate::chat::state::ChatState)).
 //!
-//! ## Cache TTL (PLAN §7 P3)
+//! ## Cache TTL
 //!
 //! Use the **1-hour ephemeral cache TTL** (beta header
 //! `extended-cache-ttl-2025-04-11`) on the cached blocks. The default
@@ -112,7 +112,7 @@ impl fmt::Display for ApiKey {
 pub enum CacheTtl {
     /// Default 5-minute ephemeral cache.
     Ephemeral5Min,
-    /// Extended 1-hour ephemeral cache (PLAN §7 P3). Requires the
+    /// Extended 1-hour ephemeral cache. Requires the
     /// `extended-cache-ttl-2025-04-11` beta header on the request.
     Ephemeral1Hour,
 }
@@ -261,7 +261,7 @@ pub enum ClientError {
     /// Response body could not be parsed as the expected JSON shape.
     Decode(String),
     /// Local (client-side) rate limiter held the call past
-    /// `rate_limit_wait_max_secs` and gave up. PLAN §7 P12.
+    /// `rate_limit_wait_max_secs` and gave up. CHAT.md.
     RateLimited { reason: String },
 }
 
@@ -287,9 +287,9 @@ impl std::error::Error for ClientError {}
 
 /// Anthropic Messages endpoint.
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-/// Pinned API version. PLAN §7.
+/// Pinned API version. CHAT.md
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Beta header for the 1-hour ephemeral cache TTL (PLAN §7 P3).
+/// Beta header for the 1-hour ephemeral cache TTL.
 const EXTENDED_CACHE_BETA: &str = "extended-cache-ttl-2025-04-11";
 
 /// Process-wide reqwest client. Singleton so connection pooling
@@ -301,7 +301,7 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             // 15 s per-attempt budget. The retry layer caps total wall-clock
-            // at 30 s with 1 s + 2 s backoff between attempts (PLAN §7); a
+            // at 30 s with 1 s + 2 s backoff between attempts; a
             // 60 s per-attempt timeout would let a single hung attempt blow
             // through the entire budget. 15 s allows 2 attempts + backoff to
             // fit inside 30 s while still tolerating slow networks.
@@ -401,7 +401,7 @@ pub async fn send_one(
             })
         }
         s => {
-            // Beta-header rejection detection (PLAN §7 P3 fallback). If
+            // Beta-header rejection detection. If
             // the API rebuffs the extended-cache-ttl beta, flip the flag
             // off so subsequent calls demote to 5-min and skip the header.
             // Detection is conservative: only flip for 4xx whose body
@@ -595,7 +595,7 @@ pub enum RetryDecision {
 }
 
 /// Decide whether to retry given the just-observed status and attempt
-/// number (0-indexed). PLAN §7: exponential backoff on
+/// number (0-indexed). CHAT.md: exponential backoff on
 /// `429, 500, 502, 503, 504`, capped at 3 attempts, total wall-clock
 /// budget 30 s.
 pub fn retry_decision(status: u16, attempt: u32) -> RetryDecision {
@@ -614,7 +614,7 @@ pub fn retry_decision(status: u16, attempt: u32) -> RetryDecision {
     RetryDecision::Retry { delay_ms }
 }
 
-// ---- Per-model rate limiter (PLAN §7 P12) -------------------------------
+// ---- Per-model rate limiter -------------------------------
 
 /// Per-model rate limiter: tracks requests-per-minute (RPM) and
 /// input-tokens-per-minute (ITPM) in two sliding 60-second windows.
@@ -712,7 +712,7 @@ impl RateLimiter {
     }
 }
 
-// ---- Model-404 backoff (PLAN §7) ----------------------------------------
+// ---- Model-404 backoff ----------------------------------------
 
 /// Returns true if the given UTC-ISO `backoff_until` (from
 /// `state.model_404_backoff_until`) is in the future. Callers consult
@@ -733,14 +733,14 @@ pub fn is_model_404_backed_off(backoff_until: Option<&str>) -> bool {
 }
 
 /// Compute the new backoff timestamp for a model-404 (1 hour from now
-/// per PLAN §7). Format is RFC 3339 with seconds precision and `Z`
+/// ). Format is RFC 3339 with seconds precision and `Z`
 /// suffix so it's stable across reloads.
 pub fn model_404_backoff_until_now_plus_1h() -> String {
     use chrono::SecondsFormat;
     (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-// ---- Startup spend estimate (PLAN §7 OPS4) ------------------------------
+// ---- Startup spend estimate ------------------------------
 
 /// Build a one-line log entry summarizing the worst-case daily spend
 /// implied by the configured token caps. Composer input/output use
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn parses_response_with_cache_token_fields() {
-        // PLAN §7: usage carries cache_creation_input_tokens and
+        // CHAT.md: usage carries cache_creation_input_tokens and
         // cache_read_input_tokens once prompt caching kicks in.
         let raw = r#"{
             "id": "msg_03",
@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn retry_decision_third_attempt_stops() {
-        // PLAN §7: capped at 3 attempts (initial + 2 retries).
+        // CHAT.md: capped at 3 attempts (initial + 2 retries).
         let v = retry_decision(429, 2);
         assert_eq!(v, RetryDecision::Stop);
     }

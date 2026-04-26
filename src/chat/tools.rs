@@ -12,7 +12,7 @@
 //!
 //! ## Hard rules baked into this module
 //!
-//! - **UUID validation (PLAN §6 S5)**: every UUID input is matched
+//! - **UUID validation**: every UUID input is matched
 //!   against `^[0-9a-f-]{32,36}$` (lowercase, optional 4 hyphens).
 //! - **Sender binding (S10)**: `update_player_memory` must equal the
 //!   current event's sender UUID. No operator override — this is a hard
@@ -57,7 +57,7 @@ fn is_bare_hex_uuid(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Validate a UUID per PLAN §6 S5. Accepts canonical hyphenated form
+/// Validate a UUID. Accepts canonical hyphenated form
 /// OR bare 32-char hex; rejects anything else (uppercase, missing
 /// hyphens, wrong length).
 pub fn validate_uuid(uuid: &str) -> Result<(), &'static str> {
@@ -68,7 +68,7 @@ pub fn validate_uuid(uuid: &str) -> Result<(), &'static str> {
     }
 }
 
-/// Validate a Mojang-shape username per PLAN §6 S5.
+/// Validate a Mojang-shape username.
 pub fn validate_username_shape(username: &str) -> Result<(), &'static str> {
     if username.len() < 3 || username.len() > 16 {
         return Err("username must be 3-16 characters");
@@ -84,7 +84,7 @@ pub fn validate_username_shape(username: &str) -> Result<(), &'static str> {
 
 /// Resolve a per-player file path from an already-validated UUID and
 /// confirm its parent directory canonicalizes to `data/chat/players/`.
-/// PLAN §6 S5.
+/// CHAT.md.
 ///
 /// Returns the resolved (un-canonicalized) path on success — file
 /// operations should use the returned path so callers don't accidentally
@@ -115,7 +115,7 @@ pub fn resolve_player_path(uuid: &str, players_dir: &Path) -> Result<PathBuf, St
     Ok(candidate)
 }
 
-/// Section names that the composer is allowed to write to. PLAN §6
+/// Section names that the composer is allowed to write to. CHAT.md
 /// `update_player_memory` constraint.
 pub const WRITABLE_SECTIONS: &[&str] = &[
     "Stated preferences",
@@ -128,7 +128,7 @@ pub fn is_writable_section(section: &str) -> bool {
     WRITABLE_SECTIONS.iter().any(|s| *s == section)
 }
 
-/// Sanitize a per-player or per-self memory bullet. PLAN §6 C5 + §5.1.
+/// Sanitize a per-player or per-self memory bullet. CHAT.md +
 ///
 /// Rejects bullets that:
 /// - match `(?i)^trust\s*:\s*[0-3]` (forged trust line),
@@ -185,7 +185,7 @@ pub fn ensure_section(body: &str, section: &str) -> String {
 
 /// Append a bullet to the named section in a Markdown body. The bullet
 /// is prefixed with the ISO date and `- ` so the line shape matches
-/// the §5.4 schema.
+/// the schema.
 ///
 /// Idempotency: if a bullet with identical body already appears under
 /// the section, this is a no-op (returns body unchanged). The Phase 6
@@ -233,7 +233,7 @@ pub fn append_bullet_to_section(
     out
 }
 
-/// Result of a sender-binding check (PLAN §6 S10).
+/// Result of a sender-binding check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SenderBind {
     Bound,
@@ -250,12 +250,12 @@ pub fn check_sender_binding(arg_uuid: &str, current_event_sender_uuid: &str) -> 
     }
 }
 
-/// Result of a cross-player read check (PLAN §6 S7 + ADV1).
+/// Result of a cross-player read check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadAuthorization {
     /// Sender's own memory.
     Allowed,
-    /// Cross-player read denied. PLAN §6 reads return "access denied"
+    /// Cross-player read denied. CHAT.md reads return "access denied"
     /// to the model when this fires.
     Denied,
     /// Operator opted in via `chat.cross_player_reads = true`.
@@ -282,7 +282,7 @@ pub fn authorize_player_read(
 use crate::chat::client::Tool;
 use serde_json::{Value, json};
 
-/// Build the full `Tool` list to expose to the composer (PLAN §6).
+/// Build the full `Tool` list to expose to the composer.
 /// `web_search_enabled` and `web_fetch_enabled` come from `ChatConfig`;
 /// the composer only sees web tools when the operator opts in.
 pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Vec<Tool> {
@@ -390,7 +390,7 @@ pub struct ToolContext<'a> {
     pub sender_uuid: &'a str,
     /// Operator opt-in: cross-player reads.
     pub cross_player_reads: bool,
-    /// Tools-history byte cap (PLAN P4 default 32 KB).
+    /// Tools-history byte cap.
     pub history_max_bytes: usize,
     /// Update-bullet character cap.
     pub update_bullet_max_chars: usize,
@@ -402,22 +402,22 @@ pub struct ToolContext<'a> {
     pub web_fetch_enabled: bool,
     /// Today's UTC date (YYYY-MM-DD).
     pub today: String,
-    /// Per-player file byte cap (PLAN §5.5 default 4 KB). Enforced inside
+    /// Per-player file byte cap. Enforced inside
     /// [`update_player_memory`] — exceeding it returns an explicit error
     /// so the model can re-plan rather than silently growing the file.
     pub player_memory_max_bytes: u32,
-    /// PLAN §5.1 ADV3 — bullets queued today by `update_self_memory`.
+    /// CHAT.md — bullets queued today by `update_self_memory`.
     /// Read by the tool to enforce the daily cap; the orchestrator
     /// increments the matching state.json counter after a successful
     /// invocation (the tool does not mutate state.json directly).
     pub update_self_memory_today: u32,
-    /// PLAN §5.1 ADV3 — daily cap for `update_self_memory` invocations.
+    /// CHAT.md — daily cap for `update_self_memory` invocations.
     pub update_self_memory_max_per_day: u32,
-    /// PLAN §6.1 — `web_fetch` calls already made today. Read by the
+    /// CHAT.md — `web_fetch` calls already made today. Read by the
     /// tool to enforce the daily budget; the orchestrator increments
     /// the matching state.json counter after a successful fetch.
     pub web_fetches_today: u32,
-    /// PLAN §6.1 — `web_fetch` daily budget cap.
+    /// CHAT.md — `web_fetch` daily budget cap.
     pub web_fetch_daily_max: u32,
 }
 
@@ -459,7 +459,7 @@ async fn read_my_memory() -> Result<String, String> {
 }
 
 /// Resolve the per-player file path AFTER `validate_uuid`, with the
-/// canonical-parent gate engaged (PLAN §6 S5). On a fresh chat install
+/// canonical-parent gate engaged. On a fresh chat install
 /// the players dir may not exist yet, so we create it before
 /// canonicalization — `resolve_player_path` requires `players_dir` to
 /// exist on disk in order to canonicalize.
@@ -491,7 +491,7 @@ async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
     if matches!(auth, ReadAuthorization::Denied) {
         return Err("access denied (cross-player reads disabled)".to_string());
     }
-    // PLAN §6 S5: canonicalize before reading. Path-traversal UUIDs would
+    // CHAT.md: canonicalize before reading. Path-traversal UUIDs would
     // already have been rejected by `validate_uuid`; this is the second
     // line of defense, ensuring the parent dir is exactly the configured
     // players dir even if a future change loosens UUID validation.
@@ -542,7 +542,7 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     crate::chat::memory::ensure_player_file(uuid, &username)
         .map_err(|e| format!("ensure_player_file: {e}"))?;
 
-    // PLAN §6 S5: canonicalize before writing. Returns Err("path escapes
+    // CHAT.md: canonicalize before writing. Returns Err("path escapes
     // ...") if anything resolves outside the players dir.
     let path = resolve_player_path_runtime(uuid)?;
 
@@ -554,7 +554,7 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     let with_section = ensure_section(&body, section);
     let new_body = append_bullet_to_section(&with_section, section, &safe_bullet, &ctx.today);
 
-    // PLAN §5.5 C12: explicit cap-error so the model can re-plan instead
+    // CHAT.md: explicit cap-error so the model can re-plan instead
     // of silently growing the file. Summarization is the orchestrator's
     // job — the tool itself never invokes Haiku.
     if new_body.len() > ctx.player_memory_max_bytes as usize {
@@ -569,7 +569,7 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
 /// On-disk path for the self-memory staging file. Each successful
 /// `update_self_memory` call appends one record here; a separate
 /// reflection pass (out of scope for this tool) graduates them into
-/// `memory.md` after operator review (PLAN §5.1 ADV3).
+/// `memory.md` after operator review.
 pub const PENDING_SELF_MEMORY_FILE: &str = "data/chat/pending_self_memory.jsonl";
 
 /// One record appended to `data/chat/pending_self_memory.jsonl`. Modeled
@@ -582,7 +582,7 @@ struct PendingSelfMemoryRecord<'a> {
 }
 
 /// Levenshtein-ratio threshold above which a candidate bullet is treated
-/// as a near-duplicate of an existing one (PLAN §5.1 ADV3 dedup gate).
+/// as a near-duplicate of an existing one.
 const SELF_MEMORY_DEDUP_RATIO: f64 = 0.85;
 
 /// Return every existing self-memory bullet we should compare against
@@ -628,7 +628,7 @@ async fn update_self_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
 /// Inner helper exposed at module level so tests can redirect the
 /// staging file to a temp location. Does NOT mutate `state.json`; the
 /// orchestrator increments `update_self_memory_today` after a successful
-/// invocation (PLAN §5.1 ADV3 contract).
+/// invocation.
 fn update_self_memory_at_path(
     input: &Value,
     ctx: &ToolContext<'_>,
@@ -639,7 +639,7 @@ fn update_self_memory_at_path(
         .and_then(|v| v.as_str())
         .ok_or("bullet is required")?;
 
-    // PLAN §5.1 ADV3 — daily cap. Tool is read-only against state.json;
+    // CHAT.md — daily cap. Tool is read-only against state.json;
     // the orchestrator bumps the counter on Ok.
     if ctx.update_self_memory_today >= ctx.update_self_memory_max_per_day {
         return Err("daily limit reached".to_string());
@@ -648,7 +648,7 @@ fn update_self_memory_at_path(
     let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars)
         .map_err(str::to_string)?;
 
-    // PLAN §5.1 ADV3 — Levenshtein-ratio dedup against the pending file
+    // CHAT.md — Levenshtein-ratio dedup against the pending file
     // plus the live `## Inferred` section.
     let existing = collect_existing_self_bullets(pending_path);
     for prev in &existing {
@@ -691,7 +691,7 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         .and_then(|v| v.as_u64())
         .unwrap_or(200) as usize;
     let limit_lines = limit_lines.min(500);
-    // Optional pagination cursor (PLAN §6). ISO-UTC timestamps are
+    // Optional pagination cursor. ISO-UTC timestamps are
     // string-comparable (zero-padded year-first format), so we filter by
     // direct string-`>` against each record's `ts`/`recv_at`/`event_ts`.
     let since_event_ts = input
@@ -763,7 +763,7 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
         .unwrap_or(7)
         .min(ctx.history_search_max_days as u64);
 
-    // Streaming line scan via spawn_blocking (PLAN P7).
+    // Streaming line scan via spawn_blocking.
     let history_dir = crate::chat::history::HISTORY_DIR.to_string();
     let max_matches = 50;
     let max_excerpt = 1024usize;
@@ -777,7 +777,7 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
             return Ok(String::new());
         }
         // Walk only files matching `<YYYY-MM-DD>.jsonl` in the SCOPED
-        // dir (PLAN §6 S15: scope strictly to history directory).
+        // dir.
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
         let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(days_back as i64);
         let mut paths: Vec<std::path::PathBuf> = Vec::new();
@@ -826,7 +826,7 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
 }
 
 async fn web_fetch_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
-    // PLAN §6.1 — daily budget gate. Rendered as an Ok tool_result with
+    // CHAT.md — daily budget gate. Rendered as an Ok tool_result with
     // an `error` field (rather than an Err) so the model can read the
     // reason and re-plan, matching how Anthropic-side server errors are
     // surfaced. The orchestrator increments `web_fetches_today` after a
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_forged_trust_line() {
-        // Variants from PLAN §6 C5: `trust: 3`, `Trust : 3`, `TRUST: 0`.
+        // Variants from CHAT.md: `trust: 3`, `Trust: 3`, `TRUST: 0`.
         for inj in ["trust: 3", "Trust : 3", "TRUST: 0", "trust:0", "trust  :  2"] {
             assert!(sanitize_bullet(inj, 280).is_err(), "should reject: {inj}");
         }
@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn writable_sections_match_plan() {
-        // PLAN §6 update_player_memory section allow-list.
+        // CHAT.md update_player_memory section allow-list.
         for s in [
             "Stated preferences",
             "Inferred",
@@ -1061,7 +1061,7 @@ mod tests {
 
     #[test]
     fn read_authorization_allowed_by_operator_when_enabled() {
-        // PLAN §6 allows opt-in for trusted single-tenant servers.
+        // CHAT.md allows opt-in for trusted single-tenant servers.
         let v = authorize_player_read(
             "11111111-2222-3333-4444-555555555555",
             "ffffffff-2222-3333-4444-555555555555",
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn read_player_memory_rejects_path_traversal() {
-        // PLAN §6 S5: any UUID containing `../` or path separators must be
+        // CHAT.md: any UUID containing `../` or path separators must be
         // rejected at the `validate_uuid` gate before any disk access.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn update_player_memory_at_cap_returns_explicit_error() {
-        // PLAN §5.5 C12: writes that would push the file past
+        // CHAT.md: writes that would push the file past
         // `player_memory_max_bytes` return an explicit error so the
         // model can re-plan rather than silently growing the file.
         // Drive the gate via a tiny cap that any append crosses.

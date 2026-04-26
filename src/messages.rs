@@ -19,6 +19,71 @@ use serde::{Deserialize, Serialize};
 use crate::types::{Chest, User};
 use tokio::sync::oneshot;
 
+/// A single chat line observed by the bot, structured for the chat module.
+///
+/// In-memory only (no Serde derives) — the chat module's history writer
+/// produces its own JSON record for each event. Sender is the raw Minecraft
+/// username as it appears on the wire; `content` has the chat / whisper prefix
+/// already stripped (e.g. "Steve whispers: hi" → `content = "hi"`).
+#[derive(Debug, Clone)]
+pub struct ChatEvent {
+    pub kind: ChatEventKind,
+    pub sender: String,
+    pub content: String,
+    pub recv_at: std::time::SystemTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatEventKind {
+    Public,
+    Whisper,
+}
+
+/// Commands sent from the CLI (or other operator surfaces) to `chat_task`.
+///
+/// The chat module's command channel is intentionally separate from
+/// `StoreMessage` / `BotInstruction` so the Store remains ignorant of chat —
+/// see PLAN §2.5 / §10.
+#[derive(Debug)]
+pub enum ChatCommand {
+    /// Graceful shutdown: chat task drains in-flight work and returns.
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
+    /// Snapshot of runtime state for the operator (PLAN §10
+    /// `Chat: status`).
+    Status {
+        respond_to: oneshot::Sender<crate::chat::ChatStatusReport>,
+    },
+    /// Toggle runtime pause flag (PLAN §10 `Chat: pause/resume`).
+    SetPaused {
+        paused: bool,
+        respond_to: oneshot::Sender<()>,
+    },
+    /// Toggle runtime dry-run override (independent of `chat.dry_run`
+    /// in config).
+    SetDryRun {
+        dry_run: bool,
+        respond_to: oneshot::Sender<()>,
+    },
+    /// Clear moderation backoff (PLAN §10
+    /// `Chat: resume after moderation backoff`).
+    ClearModerationBackoff {
+        respond_to: oneshot::Sender<()>,
+    },
+    /// Run the retention sweep on demand. Normally triggered at
+    /// startup and at the first event each new UTC day.
+    RunRetentionSweep {
+        respond_to: oneshot::Sender<crate::chat::retention::SweepReport>,
+    },
+    /// Run the AI-call-out reflection pass on demand (PLAN §10
+    /// `Chat: run reflection now`). Reads `pending_adjustments.jsonl`,
+    /// asks Haiku to paraphrase, validates, appends to `adjustments.md`.
+    RunReflection {
+        respond_to: oneshot::Sender<Result<crate::chat::reflection::ReflectionOutcome, String>>,
+    },
+}
+
 /// Type of queued order for the order queue system.
 ///
 /// Serialized as part of the on-disk queue file, so any variant or field
@@ -197,6 +262,12 @@ pub enum BotInstruction {
     Whisper {
         target: String,
         message: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    /// Send a public chat line. Used by the chat module to speak in open
+    /// chat. Whispers (DMs) reuse the existing `Whisper` variant.
+    SendChat {
+        content: String,
         respond_to: oneshot::Sender<Result<(), String>>,
     },
     /// Navigate to a chest, perform the given action, then read chest

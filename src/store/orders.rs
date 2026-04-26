@@ -208,7 +208,9 @@ async fn validate_and_plan_buy(
     item: &str,
     quantity: u32,
 ) -> Result<Option<BuyPlan>, StoreError> {
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -668,7 +670,9 @@ async fn validate_and_plan_sell(
     item: &str,
     quantity: u32,
 ) -> Result<Option<SellPlan>, StoreError> {
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -1133,8 +1137,8 @@ mod tests {
     //! These tests construct a `Store` entirely in-memory via
     //! `Store::new_for_test` and spawn a mock bot task that auto-responds to
     //! every `BotInstruction`. Username→UUID resolution is stubbed in
-    //! `utils::resolve_user_uuid` under `#[cfg(test)]` so no Mojang API calls
-    //! happen.
+    //! `crate::mojang::resolve_user_uuid` under `#[cfg(test)]` so no Mojang
+    //! API calls happen.
 
     use super::*;
     use crate::config::Config;
@@ -1156,6 +1160,7 @@ mod tests {
             max_orders: 1000,
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
         }
     }
 

@@ -51,6 +51,11 @@ pub async fn connect(
         client: bot.client.clone(),
         chat_tx: bot.chat_tx.clone(),
         connecting: bot.connecting.clone(),
+        chat_events_tx: bot.chat_events_tx.clone(),
+        history_tx: bot.history_tx.clone(),
+        bot_username: bot.bot_username.clone(),
+        chat_config: bot.chat_config.clone(),
+        history_drops: bot.history_drops.clone(),
     };
 
     let shutdown = bot.shutdown.clone();

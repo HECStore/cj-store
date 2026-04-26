@@ -1,114 +1,11 @@
 //! Utility functions for the Store
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
-use parking_lot::Mutex;
-
 use tokio::sync::oneshot;
 use tracing::debug;
 
-use crate::constants::UUID_CACHE_TTL_SECS;
 use crate::messages::BotInstruction;
 use crate::types::User;
 use super::Store;
-
-/// Map of lowercased username -> (uuid, lookup timestamp).
-type UuidCache = HashMap<String, (String, Instant)>;
-
-/// Global UUID cache for Mojang API lookups. TTL-expiry only — stale entries
-/// are rejected on read and pruned periodically by `cleanup_uuid_cache`.
-static UUID_CACHE: OnceLock<Mutex<UuidCache>> = OnceLock::new();
-
-fn uuid_cache() -> &'static Mutex<UuidCache> {
-    UUID_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Resolve username to UUID via Mojang API (async), with in-memory caching.
-///
-/// Lookups are cached for `UUID_CACHE_TTL_SECS` (default 5 minutes). Repeated
-/// commands from the same player reuse the cached UUID instead of hitting the
-/// Mojang API on every interaction. Cache keys are lowercased so `Steve` and
-/// `steve` share an entry.
-///
-/// Returns a typed `StoreError::ValidationError` on Mojang lookup failure —
-/// the text is user-safe and the handlers whisper it straight back to the
-/// player.
-pub async fn resolve_user_uuid(username: &str) -> Result<String, crate::error::StoreError> {
-    #[cfg(test)]
-    {
-        // Offline deterministic UUID for integration tests: avoids hitting the
-        // Mojang API (which requires network and introduces flakiness). Format:
-        // zero-padded username embedded in the last UUID segment.
-        let trimmed: String = username.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
-        Ok(format!("00000000-0000-0000-0000-{}", padded))
-    }
-    #[cfg(not(test))]
-    {
-        let key = username.to_lowercase();
-        let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
-
-        {
-            let cache = uuid_cache().lock();
-            if let Some((uuid, ts)) = cache.get(&key) {
-                if ts.elapsed() < ttl {
-                    debug!(username = username, uuid = %uuid, "UUID cache hit");
-                    return Ok(uuid.clone());
-                }
-                debug!(
-                    username = username,
-                    age_secs = ts.elapsed().as_secs(),
-                    "UUID cache stale, refetching"
-                );
-            } else {
-                debug!(username = username, "UUID cache miss");
-            }
-        }
-
-        let uuid = User::get_uuid_async(username)
-            .await
-            .map_err(crate::error::StoreError::ValidationError)?;
-        debug!(username = username, uuid = %uuid, "UUID fetched from Mojang");
-
-        {
-            let mut cache = uuid_cache().lock();
-            cache.insert(key, (uuid.clone(), Instant::now()));
-        }
-
-        Ok(uuid)
-    }
-}
-
-/// Clear the entire UUID cache. Test-only — used to isolate cache tests.
-#[cfg(test)]
-pub fn clear_uuid_cache() {
-    uuid_cache().lock().clear();
-}
-
-/// Drop UUID cache entries older than `UUID_CACHE_TTL_SECS`.
-///
-/// Stale entries never serve a cache hit (the TTL check in `resolve_user_uuid`
-/// rejects them), but unless they are removed they keep growing the HashMap
-/// indefinitely. The periodic cleanup task calls this to bound memory.
-pub fn cleanup_uuid_cache() {
-    let mut cache = uuid_cache().lock();
-    let now = Instant::now();
-    let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
-    let before = cache.len();
-    cache.retain(|_, (_, inserted)| now.duration_since(*inserted) < ttl);
-    let removed = before - cache.len();
-    if removed > 0 {
-        debug!(
-            removed = removed,
-            remaining = cache.len(),
-            "Evicted stale UUID cache entries"
-        );
-    } else {
-        debug!(remaining = cache.len(), "UUID cache cleanup: no stale entries");
-    }
-}
 
 /// Ensure user exists in store, creating if missing.
 ///
@@ -243,6 +140,8 @@ pub fn fmt_issues(prefix: &str, issues: &[String], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
 
     #[test]
     fn fmt_issues_empty_returns_bare_prefix() {
@@ -344,98 +243,11 @@ mod tests {
         assert_eq!(s, "1x stone; 1x stone; (+3 more)");
     }
 
-    #[test]
-    fn uuid_cache_insert_then_read_returns_same_entry() {
-        clear_uuid_cache();
-        let cache = uuid_cache();
-        let key = "testplayer".to_string();
-        let uuid = "00000000-0000-0000-0000-000000000001".to_string();
-
-        cache.lock().insert(key.clone(), (uuid.clone(), Instant::now()));
-
-        let cached = cache.lock().get(&key).cloned();
-        assert_eq!(cached.map(|(u, _)| u), Some(uuid));
-    }
-
-    #[test]
-    fn uuid_cache_lookup_uses_lowercased_key() {
-        // resolve_user_uuid lowercases before inserting, so lookup callers
-        // must also lowercase — verify the contract holds for "steve".
-        clear_uuid_cache();
-        let cache = uuid_cache();
-        let uuid = "00000000-0000-0000-0000-000000000002".to_string();
-
-        cache.lock().insert("steve".to_string(), (uuid.clone(), Instant::now()));
-
-        let hit = cache.lock().get("steve").cloned();
-        assert_eq!(hit.map(|(u, _)| u), Some(uuid));
-    }
-
-    #[test]
-    fn uuid_cache_entry_older_than_ttl_is_treated_as_stale() {
-        clear_uuid_cache();
-        let cache = uuid_cache();
-        let key = "expiredplayer".to_string();
-        let uuid = "00000000-0000-0000-0000-000000000003".to_string();
-
-        let old_instant = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
-        cache.lock().insert(key.clone(), (uuid, old_instant));
-
-        let entry = cache.lock().get(&key).cloned().unwrap();
-        let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
-        assert!(entry.1.elapsed() >= ttl, "Entry should be past TTL");
-    }
-
-    #[test]
-    fn cleanup_uuid_cache_drops_stale_entries_and_keeps_fresh_ones() {
-        clear_uuid_cache();
-        let cache = uuid_cache();
-
-        cache.lock().insert(
-            "fresh".to_string(),
-            ("uuid-fresh".to_string(), Instant::now()),
-        );
-        let stale_ts = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
-        cache.lock().insert(
-            "stale".to_string(),
-            ("uuid-stale".to_string(), stale_ts),
-        );
-
-        cleanup_uuid_cache();
-
-        let guard = cache.lock();
-        assert!(guard.contains_key("fresh"), "fresh entry should be retained");
-        assert!(!guard.contains_key("stale"), "stale entry should be dropped");
-    }
-
-    #[test]
-    fn cleanup_uuid_cache_is_noop_when_all_entries_are_fresh() {
-        clear_uuid_cache();
-        let cache = uuid_cache();
-        cache.lock().insert("a".to_string(), ("uuid-a".to_string(), Instant::now()));
-        cache.lock().insert("b".to_string(), ("uuid-b".to_string(), Instant::now()));
-
-        cleanup_uuid_cache();
-
-        assert_eq!(cache.lock().len(), 2);
-    }
-
-    #[test]
-    fn clear_uuid_cache_empties_the_cache() {
-        let cache = uuid_cache();
-        cache.lock().insert("a".to_string(), ("uuid-a".to_string(), Instant::now()));
-        cache.lock().insert("b".to_string(), ("uuid-b".to_string(), Instant::now()));
-
-        clear_uuid_cache();
-        assert!(cache.lock().is_empty());
-    }
-
     // ------------------------------------------------------------------------
     // ensure_user_exists / is_operator / get_node_position each need a Store.
     // Use `Store::new_for_test` to bypass disk I/O.
     // ------------------------------------------------------------------------
     fn test_store() -> Store {
-        use tokio::sync::mpsc;
         let (tx, _rx) = mpsc::channel::<BotInstruction>(1);
         let config = crate::config::Config {
             position: crate::types::Position { x: 0, y: 64, z: 0 },
@@ -448,6 +260,7 @@ mod tests {
             max_orders: 1000,
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
         };
         Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), crate::types::Storage::default())
     }

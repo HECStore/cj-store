@@ -275,7 +275,7 @@ impl Store {
             // exact scenario where memory pressure is highest).
             if last_cleanup.elapsed() >= cleanup_interval {
                 self.rate_limiter.cleanup_stale(rate_limit_stale_after);
-                utils::cleanup_uuid_cache();
+                crate::mojang::cleanup_uuid_cache();
                 debug!("[Store] Periodic cleanup completed");
                 last_cleanup = tokio::time::Instant::now();
             }
@@ -725,6 +725,7 @@ mod tests {
             max_orders: 1000,
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
         }
     }
 

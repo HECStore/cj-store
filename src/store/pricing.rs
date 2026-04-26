@@ -383,6 +383,7 @@ mod tests {
             max_orders: 1000,
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
         };
 
         let mut pairs = HashMap::new();

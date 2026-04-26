@@ -6,7 +6,7 @@
 //! awaiting replies via `oneshot` channels using `blocking_send` /
 //! `blocking_recv`.
 
-use crate::messages::{CliMessage, StoreMessage};
+use crate::messages::{ChatCommand, CliMessage, StoreMessage};
 use crate::types::TradeType;
 use dialoguer::{Confirm, Input, Select};
 use tokio::sync::{mpsc, oneshot};
@@ -50,11 +50,19 @@ fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result
 /// selects "Exit". On exit it performs a coordinated shutdown: it sends a
 /// `Shutdown` message, waits for the `Store` to confirm, then drops
 /// `store_tx` so the `Store`'s receiver closes and its task can terminate.
-pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
+///
+/// `chat_tx` is `None` when chat is disabled; chat-related menu entries
+/// are only shown when it is `Some`.
+pub fn cli_task(
+    store_tx: mpsc::Sender<StoreMessage>,
+    chat_tx: Option<mpsc::Sender<ChatCommand>>,
+) {
+    let chat_enabled = chat_tx.is_some();
     loop {
         // Indices in the match below are positional — adding/removing an entry
-        // shifts every case after it.
-        let options = vec![
+        // shifts every case after it. Chat entries appear only when chat is
+        // enabled (PLAN §10).
+        let mut options: Vec<&str> = vec![
             "Get user balances",
             "Get pairs",
             "Set operator status",
@@ -70,8 +78,17 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
             "Repair state (recompute pair stock)",
             "Restart Bot",
             "Clear stuck order",
-            "Exit",
         ];
+        if chat_enabled {
+            options.push("Chat: status");
+            options.push("Chat: pause");
+            options.push("Chat: resume");
+            options.push("Chat: toggle dry-run");
+            options.push("Chat: clear moderation backoff");
+            options.push("Chat: run retention sweep");
+            options.push("Chat: run reflection now");
+        }
+        options.push("Exit");
         let selection = with_retry("Failed to read selection", || {
             Select::new()
                 .with_prompt("Select an action")
@@ -80,24 +97,43 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
                 .interact()
         });
 
-        match selection {
-            0 => get_balances(&store_tx),
-            1 => get_pairs(&store_tx),
-            2 => set_operator(&store_tx),
-            3 => add_node(&store_tx),
-            4 => add_node_with_validation(&store_tx),
-            5 => discover_storage(&store_tx),
-            6 => remove_node(&store_tx),
-            7 => add_pair(&store_tx),
-            8 => remove_pair(&store_tx),
-            9 => view_storage(&store_tx),
-            10 => view_trades(&store_tx),
-            11 => audit_state(&store_tx, false),
-            12 => audit_state(&store_tx, true),
-            13 => restart_bot(&store_tx),
-            14 => clear_stuck_order(&store_tx),
-            15 => {
+        // Resolve the chosen menu label to its handler. Indexing the
+        // dynamic `options` vec by selection lets us avoid hard-coding
+        // chat-entry indices that would shift if menu items move.
+        let label = options.get(selection).copied().unwrap_or("Exit");
+        match label {
+            "Get user balances" => get_balances(&store_tx),
+            "Get pairs" => get_pairs(&store_tx),
+            "Set operator status" => set_operator(&store_tx),
+            "Add node (no validation)" => add_node(&store_tx),
+            "Add node (with bot validation)" => add_node_with_validation(&store_tx),
+            "Discover storage (scan for existing nodes)" => discover_storage(&store_tx),
+            "Remove node" => remove_node(&store_tx),
+            "Add pair" => add_pair(&store_tx),
+            "Remove pair" => remove_pair(&store_tx),
+            "View storage" => view_storage(&store_tx),
+            "View recent trades" => view_trades(&store_tx),
+            "Audit state" => audit_state(&store_tx, false),
+            "Repair state (recompute pair stock)" => audit_state(&store_tx, true),
+            "Restart Bot" => restart_bot(&store_tx),
+            "Clear stuck order" => clear_stuck_order(&store_tx),
+            "Chat: status" => chat_status(chat_tx.as_ref()),
+            "Chat: pause" => chat_set_paused(chat_tx.as_ref(), true),
+            "Chat: resume" => chat_set_paused(chat_tx.as_ref(), false),
+            "Chat: toggle dry-run" => chat_toggle_dry_run(chat_tx.as_ref()),
+            "Chat: clear moderation backoff" => chat_clear_moderation(chat_tx.as_ref()),
+            "Chat: run retention sweep" => chat_run_sweep(chat_tx.as_ref()),
+            "Chat: run reflection now" => chat_run_reflection(chat_tx.as_ref()),
+            "Exit" => {
                 info!("[CLI] Initiating graceful shutdown");
+                // Tell chat to drain in-flight work first; ignore failures
+                // (chat may already be down).
+                if let Some(ref ct) = chat_tx {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    if ct.blocking_send(ChatCommand::Shutdown { ack: ack_tx }).is_ok() {
+                        let _ = ack_rx.blocking_recv();
+                    }
+                }
                 let (response_tx, response_rx) = oneshot::channel();
                 let msg = StoreMessage::FromCli(CliMessage::Shutdown {
                     respond_to: response_tx,
@@ -113,13 +149,192 @@ pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>) {
                     return;
                 }
 
-                // Drop sender so the Store's receiver closes and its task can terminate.
+                // Drop senders so the Store's / Chat's receivers close and
+                // their tasks can terminate.
+                drop(chat_tx);
                 drop(store_tx);
                 info!("[CLI] Shutdown complete");
                 break;
             }
-            _ => unreachable!(),
+            other => {
+                warn!("[CLI] Unknown menu label: {other}");
+            }
         }
+    }
+}
+
+// ---- Chat command helpers --------------------------------------------------
+
+fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct.blocking_send(ChatCommand::Status { respond_to: resp_tx }).is_err() {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(s) => {
+            println!("\n=== Chat status ===");
+            println!("enabled:           {}", s.enabled);
+            println!("paused:            {}", s.paused);
+            println!("dry-run effective: {}", s.dry_run_effective);
+            println!(
+                "bot username:      {}",
+                s.bot_username.as_deref().unwrap_or("<unknown>")
+            );
+            println!(
+                "composer tokens:   in={} out={}",
+                s.composer_input_today, s.composer_output_today
+            );
+            println!(
+                "classifier tokens: in={} out={}",
+                s.classifier_input_today, s.classifier_output_today
+            );
+            println!(
+                "today USD spend:   ${:.4} / ${:.2} cap",
+                s.estimated_usd_today, s.usd_cap
+            );
+            println!("history drops today: {}", s.history_drops_today);
+            println!(
+                "moderation backoff: {}",
+                s.moderation_backoff_until.as_deref().unwrap_or("<none>")
+            );
+            println!("====================\n");
+        }
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+fn chat_set_paused(chat_tx: Option<&mpsc::Sender<ChatCommand>>, paused: bool) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::SetPaused {
+            paused,
+            respond_to: resp_tx,
+        })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    let _ = resp_rx.blocking_recv();
+    println!("Chat {}.", if paused { "paused" } else { "resumed" });
+}
+
+fn chat_toggle_dry_run(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    // Without snapshotting current state we'd toggle blindly; query
+    // status first.
+    let (q_tx, q_rx) = oneshot::channel();
+    if ct.blocking_send(ChatCommand::Status { respond_to: q_tx }).is_err() {
+        println!("Chat task is not running.");
+        return;
+    }
+    let now = match q_rx.blocking_recv() {
+        Ok(s) => s.dry_run_effective,
+        Err(_) => {
+            println!("Chat task did not respond.");
+            return;
+        }
+    };
+    let want = !now;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::SetDryRun {
+            dry_run: want,
+            respond_to: resp_tx,
+        })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    let _ = resp_rx.blocking_recv();
+    println!("Chat dry-run is now {}.", if want { "ON" } else { "OFF" });
+}
+
+fn chat_clear_moderation(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::ClearModerationBackoff { respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    let _ = resp_rx.blocking_recv();
+    println!("Moderation backoff cleared.");
+}
+
+fn chat_run_reflection(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::RunReflection { respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(Ok(o)) => println!(
+            "Reflection: admitted {} lessons; rejected (substring={} triggers={} senders={} trust={}); haiku tokens in={} out={}",
+            o.admitted.len(),
+            o.rejected_substring,
+            o.rejected_distinct_triggers,
+            o.rejected_distinct_senders,
+            o.rejected_low_trust,
+            o.haiku_input_tokens,
+            o.haiku_output_tokens,
+        ),
+        Ok(Err(e)) => println!("Reflection failed: {e}"),
+        Err(_) => println!("Chat task did not respond."),
+    }
+}
+
+fn chat_run_sweep(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
+    let Some(ct) = chat_tx else {
+        println!("Chat is not enabled.");
+        return;
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if ct
+        .blocking_send(ChatCommand::RunRetentionSweep { respond_to: resp_tx })
+        .is_err()
+    {
+        println!("Chat task is not running.");
+        return;
+    }
+    match resp_rx.blocking_recv() {
+        Ok(r) => println!(
+            "Retention sweep deleted {} files (history={} decisions={} overlays={} pending_adj={} pending_self={} persona_archives={} markdown_archives={}).",
+            r.total(),
+            r.history_deleted,
+            r.decisions_deleted,
+            r.overlays_deleted,
+            r.pending_adjustments_deleted,
+            r.pending_self_memory_deleted,
+            r.persona_archives_deleted,
+            r.markdown_archives_deleted,
+        ),
+        Err(_) => println!("Chat task did not respond."),
     }
 }
 

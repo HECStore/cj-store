@@ -43,6 +43,192 @@ pub struct Config {
     pub max_trades_in_memory: usize,
     #[serde(default = "default_autosave_interval_secs")]
     pub autosave_interval_secs: u64,
+
+    /// Chat AI module configuration. Defaults disable the module entirely so
+    /// existing operators are unaffected; see [`ChatConfig`] for the full
+    /// schema. The full plan documented in `PLAN.md` (§9) lists every knob;
+    /// this skeleton only includes the fields needed for the wiring phase.
+    #[serde(default)]
+    pub chat: ChatConfig,
+}
+
+/// Chat module configuration. Disabled by default. See `PLAN.md` §9 for
+/// the full design and field-by-field rationale; every knob defaults to
+/// the value documented in the plan.
+///
+/// Adding a field here requires updating only this struct: every
+/// constructor in tests reads from `ChatConfig::default()`, and on-disk
+/// configs use serde defaults so older `data/config.json` files keep
+/// loading after a field is added.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatConfig {
+    #[serde(default = "default_chat_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_chat_dry_run")]
+    pub dry_run: bool,
+    #[serde(default = "default_chat_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_chat_composer_model")]
+    pub composer_model: String,
+    #[serde(default = "default_chat_classifier_model")]
+    pub classifier_model: String,
+    #[serde(default)]
+    pub persona_seed: String,
+
+    #[serde(default = "default_chat_command_prefixes")]
+    pub command_prefixes: Vec<String>,
+    #[serde(default = "default_chat_command_typo_max_distance")]
+    pub command_typo_max_distance: u32,
+
+    // Caps
+    #[serde(default = "default_chat_daily_input_token_cap")]
+    pub daily_input_token_cap: u64,
+    #[serde(default = "default_chat_daily_output_token_cap")]
+    pub daily_output_token_cap: u64,
+    #[serde(default = "default_chat_daily_classifier_token_cap")]
+    pub daily_classifier_token_cap: u64,
+    #[serde(default = "default_chat_daily_dollar_cap_usd")]
+    pub daily_dollar_cap_usd: f64,
+    #[serde(default)]
+    pub acknowledge_high_spend: bool,
+
+    // Classifier gating
+    #[serde(default = "default_chat_recent_speaker_secs")]
+    pub recent_speaker_secs: u32,
+    #[serde(default = "default_chat_classifier_sample_rate")]
+    pub classifier_sample_rate: f32,
+    #[serde(default = "default_chat_classifier_per_sender_per_minute")]
+    pub classifier_per_sender_per_minute: u32,
+    #[serde(default = "default_chat_classifier_min_confidence")]
+    pub classifier_min_confidence: f32,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_chat_enabled(),
+            dry_run: default_chat_dry_run(),
+            api_key_env: default_chat_api_key_env(),
+            composer_model: default_chat_composer_model(),
+            classifier_model: default_chat_classifier_model(),
+            persona_seed: String::new(),
+            command_prefixes: default_chat_command_prefixes(),
+            command_typo_max_distance: default_chat_command_typo_max_distance(),
+            daily_input_token_cap: default_chat_daily_input_token_cap(),
+            daily_output_token_cap: default_chat_daily_output_token_cap(),
+            daily_classifier_token_cap: default_chat_daily_classifier_token_cap(),
+            daily_dollar_cap_usd: default_chat_daily_dollar_cap_usd(),
+            acknowledge_high_spend: false,
+            recent_speaker_secs: default_chat_recent_speaker_secs(),
+            classifier_sample_rate: default_chat_classifier_sample_rate(),
+            classifier_per_sender_per_minute: default_chat_classifier_per_sender_per_minute(),
+            classifier_min_confidence: default_chat_classifier_min_confidence(),
+        }
+    }
+}
+
+fn default_chat_enabled() -> bool { false }
+fn default_chat_dry_run() -> bool { false }
+fn default_chat_api_key_env() -> String { "ANTHROPIC_API_KEY".to_string() }
+fn default_chat_composer_model() -> String { "claude-opus-4-7".to_string() }
+fn default_chat_classifier_model() -> String { "claude-haiku-4-5-20251001".to_string() }
+fn default_chat_command_typo_max_distance() -> u32 { 2 }
+fn default_chat_daily_input_token_cap() -> u64 { 2_000_000 }
+fn default_chat_daily_output_token_cap() -> u64 { 200_000 }
+fn default_chat_daily_classifier_token_cap() -> u64 { 500_000 }
+fn default_chat_daily_dollar_cap_usd() -> f64 { 5.00 }
+fn default_chat_recent_speaker_secs() -> u32 { 600 }
+fn default_chat_classifier_sample_rate() -> f32 { 0.5 }
+fn default_chat_classifier_per_sender_per_minute() -> u32 { 3 }
+fn default_chat_classifier_min_confidence() -> f32 { 0.6 }
+
+impl ChatConfig {
+    /// Validate the chat-config invariants. Returns a single human-readable
+    /// error string on failure (with every problem listed) so the operator
+    /// fixes the whole config in one pass — same shape as
+    /// [`Config::validate`].
+    ///
+    /// Checked here:
+    ///
+    /// - `enabled = true` requires a non-empty `persona_seed` AND the seed
+    ///   must pass [`crate::chat::persona::validate_seed`]'s rejection list
+    ///   (PLAN §5.3 ADV8).
+    /// - `daily_dollar_cap_usd > 30.0` requires `acknowledge_high_spend = true`
+    ///   (PLAN §7 OPS4).
+    /// - `classifier_sample_rate` and `classifier_min_confidence` in [0,1].
+    /// - `command_typo_max_distance` in [0, 4].
+    pub fn validate(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+
+        if self.enabled {
+            if self.persona_seed.trim().is_empty() {
+                errors.push("persona_seed is required when chat.enabled = true".to_string());
+            } else if let Err(e) = crate::chat::persona::validate_seed(&self.persona_seed) {
+                errors.push(format!("persona_seed: {e}"));
+            }
+        }
+
+        if self.daily_dollar_cap_usd > 30.0 && !self.acknowledge_high_spend {
+            errors.push(format!(
+                "daily_dollar_cap_usd = {:.2} requires acknowledge_high_spend = true (operator opt-in for >$30/day)",
+                self.daily_dollar_cap_usd
+            ));
+        }
+        if self.daily_dollar_cap_usd < 0.0 || !self.daily_dollar_cap_usd.is_finite() {
+            errors.push("daily_dollar_cap_usd must be a non-negative finite number".to_string());
+        }
+
+        if !(0.0..=1.0).contains(&self.classifier_sample_rate) {
+            errors.push(format!(
+                "classifier_sample_rate must be in [0.0, 1.0] (got {})",
+                self.classifier_sample_rate
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.classifier_min_confidence) {
+            errors.push(format!(
+                "classifier_min_confidence must be in [0.0, 1.0] (got {})",
+                self.classifier_min_confidence
+            ));
+        }
+
+        if self.command_typo_max_distance > 4 {
+            errors.push(format!(
+                "command_typo_max_distance must be in [0, 4] (got {})",
+                self.command_typo_max_distance
+            ));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+fn default_chat_command_prefixes() -> Vec<String> {
+    // Kept in sync with the verbs `parse_command` recognises in
+    // store::command. A unit test in chat::conversation pins this list to
+    // the parser's accepted verb set so adding a new command without
+    // updating this default produces a test failure rather than silent chat
+    // shadowing of the new command.
+    [
+        // Order commands + aliases
+        "buy", "b", "sell", "s",
+        "deposit", "d", "withdraw", "w",
+        // Quick commands + aliases
+        "price", "p", "balance", "bal", "pay",
+        "items", "queue", "q", "cancel", "c",
+        "status", "help", "h",
+        // Operator commands + aliases (operator-only at dispatch, but still
+        // reach the Store rather than chat — operators expect their typos to
+        // get a hint, not an AI reply).
+        "additem", "ai", "removeitem", "ri",
+        "addcurrency", "ac", "removecurrency", "rc",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 // Timeout defaults defer to the canonical constants so the value lives in
@@ -170,7 +356,12 @@ impl Config {
         if self.max_trades_in_memory == 0 {
             errors.push("max_trades_in_memory must be greater than 0".to_string());
         }
-        
+
+        // Chat config validation. Reads, but does not mutate, `self.chat`.
+        if let Err(e) = self.chat.validate() {
+            errors.push(format!("chat: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -211,6 +402,7 @@ impl Config {
                 max_orders: default_max_orders(),
                 max_trades_in_memory: default_max_trades_in_memory(),
                 autosave_interval_secs: default_autosave_interval_secs(),
+                chat: ChatConfig::default(),
             };
 
             if let Some(parent_dir) = config_path.parent()
@@ -250,6 +442,7 @@ mod tests {
             max_orders: default_max_orders(),
             max_trades_in_memory: default_max_trades_in_memory(),
             autosave_interval_secs: default_autosave_interval_secs(),
+            chat: ChatConfig::default(),
         }
     }
 

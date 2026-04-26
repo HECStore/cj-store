@@ -46,7 +46,9 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             let uuid = if username_or_uuid.contains('-') {
                 username_or_uuid.clone()
             } else {
-                utils::resolve_user_uuid(&username_or_uuid).await?
+                crate::mojang::resolve_user_uuid(&username_or_uuid)
+                    .await
+                    .map_err(StoreError::ValidationError)?
             };
             // Auto-create the user record so operators can be granted to
             // players who have never interacted with the store.

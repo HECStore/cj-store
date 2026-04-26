@@ -11,7 +11,7 @@
 //! ## Mojang API Integration
 //! - `get_uuid_async()` calls Mojang's public API to resolve usernames to UUIDs
 //! - Returns hyphenated UUID format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
-//! - Caching (TTL = `UUID_CACHE_TTL_SECS`) is handled in `store::utils::resolve_user_uuid`
+//! - Caching (TTL = `UUID_CACHE_TTL_SECS`) is handled in `crate::mojang::resolve_user_uuid`
 
 use std::{
     collections::{HashMap, HashSet},

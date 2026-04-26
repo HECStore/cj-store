@@ -13,9 +13,11 @@
 #![deny(rustdoc::invalid_html_tags)]
 
 use crate::cli::cli_task;
-use crate::messages::{BotInstruction, StoreMessage};
+use crate::messages::{BotInstruction, ChatCommand, ChatEvent, StoreMessage};
 use crate::store::Store;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::LocalSet;
 use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -23,12 +25,14 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod bot;
+mod chat;
 mod cli;
 mod config;
 mod constants;
 mod error;
 mod fsutil;
 mod messages;
+mod mojang;
 mod store;
 mod types;
 
@@ -106,6 +110,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (store_tx, store_rx) = mpsc::channel::<StoreMessage>(128);
             let (bot_tx, bot_rx) = mpsc::channel::<BotInstruction>(128);
 
+            // Chat-side channels (PLAN §2.5). Constructed in main so each
+            // task gets the right end. Capacities follow PLAN: 2048 for the
+            // broadcast (absorb burst loads, A3) and 4096 for the history
+            // mpsc (history is best-effort, never blocking — A3 + ADV11).
+            let (chat_events_tx, _chat_events_rx_root) =
+                broadcast::channel::<ChatEvent>(2048);
+            let chat_events_tx = Arc::new(chat_events_tx);
+            let (history_tx, history_rx) = mpsc::channel::<ChatEvent>(4096);
+            let (chat_cmd_tx, chat_cmd_rx) = mpsc::channel::<ChatCommand>(64);
+            let in_critical_section = Arc::new(AtomicBool::new(false));
+            let bot_username = Arc::new(RwLock::new(None));
+
             let store = Store::new(bot_tx.clone()).await?;
 
             // Snapshot the config fields needed by bot_task before `store` is
@@ -116,9 +132,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let buffer_chest_position = store.config.buffer_chest_position;
             let trade_timeout_ms = store.config.trade_timeout_ms;
             let pathfinding_timeout_ms = store.config.pathfinding_timeout_ms;
+            // Snapshot chat config too — `Arc<ChatConfig>` is shared with
+            // the bot's whisper router and the chat task itself.
+            let chat_config = Arc::new(store.config.chat.clone());
 
             let store_handle = tokio::spawn(store.run(store_rx, bot_tx.clone()));
 
+            // Spawn the chat history writer task. Owns `history_rx`
+            // exclusively so the bot's `try_send` lands in a single,
+            // dedicated drainer (PLAN §2.2). The skeleton drains and
+            // discards; Phase 2 adds the JSONL writer.
+            let history_handle =
+                tokio::spawn(crate::chat::history_writer_task(history_rx));
+
+            // Spawn the chat task with PANIC ISOLATION (PLAN §2.5 A1).
+            // A panic inside chat_task must not tear down the trade bot —
+            // the inner `tokio::spawn` catches the JoinError and we always
+            // return Ok from the outer wrapper.
+            let chat_events_rx_for_chat = chat_events_tx.subscribe();
+            let chat_bot_tx = bot_tx.clone();
+            let chat_in_critical = in_critical_section.clone();
+            let chat_bot_username = bot_username.clone();
+            let chat_config_for_task = (*chat_config).clone();
+            let chat_handle = tokio::spawn(async move {
+                let result = tokio::spawn(crate::chat::chat_task(
+                    chat_events_rx_for_chat,
+                    chat_bot_tx,
+                    chat_cmd_rx,
+                    chat_in_critical,
+                    chat_bot_username,
+                    chat_config_for_task,
+                ))
+                .await;
+                if let Err(e) = result {
+                    error!("[Chat] task panicked, trade bot continues: {e}");
+                }
+            });
+
+            // Bot task — pass chat-side channels via `BotChannels`.
+            let bot_channels = crate::bot::BotChannels {
+                chat_events_tx: chat_events_tx.clone(),
+                history_tx,
+                bot_username,
+                chat_config: chat_config.clone(),
+                in_critical_section,
+            };
             // Local spawn: Azalea's bot_task is !Send.
             let bot_handle = tokio::task::spawn_local(crate::bot::bot_task(
                 store_tx.clone(),
@@ -128,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buffer_chest_position,
                 trade_timeout_ms,
                 pathfinding_timeout_ms,
+                bot_channels,
             ));
 
             // Spawn config file watcher (hot-reload of `fee` and `autosave_interval_secs`).
@@ -136,10 +195,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             spawn_config_watcher(store_tx.clone());
 
             // Blocking spawn: cli_task uses stdin which blocks the thread.
-            let cli_handle = tokio::task::spawn_blocking(move || cli_task(store_tx));
+            // Pass `chat_cmd_tx` only when chat is enabled — the CLI uses
+            // its presence to decide whether to show chat menu entries.
+            let chat_cmd_for_cli = if chat_config.enabled {
+                Some(chat_cmd_tx.clone())
+            } else {
+                None
+            };
+            // Drop the root chat_cmd_tx clone now that any consumers (CLI
+            // when enabled) have their own clone — otherwise it would
+            // keep the chat command channel open past CLI shutdown.
+            drop(chat_cmd_tx);
+            let cli_handle = tokio::task::spawn_blocking(move || {
+                cli_task(store_tx, chat_cmd_for_cli)
+            });
 
             info!("[Main] All tasks spawned");
+            // chat_handle and history_handle are not joined into try_join!
+            // — chat is panic-isolated and history exits when its mpsc
+            // closes (which happens after bot_task drops `history_tx`).
+            // Awaiting them after the trade-side join completes lets us
+            // log their final status without coupling shutdown ordering.
             let join_result = tokio::try_join!(store_handle, bot_handle, cli_handle);
+            // Wait briefly for chat / history to wind down. Both should
+            // exit naturally when their inputs close.
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(3),
+                async {
+                    let _ = chat_handle.await;
+                    let _ = history_handle.await;
+                },
+            )
+            .await;
             Ok::<_, Box<dyn std::error::Error>>(join_result)
         })
         .await;

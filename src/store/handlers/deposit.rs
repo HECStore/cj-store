@@ -107,7 +107,9 @@ pub async fn handle_deposit_balance_queued(
         None => (MAX_TRADE_DIAMONDS, true),
     };
 
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     let msg = if is_flexible {

@@ -18,7 +18,9 @@ pub async fn handle_additem_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-additem", false)?;
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -288,7 +290,9 @@ pub async fn handle_removeitem_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-removeitem", false)?;
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -551,7 +555,9 @@ pub async fn handle_add_currency(
     amount: f64,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-add-currency", false)?;
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -627,7 +633,9 @@ pub async fn handle_remove_currency(
     amount: f64,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-remove-currency", false)?;
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {

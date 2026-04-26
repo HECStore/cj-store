@@ -100,8 +100,8 @@ recovered). The usual async discipline — never hold the guard across
   and release builds. **`debug_assert!`** guards in
   [src/store/orders.rs](src/store/orders.rs) are compiled out of release.
 - **Integration tests** build a `Store` in-memory via `Store::new_for_test`
-  and spawn a mock bot task; `utils::resolve_user_uuid` is cfg-gated to
-  deterministic offline UUIDs under `#[cfg(test)]`.
+  and spawn a mock bot task; `crate::mojang::resolve_user_uuid` is cfg-gated
+  to deterministic offline UUIDs under `#[cfg(test)]`.
 
 ## Known limitations
 

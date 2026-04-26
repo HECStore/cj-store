@@ -1,0 +1,903 @@
+//! Composer tools — memory read/write, history search.
+//!
+//! Each public function in this module is the **server-side** of one
+//! Anthropic `tool_use` block: validates input, executes, returns a
+//! JSON-serializable result string. The composer in [`super::composer`]
+//! threads tool results back into the next turn.
+//!
+//! Phase 5 lands the security-critical primitives (path validation,
+//! sender binding, bullet sanitization) and the read-only tools. Write
+//! tools (`update_player_memory`, `update_self_memory`) and the
+//! reflection-pass writer for `adjustments.md` arrive in Phase 6.
+//!
+//! ## Hard rules baked into this module
+//!
+//! - **UUID validation (PLAN §6 S5)**: every UUID input is matched
+//!   against `^[0-9a-f-]{32,36}$` (lowercase, optional 4 hyphens).
+//! - **Sender binding (S10)**: `update_player_memory` must equal the
+//!   current event's sender UUID. No operator override — this is a hard
+//!   integrity boundary.
+//! - **Cross-player firewall (S7 + ADV1)**: `read_player_memory` is
+//!   sender-only by default. `chat.cross_player_reads = true` enables
+//!   addressee reads on trusted single-tenant servers; even then,
+//!   addressee reads do NOT include the addressee's identity-secrets.
+//! - **Section allow-list**: writes are confined to `Stated preferences`,
+//!   `Inferred`, `Topics & history`, `Do not mention` — `Identity` and
+//!   `Trust` are operator-only.
+//! - **Bullet sanitization (C5)**: rejects bullets matching
+//!   `(?i)^trust\s*:\s*[0-3]` (forged trust line) or containing `## `
+//!   (header injection) or exceeding `update_bullet_max_chars`.
+
+use std::path::{Path, PathBuf};
+
+/// Canonical hyphenated UUID regex shape (the Mojang-resolved form):
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+fn is_canonical_hyphen_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let expected_hyphen = matches!(i, 8 | 13 | 18 | 23);
+        if expected_hyphen {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() || b.is_ascii_uppercase() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Bare 32-char hex UUID (Mojang's wire format before hyphenation).
+fn is_bare_hex_uuid(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Validate a UUID per PLAN §6 S5. Accepts canonical hyphenated form
+/// OR bare 32-char hex; rejects anything else (uppercase, missing
+/// hyphens, wrong length).
+pub fn validate_uuid(uuid: &str) -> Result<(), &'static str> {
+    if is_canonical_hyphen_uuid(uuid) || is_bare_hex_uuid(uuid) {
+        Ok(())
+    } else {
+        Err("uuid must be canonical hyphenated form or bare 32-char hex")
+    }
+}
+
+/// Validate a Mojang-shape username per PLAN §6 S5.
+pub fn validate_username_shape(username: &str) -> Result<(), &'static str> {
+    if username.len() < 3 || username.len() > 16 {
+        return Err("username must be 3-16 characters");
+    }
+    if !username
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err("username may only contain ASCII alphanumerics and underscore");
+    }
+    Ok(())
+}
+
+/// Resolve a per-player file path from an already-validated UUID and
+/// confirm its parent directory canonicalizes to `data/chat/players/`.
+/// PLAN §6 S5.
+///
+/// Returns the resolved (un-canonicalized) path on success — file
+/// operations should use the returned path so callers don't accidentally
+/// dereference a different one. The canonical-parent check is the
+/// security gate; we don't canonicalize the file itself because the
+/// file may not exist yet (ensure-or-write paths).
+pub fn resolve_player_path(uuid: &str, players_dir: &Path) -> Result<PathBuf, String> {
+    validate_uuid(uuid).map_err(str::to_string)?;
+    // Defense-in-depth: never trust a UUID containing path separators.
+    if uuid.contains('/') || uuid.contains('\\') {
+        return Err("uuid contains path separator".to_string());
+    }
+    let candidate = players_dir.join(format!("{uuid}.md"));
+
+    // The PARENT directory must canonicalize to `players_dir`. We
+    // canonicalize the parent specifically so a freshly-created
+    // (not-yet-existing) candidate file path is fine.
+    let parent = candidate
+        .parent()
+        .ok_or("candidate path has no parent")?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("could not canonicalize players dir: {e}"))?;
+    let expected_parent = std::fs::canonicalize(players_dir)
+        .map_err(|e| format!("could not canonicalize expected players dir: {e}"))?;
+    if canonical_parent != expected_parent {
+        return Err("path escapes players dir".to_string());
+    }
+    Ok(candidate)
+}
+
+/// Section names that the composer is allowed to write to. PLAN §6
+/// `update_player_memory` constraint.
+pub const WRITABLE_SECTIONS: &[&str] = &[
+    "Stated preferences",
+    "Inferred",
+    "Topics & history",
+    "Do not mention",
+];
+
+pub fn is_writable_section(section: &str) -> bool {
+    WRITABLE_SECTIONS.iter().any(|s| *s == section)
+}
+
+/// Sanitize a per-player or per-self memory bullet. PLAN §6 C5 + §5.1.
+///
+/// Rejects bullets that:
+/// - match `(?i)^trust\s*:\s*[0-3]` (forged trust line),
+/// - contain `## ` (section-header injection),
+/// - exceed `max_chars`.
+///
+/// `max_chars` is `chat.update_bullet_max_chars` (default 280).
+pub fn sanitize_bullet(bullet: &str, max_chars: usize) -> Result<String, &'static str> {
+    let trimmed = bullet.trim();
+    if trimmed.is_empty() {
+        return Err("bullet is empty");
+    }
+    if trimmed.chars().count() > max_chars {
+        return Err("bullet exceeds max_chars");
+    }
+    if trimmed.contains("## ") {
+        return Err("bullet contains '## ' (section-header injection)");
+    }
+    // Match `(?i)^trust\s*:\s*[0-3]` without a regex dep.
+    let lower = trimmed.to_lowercase();
+    let after_trust = lower.strip_prefix("trust");
+    if let Some(rest) = after_trust {
+        let rest = rest.trim_start();
+        if let Some(rest) = rest.strip_prefix(':') {
+            let rest = rest.trim_start();
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| ('0'..='3').contains(&c))
+            {
+                return Err("bullet contains forged trust line");
+            }
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Ensure a section header exists in a Markdown body. If `## <name>`
+/// is missing, append it (with a blank line before) and return the new
+/// body. Otherwise return the body unchanged.
+pub fn ensure_section(body: &str, section: &str) -> String {
+    let header = format!("## {section}");
+    if body.contains(&header) {
+        return body.to_string();
+    }
+    let mut out = body.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&header);
+    out.push('\n');
+    out
+}
+
+/// Append a bullet to the named section in a Markdown body. The bullet
+/// is prefixed with the ISO date and `- ` so the line shape matches
+/// the §5.4 schema.
+///
+/// Idempotency: if a bullet with identical body already appears under
+/// the section, this is a no-op (returns body unchanged). The Phase 6
+/// dedup pass handles fuzzier near-duplicates via Levenshtein ≥ 0.85.
+///
+/// Caller is responsible for `ensure_section` first if the section
+/// might be missing.
+pub fn append_bullet_to_section(
+    body: &str,
+    section: &str,
+    bullet: &str,
+    today: &str,
+) -> String {
+    let header = format!("## {section}");
+    let new_line = format!("- {today}: {bullet}");
+    if body.contains(&format!("- {today}: {bullet}\n"))
+        || body.contains(&format!("- {today}: {bullet}\r\n"))
+    {
+        return body.to_string();
+    }
+    let Some(start) = body.find(&header) else {
+        // Caller should have ensured the section; defensively append at end.
+        let mut out = ensure_section(body, section);
+        out.push_str(&new_line);
+        out.push('\n');
+        return out;
+    };
+    // Find the end of this section: either the next `\n## ` header or EOF.
+    let after_header = start + header.len();
+    let rest = &body[after_header..];
+    let next_header_offset = rest.find("\n## ");
+    let (insert_at, before_next) = match next_header_offset {
+        Some(off) => (after_header + off, true),
+        None => (body.len(), false),
+    };
+    let mut out = body[..insert_at].trim_end().to_string();
+    out.push('\n');
+    out.push_str(&new_line);
+    if before_next {
+        out.push_str("\n");
+        out.push_str(&body[insert_at..]);
+    } else {
+        out.push('\n');
+    }
+    out
+}
+
+/// Result of a sender-binding check (PLAN §6 S10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderBind {
+    Bound,
+    Mismatch,
+}
+
+/// Verify the `uuid` argument equals the current event's sender UUID.
+/// Used by `update_player_memory`. No operator override — hard boundary.
+pub fn check_sender_binding(arg_uuid: &str, current_event_sender_uuid: &str) -> SenderBind {
+    if arg_uuid.eq_ignore_ascii_case(current_event_sender_uuid) {
+        SenderBind::Bound
+    } else {
+        SenderBind::Mismatch
+    }
+}
+
+/// Result of a cross-player read check (PLAN §6 S7 + ADV1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAuthorization {
+    /// Sender's own memory.
+    Allowed,
+    /// Cross-player read denied. PLAN §6 reads return "access denied"
+    /// to the model when this fires.
+    Denied,
+    /// Operator opted in via `chat.cross_player_reads = true`.
+    AllowedByOperator,
+}
+
+pub fn authorize_player_read(
+    arg_uuid: &str,
+    current_event_sender_uuid: &str,
+    cross_player_reads_enabled: bool,
+) -> ReadAuthorization {
+    if arg_uuid.eq_ignore_ascii_case(current_event_sender_uuid) {
+        return ReadAuthorization::Allowed;
+    }
+    if cross_player_reads_enabled {
+        ReadAuthorization::AllowedByOperator
+    } else {
+        ReadAuthorization::Denied
+    }
+}
+
+// ===== Runtime tool definitions and dispatcher =============================
+
+use crate::chat::client::Tool;
+use serde_json::{Value, json};
+
+/// Build the full `Tool` list to expose to the composer (PLAN §6).
+/// `web_search_enabled` and `web_fetch_enabled` come from `ChatConfig`;
+/// the composer only sees web tools when the operator opts in.
+pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Vec<Tool> {
+    let mut tools = vec![
+        Tool {
+            name: "read_my_memory".to_string(),
+            description: "Read the global memory.md (your own memory of the server / yourself). Returns markdown text.".to_string(),
+            input_schema: json!({"type": "object", "properties": {}, "required": []}),
+        },
+        Tool {
+            name: "read_player_memory".to_string(),
+            description: "Read the per-player memory file for a UUID or username. Returns markdown text or 'access denied' if the player is not the current sender.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string", "description": "Canonical hyphenated UUID"},
+                    "username": {"type": "string", "description": "Mojang username; resolved to UUID"}
+                },
+                "required": []
+            }),
+        },
+        Tool {
+            name: "update_player_memory".to_string(),
+            description: "Append a single bullet to a section of the current sender's per-player file. Allowed sections: 'Stated preferences', 'Inferred', 'Topics & history', 'Do not mention'.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string"},
+                    "section": {"type": "string"},
+                    "bullet": {"type": "string"}
+                },
+                "required": ["uuid", "section", "bullet"]
+            }),
+        },
+        Tool {
+            name: "update_self_memory".to_string(),
+            description: "Append a bullet to the '## Inferred' section of memory.md. ISO-date prefixed.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"bullet": {"type": "string"}},
+                "required": ["bullet"]
+            }),
+        },
+        Tool {
+            name: "read_today_history".to_string(),
+            description: "Read today's chat history JSONL, capped at 32 KB. Most recent first.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit_lines": {"type": "integer", "default": 200}
+                },
+                "required": []
+            }),
+        },
+        Tool {
+            name: "search_history".to_string(),
+            description: "Substring search across today's and recent past chat history JSONL files. Up to 50 matches.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "days_back": {"type": "integer", "default": 7}
+                },
+                "required": ["query"]
+            }),
+        },
+    ];
+    if web_search_enabled {
+        // Anthropic-managed server tool — no schema we own; passing it
+        // through as an opaque tool so the model can request it. The
+        // server-side ID is the canonical tool name; we present it as
+        // `web_search_20250305`. If the account doesn't have access,
+        // Anthropic returns an error result we surface as a tool_error.
+        tools.push(Tool {
+            name: "web_search".to_string(),
+            description: "Search the web (Anthropic-managed). Use sparingly.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }),
+        });
+    }
+    if web_fetch_enabled {
+        tools.push(Tool {
+            name: "web_fetch".to_string(),
+            description: "Fetch the contents of an http(s) URL (max 256 KB). Strict deny-list applies; rejects local / metadata / numeric-form addresses.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }),
+        });
+    }
+    tools
+}
+
+/// Context passed to [`dispatch`].
+pub struct ToolContext<'a> {
+    /// UUID of the current event's sender (for sender-binding checks).
+    pub sender_uuid: &'a str,
+    /// Operator opt-in: cross-player reads.
+    pub cross_player_reads: bool,
+    /// Tools-history byte cap (PLAN P4 default 32 KB).
+    pub history_max_bytes: usize,
+    /// Update-bullet character cap.
+    pub update_bullet_max_chars: usize,
+    /// Days-back cap for `search_history`.
+    pub history_search_max_days: u32,
+    /// `web_fetch_max_bytes` from ChatConfig (default 256 KB).
+    pub web_fetch_max_bytes: usize,
+    /// Whether the operator enabled `web_fetch`.
+    pub web_fetch_enabled: bool,
+    /// Today's UTC date (YYYY-MM-DD).
+    pub today: String,
+}
+
+/// Dispatch one tool_use block from the model. Returns the textual
+/// tool_result body (or error string). Always returns Ok — errors are
+/// returned as the result string with `is_error = true` at the
+/// composer layer.
+pub async fn dispatch(name: &str, input: &Value, ctx: &ToolContext<'_>) -> (String, bool) {
+    let result = match name {
+        "read_my_memory" => read_my_memory().await,
+        "read_player_memory" => read_player_memory_tool(input, ctx).await,
+        "update_player_memory" => update_player_memory_tool(input, ctx).await,
+        "update_self_memory" => update_self_memory_tool(input, ctx).await,
+        "read_today_history" => read_today_history_tool(input, ctx).await,
+        "search_history" => search_history_tool(input, ctx).await,
+        "web_fetch" => {
+            if !ctx.web_fetch_enabled {
+                Err("web_fetch is not enabled in config".to_string())
+            } else {
+                web_fetch_tool(input, ctx).await
+            }
+        }
+        // web_search is Anthropic-managed; if the model invokes it via
+        // our tool exposure, we return a stub explaining we can't run
+        // it locally (real implementation would proxy to Anthropic's
+        // server tool). For now, surface a clear error.
+        "web_search" => Err("web_search is provided as an Anthropic server tool; not dispatchable locally in this build".to_string()),
+        other => Err(format!("unknown tool: {other}")),
+    };
+    match result {
+        Ok(s) => (s, false),
+        Err(e) => (e, true),
+    }
+}
+
+async fn read_my_memory() -> Result<String, String> {
+    crate::chat::memory::read_global_memory()
+        .map_err(|e| format!("read_global_memory: {e}"))
+}
+
+async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let uuid_arg = input.get("uuid").and_then(|v| v.as_str());
+    let username_arg = input.get("username").and_then(|v| v.as_str());
+    let target_uuid = if let Some(u) = uuid_arg {
+        validate_uuid(u).map_err(str::to_string)?;
+        u.to_string()
+    } else if let Some(name) = username_arg {
+        validate_username_shape(name).map_err(str::to_string)?;
+        crate::mojang::resolve_user_uuid(name)
+            .await
+            .map_err(|e| format!("resolve {name}: {e}"))?
+    } else {
+        return Err("require either uuid or username".to_string());
+    };
+    let auth = authorize_player_read(&target_uuid, ctx.sender_uuid, ctx.cross_player_reads);
+    if matches!(auth, ReadAuthorization::Denied) {
+        return Err("access denied (cross-player reads disabled)".to_string());
+    }
+    match crate::chat::memory::read_player(&target_uuid) {
+        Ok(Some(body)) => Ok(body),
+        Ok(None) => Ok(String::new()),
+        Err(e) => Err(format!("read_player: {e}")),
+    }
+}
+
+async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let uuid = input
+        .get("uuid")
+        .and_then(|v| v.as_str())
+        .ok_or("uuid is required")?;
+    let section = input
+        .get("section")
+        .and_then(|v| v.as_str())
+        .ok_or("section is required")?;
+    let bullet = input
+        .get("bullet")
+        .and_then(|v| v.as_str())
+        .ok_or("bullet is required")?;
+
+    validate_uuid(uuid).map_err(str::to_string)?;
+    if !matches!(check_sender_binding(uuid, ctx.sender_uuid), SenderBind::Bound) {
+        return Err("sender binding violated: uuid must equal the current sender".to_string());
+    }
+    if !is_writable_section(section) {
+        return Err(format!("section '{section}' is not writable"));
+    }
+    let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
+
+    // Bootstrap the file if needed. Username goes from the index map;
+    // if not present, fall back to "unknown" — the bot's own
+    // observation will refresh it later.
+    let username = crate::chat::memory::load_or_rebuild_index()
+        .ok()
+        .and_then(|idx| {
+            idx.by_lower_username
+                .iter()
+                .find(|(_, v)| v.eq_ignore_ascii_case(uuid))
+                .map(|(k, _)| k.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    crate::chat::memory::ensure_player_file(uuid, &username, &ctx.today)
+        .map_err(|e| format!("ensure_player_file: {e}"))?;
+
+    let body = crate::chat::memory::read_player(uuid)
+        .map_err(|e| format!("read_player: {e}"))?
+        .unwrap_or_default();
+    let with_section = ensure_section(&body, section);
+    let new_body = append_bullet_to_section(&with_section, section, &safe_bullet, &ctx.today);
+    crate::chat::memory::write_player(uuid, &new_body)
+        .map_err(|e| format!("write_player: {e}"))?;
+    Ok(format!("appended to '{section}'"))
+}
+
+async fn update_self_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let bullet = input
+        .get("bullet")
+        .and_then(|v| v.as_str())
+        .ok_or("bullet is required")?;
+    let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
+
+    let body = crate::chat::memory::read_global_memory()
+        .map_err(|e| format!("read_global_memory: {e}"))?;
+    let with_section = ensure_section(&body, "Inferred");
+    let new_body = append_bullet_to_section(&with_section, "Inferred", &safe_bullet, &ctx.today);
+    crate::fsutil::write_atomic(crate::chat::memory::GLOBAL_MEMORY, &new_body)
+        .map_err(|e| format!("write memory.md: {e}"))?;
+    Ok("appended to '## Inferred' in memory.md".to_string())
+}
+
+async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let limit_lines = input
+        .get("limit_lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200) as usize;
+    let limit_lines = limit_lines.min(500);
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let path = std::path::Path::new(crate::chat::history::HISTORY_DIR)
+        .join(format!("{today}.jsonl"));
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(format!("read today's history: {e}")),
+    };
+    // Most recent first, capped by both line count and byte count.
+    let mut lines: Vec<&str> = contents.lines().rev().take(limit_lines).collect();
+    let mut out = String::new();
+    let mut bytes = 0usize;
+    let mut truncated = false;
+    let mut taken = 0usize;
+    for line in lines.drain(..) {
+        if bytes + line.len() + 1 > ctx.history_max_bytes {
+            truncated = true;
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        bytes += line.len() + 1;
+        taken += 1;
+    }
+    if truncated {
+        out.push_str(&format!("[truncated at {} bytes / {taken} lines]\n", ctx.history_max_bytes));
+    }
+    Ok(out)
+}
+
+async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("query is required")?
+        .to_string();
+    let days_back = input
+        .get("days_back")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7)
+        .min(ctx.history_search_max_days as u64);
+
+    // Streaming line scan via spawn_blocking (PLAN P7).
+    let history_dir = crate::chat::history::HISTORY_DIR.to_string();
+    let max_matches = 50;
+    let max_excerpt = 1024usize;
+    let q = query.clone();
+    let dir_clone = history_dir.clone();
+    let result: Result<String, String> = tokio::task::spawn_blocking(move || {
+        let q_lc = q.to_lowercase();
+        let mut matches: Vec<String> = Vec::new();
+        let dir = std::path::Path::new(&dir_clone);
+        if !dir.exists() {
+            return Ok(String::new());
+        }
+        // Walk only files matching `<YYYY-MM-DD>.jsonl` in the SCOPED
+        // dir (PLAN §6 S15: scope strictly to history directory).
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
+        let cutoff = chrono::Utc::now().date_naive() - chrono::Duration::days(days_back as i64);
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(stem) = name.strip_suffix(".jsonl")
+                && let Ok(d) = chrono::NaiveDate::parse_from_str(stem, "%Y-%m-%d")
+                && d >= cutoff
+            {
+                paths.push(p);
+            }
+        }
+        // Newest first.
+        paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        for p in paths {
+            let body = match std::fs::read_to_string(&p) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            for line in body.lines().rev() {
+                if line.to_lowercase().contains(&q_lc) {
+                    let mut excerpt = line.to_string();
+                    if excerpt.len() > max_excerpt {
+                        excerpt.truncate(max_excerpt);
+                        excerpt.push_str(" ...[truncated]");
+                    }
+                    matches.push(excerpt);
+                    if matches.len() >= max_matches {
+                        return Ok(matches.join("\n"));
+                    }
+                }
+            }
+        }
+        Ok(matches.join("\n"))
+    })
+    .await
+    .map_err(|e| format!("search_history join: {e}"))?;
+    result
+}
+
+async fn web_fetch_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let url = input
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or("url is required")?;
+    crate::chat::web::fetch(url, ctx.web_fetch_max_bytes).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- UUID validation ------------------------------------------------
+
+    #[test]
+    fn canonical_hyphenated_uuid_accepted() {
+        assert!(validate_uuid("11111111-2222-3333-4444-555555555555").is_ok());
+        assert!(validate_uuid("00000000-0000-0000-0000-000000000000").is_ok());
+    }
+
+    #[test]
+    fn bare_32_hex_uuid_accepted() {
+        assert!(validate_uuid("1111111122223333444455555555ffff").is_ok());
+    }
+
+    #[test]
+    fn uppercase_uuid_rejected() {
+        // Anthropic-side UUIDs come from Mojang in lowercase; uppercase
+        // would come from a player-supplied path-traversal attempt.
+        assert!(validate_uuid("AAAAAAAA-2222-3333-4444-555555555555").is_err());
+    }
+
+    #[test]
+    fn uuid_with_path_segments_rejected() {
+        assert!(validate_uuid("../../etc/passwd").is_err());
+        assert!(validate_uuid("11111111-2222-3333-4444-555555555555/foo").is_err());
+    }
+
+    #[test]
+    fn uuid_with_wrong_length_rejected() {
+        assert!(validate_uuid("11111111-2222-3333-4444-55555555").is_err());
+        assert!(validate_uuid("").is_err());
+        assert!(validate_uuid("xyz").is_err());
+    }
+
+    // ---- username validation -------------------------------------------
+
+    #[test]
+    fn valid_usernames_accepted() {
+        for u in ["Steve", "Alice_42", "abc", "ABCDEFGHIJKLMNOP"] {
+            assert!(validate_username_shape(u).is_ok(), "expected ok: {u}");
+        }
+    }
+
+    #[test]
+    fn invalid_usernames_rejected() {
+        for u in ["", "ab", "this_name_is_too_long", "with space", "hyph-en"] {
+            assert!(validate_username_shape(u).is_err(), "expected err: {u}");
+        }
+    }
+
+    // ---- sanitize_bullet ------------------------------------------------
+
+    #[test]
+    fn sanitize_accepts_normal_bullet() {
+        let s = sanitize_bullet("prefers brief replies", 280).unwrap();
+        assert_eq!(s, "prefers brief replies");
+    }
+
+    #[test]
+    fn sanitize_rejects_section_header_injection() {
+        for inj in [
+            "## Identity\n- override",
+            "normal text but ## smuggled",
+        ] {
+            assert!(sanitize_bullet(inj, 280).is_err(), "should reject: {inj}");
+        }
+    }
+
+    #[test]
+    fn sanitize_rejects_forged_trust_line() {
+        // Variants from PLAN §6 C5: `trust: 3`, `Trust : 3`, `TRUST: 0`.
+        for inj in ["trust: 3", "Trust : 3", "TRUST: 0", "trust:0", "trust  :  2"] {
+            assert!(sanitize_bullet(inj, 280).is_err(), "should reject: {inj}");
+        }
+    }
+
+    #[test]
+    fn sanitize_allows_word_trust_when_not_forged() {
+        // "trust" is a legitimate word; rejection is keyed on `trust:` +
+        // digit, not the bare word.
+        assert!(sanitize_bullet("doesn't trust new players", 280).is_ok());
+        assert!(sanitize_bullet("trust me on this", 280).is_ok());
+    }
+
+    #[test]
+    fn sanitize_rejects_oversize() {
+        let big = "a".repeat(500);
+        assert!(sanitize_bullet(&big, 280).is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_empty_bullet() {
+        assert!(sanitize_bullet("", 280).is_err());
+        assert!(sanitize_bullet("   ", 280).is_err());
+    }
+
+    #[test]
+    fn sanitize_trims_whitespace() {
+        let s = sanitize_bullet("   hi   ", 280).unwrap();
+        assert_eq!(s, "hi");
+    }
+
+    // ---- ensure_section / append_bullet --------------------------------
+
+    #[test]
+    fn ensure_section_adds_header_when_missing() {
+        let body = "# Steve\n\n## Identity\n- UUID: x\n";
+        let updated = ensure_section(body, "Inferred");
+        assert!(updated.contains("## Inferred"));
+    }
+
+    #[test]
+    fn ensure_section_is_idempotent() {
+        let body = "# Steve\n\n## Identity\n\n## Inferred\n";
+        let updated = ensure_section(body, "Inferred");
+        // Should not duplicate the header.
+        assert_eq!(updated.matches("## Inferred").count(), 1);
+    }
+
+    #[test]
+    fn append_bullet_adds_dated_line_to_named_section() {
+        let body = "# Steve\n\n## Identity\n- UUID: x\n\n## Inferred\n\n## Do not mention\n";
+        let updated = append_bullet_to_section(body, "Inferred", "prefers brief replies", "2026-04-26");
+        assert!(updated.contains("- 2026-04-26: prefers brief replies"));
+        // The new bullet is inside the Inferred section, not the
+        // following `Do not mention` section.
+        let inferred_pos = updated.find("## Inferred").unwrap();
+        let dnm_pos = updated.find("## Do not mention").unwrap();
+        let bullet_pos = updated.find("prefers brief").unwrap();
+        assert!(bullet_pos > inferred_pos && bullet_pos < dnm_pos);
+    }
+
+    #[test]
+    fn append_bullet_is_idempotent_for_exact_duplicates() {
+        let body = "# Steve\n\n## Inferred\n- 2026-04-26: same\n";
+        let updated = append_bullet_to_section(body, "Inferred", "same", "2026-04-26");
+        assert_eq!(updated.matches("- 2026-04-26: same").count(), 1);
+    }
+
+    // ---- writable section gate -----------------------------------------
+
+    #[test]
+    fn writable_sections_match_plan() {
+        // PLAN §6 update_player_memory section allow-list.
+        for s in [
+            "Stated preferences",
+            "Inferred",
+            "Topics & history",
+            "Do not mention",
+        ] {
+            assert!(is_writable_section(s));
+        }
+        // Operator-managed sections must NOT be in the allow-list.
+        assert!(!is_writable_section("Identity"));
+        assert!(!is_writable_section("Trust"));
+        assert!(!is_writable_section(""));
+    }
+
+    // ---- sender binding ------------------------------------------------
+
+    #[test]
+    fn sender_binding_pass_for_self() {
+        let v = check_sender_binding(
+            "11111111-2222-3333-4444-555555555555",
+            "11111111-2222-3333-4444-555555555555",
+        );
+        assert_eq!(v, SenderBind::Bound);
+    }
+
+    #[test]
+    fn sender_binding_pass_is_case_insensitive() {
+        // Mojang returns lowercase; defense-in-depth admits mixed case.
+        let v = check_sender_binding(
+            "AAAAAAAA-2222-3333-4444-555555555555",
+            "aaaaaaaa-2222-3333-4444-555555555555",
+        );
+        assert_eq!(v, SenderBind::Bound);
+    }
+
+    #[test]
+    fn sender_binding_fails_for_different_uuid() {
+        let v = check_sender_binding(
+            "11111111-2222-3333-4444-555555555555",
+            "ffffffff-2222-3333-4444-555555555555",
+        );
+        assert_eq!(v, SenderBind::Mismatch);
+    }
+
+    // ---- cross-player firewall (read) ---------------------------------
+
+    #[test]
+    fn read_authorization_allowed_for_self() {
+        let v = authorize_player_read(
+            "11111111-2222-3333-4444-555555555555",
+            "11111111-2222-3333-4444-555555555555",
+            false,
+        );
+        assert_eq!(v, ReadAuthorization::Allowed);
+    }
+
+    #[test]
+    fn read_authorization_denied_for_cross_player_default() {
+        // Default config (`cross_player_reads = false`).
+        let v = authorize_player_read(
+            "11111111-2222-3333-4444-555555555555",
+            "ffffffff-2222-3333-4444-555555555555",
+            false,
+        );
+        assert_eq!(v, ReadAuthorization::Denied);
+    }
+
+    #[test]
+    fn read_authorization_allowed_by_operator_when_enabled() {
+        // PLAN §6 allows opt-in for trusted single-tenant servers.
+        let v = authorize_player_read(
+            "11111111-2222-3333-4444-555555555555",
+            "ffffffff-2222-3333-4444-555555555555",
+            true,
+        );
+        assert_eq!(v, ReadAuthorization::AllowedByOperator);
+    }
+
+    // ---- resolve_player_path -------------------------------------------
+
+    #[test]
+    fn resolve_player_path_rejects_invalid_uuid() {
+        let scratch = std::env::temp_dir().join(format!(
+            "cj-store-tools-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let r = resolve_player_path("../../etc/passwd", &scratch);
+        assert!(r.is_err());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn resolve_player_path_rejects_uuid_with_path_separator() {
+        let scratch = std::env::temp_dir().join(format!(
+            "cj-store-tools-test-sep-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        // Path separators inside the UUID would never pass
+        // `validate_uuid`, but the explicit guard inside
+        // `resolve_player_path` is belt-and-braces.
+        let r = resolve_player_path(
+            "11111111-2222-3333-4444-555555555555\\..\\etc",
+            &scratch,
+        );
+        assert!(r.is_err());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}

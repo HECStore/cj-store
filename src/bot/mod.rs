@@ -31,7 +31,11 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::messages::{BotInstruction, BotMessage, ChestAction, ChestSyncReport, StoreMessage};
+use crate::config::ChatConfig;
+use crate::messages::{
+    BotInstruction, BotMessage, ChatEvent, ChatEventKind, ChestAction, ChestSyncReport,
+    StoreMessage,
+};
 use crate::types::Position;
 
 #[derive(Clone, Component)]
@@ -41,17 +45,49 @@ pub struct BotState {
     pub client: Arc<RwLock<Option<Client>>>,
     pub chat_tx: Arc<broadcast::Sender<String>>,
     pub connecting: Arc<AtomicBool>,
+    /// Typed chat-event broadcast — separate from the legacy `chat_tx`
+    /// (which trade.rs subscribes to for trade-failure detection). Chat
+    /// events are published to BOTH; see PLAN §2.2 for why splitting is
+    /// load-bearing.
+    pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
+    /// Mpsc to the dedicated history writer task (PLAN §2.2 ADV11). Used
+    /// with `try_send`, never `await`, so a hostile flood cannot block
+    /// `bot_task`.
+    pub history_tx: mpsc::Sender<ChatEvent>,
+    /// Live Minecraft username, populated on `Event::Init` and cleared on
+    /// `Event::Disconnect`. Read-only by chat (PLAN §2.4).
+    pub bot_username: Arc<RwLock<Option<String>>>,
+    /// Snapshot of chat config — `chat.enabled`, `chat.dry_run`,
+    /// `chat.command_prefixes`, `chat.command_typo_max_distance` are
+    /// consulted by the whisper router. Held in an `Arc` so per-event
+    /// reads are zero-cost.
+    pub chat_config: Arc<ChatConfig>,
+    /// History-drop counter for the §2.2 try_send path. Incremented when
+    /// the history mpsc is full and an event is dropped. Wrapped in
+    /// `parking_lot::Mutex` (vs atomic) so the future "1 warn per minute"
+    /// rate-limit logic can read+update both the counter and a timestamp
+    /// atomically.
+    pub history_drops: Arc<parking_lot::Mutex<u64>>,
 }
 
 impl Default for BotState {
     fn default() -> Self {
-        let (chat_tx, _chat_rx) = broadcast::channel(256);
+        let (chat_tx, _) = broadcast::channel(256);
+        let (chat_events_tx, _) = broadcast::channel(2048);
+        // Default impl is used only by tests where the receivers are not
+        // observed; a small mpsc keeps the channel valid without leaking.
+        let (history_tx, _history_rx) = mpsc::channel(1);
         Self {
             connected: false,
             store_tx: None,
             client: Arc::new(RwLock::new(None)),
             chat_tx: Arc::new(chat_tx),
             connecting: Arc::new(AtomicBool::new(false)),
+            chat_events_tx: Arc::new(chat_events_tx),
+            history_tx,
+            bot_username: Arc::new(RwLock::new(None)),
+            chat_config: Arc::new(ChatConfig::default()),
+            history_drops: Arc::new(parking_lot::Mutex::new(0)),
         }
     }
 }
@@ -85,6 +121,35 @@ pub struct Bot {
     /// detect — and an operator can reconcile — any operation that was
     /// mid-flight at the moment of a crash.
     pub journal: crate::store::journal::SharedJournal,
+    /// Typed chat-event broadcast (PLAN §2.2). The bot publishes parsed
+    /// chat lines here for chat_task to consume.
+    pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
+    /// Mpsc to the chat history writer (PLAN §2.2). `try_send` only.
+    pub history_tx: mpsc::Sender<ChatEvent>,
+    /// Live Minecraft username (PLAN §2.4). `None` while disconnected or
+    /// pre-Init.
+    pub bot_username: Arc<RwLock<Option<String>>>,
+    /// Snapshot of chat config; held in `Arc` so the whisper router and
+    /// chat_task share a single allocation per process.
+    pub chat_config: Arc<ChatConfig>,
+    /// History-drop counter (see `BotState::history_drops`).
+    pub history_drops: Arc<parking_lot::Mutex<u64>>,
+    /// Critical-section gate (PLAN §2.2 / §4.8 ADV4). Set while a trade
+    /// or chest IO is in flight. Read-only by chat (chat task gets a
+    /// clone of the same `Arc` and observes via `.load()` only).
+    pub in_critical_section: Arc<AtomicBool>,
+}
+
+/// Channels and shared state passed from `main` into [`bot_task`].
+///
+/// Bundled into a struct rather than a long argument list so adding new
+/// chat-related shared state (Phase 1+) does not balloon every call site.
+pub struct BotChannels {
+    pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
+    pub history_tx: mpsc::Sender<ChatEvent>,
+    pub bot_username: Arc<RwLock<Option<String>>>,
+    pub chat_config: Arc<ChatConfig>,
+    pub in_critical_section: Arc<AtomicBool>,
 }
 
 impl Bot {
@@ -101,6 +166,7 @@ impl Bot {
         trade_timeout_ms: u64,
         pathfinding_timeout_ms: u64,
         journal: crate::store::journal::SharedJournal,
+        channels: BotChannels,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let account = Account::microsoft(&account_email).await?;
 
@@ -117,6 +183,12 @@ impl Bot {
             trade_timeout_ms,
             pathfinding_timeout_ms,
             journal,
+            chat_events_tx: channels.chat_events_tx,
+            history_tx: channels.history_tx,
+            bot_username: channels.bot_username,
+            chat_config: channels.chat_config,
+            history_drops: Arc::new(parking_lot::Mutex::new(0)),
+            in_critical_section: channels.in_critical_section,
         })
     }
 
@@ -168,6 +240,7 @@ impl Bot {
 }
 
 /// Main bot task that handles instructions from the Store
+#[allow(clippy::too_many_arguments)]
 pub async fn bot_task(
     store_tx: mpsc::Sender<StoreMessage>,
     mut bot_rx: mpsc::Receiver<BotInstruction>,
@@ -176,6 +249,7 @@ pub async fn bot_task(
     buffer_chest_position: Option<Position>,
     trade_timeout_ms: u64,
     pathfinding_timeout_ms: u64,
+    channels: BotChannels,
 ) {
     let (chat_tx, _chat_rx) = broadcast::channel::<String>(256);
 
@@ -224,6 +298,7 @@ pub async fn bot_task(
         trade_timeout_ms,
         pathfinding_timeout_ms,
         journal,
+        channels,
     )
     .await
     {
@@ -309,11 +384,44 @@ pub async fn bot_task(
                 respond_to,
             } => {
                 let result = bot.send_whisper(&target, &message).await;
+                // Tag bot output to history so tool-time history searches
+                // can attribute messages back to the bot (PLAN §2.4 C3).
+                if result.is_ok()
+                    && let Some(name) = bot.bot_username.read().await.as_ref()
+                {
+                    crate::chat::history::append_bot_output(
+                        name,
+                        Some(&target),
+                        &message,
+                        /* is_whisper */ true,
+                    );
+                }
                 if respond_to.send(result).is_err() {
                     warn!(
                         "[Bot] Whisper response channel dropped before ack (target={})",
                         target
                     );
+                }
+            }
+            BotInstruction::SendChat { content, respond_to } => {
+                // The chat module is responsible for the §2.2
+                // critical-section gate and pacing limits — by the time a
+                // SendChat reaches here, those checks have already run. The
+                // bot layer is a dumb wire: send what it's given, ack the
+                // result.
+                let result = bot.send_chat_message(&content).await;
+                if result.is_ok()
+                    && let Some(name) = bot.bot_username.read().await.as_ref()
+                {
+                    crate::chat::history::append_bot_output(
+                        name,
+                        None,
+                        &content,
+                        /* is_whisper */ false,
+                    );
+                }
+                if respond_to.send(result).is_err() {
+                    warn!("[Bot] SendChat response channel dropped before ack");
                 }
             }
             BotInstruction::InteractWithChestAndSync {
@@ -720,29 +828,112 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             state.connected = true;
             *state.client.write().await = Some(client.clone());
             state.connecting.store(false, Ordering::SeqCst);
+            // PLAN §2.4: populate bot_username from the Mojang account
+            // profile once login completes. The chat module observes this
+            // and refuses to compose until it is `Some(_)`.
+            let username = client.profile().name.clone();
+            *state.bot_username.write().await = Some(username.clone());
+            debug!("[Event] bot_username populated: {}", username);
         }
         Event::Chat(m) => {
             let message_text = m.message().to_string();
             tracing::debug!("Chat message received: {}", message_text);
 
-            // Log ALL whispers at info level, regardless of store connection
-            if message_text.contains("whispers:") {
-                let sender = m.sender().unwrap_or_else(|| "Unknown".to_string());
-                let content = if let Some(pos) = message_text.find("whispers:") {
-                    message_text[pos + 9..].trim()
-                } else {
-                    ""
-                };
-                info!("Received whisper from {}: {}", sender, content);
+            // Parse once. `parse_chat_line` distinguishes whisper vs public
+            // chat and strips the prefix. Both branches publish to the
+            // legacy `chat_tx` (trade-failure detection) AND to the typed
+            // chat-events channel + history mpsc.
+            let parsed = parse_chat_line(&m, &message_text);
+
+            // Log whispers at info level (existing behavior).
+            if let Some(ref p) = parsed
+                && p.kind == ChatEventKind::Whisper
+            {
+                info!("Received whisper from {}: {}", p.sender, p.content);
             }
 
-            // Broadcast chat to the bot task for trade failure detection.
+            // Step 1: legacy chat_tx publish FIRST — trade-failure
+            // detection in trade.rs is latency-sensitive (PLAN §2.2).
             let _ = state.chat_tx.send(message_text);
 
-            if let Some(store_tx) = &state.store_tx
-                && let Err(e) = handle_chat_message(client, m, store_tx).await
+            // Step 2: history try_send (durable logging path, PLAN §2.2 ADV11).
+            if let Some(ref p) = parsed {
+                let event = ChatEvent {
+                    kind: p.kind,
+                    sender: p.sender.clone(),
+                    content: p.content.clone(),
+                    recv_at: std::time::SystemTime::now(),
+                };
+                if let Err(e) = state.history_tx.try_send(event.clone()) {
+                    // Channel full or closed — increment drop counter and
+                    // emit at most one warn per 60 s to bound log volume
+                    // under sustained flooding.
+                    let mut drops = state.history_drops.lock();
+                    *drops += 1;
+                    let count = *drops;
+                    drop(drops);
+                    if count == 1 || count.is_multiple_of(60) {
+                        warn!(
+                            history_drops = count,
+                            error = ?e,
+                            "[Event] history mpsc try_send failed; durable history degraded"
+                        );
+                    }
+                }
+
+                // Step 3: typed broadcast for chat-decision pipeline.
+                // `send` failure here means no receiver yet — that's fine
+                // (chat task disabled or not yet subscribed); the failure
+                // is silent on purpose.
+                let _ = state.chat_events_tx.send(event);
+            }
+
+            // Step 4: whisper router. If chat is disabled or this is a
+            // command-shaped whisper, forward to Store; otherwise the
+            // chat module owns the response (and we don't pipe to Store
+            // to avoid the §2.3 "Unknown command" double-reply).
+            if let Some(p) = parsed
+                && p.kind == ChatEventKind::Whisper
+                && let Some(store_tx) = &state.store_tx
             {
-                error!("Error handling chat message: {}", e);
+                let route = crate::chat::conversation::route_whisper(
+                    &p.content,
+                    state.chat_config.enabled,
+                    state.chat_config.dry_run,
+                    &state.chat_config.command_prefixes,
+                    state.chat_config.command_typo_max_distance,
+                );
+                use crate::chat::conversation::WhisperRoute;
+                match route {
+                    WhisperRoute::Store => {
+                        let bot_message = BotMessage::PlayerCommand {
+                            player_name: p.sender.clone(),
+                            command: p.content.clone(),
+                        };
+                        if let Err(e) = store_tx
+                            .send(StoreMessage::FromBot(bot_message))
+                            .await
+                        {
+                            error!(
+                                "Failed to forward player command to store (sender={} command={}): {}",
+                                p.sender, p.content, e
+                            );
+                        }
+                    }
+                    WhisperRoute::Chat => {
+                        // Already published to chat_events_tx above.
+                        debug!(
+                            "[Event] whisper from {} routed to chat module",
+                            p.sender
+                        );
+                    }
+                    WhisperRoute::Drop => {
+                        debug!(
+                            "[Event] whisper from {} dropped (empty/sigil-only/<2 chars)",
+                            p.sender
+                        );
+                    }
+                }
             }
         }
         Event::Disconnect(reason) => {
@@ -753,6 +944,9 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             let disconnect_time = std::time::Instant::now();
             state.connected = false;
             *state.client.write().await = None;
+            // PLAN §2.4: clear bot_username so chat refuses to compose under
+            // a stale identity during the reconnect window.
+            *state.bot_username.write().await = None;
             state.connecting.store(false, Ordering::SeqCst);
             info!("[Event] Disconnect event processed - client cleared, flags updated");
             debug!(
@@ -765,38 +959,54 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
     Ok(())
 }
 
-async fn handle_chat_message(
-    _client: Client,
-    message: azalea::client_chat::ChatPacket,
-    store_tx: &mpsc::Sender<StoreMessage>,
-) -> anyhow::Result<()> {
-    let msg = message.message().to_string();
-    let sender = message.sender().unwrap_or_else(|| "Unknown".to_string());
+/// Parsed chat line — either a whisper (DM) or a public chat message.
+#[derive(Debug, Clone)]
+struct ParsedChat {
+    kind: ChatEventKind,
+    sender: String,
+    /// Already stripped of "X whispers:" / chat prefix.
+    content: String,
+}
 
-    if msg.contains("whispers:") {
-        // Whisper text was already logged at info! in handle_event; don't re-log here.
-        let content = if let Some(pos) = msg.find("whispers:") {
-            msg[pos + 9..].trim()
-        } else {
-            return Ok(());
-        };
+/// Parse a single Azalea `ChatPacket` into a [`ParsedChat`]. Returns
+/// `None` for messages with no recognizable sender — typically
+/// system/server lines that aren't player chat.
+fn parse_chat_line(message: &azalea::client_chat::ChatPacket, message_text: &str) -> Option<ParsedChat> {
+    let sender = message.sender()?;
 
-        let bot_message = BotMessage::PlayerCommand {
-            player_name: sender.clone(),
-            command: content.to_string(),
-        };
-
-        let store_message = StoreMessage::FromBot(bot_message);
-
-        if let Err(e) = store_tx.send(store_message).await {
-            error!(
-                "Failed to forward player command to store (sender={} command={}): {}",
-                sender, content, e
-            );
+    // Whisper detection: look for "whispers:" anywhere in the line. This
+    // is server-format-specific but matches the existing detection in
+    // `handle_chat_message` (the previous implementation).
+    if let Some(pos) = message_text.find("whispers:") {
+        let content = message_text[pos + "whispers:".len()..].trim().to_string();
+        if content.is_empty() {
+            return None;
         }
+        return Some(ParsedChat {
+            kind: ChatEventKind::Whisper,
+            sender,
+            content,
+        });
     }
 
-    Ok(())
+    // Public chat: best-effort extraction of "<sender> content". If the
+    // server format doesn't include the angle-bracketed prefix, fall back
+    // to using the raw message text. The chat module is robust to either.
+    let content = if let Some(rest) = message_text.split_once('>').map(|(_, r)| r.trim()) {
+        if rest.is_empty() {
+            message_text.to_string()
+        } else {
+            rest.to_string()
+        }
+    } else {
+        message_text.to_string()
+    };
+
+    Some(ParsedChat {
+        kind: ChatEventKind::Public,
+        sender,
+        content,
+    })
 }
 
 #[cfg(test)]

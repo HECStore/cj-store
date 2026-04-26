@@ -73,7 +73,9 @@ pub async fn handle_player_command(
         return utils::send_message_to_player(store, player_name, &msg).await;
     }
 
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     // Rate-limit check precedes parsing so malformed spam still counts
@@ -245,6 +247,7 @@ mod tests {
             max_orders: 1000,
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
         }
     }
 

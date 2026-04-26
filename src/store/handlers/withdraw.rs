@@ -67,7 +67,9 @@ pub async fn handle_withdraw_balance_queued(
     // 12 trade-window slots * 64 items per stack = 768 diamonds per trade.
     const MAX_TRADE_DIAMONDS: i32 = 12 * 64;
 
-    let user_uuid = utils::resolve_user_uuid(player_name).await?;
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
+        .await
+        .map_err(StoreError::ValidationError)?;
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     let user_balance = store.expect_user(&user_uuid, "withdraw-balance/pre-check")?.balance;

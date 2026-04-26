@@ -362,7 +362,7 @@ async fn handle_help_command(
     player_name: &str,
     command: Option<&str>,
 ) -> Result<(), StoreError> {
-    let user_uuid = utils::resolve_user_uuid(player_name).await.ok();
+    let user_uuid = crate::mojang::resolve_user_uuid(player_name).await.ok();
     let is_op = user_uuid
         .as_ref()
         .map(|u| utils::is_operator(store, u))
@@ -516,7 +516,7 @@ async fn handle_help_command(
 
 async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64, String> {
     state::assert_invariants(store, "pre-balance", false)?;
-    let uuid = utils::resolve_user_uuid(username).await?;
+    let uuid = crate::mojang::resolve_user_uuid(username).await?;
     utils::ensure_user_exists(store, username, &uuid);
     let bal = store.users.get(&uuid).map(|u| u.balance).unwrap_or(0.0);
     if !bal.is_finite() || bal < 0.0 {
@@ -547,8 +547,12 @@ pub async fn pay_async(
         return Err(StoreError::ValidationError("Amount must be positive".to_string()));
     }
 
-    let payer_uuid = utils::resolve_user_uuid(payer_username).await?;
-    let payee_uuid = utils::resolve_user_uuid(payee_username).await?;
+    let payer_uuid = crate::mojang::resolve_user_uuid(payer_username)
+        .await
+        .map_err(StoreError::ValidationError)?;
+    let payee_uuid = crate::mojang::resolve_user_uuid(payee_username)
+        .await
+        .map_err(StoreError::ValidationError)?;
 
     if !store.users.contains_key(&payer_uuid) {
         return Err(StoreError::ValidationError(format!(
@@ -618,6 +622,7 @@ mod tests {
             max_orders: 1000,
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
         };
         Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), Storage::default())
     }

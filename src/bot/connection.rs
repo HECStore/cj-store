@@ -2,9 +2,18 @@
 
 use super::{Bot, BotState, handle_event_fn};
 use azalea::account::Account;
+use azalea_viaversion::ViaVersionPlugin;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info, warn};
+
+/// Target Minecraft protocol version translated to by the ViaVersion plugin.
+///
+/// Azalea itself follows Mojang's latest release; this string tells ViaProxy
+/// which older protocol to translate down to so the bot can connect to a
+/// server that hasn't been bumped yet. Update this when the target server is
+/// upgraded.
+const VIA_TARGET_VERSION: &str = "1.21.10";
 
 /// Connect the bot to the server
 pub async fn connect(
@@ -62,6 +71,11 @@ pub async fn connect(
     let task_account = account_name.clone();
     let task_server = server_address.clone();
 
+    // ViaVersionPlugin::start downloads ViaProxy on first run and spawns it,
+    // so it's done outside the LocalSet task to avoid blocking the client
+    // future and to surface install errors as a normal connect failure.
+    let via_plugin = ViaVersionPlugin::start(VIA_TARGET_VERSION).await;
+
     // Azalea's ClientBuilder::start returns !Send, so it must run on a LocalSet
     // (see main.rs). tokio::spawn would fail to compile.
     let handle = tokio::task::spawn_local(async move {
@@ -75,6 +89,7 @@ pub async fn connect(
         // in a direct bevy dep. start() returns AppExit; any real connection error is
         // reported separately via Event::Disconnect.
         let exit = azalea::ClientBuilder::new()
+            .add_plugins(via_plugin)
             .set_handler(handle_event_fn)
             .set_state(initial_state)
             .start(account, task_server.clone())

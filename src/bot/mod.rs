@@ -978,10 +978,7 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
                             player_name: p.sender.clone(),
                             command: p.content.clone(),
                         };
-                        if let Err(e) = store_tx
-                            .send(StoreMessage::FromBot(bot_message))
-                            .await
-                        {
+                        if let Err(e) = store_tx.send(StoreMessage::FromBot(bot_message)).await {
                             error!(
                                 "Failed to forward player command to store (sender={} command={}): {}",
                                 p.sender, p.content, e
@@ -990,10 +987,7 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
                     }
                     WhisperRoute::Chat => {
                         // Already published to chat_events_tx above.
-                        debug!(
-                            "[Event] whisper from {} routed to chat module",
-                            p.sender
-                        );
+                        debug!("[Event] whisper from {} routed to chat module", p.sender);
                     }
                     WhisperRoute::Drop => {
                         debug!(
@@ -1039,7 +1033,10 @@ struct ParsedChat {
 /// Parse a single Azalea `ChatPacket` into a [`ParsedChat`]. Returns
 /// `None` for messages with no recognizable sender — typically
 /// system/server lines that aren't player chat.
-fn parse_chat_line(message: &azalea::client_chat::ChatPacket, message_text: &str) -> Option<ParsedChat> {
+fn parse_chat_line(
+    message: &azalea::client_chat::ChatPacket,
+    message_text: &str,
+) -> Option<ParsedChat> {
     let sender = message.sender()?;
 
     // Whisper detection: look for "whispers:" anywhere in the line. This
@@ -1118,14 +1115,23 @@ mod tests {
     #[test]
     fn bot_state_default_starts_disconnected_and_idle() {
         let state = BotState::default();
-        assert!(!state.connected, "new BotState must not claim to be connected");
-        assert!(state.store_tx.is_none(), "new BotState must have no store channel");
+        assert!(
+            !state.connected,
+            "new BotState must not claim to be connected"
+        );
+        assert!(
+            state.store_tx.is_none(),
+            "new BotState must have no store channel"
+        );
         assert!(
             !state.connecting.load(Ordering::SeqCst),
             "new BotState must not claim a connect is in flight"
         );
         // Client handle is present but holds no Client yet.
-        let guard = state.client.try_read().expect("client RwLock should not be poisoned");
+        let guard = state
+            .client
+            .try_read()
+            .expect("client RwLock should not be poisoned");
         assert!(guard.is_none(), "new BotState must have no attached Client");
     }
 
@@ -1138,7 +1144,9 @@ mod tests {
         let state = BotState::default();
         let mut rx = state.chat_tx.subscribe();
         state.chat_tx.send("hello".to_string()).expect("send");
-        let got = rx.try_recv().expect("receiver should have a message buffered");
+        let got = rx
+            .try_recv()
+            .expect("receiver should have a message buffered");
         assert_eq!(got, "hello");
     }
 }

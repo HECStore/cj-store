@@ -38,6 +38,11 @@ mod types;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load `.env` from the working directory if present. Real process
+    // env vars take precedence over `.env` entries — `.env` is fallback,
+    // not override. Silently no-ops if the file is missing.
+    let _ = dotenvy::dotenv();
+
     // CLI flag parsing — kept tiny on purpose (no clap dependency).
     // Supported:
     //   --validate-only / --dry-run : load + validate config, then exit.

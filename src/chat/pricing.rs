@@ -8,9 +8,10 @@
 //! Rates are USD per **million** tokens, matching how Anthropic publishes
 //! them. `usd_for_tokens` accepts raw token counts and returns USD.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -18,6 +19,11 @@ use tracing::{info, warn};
 use crate::fsutil::write_atomic;
 
 pub const PRICING_FILE: &str = "data/chat/pricing.json";
+
+/// Tracks model names that `usd_for_call` has already warned about, so the
+/// "unknown model, billing $0.00" log fires exactly once per process per
+/// model rather than spamming on every call.
+static SEEN_UNKNOWN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// Per-model rates in USD per million tokens. The classifier uses Haiku
 /// rates; the composer uses Opus rates. Cache-write and cache-read are
@@ -91,11 +97,52 @@ impl PricingTable {
         }
         let s = fs::read_to_string(path)?;
         match serde_json::from_str::<PricingTable>(&s) {
-            Ok(t) if t.version == VERSION => Ok(t),
-            Ok(_) | Err(_) => {
+            Ok(t) if t.version == VERSION => {
+                for (name, r) in &t.rates {
+                    let cw = r.cache_write_per_million.unwrap_or(0.0);
+                    let cr = r.cache_read_per_million.unwrap_or(0.0);
+                    if !r.input_per_million.is_finite()
+                        || r.input_per_million < 0.0
+                        || !r.output_per_million.is_finite()
+                        || r.output_per_million < 0.0
+                        || !cw.is_finite()
+                        || cw < 0.0
+                        || !cr.is_finite()
+                        || cr < 0.0
+                    {
+                        warn!(
+                            path = %path.display(),
+                            model = %name,
+                            "pricing.json has invalid rates (non-finite or negative); using built-in defaults (file unchanged)"
+                        );
+                        return Ok(Self::default_table());
+                    }
+                }
+                Ok(t)
+            }
+            Ok(t) if t.version > VERSION => {
                 warn!(
                     path = %path.display(),
-                    "pricing.json unparseable or wrong version; using built-in defaults (file unchanged)"
+                    found = t.version,
+                    expected = VERSION,
+                    "pricing.json was written by a newer build; falling back to built-in defaults (file unchanged)"
+                );
+                Ok(Self::default_table())
+            }
+            Ok(t) => {
+                warn!(
+                    path = %path.display(),
+                    found = t.version,
+                    expected = VERSION,
+                    "pricing.json version mismatch; using built-in defaults (file unchanged)"
+                );
+                Ok(Self::default_table())
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "pricing.json parse error; using built-in defaults (file unchanged)"
                 );
                 Ok(Self::default_table())
             }
@@ -104,20 +151,73 @@ impl PricingTable {
 
     /// Compute USD cost for a given model + token spend. Returns 0.0 if
     /// the model is unknown — better to under-report cost than crash on
-    /// a freshly-deployed model name; the daily-cap meter logs unknowns
-    /// once at warn level.
+    /// a freshly-deployed model name; this function logs unknowns once
+    /// at warn level (see [`usd_for_call`]).
+    ///
+    /// Cache tokens are NOT charged here. Use [`usd_for_call`] when the
+    /// API response carries `cache_creation_input_tokens` /
+    /// `cache_read_input_tokens` — that path bills cache writes at the
+    /// premium rate and cache reads at the discount rate so the daily
+    /// USD cap reflects what Anthropic will actually invoice.
     pub fn usd_for_tokens(
         &self,
         model: &str,
         input_tokens: u64,
         output_tokens: u64,
     ) -> f64 {
+        self.usd_for_call(model, input_tokens, output_tokens, 0, 0)
+    }
+
+    /// Like [`usd_for_tokens`] but also bills cache-creation and
+    /// cache-read tokens. Anthropic reports them separately from
+    /// `input_tokens`; ignoring them lets the meter UNDERESTIMATE real
+    /// spend (cache writes cost 1.25-2× the base input rate) and the
+    /// `daily_dollar_cap_usd` safety net would silently overrun.
+    ///
+    /// Falls back to the base input rate when a model's
+    /// `cache_write_per_million` / `cache_read_per_million` is not
+    /// declared — optimistic for cache writes (under-bills relative to
+    /// the true ~1.25-2× rate), pessimistic for cache reads (over-bills
+    /// relative to the true ~0.1× rate), but never panics on a
+    /// freshly-deployed model.
+    ///
+    /// Unknown models bill as $0.00 and this function logs them once at
+    /// warn level so a misconfigured composer model is visible to the
+    /// operator instead of silently disabling the daily USD cap.
+    pub fn usd_for_call(
+        &self,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+    ) -> f64 {
         let Some(r) = self.rates.get(model) else {
+            let seen = SEEN_UNKNOWN.get_or_init(|| Mutex::new(HashSet::new()));
+            if let Ok(mut set) = seen.lock()
+                && set.insert(model.to_string())
+            {
+                warn!(
+                    model = %model,
+                    "pricing: unknown model, billing as $0.00 — add it to data/chat/pricing.json to enforce the daily USD cap"
+                );
+            }
             return 0.0;
         };
+        let cache_write_rate = r
+            .cache_write_per_million
+            .unwrap_or(r.input_per_million);
+        let cache_read_rate = r
+            .cache_read_per_million
+            .unwrap_or(r.input_per_million);
         let input_usd = (input_tokens as f64) * r.input_per_million / 1_000_000.0;
         let output_usd = (output_tokens as f64) * r.output_per_million / 1_000_000.0;
-        input_usd + output_usd
+        let cache_write_usd =
+            (cache_creation_input_tokens as f64) * cache_write_rate / 1_000_000.0;
+        let cache_read_usd =
+            (cache_read_input_tokens as f64) * cache_read_rate / 1_000_000.0;
+        let total = input_usd + output_usd + cache_write_usd + cache_read_usd;
+        if total.is_finite() && total >= 0.0 { total } else { 0.0 }
     }
 }
 
@@ -164,6 +264,33 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let back: PricingTable = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn usd_for_call_bills_cache_creation_at_premium_rate() {
+        // Cache creation is more expensive than base input; verify
+        // 1M cache-write tokens cost more than 1M plain input tokens
+        // for Opus (defaults: input=15.0, cache_write=18.75).
+        let t = PricingTable::default_table();
+        let plain = t.usd_for_call("claude-opus-4-7", 1_000_000, 0, 0, 0);
+        let with_cache_write = t.usd_for_call("claude-opus-4-7", 0, 0, 1_000_000, 0);
+        assert!(
+            with_cache_write > plain,
+            "cache_write must cost more than base input ({with_cache_write} vs {plain})"
+        );
+    }
+
+    #[test]
+    fn usd_for_call_bills_cache_read_at_discount_rate() {
+        // Cache reads are far cheaper than base input.
+        let t = PricingTable::default_table();
+        let plain = t.usd_for_call("claude-opus-4-7", 1_000_000, 0, 0, 0);
+        let cache_read = t.usd_for_call("claude-opus-4-7", 0, 0, 0, 1_000_000);
+        assert!(
+            cache_read < plain,
+            "cache_read must cost less than base input ({cache_read} vs {plain})"
+        );
+        assert!(cache_read > 0.0, "cache_read should still be billed");
     }
 
     #[test]

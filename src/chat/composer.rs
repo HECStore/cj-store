@@ -112,6 +112,17 @@ or stay silent. Hard rules:
     )
 }
 
+/// Substitute a placeholder when `text` is empty. Anthropic rejects
+/// `cache_control` on empty text blocks, so any cached system block
+/// whose backing file is missing/empty needs a non-empty body.
+fn non_empty_or_placeholder(text: &str, label: &str) -> String {
+    if text.is_empty() {
+        format!("(no {label} entries yet)\n")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Assemble the [`CreateMessageRequest`] for a composer call. The
 /// returned request has cache breakpoints placed:
 /// memory.md (block 3) and adjustments.md (block 4) carry
@@ -146,8 +157,10 @@ pub fn build_request(
     });
 
     // Block 3 — memory.md. Trusted, **cache breakpoint** here.
+    // Anthropic rejects empty text blocks with cache_control set, so a
+    // missing/empty memory.md falls back to a placeholder.
     system.push(SystemBlock::Text {
-        text: snapshot.memory_md.clone(),
+        text: non_empty_or_placeholder(&snapshot.memory_md, "memory.md"),
         cache_control: Some(CacheControl::ephemeral(cache_ttl)),
     });
 
@@ -155,7 +168,7 @@ pub fn build_request(
     // Splitting from memory.md isolates reflection-pass mutations from
     // persona/memory cache.
     system.push(SystemBlock::Text {
-        text: snapshot.adjustments_md.clone(),
+        text: non_empty_or_placeholder(&snapshot.adjustments_md, "adjustments.md"),
         cache_control: Some(CacheControl::ephemeral(cache_ttl)),
     });
 
@@ -274,6 +287,7 @@ pub async fn run_loop(
     max_iterations: u32,
     use_extended_cache: bool,
     rate_limiter: Option<&crate::chat::client::RateLimiter>,
+    nonce: &str,
 ) -> Result<ComposerRun, String> {
     let mut req = initial_request;
     let mut input_tokens = 0u64;
@@ -370,6 +384,43 @@ pub async fn run_loop(
                 if crate::chat::client::is_server_side_tool(name) {
                     continue;
                 }
+                // Daily-cap enforcement WITHIN a single composer run.
+                // The tool's own check uses `tool_ctx.update_self_memory_today`
+                // (or `web_fetches_today`), which is a snapshot taken
+                // before this composer dispatch — so if the model fires
+                // the same tool repeatedly inside one run, every call
+                // sees the stale pre-call count and the cap is silently
+                // exceeded by up to `max_iterations`. Combine the
+                // snapshot with the in-run tally and short-circuit
+                // before dispatch when the live total would breach.
+                let (cap_now, cap_max) = match name.as_str() {
+                    "update_self_memory" => (
+                        tool_ctx
+                            .update_self_memory_today
+                            .saturating_add(update_self_memory_calls),
+                        tool_ctx.update_self_memory_max_per_day,
+                    ),
+                    "web_fetch" => (
+                        tool_ctx
+                            .web_fetches_today
+                            .saturating_add(web_fetch_calls),
+                        tool_ctx.web_fetch_daily_max,
+                    ),
+                    _ => (0, u32::MAX),
+                };
+                if cap_now >= cap_max {
+                    let msg = format!(
+                        "{name} daily cap reached ({cap_now}/{cap_max}); will be available tomorrow"
+                    );
+                    let wrapped = wrap_untrusted("tool_result", nonce, &msg)
+                        .unwrap_or_else(|_| "[content withheld]".to_string());
+                    tool_results.push(crate::chat::client::ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: wrapped,
+                        is_error: true,
+                    });
+                    continue;
+                }
                 let (text, is_err) = crate::chat::tools::dispatch(name, input, tool_ctx).await;
                 if !is_err {
                     if name == "update_self_memory" {
@@ -378,9 +429,19 @@ pub async fn run_loop(
                         web_fetch_calls += 1;
                     }
                 }
+                // Wrap tool result content in `<untrusted_tool_result_*>`
+                // per the static-rules contract — tool results often
+                // include player-authored text (memory bullets, history
+                // lines, fetched web bodies) which the model must treat
+                // as data, not instructions. `wrap_untrusted` rejects
+                // content containing literal `<untrusted` to defeat
+                // injected fake closers; on rejection we fall back to a
+                // neutral placeholder.
+                let wrapped = wrap_untrusted("tool_result", nonce, &text)
+                    .unwrap_or_else(|_| "[content withheld]".to_string());
                 tool_results.push(crate::chat::client::ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
-                    content: text,
+                    content: wrapped,
                     is_error: is_err,
                 });
             }
@@ -604,6 +665,40 @@ mod tests {
             SystemBlock::Text { text, .. } => text.contains("PLAYER_MEMORY_MARKER"),
         });
         assert!(!any_has_marker);
+    }
+
+    #[test]
+    fn build_request_substitutes_placeholder_for_empty_cached_blocks() {
+        // Regression: Anthropic rejects empty text blocks with
+        // cache_control set ("system.2: cache_control cannot be set for
+        // empty text blocks"). A fresh install with no memory.md /
+        // adjustments.md must still produce a valid request.
+        let snap = PromptSnapshot {
+            static_rules: "rules".into(),
+            persona: "persona".into(),
+            memory_md: String::new(),
+            adjustments_md: String::new(),
+            player_memory: None,
+            history_slice: "hist".into(),
+        };
+        let req = build_request(
+            "claude-opus-4-7".to_string(),
+            128,
+            None,
+            &snap,
+            vec![],
+            vec![],
+            CacheTtl::Ephemeral5Min,
+        );
+        for (i, block) in req.system.iter().enumerate() {
+            let SystemBlock::Text { text, cache_control } = block;
+            if cache_control.is_some() {
+                assert!(
+                    !text.is_empty(),
+                    "system block {i} has cache_control but empty text",
+                );
+            }
+        }
     }
 
     #[test]

@@ -73,12 +73,20 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
     {
         return Err(UrlError::BadFormat);
     }
-    // Scheme split.
-    let lower = input.to_lowercase();
-    let (scheme, rest) = if let Some(rest) = lower.strip_prefix("https://") {
-        (Scheme::Https, &input[8..8 + rest.len()])
-    } else if let Some(rest) = lower.strip_prefix("http://") {
-        (Scheme::Http, &input[7..7 + rest.len()])
+    // Scheme split. Done via byte-level ASCII-case-insensitive prefix
+    // match so a URL containing Unicode that changes byte length on
+    // lowercase (e.g. Turkish 'İ' → "i\u{307}") cannot break the
+    // length-based slice and panic. The first 7-8 bytes of any valid
+    // http(s) URL are ASCII, so slicing at byte 7/8 is char-aligned.
+    let bytes = input.as_bytes();
+    let (scheme, rest) = if bytes.len() >= 8
+        && bytes[..8].eq_ignore_ascii_case(b"https://")
+    {
+        (Scheme::Https, &input[8..])
+    } else if bytes.len() >= 7
+        && bytes[..7].eq_ignore_ascii_case(b"http://")
+    {
+        (Scheme::Http, &input[7..])
     } else {
         return Err(UrlError::BadScheme);
     };
@@ -373,10 +381,20 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
             Host::Name(name) => {
                 let port = port_for(&safe);
                 let lookup = format!("{name}:{port}");
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host(lookup)
-                    .await
-                    .map_err(|e| format!("DNS lookup failed: {e}"))?
-                    .collect();
+                // Bound DNS resolution by the same 5 s budget as the HTTP
+                // call. Without this, a slow / hung system resolver could
+                // block the chat task for the OS default (often 15 s+ on
+                // Windows) before the reqwest timeout takes over.
+                let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+                    std::time::Duration::from_secs(FETCH_TIMEOUT_SECS),
+                    tokio::net::lookup_host(lookup),
+                )
+                .await
+                {
+                    Ok(Ok(it)) => it.collect(),
+                    Ok(Err(e)) => return Err(format!("DNS lookup failed: {e}")),
+                    Err(_) => return Err("DNS lookup timed out".to_string()),
+                };
                 let mut accepted = Vec::with_capacity(addrs.len());
                 for a in addrs {
                     if is_denied_ip(a.ip()) {
@@ -514,14 +532,28 @@ fn port_for(safe: &SafeUrl) -> u16 {
 }
 
 fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
-    // Absolute URL — pass through; will be re-validated.
-    if location.starts_with("http://") || location.starts_with("https://") {
+    // Absolute URL — pass through; will be re-validated. Match
+    // case-insensitively because validate_url accepts mixed-case schemes.
+    let loc_bytes = location.as_bytes();
+    let loc_is_absolute = (loc_bytes.len() >= 7
+        && loc_bytes[..7].eq_ignore_ascii_case(b"http://"))
+        || (loc_bytes.len() >= 8 && loc_bytes[..8].eq_ignore_ascii_case(b"https://"));
+    if loc_is_absolute {
         return Ok(location.to_string());
     }
     // Path-absolute or path-relative — splice onto the base authority.
-    let scheme_len = if base.starts_with("https://") { 8 }
-        else if base.starts_with("http://") { 7 }
-        else { return Err("base URL has no http(s) scheme".to_string()); };
+    let base_bytes = base.as_bytes();
+    let scheme_len = if base_bytes.len() >= 8
+        && base_bytes[..8].eq_ignore_ascii_case(b"https://")
+    {
+        8
+    } else if base_bytes.len() >= 7
+        && base_bytes[..7].eq_ignore_ascii_case(b"http://")
+    {
+        7
+    } else {
+        return Err("base URL has no http(s) scheme".to_string());
+    };
     let after = &base[scheme_len..];
     let path_start = after.find('/').unwrap_or(after.len());
     let authority = &after[..path_start];
@@ -575,6 +607,20 @@ mod tests {
     use super::*;
 
     // ---- validate_url ---------------------------------------------------
+
+    #[test]
+    fn uppercase_scheme_accepted_and_resolves_relative() {
+        // Regression: validate_url used to lowercase the entire URL and
+        // slice the original by lowercase-derived length, which panicked
+        // when Unicode chars changed byte length on lowercase. Verify the
+        // uppercase case still works.
+        let u = validate_url("HTTPS://example.com/path").unwrap();
+        assert_eq!(u.scheme, Scheme::Https);
+        // resolve_relative used case-sensitive `starts_with` so a
+        // mixed-case base URL would error. Verify it now works.
+        let r = resolve_relative("HTTPS://example.com/a/b", "/c").unwrap();
+        assert_eq!(r, "HTTPS://example.com/c");
+    }
 
     #[test]
     fn https_with_textual_host_accepted() {

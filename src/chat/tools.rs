@@ -819,7 +819,14 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
                 if line.to_lowercase().contains(&q_lc) {
                     let mut excerpt = line.to_string();
                     if excerpt.len() > max_excerpt {
-                        excerpt.truncate(max_excerpt);
+                        // Round down to a char boundary; `String::truncate`
+                        // panics if the index falls mid-codepoint, and
+                        // history lines can contain multi-byte chat content.
+                        let mut cut = max_excerpt;
+                        while cut > 0 && !excerpt.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        excerpt.truncate(cut);
                         excerpt.push_str(" ...[truncated]");
                     }
                     matches.push(excerpt);

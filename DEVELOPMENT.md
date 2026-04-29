@@ -9,11 +9,11 @@ see [ARCHITECTURE.md](ARCHITECTURE.md); for on-disk formats see
 
 - **Rust edition 2024** (stabilized in Rust 1.85, Feb 2025). The **nightly
   toolchain** is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
-  The pin is there because Azalea's transitive dependency graph sometimes
-  requires nightly features — it is not a project-internal choice. If
-  `.cargo/config.toml` is present in your tree, inspect its `-Z...` flags
-  before attempting a stable build; remove them to drop the nightly
-  requirement.
+  The pin is required because [`.cargo/config.toml`](.cargo/config.toml)
+  sets `-Zshare-generics=y`, a nightly-only flag. Azalea's transitive
+  dependency graph may also require nightly features. To drop the nightly
+  requirement, remove the `-Z...` flags from `.cargo/config.toml` before
+  attempting a stable build.
 - Tested on Windows; Linux and macOS should work unchanged.
 - Logs go **only** to `data/logs/store.log`. `stdout` gets a handful of
   startup lines telling the operator how to tail the log (the exact
@@ -32,7 +32,8 @@ architectural layer. They meet at the Store boundary.
 `assert_invariants` returns. See [src/error.rs](src/error.rs) for the
 canonical variant list; at time of writing the variants are
 `UnknownPair`, `UnknownUser`, `BotDisconnected`, `TradeTimeout`,
-`TradeRejected`, `BotError`, `ValidationError`, `ChestOp`,
+`TradeRejected`, `BotSendFailed`, `BotResponseDropped`,
+`BotReportedError`, `ValidationError`, `ChestOp`,
 `InvariantViolation`, and `Io`. Only `From<StoreError> for String` is
 implemented (so handlers can stringify at the outermost whisper-pipeline
 boundary); the reverse direction is intentionally **not** implemented —
@@ -44,7 +45,8 @@ helpers must be wrapped at their call sites with an explicit variant.
 
 Bot-internal operations use stringly-typed errors. They are converted to
 the appropriate `StoreError` variant at the Store boundary (typically
-`StoreError::BotError` or `ChestOp`).
+`StoreError::BotSendFailed`, `BotResponseDropped`, `BotReportedError`,
+or `ChestOp`).
 
 ### Persistence — `Result<(), Box<dyn Error>>`
 

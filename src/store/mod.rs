@@ -286,7 +286,7 @@ impl Store {
             // to here so a lingering dirty flag is flushed on the configured
             // cadence even with zero inbound traffic.
             if self.dirty && last_save.elapsed() >= min_save_interval {
-                if let Err(e) = state::save(&self) {
+                if let Err(e) = state::save(&mut self) {
                     error!("[Store] Autosave failed: {}", e);
                 } else {
                     last_save = tokio::time::Instant::now();
@@ -330,7 +330,7 @@ impl Store {
                 // Save eagerly after every order so trades and stock updates
                 // cannot be lost to a crash before the next debounced autosave.
                 if self.dirty {
-                    if let Err(e) = state::save(&self) {
+                    if let Err(e) = state::save(&mut self) {
                         error!("[Store] Autosave failed: {}", e);
                     } else {
                         last_save = tokio::time::Instant::now();
@@ -390,7 +390,7 @@ impl Store {
 
                     // Debounced autosave: save at most every `min_save_interval`.
                     if self.dirty && last_save.elapsed() >= min_save_interval {
-                        if let Err(e) = state::save(&self) {
+                        if let Err(e) = state::save(&mut self) {
                             error!("[Store] Autosave failed: {}", e);
                         } else {
                             last_save = tokio::time::Instant::now();
@@ -410,7 +410,7 @@ impl Store {
         // the on-disk snapshot is guaranteed to mirror the full in-memory map
         // regardless of what the tracked dirty set happens to contain.
         self.dirty_users.extend(self.users.keys().cloned());
-        if let Err(e) = state::save(&self) {
+        if let Err(e) = state::save(&mut self) {
             error!("[Store] Final save failed: {}", e);
         }
         drop(bot_tx);
@@ -573,6 +573,18 @@ impl Store {
         }
         if self.config.max_trades_in_memory != new.max_trades_in_memory {
             warn!("Config field 'max_trades_in_memory' changed but requires restart");
+        }
+
+        // Chat fields are restart-only as a group: the chat task is
+        // spawned once at startup with a snapshot of `chat.*`, so any
+        // edit (enabling chat, changing model, raising caps) needs a
+        // fresh process. Comparing the whole `ChatConfig` blob avoids
+        // listing every field by name; we just tell the operator.
+        if self.config.chat != new.chat {
+            warn!(
+                "Config section 'chat' changed but requires restart \
+                 (chat task is spawned once at startup; restart cj-store to apply)"
+            );
         }
 
         if applied.is_empty() {

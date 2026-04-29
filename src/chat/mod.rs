@@ -1,14 +1,10 @@
 //! # Chat module — natural-language chat AI
 //!
 //! Disabled by default behind `chat.enabled = false`. See CHAT.md for the
-//! full design. This Phase 1 skeleton wires up:
-//! - [`ChatEvent`](crate::messages::ChatEvent) broadcast subscription.
-//! - [`ChatCommand`](crate::messages::ChatCommand) command channel.
-//! - The whisper router ([`conversation::route_whisper`]) used by the bot
-//!   layer to split inbound whispers between Store and Chat.
-//!
-//! The actual Anthropic API client, classifier, composer, persona, memory,
-//! and tool-use loop are stubbed out and arrive in later phases.
+//! full design. The orchestration entry point is [`chat_task`]; per-event
+//! flow (pre-filter → classifier → composer → pacing → send) lives in
+//! [`process_event`]. Whisper routing happens at the bot layer via
+//! [`conversation::route_whisper`].
 
 pub mod classifier;
 pub mod client;
@@ -55,10 +51,10 @@ pub struct ChatStatusReport {
     pub moderation_backoff_until: Option<String>,
     /// CHAT.md — operator-facing fields filled by chat orchestrator.
     pub model_404_backoff_until: Option<String>,
+    pub composer_throttle_backoff_until: Option<String>,
     pub persona_regen_cooldown_until: Option<String>,
     pub last_persona_regenerated_at: Option<String>,
     pub pending_adjustments_count: u32,
-    pub uuid_resolve_queue_depth: u32,
     pub critical_section_active: bool,
     pub last_composer_call_at: Option<String>,
     pub last_composer_call_usd: f64,
@@ -180,13 +176,29 @@ pub async fn chat_task(
         }
     };
 
-    // Run the retention sweep on startup.
+    // CHAT.md: seed `bot_username` from the cached `last_known_bot_username`
+    // so events arriving in the pre-Init window (join broadcasts, early
+    // chat) aren't dropped with `bot_username_unknown`. `Event::Init`
+    // overwrites this with the authoritative value once the handshake
+    // completes, and divergence between the two is logged in `bot::handle_event`.
+    if let Some(cached) = runtime_state.last_known_bot_username.clone() {
+        let mut guard = bot_username.write().await;
+        if guard.is_none() {
+            info!(cached_username = %cached, "[Chat] seeded bot_username from cached state for pre-Init window");
+            *guard = Some(cached);
+        }
+    }
+
+    // Run the retention sweep on startup. Honor config values rather
+    // than the 30/30/10 defaults — operators that lowered retention
+    // were silently kept on the defaults at startup; only the daily
+    // sweep used the configured values.
     if let Some(today) = retention::sweep_due_today(None) {
         let cfg = retention::SweepConfig {
             chat_dir: PathBuf::from(memory::CHAT_DIR),
-            history_retention_days: 30,
-            decisions_retention_days: 30,
-            persona_archive_max: 10,
+            history_retention_days: config.history_retention_days,
+            decisions_retention_days: config.decisions_retention_days,
+            persona_archive_max: config.persona_archive_max,
             today: chrono::Utc::now(),
         };
         let report = retention::run_sweep(&cfg);
@@ -195,6 +207,9 @@ pub async fn chat_task(
             deleted = report.total(),
             "[Chat] startup retention sweep complete"
         );
+        // Record so the per-event "first event of new day" trigger
+        // doesn't immediately re-run the same sweep.
+        runtime_state.last_sweep_day = Some(today);
     }
 
     // Per-channel sliding window of last 8 events for dyad detection.
@@ -246,6 +261,7 @@ pub async fn chat_task(
                         return;
                     }
                     Some(ChatCommand::Status { respond_to }) => {
+                        runtime_state.roll_to_today();
                         // Count pending_adjustments.jsonl lines for status display.
                         let pending_count = std::fs::read_to_string(
                             std::path::Path::new(memory::CHAT_DIR).join("pending_adjustments.jsonl"),
@@ -266,13 +282,14 @@ pub async fn chat_task(
                             history_drops_today: runtime_state.history_drops_today,
                             moderation_backoff_until: runtime_state.moderation_backoff_until.clone(),
                             model_404_backoff_until: runtime_state.model_404_backoff_until.clone(),
+                            composer_throttle_backoff_until: runtime_state
+                                .composer_throttle_backoff_until
+                                .clone(),
                             persona_regen_cooldown_until: runtime_state.persona_regen_cooldown_until.clone(),
                             last_persona_regenerated_at: runtime_state
                                 .last_persona_regenerated_at
                                 .clone(),
                             pending_adjustments_count: pending_count,
-                            uuid_resolve_queue_depth: runtime_state
-                                .uuid_resolve_queue_depth,
                             critical_section_active: in_critical_section.load(Ordering::Acquire),
                             last_composer_call_at: runtime_state
                                 .last_composer_call
@@ -289,6 +306,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(report);
                     }
                     Some(ChatCommand::SetPaused { paused, respond_to }) => {
+                        runtime_state.roll_to_today();
                         runtime_state.paused = paused;
                         info!(paused, "[Chat] pause flag updated");
                         if let Err(e) = runtime_state.save() {
@@ -297,6 +315,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(());
                     }
                     Some(ChatCommand::SetDryRun { dry_run, respond_to }) => {
+                        runtime_state.roll_to_today();
                         runtime_state.dry_run_runtime_override = dry_run;
                         info!(dry_run, "[Chat] dry-run override updated");
                         if let Err(e) = runtime_state.save() {
@@ -305,6 +324,7 @@ pub async fn chat_task(
                         let _ = respond_to.send(());
                     }
                     Some(ChatCommand::ClearModerationBackoff { respond_to }) => {
+                        runtime_state.roll_to_today();
                         let was = runtime_state.moderation_backoff_until.take();
                         info!(prior = ?was, "[Chat] moderation backoff cleared");
                         if let Err(e) = runtime_state.save() {
@@ -361,10 +381,12 @@ pub async fn chat_task(
                         )
                         .await;
                         if let Ok(ref outcome) = result {
-                            let usd = pricing.usd_for_tokens(
+                            let usd = pricing.usd_for_call(
                                 &config.classifier_model,
                                 outcome.haiku_input_tokens,
                                 outcome.haiku_output_tokens,
+                                outcome.haiku_cache_creation_input_tokens,
+                                outcome.haiku_cache_read_input_tokens,
                             );
                             runtime_state.record_classifier(
                                 &state::capture_today_utc(),
@@ -556,23 +578,36 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::ForgetPlayer { username, respond_to }) => {
-                        // CHAT.md — purge per-player file. Full
-                        // history-JSONL scrub is Phase 8 polish; the
-                        // user-facing GDPR handle is the per-player file
-                        // delete. The action is recorded to the operator
-                        // audit ledger so a later compliance review can
-                        // confirm the deletion happened.
+                        // CHAT.md GDPR purge: delete the per-player file
+                        // AND scrub matching records from history /
+                        // decisions JSONL files plus any uuids overlay
+                        // sidecars. The action is recorded to the
+                        // operator audit ledger so a later compliance
+                        // review can confirm the deletion happened.
                         let result = match resolve_username_via_index_or_mojang(&username).await {
                             Ok(uuid) => {
-                                let path = memory::player_file_path(&uuid);
-                                let outcome = if path.exists() {
-                                    std::fs::remove_file(&path).map_err(|e| e.to_string())
+                                let player_path = memory::player_file_path(&uuid);
+                                let player_outcome = if player_path.exists() {
+                                    std::fs::remove_file(&player_path).map_err(|e| e.to_string())
                                 } else {
                                     Ok(())
                                 };
-                                if outcome.is_ok() {
-                                    write_operator_audit("forget_player", &username, &uuid, "");
-                                }
+                                let scrub_outcome = scrub_history_for_player(&uuid, &username);
+                                let outcome = match (player_outcome, scrub_outcome) {
+                                    (Ok(()), Ok(stats)) => {
+                                        info!(
+                                            uuid = %uuid,
+                                            username = %username,
+                                            history_lines_removed = stats.history_lines,
+                                            decisions_lines_removed = stats.decisions_lines,
+                                            uuid_overlay_entries_removed = stats.overlay_entries,
+                                            "[Chat] forget_player completed"
+                                        );
+                                        write_operator_audit("forget_player", &username, &uuid, "");
+                                        Ok(())
+                                    }
+                                    (Err(e), _) | (_, Err(e)) => Err(e),
+                                };
                                 outcome
                             }
                             Err(e) => Err(e),
@@ -593,11 +628,23 @@ pub async fn chat_task(
                     Ok(event) => {
                         // Refresh runtime state's day rollover (lazy reset).
                         runtime_state.roll_to_today();
-                        // Maintain channel sliding window.
-                        if window.len() == 8 {
-                            window.pop_front();
+                        // Maintain channel sliding window — but skip system
+                        // pseudo-senders ([Server], plugin output, mod
+                        // broadcasts). They aren't conversational and would
+                        // pollute dyad detection: e.g. an alternating
+                        // [Server]/player flood would synthesize a false
+                        // dyad and silence legitimate player chat.
+                        let is_system = conversation::is_system_pseudo_sender(
+                            &event.sender,
+                            &system_senders_re,
+                            &system_senders_exact,
+                        );
+                        if !is_system {
+                            if window.len() == 8 {
+                                window.pop_front();
+                            }
+                            window.push_back(event.clone());
                         }
-                        window.push_back(event.clone());
 
                         // Persist `last_known_bot_username` on every transition
                         //. Cheap — the read returns immediately
@@ -626,10 +673,9 @@ pub async fn chat_task(
 
                         // CHAT.md — auto-trigger reflection when the
                         // pending file's size cap or idle window is met.
-                        // Only the size-cap branch is wired here; the idle
-                        // branch fires on each event (cheap check) when
-                        // the last composer call has been quiet long
-                        // enough.
+                        // Both branches are gated by `min_interval_elapsed`
+                        // so a quiet stretch can't fire reflection more
+                        // often than the operator-configured floor.
                         if reflection::min_interval_elapsed(
                             runtime_state.last_reflection_at.as_deref(),
                             config.reflection_min_interval_secs,
@@ -680,7 +726,7 @@ pub async fn chat_task(
                                 };
                                 let today_iso = chrono::Utc::now().format("%Y-%m-%d").to_string();
                                 let adj = read_adjustments_or_empty();
-                                let _ = reflection::run_pass(
+                                let auto_result = reflection::run_pass(
                                     &api_key,
                                     &config.classifier_model,
                                     &pending,
@@ -690,6 +736,43 @@ pub async fn chat_task(
                                     &today_iso,
                                 )
                                 .await;
+                                match auto_result {
+                                    Ok(outcome) => {
+                                        let usd = pricing.usd_for_call(
+                                            &config.classifier_model,
+                                            outcome.haiku_input_tokens,
+                                            outcome.haiku_output_tokens,
+                                            outcome.haiku_cache_creation_input_tokens,
+                                            outcome.haiku_cache_read_input_tokens,
+                                        );
+                                        runtime_state.record_classifier(
+                                            &state::capture_today_utc(),
+                                            outcome.haiku_input_tokens,
+                                            outcome.haiku_output_tokens,
+                                            usd,
+                                        );
+                                        if let Err(e) = runtime_state.save() {
+                                            warn!(error = %e, "[Chat] state save failed after auto reflection");
+                                        }
+                                        decisions::write(
+                                            &decisions::DecisionRecord::new("reflection")
+                                                .with_tokens(
+                                                    outcome.haiku_input_tokens,
+                                                    outcome.haiku_output_tokens,
+                                                    usd,
+                                                )
+                                                .extra("trigger", serde_json::Value::from("auto"))
+                                                .extra("admitted", serde_json::Value::from(outcome.admitted.len()))
+                                                .extra("rejected_substring", serde_json::Value::from(outcome.rejected_substring))
+                                                .extra("rejected_distinct_triggers", serde_json::Value::from(outcome.rejected_distinct_triggers))
+                                                .extra("rejected_distinct_senders", serde_json::Value::from(outcome.rejected_distinct_senders))
+                                                .extra("rejected_low_trust", serde_json::Value::from(outcome.rejected_low_trust)),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "[Chat] auto reflection pass failed");
+                                    }
+                                }
                             }
                         }
 
@@ -760,12 +843,22 @@ pub async fn chat_task(
                             b_da.cmp(&a_da)
                         });
                         for backlog_ev in backlog {
-                            // Update window before processing.
-                            if window.len() == 8 {
-                                window.pop_front();
+                            // Update window before processing — but skip
+                            // system pseudo-senders so they don't pollute
+                            // dyad detection (same reason as the live-event
+                            // path above).
+                            let bl_is_system = conversation::is_system_pseudo_sender(
+                                &backlog_ev.sender,
+                                &system_senders_re,
+                                &system_senders_exact,
+                            );
+                            if !bl_is_system {
+                                if window.len() == 8 {
+                                    window.pop_front();
+                                }
+                                window.push_back(backlog_ev.clone());
                             }
-                            window.push_back(backlog_ev.clone());
-                            let _ = process_event(
+                            let backlog_result = process_event(
                                 &backlog_ev,
                                 &api_key,
                                 &config,
@@ -792,6 +885,9 @@ pub async fn chat_task(
                                 &classifier_limiter,
                             )
                             .await;
+                            if let Err(e) = backlog_result {
+                                warn!(sender = %backlog_ev.sender, error = %e, "[Chat] backlog event processing error");
+                            }
                         }
 
                         // Prune `recent_speakers` so a long-running session
@@ -805,7 +901,11 @@ pub async fn chat_task(
                         // way — its own `record_and_check` only prunes the
                         // entries it touches, so a sender who left the
                         // server still occupies a slot until pruned here.
-                        classifier_counter.prune(Instant::now());
+                        // The spam guard has the same shape and the same
+                        // leak; prune it on the same tick.
+                        let now_prune = Instant::now();
+                        classifier_counter.prune(now_prune);
+                        spam_guard.prune(now_prune);
 
                         // Persist runtime state after each event so token
                         // counters survive a crash.
@@ -868,29 +968,14 @@ async fn process_event(
     classifier_limiter: &client::RateLimiter,
 ) -> Result<(), String> {
     let now = Instant::now();
-    // Resolve bot's live username — refuse to act if unknown.
-    let bot_name = bot_username.read().await.clone();
-    let Some(bot_name) = bot_name else {
-        decisions::write(
-            &decisions::DecisionRecord::new("pre_filter_skip")
-                .with_sender(&event.sender)
-                .with_event_ts(event.recv_at)
-                .with_reason("bot_username_unknown"),
-        );
-        return Ok(());
-    };
 
-    // self-echo guard.
-    if event.sender.eq_ignore_ascii_case(&bot_name) {
-        return Ok(());
-    }
-
-    // system pseudo-sender filter — automated lines never trigger
-    // a response (but they were already written to history by the
-    // publisher). Cheap, runs before any LLM-cost path.
+    // System pseudo-sender filter runs FIRST so server broadcasts (e.g.
+    // a literal `"1"` sender on some anarchy proxies, `[Server]`,
+    // `[CONSOLE]`) don't get spuriously skipped with `bot_username_unknown`
+    // when they arrive in the post-disconnect/pre-Init window. These
+    // events never produce a response anyway — they only need to feed
+    // the moderation-pattern detector, which works on content alone.
     if conversation::is_system_pseudo_sender(&event.sender, system_senders_re, system_senders_exact) {
-        // Check moderation patterns on system-pseudo-sender lines that
-        // address the bot — that's how server mods announce mutes/bans.
         if moderation_patterns.is_moderation_event(&event.content) {
             let until = state::iso_utc(
                 chrono::Utc::now()
@@ -912,6 +997,47 @@ async fn process_event(
         return Ok(());
     }
 
+    // Resolve bot's live username — refuse to act if unknown. Reaches
+    // here only for events that passed the system-sender shape gate, so
+    // every skip from this point onward represents a real player line
+    // we can't safely classify without knowing our own name. Falls back
+    // to `last_known_bot_username` (seeded from disk at startup) so
+    // events arriving in the post-disconnect / pre-Init window — when
+    // the live Arc has been cleared but the cache still holds the right
+    // name — are processed instead of dropped. Init will overwrite the
+    // Arc with the authoritative value once the handshake completes.
+    let bot_name = match bot_username.read().await.clone() {
+        Some(n) => n,
+        None => match runtime_state.last_known_bot_username.clone() {
+            Some(cached) => {
+                info!(
+                    cached_username = %cached,
+                    sender = %event.sender,
+                    "[Chat] live bot_username unknown; using cached identity for this event"
+                );
+                cached
+            }
+            None => {
+                info!(
+                    sender = %event.sender,
+                    "[Chat] skipping event — bot username not yet known and no cached identity (waiting on Event::Init)"
+                );
+                decisions::write(
+                    &decisions::DecisionRecord::new("pre_filter_skip")
+                        .with_sender(&event.sender)
+                        .with_event_ts(event.recv_at)
+                        .with_reason("bot_username_unknown"),
+                );
+                return Ok(());
+            }
+        },
+    };
+
+    // self-echo guard.
+    if event.sender.eq_ignore_ascii_case(&bot_name) {
+        return Ok(());
+    }
+
     // moderation backoff — silently observe while in backoff.
     if let Some(ref until) = runtime_state.moderation_backoff_until
         && let Ok(t) = chrono::DateTime::parse_from_rfc3339(until)
@@ -930,6 +1056,10 @@ async fn process_event(
     // answered when the bot is connected and the operator hasn't
     // paused).
     if event.kind == ChatEventKind::Public && !pacing::within_active_hours_now(config.active_hours_utc) {
+        info!(
+            sender = %event.sender,
+            "[Chat] skipping public event — outside configured active hours"
+        );
         decisions::write(
             &decisions::DecisionRecord::new("pre_filter_skip")
                 .with_sender(&event.sender)
@@ -967,11 +1097,24 @@ async fn process_event(
     let spam_suppressed = spam_guard.is_suppressed(&event.sender, now);
 
     // direct-address detection — common-words downgrade enforced.
-    let directly_addressed = conversation::is_direct_address_with_common_words(
-        &event.content,
-        persona_nicknames,
-        common_words,
-    );
+    // Whispers always count as direct contact: the player explicitly
+    // DM'd the bot, so a bare "hi" should bypass dyad / lurk / silence
+    // guards just like an `@bot ping` in public chat does. The candidate
+    // names are the persona's chosen name and nicknames PLUS the bot's
+    // live Minecraft username — players will use whichever they know.
+    let mut address_names: Vec<String> = persona_nicknames.to_vec();
+    if !address_names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(&bot_name))
+    {
+        address_names.push(bot_name.clone());
+    }
+    let directly_addressed = event.kind == ChatEventKind::Whisper
+        || conversation::is_direct_address_with_common_words(
+            &event.content,
+            &address_names,
+            common_words,
+        );
 
     // reply-to-other-speaker heuristic. If the message looks like
     // it's threaded at someone else (and the bot isn't the addressee),
@@ -989,6 +1132,10 @@ async fn process_event(
             &recent_speaker_list,
             common_words,
         ) {
+            info!(
+                sender = %event.sender,
+                "[Chat] skipping event — looks like reply to another player (not the bot)"
+            );
             decisions::write(
                 &decisions::DecisionRecord::new("pre_filter_skip")
                     .with_sender(&event.sender)
@@ -999,28 +1146,22 @@ async fn process_event(
         }
     }
 
-    // dyad suppression: if the channel is currently dominated by
-    // two non-bot speakers, stay silent unless directly addressed.
-    let window_slice: Vec<ChatEvent> = window.iter().cloned().collect();
-    let class = conversation::classify_window(&window_slice);
-    if !directly_addressed && matches!(class, conversation::ChannelClass::Dyad { .. }) {
-        decisions::write(
-            &decisions::DecisionRecord::new("pre_filter_skip")
-                .with_sender(&event.sender)
-                .with_event_ts(event.recv_at)
-                .with_reason("dyad_active"),
-        );
-        return Ok(());
-    }
+    // No hard dyad suppression — the classifier sees the recent window
+    // and the persona's social-judgment guidance and decides whether to
+    // chime in. A 1-on-1 between the bot and a player IS the bot's own
+    // conversation; a 1-on-1 between two other players occasionally
+    // deserves a chime-in when there's something worth contributing.
 
-    // classifier gate.
+    // classifier gate. Passes the same combined address-name list the
+    // pre-filter used so the gate's own direct-address check matches
+    // the bot's live MC username AND the persona nicknames.
     let recent_speaker = recent_speakers
         .get(&event.sender)
         .is_some_and(|t| now.duration_since(*t).as_secs() < config.recent_speaker_secs as u64);
     let gate_verdict = classifier::classifier_gate(
         event,
         Some(&bot_name),
-        persona_nicknames,
+        &address_names,
         recent_speaker,
         spam_suppressed,
         config,
@@ -1030,6 +1171,17 @@ async fn process_event(
     );
     match gate_verdict {
         classifier::GateVerdict::Skip(reason) => {
+            // Surface the skip reason at INFO so an operator watching
+            // `store.log` can see why their message was ignored without
+            // grepping the decisions JSONL. Pre-classifier skips are by
+            // design (cost firewall) but are easy to mistake for a
+            // broken pipeline when you're testing.
+            info!(
+                sender = %event.sender,
+                kind = ?event.kind,
+                reason = ?reason,
+                "[Chat] event skipped before classifier dispatch"
+            );
             decisions::write(
                 &decisions::DecisionRecord::new("classifier_skip")
                     .with_sender(&event.sender)
@@ -1118,8 +1270,13 @@ async fn process_event(
             return Ok(());
         }
     };
-    let usd =
-        pricing_table.usd_for_tokens(&config.classifier_model, resp.usage.input_tokens, resp.usage.output_tokens);
+    let usd = pricing_table.usd_for_call(
+        &config.classifier_model,
+        resp.usage.input_tokens,
+        resp.usage.output_tokens,
+        resp.usage.cache_creation_input_tokens,
+        resp.usage.cache_read_input_tokens,
+    );
     runtime_state.record_classifier(&started_day, resp.usage.input_tokens, resp.usage.output_tokens, usd);
 
     let mut text_buf = String::new();
@@ -1160,9 +1317,10 @@ async fn process_event(
     // respond decision.
     if let Some(ac) = &verdict.ai_callout
         && ac.detected
-        && !ac.trigger.is_empty()
+        && let Some(trigger) = ac.trigger.as_deref()
+        && !trigger.is_empty()
     {
-        classifier::write_pending_adjustment(&ac.trigger, &event.sender, None);
+        classifier::write_pending_adjustment(trigger, &event.sender, None);
     }
 
     if !verdict.respond || verdict.confidence < config.classifier_min_confidence {
@@ -1198,6 +1356,26 @@ async fn process_event(
         return Ok(());
     }
 
+    // Composer throttle backoff — short-circuit if Anthropic recently
+    // 429'd us through the in-call retry budget. Lazy clear: once the
+    // timestamp is in the past we drop it and proceed.
+    if let Some(ref until) = runtime_state.composer_throttle_backoff_until {
+        match chrono::DateTime::parse_from_rfc3339(until) {
+            Ok(t) if t.with_timezone(&chrono::Utc) > chrono::Utc::now() => {
+                decisions::write(
+                    &decisions::DecisionRecord::new("composer_throttle_backoff")
+                        .with_sender(&event.sender)
+                        .with_event_ts(event.recv_at)
+                        .with_reason("upstream_429_recently"),
+                );
+                return Ok(());
+            }
+            _ => {
+                runtime_state.composer_throttle_backoff_until = None;
+            }
+        }
+    }
+
     // Cap check before composer dispatch.
     let estimated_composer_input = 4000u64;
     let estimated_composer_usd =
@@ -1221,7 +1399,10 @@ async fn process_event(
     // — load per-player memory block when directly addressed
     // OR sender Trust ≥ 1. Resolve the sender's UUID, ensure the file
     // exists, and read it. Trust is computed from the per-player file
-    // + history JSONLs.
+    // + history JSONLs. The resolved UUID is also threaded into the
+    // tool context below so `update_player_memory` can actually pass
+    // its sender-binding check.
+    let resolved_sender_uuid: Option<String>;
     let player_memory_block = match crate::mojang::resolve_user_uuid(&event.sender).await {
         Ok(uuid) => {
             let _ = memory::ensure_player_file(&uuid, &event.sender);
@@ -1234,13 +1415,18 @@ async fn process_event(
                 7,
             );
             let trust = memory::compute_trust(&file, interactions, distinct_days, false);
-            if directly_addressed || trust >= 1 {
+            let block = if directly_addressed || trust >= 1 {
                 Some(file)
             } else {
                 None
-            }
+            };
+            resolved_sender_uuid = Some(uuid);
+            block
         }
-        Err(_) => None,
+        Err(_) => {
+            resolved_sender_uuid = None;
+            None
+        }
     };
 
     // Composer call.
@@ -1267,7 +1453,7 @@ async fn process_event(
     let req = composer::build_request(
         config.composer_model.clone(),
         320,
-        Some(0.85),
+        None,
         &snapshot,
         user_content,
         tools::tool_definitions(config.web_search_enabled, config.web_fetch_enabled),
@@ -1275,10 +1461,14 @@ async fn process_event(
     );
 
     // Tool context — drives every per-tool gate (sender binding, USD
-    // budgets, daily caps). Most fields are now config-driven.
-    let sender_uuid = event.sender.clone(); // placeholder; tools that
-                                            // need real UUID will fail
-                                            // sender-binding (intended)
+    // budgets, daily caps). The sender UUID was resolved above; if
+    // resolution failed we fall back to a sentinel that no real UUID
+    // ever matches, so update_player_memory's sender-binding check
+    // fails closed (the model gets `Err("sender binding violated")`
+    // and re-plans).
+    let sender_uuid = resolved_sender_uuid
+        .clone()
+        .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
     let tool_ctx = tools::ToolContext {
         sender_uuid: &sender_uuid,
         cross_player_reads: config.cross_player_reads,
@@ -1302,6 +1492,7 @@ async fn process_event(
         config.composer_max_tool_iterations,
         true,
         Some(composer_limiter),
+        &nonce,
     )
     .await
     {
@@ -1314,6 +1505,25 @@ async fn process_event(
                 runtime_state.model_404_backoff_until =
                     Some(client::model_404_backoff_until_now_plus_1h());
             }
+            // Anthropic-side 429 / 5xx that exhausted the retry budget:
+            // pause composer dispatch for `composer_throttle_backoff_secs`
+            // so the next event doesn't immediately re-race the same
+            // throttled bucket. Detected via the surface string emitted by
+            // `ClientError::Throttled`.
+            if config.composer_throttle_backoff_secs > 0 && e.contains("throttled") {
+                let until = state::iso_utc(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(
+                            config.composer_throttle_backoff_secs as i64,
+                        ),
+                );
+                warn!(
+                    until = %until,
+                    error = %e,
+                    "[Chat] composer hit upstream 429/5xx; pausing composer dispatch"
+                );
+                runtime_state.composer_throttle_backoff_until = Some(until);
+            }
             decisions::write(
                 &decisions::DecisionRecord::new("composer_error")
                     .with_sender(&event.sender)
@@ -1323,8 +1533,13 @@ async fn process_event(
             return Ok(());
         }
     };
-    let composer_usd =
-        pricing_table.usd_for_tokens(&config.composer_model, run.input_tokens, run.output_tokens);
+    let composer_usd = pricing_table.usd_for_call(
+        &config.composer_model,
+        run.input_tokens,
+        run.output_tokens,
+        run.cache_creation_input_tokens,
+        run.cache_read_input_tokens,
+    );
     runtime_state.record_composer(&started_day, run.input_tokens, run.output_tokens, composer_usd);
 
     // Update Chat: status surfacing of the latest call.
@@ -1383,7 +1598,7 @@ async fn process_event(
     let mut rng_unit = rand_unit_f32;
     let jitter_ms = pacing::gaussian_jitter_ms(0, config.typing_delay_jitter_ms, &mut rng_unit);
     let delay = pacing::compute_typing_delay(
-        reply.len(),
+        reply.chars().count(),
         config.typing_delay_base_ms,
         config.typing_delay_per_char_ms,
         jitter_ms,
@@ -1392,8 +1607,13 @@ async fn process_event(
     );
     tokio::time::sleep(Duration::from_millis(delay as u64)).await;
 
-    // Recompute window-bound counters.
-    let cutoff = now - Duration::from_secs(60);
+    // Recompute window-bound counters using a fresh `Instant::now()` —
+    // the `now` captured at the top of `process_event` is stale by the
+    // typing-delay sleep we just awaited, which would over-count
+    // recent_bot_send_times (and over-throttle the bot relative to the
+    // configured cap).
+    let now_post_sleep = Instant::now();
+    let cutoff = now_post_sleep - Duration::from_secs(60);
     while let Some(&t) = recent_bot_send_times.front() {
         if t < cutoff {
             recent_bot_send_times.pop_front();
@@ -1401,7 +1621,7 @@ async fn process_event(
             break;
         }
     }
-    let secs_since_last = last_bot_send_at.map(|t| Instant::now().duration_since(t).as_secs());
+    let secs_since_last = last_bot_send_at.map(|t| now_post_sleep.duration_since(t).as_secs());
 
     let decision = pacing::recheck_after_sleep(
         directly_addressed,
@@ -1457,9 +1677,10 @@ async fn process_event(
     }
     match resp_rx.await {
         Ok(Ok(())) => {
-            recent_bot_send_times.push_back(Instant::now());
-            *last_bot_send_at = Some(Instant::now());
-            recent_speakers.insert(event.sender.clone(), Instant::now());
+            let sent_at = Instant::now();
+            recent_bot_send_times.push_back(sent_at);
+            *last_bot_send_at = Some(sent_at);
+            recent_speakers.insert(event.sender.clone(), sent_at);
             decisions::write(
                 &decisions::DecisionRecord::new("sent")
                     .with_sender(&event.sender)
@@ -1481,6 +1702,109 @@ async fn process_event(
         }
     }
     Ok(())
+}
+
+/// Stats returned by [`scrub_history_for_player`] for the operator log.
+#[derive(Debug, Clone, Copy, Default)]
+struct ForgetScrubStats {
+    history_lines: u64,
+    decisions_lines: u64,
+    overlay_entries: u64,
+}
+
+/// Walk every JSONL under `data/chat/history/` and `data/chat/decisions/`,
+/// dropping records whose `sender`/`target`/`uuid`/`target_uuid` field
+/// matches the forgotten player. Also strips `<date>.uuids.json` overlay
+/// entries keyed on the same UUID. Each affected file is rewritten via
+/// [`crate::fsutil::write_atomic`] so a crash mid-scrub leaves either
+/// the original or the scrubbed file, never a torn one.
+fn scrub_history_for_player(uuid: &str, username: &str) -> Result<ForgetScrubStats, String> {
+    let mut stats = ForgetScrubStats::default();
+    let username_lc = username.to_lowercase();
+    let uuid_lc = uuid.to_lowercase();
+    for (dir, kind) in [
+        (history::HISTORY_DIR, "history"),
+        (decisions::DECISIONS_DIR, "decisions"),
+    ] {
+        let path = std::path::Path::new(dir);
+        if !path.exists() {
+            continue;
+        }
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| format!("read_dir({dir}): {e}"))?;
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with(".uuids.json") {
+                // Sidecar overlay — load JSON object, drop keys/values
+                // matching the UUID.
+                if let Ok(body) = std::fs::read_to_string(&p)
+                    && let Ok(mut v) =
+                        serde_json::from_str::<serde_json::Value>(&body)
+                    && let Some(obj) = v.as_object_mut()
+                {
+                    let before = obj.len();
+                    obj.retain(|_, val| {
+                        val.as_str().is_none_or(|s| !s.eq_ignore_ascii_case(&uuid_lc))
+                    });
+                    let removed = before.saturating_sub(obj.len()) as u64;
+                    if removed > 0 {
+                        let new = serde_json::to_string_pretty(&v)
+                            .map_err(|e| format!("overlay re-serialize: {e}"))?;
+                        crate::fsutil::write_atomic(&p, &new)
+                            .map_err(|e| format!("overlay rewrite: {e}"))?;
+                        stats.overlay_entries =
+                            stats.overlay_entries.saturating_add(removed);
+                    }
+                }
+                continue;
+            }
+            if !name.ends_with(".jsonl") {
+                continue;
+            }
+            let body = match std::fs::read_to_string(&p) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let mut kept = String::with_capacity(body.len());
+            let mut removed = 0u64;
+            for line in body.lines() {
+                let drop_it = match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(v) => record_matches_player(&v, &uuid_lc, &username_lc),
+                    Err(_) => false,
+                };
+                if drop_it {
+                    removed = removed.saturating_add(1);
+                    continue;
+                }
+                kept.push_str(line);
+                kept.push('\n');
+            }
+            if removed > 0 {
+                crate::fsutil::write_atomic(&p, &kept)
+                    .map_err(|e| format!("rewrite {kind} {}: {e}", p.display()))?;
+                if kind == "history" {
+                    stats.history_lines = stats.history_lines.saturating_add(removed);
+                } else {
+                    stats.decisions_lines =
+                        stats.decisions_lines.saturating_add(removed);
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+fn record_matches_player(v: &serde_json::Value, uuid_lc: &str, username_lc: &str) -> bool {
+    let str_field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    str_field("uuid").eq_ignore_ascii_case(uuid_lc)
+        || str_field("target_uuid").eq_ignore_ascii_case(uuid_lc)
+        || str_field("sender_uuid").eq_ignore_ascii_case(uuid_lc)
+        || str_field("sender").eq_ignore_ascii_case(username_lc)
+        || str_field("target").eq_ignore_ascii_case(username_lc)
 }
 
 /// Replay the system prompt that WOULD have been sent for a historical
@@ -1607,13 +1931,25 @@ fn write_operator_audit(action: &str, username: &str, uuid: &str, reason: &str) 
 /// Mojang rate limit when an operator runs CLI commands against players
 /// the bot already knows. Best-effort — index-load failures fall through
 /// to the network call rather than aborting.
+///
+/// Defense-in-depth: every returned UUID is shape-validated. The CLI
+/// commands that act on the result (`reset_player_memory`,
+/// `forget_player`, etc.) build paths via `memory::player_file_path`
+/// which does NOT canonicalize, so a malformed UUID slipped into the
+/// index could in principle escape the players dir. Validating here
+/// keeps every CLI caller honest without each having to remember.
 async fn resolve_username_via_index_or_mojang(username: &str) -> Result<String, String> {
-    if let Ok(idx) = memory::load_or_rebuild_index()
-        && let Some(uuid) = idx.lookup(username)
+    let uuid = if let Ok(idx) = memory::load_or_rebuild_index()
+        && let Some(u) = idx.lookup(username)
     {
-        return Ok(uuid.to_string());
-    }
-    crate::mojang::resolve_user_uuid(username).await
+        u.to_string()
+    } else {
+        crate::mojang::resolve_user_uuid(username).await?
+    };
+    crate::chat::tools::validate_uuid(&uuid).map_err(|e| {
+        format!("resolved uuid for {username:?} failed shape check: {e}")
+    })?;
+    Ok(uuid)
 }
 
 /// Cheap deterministic-process-RNG returning a value in [0.0, 1.0).

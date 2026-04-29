@@ -228,6 +228,13 @@ pub struct ChatConfig {
     pub moderation_backoff_secs: u32,
     #[serde(default = "default_chat_persona_regen_cooldown_secs")]
     pub persona_regen_cooldown_secs: u32,
+    /// Seconds the chat task pauses composer dispatch after Anthropic
+    /// returns a 429/5xx that blew through the in-call retry budget.
+    /// Zero disables the cooldown (every event re-races the throttled
+    /// bucket); the default lets the upstream window reset before we try
+    /// again.
+    #[serde(default = "default_chat_composer_throttle_backoff_secs")]
+    pub composer_throttle_backoff_secs: u32,
 }
 
 impl Default for ChatConfig {
@@ -298,6 +305,7 @@ impl Default for ChatConfig {
             hash_uuids_in_decisions: default_chat_hash_uuids_in_decisions(),
             moderation_backoff_secs: default_chat_moderation_backoff_secs(),
             persona_regen_cooldown_secs: default_chat_persona_regen_cooldown_secs(),
+            composer_throttle_backoff_secs: default_chat_composer_throttle_backoff_secs(),
         }
     }
 }
@@ -361,6 +369,7 @@ fn default_chat_decisions_retention_days() -> u32 { 30 }
 fn default_chat_hash_uuids_in_decisions() -> bool { true }
 fn default_chat_moderation_backoff_secs() -> u32 { 86_400 }
 fn default_chat_persona_regen_cooldown_secs() -> u32 { 86_400 }
+fn default_chat_composer_throttle_backoff_secs() -> u32 { 60 }
 
 impl ChatConfig {
     /// Validate the chat-config invariants. Returns a single human-readable

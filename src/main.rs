@@ -40,8 +40,9 @@ mod types;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load `.env` from the working directory if present. Real process
     // env vars take precedence over `.env` entries — `.env` is fallback,
-    // not override. Silently no-ops if the file is missing.
-    let _ = dotenvy::dotenv();
+    // not override. Result is captured and logged after tracing init so
+    // operators can see exactly which file was loaded (or why none was).
+    let dotenv_result = dotenvy::dotenv();
 
     // CLI flag parsing — kept tiny on purpose (no clap dependency).
     // Supported:
@@ -90,6 +91,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(env_filter)
         .try_init()
         .ok(); // Some deps may initialize logging; ignore "already set"
+
+    // Surface the dotenvy result and the cwd so operators can diagnose
+    // "key in .env but env var not set" issues at a glance.
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    match &dotenv_result {
+        Ok(path) => info!(cwd = %cwd, path = %path.display(), "[Main] .env loaded"),
+        Err(e) if e.not_found() => {
+            info!(cwd = %cwd, "[Main] no .env found walking up from cwd")
+        }
+        Err(e) => warn!(cwd = %cwd, error = %e, "[Main] .env present but failed to parse"),
+    }
 
     println!("🚀 Starting bot application...");
     println!("📋 To view logs in another terminal, run:");

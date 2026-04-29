@@ -229,6 +229,12 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
                 s.model_404_backoff_until.as_deref().unwrap_or("<none>")
             );
             println!(
+                "composer throttle backoff: {}",
+                s.composer_throttle_backoff_until
+                    .as_deref()
+                    .unwrap_or("<none>")
+            );
+            println!(
                 "persona regen cooldown: {}",
                 s.persona_regen_cooldown_until.as_deref().unwrap_or("<none>")
             );
@@ -237,7 +243,6 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
                 s.last_persona_regenerated_at.as_deref().unwrap_or("<never>")
             );
             println!("pending_adjustments: {}", s.pending_adjustments_count);
-            println!("uuid_resolve_queue depth: {}", s.uuid_resolve_queue_depth);
             println!("in_critical_section: {}", s.critical_section_active);
             println!(
                 "last composer call: {} (${:.4})",

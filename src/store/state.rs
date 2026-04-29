@@ -66,15 +66,31 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
 /// Persist every in-memory collection (pairs, users, orders, trades, storage)
 /// to disk.
 ///
-/// Orders are truncated to `config.max_orders` during save; the rest are
-/// written in full. Returns the first I/O error encountered; partial progress
-/// may have been committed to disk (each type writes independently).
+/// Trims `store.orders` and `store.trades` to their configured caps before
+/// writing — handlers append on every transaction without checking the cap, so
+/// the in-memory deques would otherwise grow unbounded between restarts.
+/// Trimming at save time means a single autosave cadence bounds the working
+/// set, and the on-disk files mirror what we kept in memory.
+///
+/// Orders are also truncated by `Order::save_all_with_limit` as a belt-and-
+/// braces second cap; the rest are written in full. Returns the first I/O
+/// error encountered; partial progress may have been committed to disk (each
+/// type writes independently).
 ///
 /// Users are written via `User::save_dirty` using the store's `dirty_users`
 /// set so only users whose balance/operator changed since the last save get
 /// rewritten + fsynced. The caller is responsible for clearing
 /// `store.dirty_users` after this returns `Ok(())`.
-pub fn save(store: &Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if store.orders.len() > store.config.max_orders {
+        let drop = store.orders.len() - store.config.max_orders;
+        store.orders.drain(..drop);
+    }
+    if store.trades.len() > store.config.max_trades_in_memory {
+        let drop = store.trades.len() - store.config.max_trades_in_memory;
+        store.trades.drain(..drop);
+    }
+
     debug!("saving pairs={} users={} (dirty={}) orders={} trades={} nodes={}",
         store.pairs.len(), store.users.len(), store.dirty_users.len(),
         store.orders.len(), store.trades.len(), store.storage.nodes.len());

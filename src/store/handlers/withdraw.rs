@@ -215,7 +215,7 @@ pub async fn handle_withdraw_balance_queued(
                     chest_id = t.chest_id,
                     "Withdraw: failed to send chest instruction: {}", e
                 );
-                return Err(StoreError::BotError(format!(
+                return Err(StoreError::BotSendFailed(format!(
                     "Failed to send chest instruction to bot: {}",
                     e
                 )));
@@ -235,7 +235,7 @@ pub async fn handle_withdraw_balance_queued(
                         chest_id = t.chest_id,
                         "Withdraw: chest response channel dropped: {}", e
                     );
-                    return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
+                    return Err(StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)));
                 }
                 Err(_) => {
                     error!(
@@ -245,7 +245,7 @@ pub async fn handle_withdraw_balance_queued(
                         timeout_secs = CHEST_OP_TIMEOUT_SECS,
                         "Withdraw: timed out waiting for bot chest operation"
                     );
-                    return Err(StoreError::TradeTimeout(CHEST_OP_TIMEOUT_SECS));
+                    return Err(StoreError::TradeTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
                 }
             };
 
@@ -320,7 +320,7 @@ pub async fn handle_withdraw_balance_queued(
             "[Withdraw] trade-send-failed",
         )
         .await;
-        return Err(StoreError::BotError(format!(
+        return Err(StoreError::BotSendFailed(format!(
             "Failed to send trade instruction to bot: {}",
             e
         )));

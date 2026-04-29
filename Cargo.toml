@@ -5,8 +5,39 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-azalea = { git = "https://github.com/azalea-rs/azalea" }
-azalea-viaversion = { git = "https://github.com/azalea-rs/azalea-viaversion" }
+# Pinned to the `1.21.11` branch tip (`41a9ae6a`, 2026-03-22 — the last commit
+# before the 26.1 protocol bump in `eeaf1435`). This avoids the `Protocol26_1`
+# rewriter chain in ViaBackwards that injects malformed `custom_data` markers
+# during 1.21.9 → 1.21.11 → 26.1 translation, which surfaced as
+# "Invalid root type 1" decode failures on `container_set_content` for the
+# diamond chest. See the bot/chest_io.rs `PACKET_DECODE_PREFIX` doc and the
+# ViaFabric#477 / azalea#262 / azalea#261 thread for the upstream history.
+#
+# Why git pin and not crates.io: the published `0.15.1+mc1.21.11` (Feb 2026)
+# has exact pre-release pins (`signature = "=3.0.0-rc.8"`,
+# `crypto-primes = "=0.7.0-pre.7"`) whose transitive resolution against
+# current rsa/pkcs8/der pre-releases no longer compiles — the 1.21.11-branch
+# tip in git has refreshed those deps but never got a new crates.io release.
+#
+# Why path-deps `azalea-viaversion` instead of git: the upstream
+# `azalea-viaversion` Cargo.toml has `azalea = { git = "..." }` with no
+# branch/rev, which cargo resolves to a *separate* git source from our
+# `branch = "1.21.11"` pin and ends up compiling two azalea instances side
+# by side. The plugin then captures 26.1's ECS event types
+# (`ReceiveCustomQueryEvent`, `StartJoinServerEvent`, `Swarm`, …) and
+# silently never fires on the 1.21.11 client's actually-emitted events —
+# breaks Mojang auth at runtime even though the build succeeds. The
+# vendored copy under `vendor/azalea-viaversion/` is byte-identical to
+# upstream (commit `c0d1e41f`, 2026-04-08, ViaProxy 3.4.10) except its
+# `Cargo.toml` adds the same `branch = "1.21.11"` to its azalea dep so
+# cargo unifies the two specs into a single git source.
+#
+# When upstream ships ViaProxy 3.4.11 (or whichever release bundles
+# ViaBackwards ≥5.9.0 with the post-26.1 `custom_data` hashing fixes),
+# both pins can be dropped to track `main` again for the 26.1 protocol
+# features.
+azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11" }
+azalea-viaversion = { path = "vendor/azalea-viaversion" }
 chrono = "0.4.44"
 dialoguer = "0.12.0"
 dotenvy = "0.15.7"
@@ -36,3 +67,4 @@ proptest = "1.11.0"
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
+

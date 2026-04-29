@@ -272,6 +272,8 @@ pub struct ReflectionOutcome {
     pub rejected_low_trust: usize,
     pub haiku_input_tokens: u64,
     pub haiku_output_tokens: u64,
+    pub haiku_cache_creation_input_tokens: u64,
+    pub haiku_cache_read_input_tokens: u64,
 }
 
 /// Read the pending-adjustments file. Returns `Ok(vec![])` if missing.
@@ -381,7 +383,7 @@ pub async fn run_pass(
                 cache_control: None,
             }],
         }],
-        temperature: Some(0.0),
+        temperature: None,
         tools: vec![],
     };
 
@@ -390,6 +392,8 @@ pub async fn run_pass(
         .map_err(|e| format!("reflection call failed: {e}"))?;
     outcome.haiku_input_tokens = resp.usage.input_tokens;
     outcome.haiku_output_tokens = resp.usage.output_tokens;
+    outcome.haiku_cache_creation_input_tokens = resp.usage.cache_creation_input_tokens;
+    outcome.haiku_cache_read_input_tokens = resp.usage.cache_read_input_tokens;
 
     let mut text_buf = String::new();
     for b in &resp.content {

@@ -2,7 +2,6 @@
 
 use super::{Bot, BotState, handle_event_fn};
 use azalea::account::Account;
-use azalea_viaversion::ViaVersionPlugin;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -13,7 +12,11 @@ use tracing::{debug, info, warn};
 /// which older protocol to translate down to so the bot can connect to a
 /// server that hasn't been bumped yet. Update this when the target server is
 /// upgraded.
-const VIA_TARGET_VERSION: &str = "1.21.10";
+///
+/// Visible to `Bot::new` (sibling module) so the one-shot `ViaVersionPlugin::start`
+/// at construction time uses the same target version this module wires into
+/// every reconnect's `ClientBuilder`.
+pub(super) const VIA_TARGET_VERSION: &str = "1.21.10";
 
 /// Connect the bot to the server
 pub async fn connect(
@@ -51,6 +54,18 @@ pub async fn connect(
             account_name
         );
         old_task.abort();
+        // abort() is asynchronous: the task continues running until its next
+        // .await checks for cancellation. Wait (bounded) for it to fully
+        // complete so its Azalea/Bevy ECS world drops before we spawn a new
+        // ClientBuilder. Without this, fast reconnects can leave multiple
+        // client instances alive simultaneously and inflate RSS by tens of MB
+        // per cycle. The disconnect path achieves the same effect via a
+        // post-abort sleep; the reconnect path previously did neither.
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(crate::constants::DELAY_DISCONNECT_MS),
+            old_task,
+        )
+        .await;
     }
 
     // Create initial state with our communication channels
@@ -71,10 +86,12 @@ pub async fn connect(
     let task_account = account_name.clone();
     let task_server = server_address.clone();
 
-    // ViaVersionPlugin::start downloads ViaProxy on first run and spawns it,
-    // so it's done outside the LocalSet task to avoid blocking the client
-    // future and to surface install errors as a normal connect failure.
-    let via_plugin = ViaVersionPlugin::start(VIA_TARGET_VERSION).await;
+    // Reuse the cached ViaProxy plugin instead of calling
+    // `ViaVersionPlugin::start` again — that would spawn a fresh `java -jar
+    // ViaProxy.jar` subprocess on every reconnect with no cleanup hook (see
+    // the `via_plugin` field doc on `Bot`). Cloning is cheap and every clone
+    // routes through the same ViaProxy instance via its shared `bind_addr`.
+    let via_plugin = bot.via_plugin.clone();
 
     // Azalea's ClientBuilder::start returns !Send, so it must run on a LocalSet
     // (see main.rs). tokio::spawn would fail to compile.

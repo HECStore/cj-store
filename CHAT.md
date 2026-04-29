@@ -45,7 +45,7 @@ src/chat/
   tools.rs          Tool handlers (memory r/w, history search, web fetch/search)
   memory.rs         Global + per-player memory file I/O, trust derivation
   history.rs        Daily JSONL chat log: writer task, search
-  conversation.rs   Whisper router, addressee/dyad detection, spam guard
+  conversation.rs   Whisper router, direct-address detection, spam guard
   persona.rs        Persona generation + load (read-only at runtime)
   pacing.rs         Typing delay, active hours, AI-tells stripping
   state.rs          Runtime state file (token meter, backoffs, last-replied)
@@ -119,8 +119,11 @@ Channels:
   replies are deferred up to 30 s.
 - `Arc<RwLock<Option<String>>> bot_username` — populated on
   `Event::Init` from `client.profile().name`, reset to `None` on
-  `Event::Disconnect`. Until `Some(…)`, chat refuses to call the
-  classifier or composer (`reason: "bot_username_unknown"`).
+  `Event::Disconnect`. When the live Arc is `None` the orchestrator
+  falls back to `state.last_known_bot_username` (seeded from disk at
+  startup) so events arriving in the post-disconnect / pre-Init window
+  are processed instead of dropped with `bot_username_unknown`. Only
+  events that find neither the live nor the cached value are skipped.
 
 ### Panic isolation
 
@@ -202,11 +205,13 @@ chat_task (subscriber):
     ├── moderation backoff active                                ── drop
     ├── outside active hours (public events only)                ── drop
     ├── spam guard (per-sender sliding window)                   ── suppress
-    ├── reply-to-other-speaker / dyad active (unless addressed)  ── drop
+    ├── reply-to-other-speaker (unless addressed)                ── drop
     ▼
   classifier.rs (Haiku gate)
-    ├── pre-classifier deterministic gate (heuristic + sample)   ── skip
     ├── per-sender classifier cap (default 3/min)                ── skip
+    ├── sample-rate roll on undirected public chat               ── skip
+    │   (whispers / direct address / questions /
+    │    recent-speaker continuations bypass the roll)
     ├── classifier daily cap                                     ── skip
     ├── Haiku call → JSON verdict                                ── parse
     ├── ai_callout.detected → pending_adjustments.jsonl
@@ -216,6 +221,7 @@ chat_task (subscriber):
     (bypassed when directly addressed)
     ▼
   composer.rs (Opus 4.7 + tool-use loop)
+    ├── composer-throttle backoff (after upstream 429/5xx)       ── skip
     ├── system prompt: rules + persona + memory + adjustments
     │                  + per-player memory + history slice + event
     ├── tool calls: read_my_memory / read_player_memory /
@@ -267,17 +273,24 @@ A 10-second composer call can shadow a direct address that arrived
 3 seconds in. Without explicit prioritization the bot would silently
 ignore "Steve, you online?" in favor of generic backlog chatter.
 
-### Addressee / dyad detection
-
-Per-channel sliding window of the last 8 events
-([conversation::classify_window](src/chat/conversation.rs)).
+### Addressee detection
 
 | Class       | Trigger                                                                                                  | Effect                                            |
 | ----------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| Direct      | Whole-word match on bot username or any nickname in `persona.md` `Nicknames:` line                       | Bypass dyad/silence guards; raise priority        |
+| Direct      | Whole-word match on bot username or any nickname in `persona.md` `Nicknames:` line                       | Bypass silence guards; raise priority             |
 | Reply-to    | `@<name>` or `<name>,`/`<name>:` in first 16 chars where `<name>` is the most recent non-self speaker    | Stay silent unless `<name>` is the bot            |
-| Active dyad | Two distinct senders ≥ 6 of last 8 slots, with ≥ 2 transitions between them, message not direct          | Drop unless directly addressed                    |
-| Open chat   | ≥ 3 distinct senders in last 8 slots                                                                     | Free-for-all; classifier alone decides            |
+
+There is no hard "dyad" pre-filter. The classifier (Haiku) sees the
+recent window and persona, and is instructed to:
+
+- treat the bot as a participant whenever the bot itself was a recent
+  speaker (the bot is part of its own 1-on-1 — never silent on those);
+- default to staying out of 1-on-1s between two OTHER players, but
+  chime in when the bot has something genuinely worth adding (a useful
+  fact, a callback, a relevant joke, correction, opinion);
+- lean toward responding when a message contains something genuinely
+  interesting that the persona has an opinion on, even without direct
+  address.
 
 **Dictionary downgrade.** If the bot's username appears in
 `data/chat/common_words.txt`, a bare-word match is downgraded — it must
@@ -679,6 +692,15 @@ incomplete; defenses cover:
 - **Retry policy**: exponential backoff on 429/500/502/503/504, capped
   at 3 attempts, total wall-clock 30 s. **Model-deprecation (404)** is
   non-retryable — log + self-disable composer for 1 h, then retry once.
+- **Composer-throttle backoff** (after retries exhaust): a 429/5xx that
+  blew through the in-call retry budget engages a short
+  `state.composer_throttle_backoff_until` cooldown
+  (`composer_throttle_backoff_secs`, default 60 s). The chat task keeps
+  classifying events while the timer is set, but composer dispatch
+  short-circuits with `kind: "composer_throttle_backoff"` so the next
+  event doesn't immediately re-race the same throttled bucket. The
+  cooldown auto-clears the first time an event is processed past the
+  recorded timestamp.
 - **Token meter**. Every response's `usage.input_tokens` and
   `usage.output_tokens` are added to per-day counters in `state.json`.
   **Lazy reset, in-flight attribution**: on every increment, compare
@@ -737,8 +759,23 @@ after login, so it lives in
   still attributed to the bot when the model later searches history.
 
 Until `Some(name)` is in the lock, `chat_task` forwards events to the
-history writer (durable logging) but refuses to call the classifier or
-composer (decision log: `silent: true, reason: "bot_username_unknown"`).
+history writer (durable logging) and uses `state.last_known_bot_username`
+as a tentative identity for self-echo and direct-address checks. The
+authoritative `Event::Init` value overwrites the lock once the handshake
+completes; events that find neither a live nor a cached username are
+skipped (decision log: `reason: "bot_username_unknown"`).
+
+System-shaped senders (anything that fails the Mojang `[A-Za-z0-9_]{3,16}`
+shape — `[Server]`, `[CONSOLE]`, a literal `"1"` proxy tag) are filtered
+*before* the bot-username check so server broadcasts in that pre-Init
+window aren't spuriously logged as `bot_username_unknown`. Join
+broadcasts on those system senders get an extra salvage step in
+`bot::parse_chat_line`: if the content carries a join cue (`joined`,
+`connected`, `welcome`, `+ <name>`, `[+] <name>`) and contains a
+Mojang-shaped username, the event is rewritten to look like a public
+chat line from the joining player with the synthetic content
+`*just joined the server*`. The classifier prompt knows about that
+literal marker and decides whether a greeting is appropriate.
 
 Persona's declared nickname list lives in `persona.md` and is loaded at
 chat startup; the canonical username comes from the live login.
@@ -850,11 +887,9 @@ Operator-editable when the chat task is stopped. **NOT** LLM-writable.
   "dry_run_runtime_override": false,
   "moderation_backoff_until": "<UTC ISO>|null",
   "model_404_backoff_until": "<UTC ISO>|null",
+  "composer_throttle_backoff_until": "<UTC ISO>|null",
   "persona_regen_cooldown_until": "<UTC ISO>|null",
-  "history_drops_today": 0,
-  "uuid_resolve_queue_depth": 0,
-  "spam_meter_snapshot": { "<sender>": { "msgs": [...], "cooldown_until": "..." } },
-  "last_replied_at_per_player": { "<uuid>": "<UTC ISO>" }
+  "history_drops_today": 0
 }
 ```
 
@@ -865,6 +900,11 @@ start on unknown versions. Operator playbook entries:
   to 0 and `last_meter_day_utc` to today.
 - **Clear moderation backoff**: set `moderation_backoff_until` to null,
   or use `Chat: resume after moderation backoff`.
+- **Clear composer-throttle backoff**: set `composer_throttle_backoff_until`
+  to null. The chat task auto-clears it on the next event whose timestamp
+  is past the recorded value, so manual edits are only needed when an
+  operator wants composer dispatch resumed *immediately* before the
+  configured `composer_throttle_backoff_secs` window has elapsed.
 - **Clear persona-regen cooldown**: set `persona_regen_cooldown_until`
   to null.
 - **Force re-resolution of bot username**: set
@@ -911,7 +951,7 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 
 | Entry                                            | Behavior                                                                                                                               |
 | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `Chat: status`                                   | Snapshot: enabled/paused/dry-run flags; today's input/output/classifier tokens vs caps with USD; last composer call ts + cost; current backoff state (moderation, model deprecation); `pending_adjustments` count; uuid_resolve_queue depth; last persona regeneration date; `in_critical_section` duration; history drop counter. |
+| `Chat: status`                                   | Snapshot: enabled/paused/dry-run flags; today's input/output/classifier tokens vs caps with USD; last composer call ts + cost; current backoff state (moderation, model deprecation); `pending_adjustments` count; last persona regeneration date; `in_critical_section` duration; history drop counter. |
 | `Chat: toggle dry-run`                           | Runtime override of `chat.dry_run`. Persists in `state.json`.                                                                          |
 | `Chat: show today's decision log (last N)`       | Tails today's `data/chat/decisions/<today>.jsonl`.                                                                                     |
 | `Chat: show token spend today`                   | Same numbers as `status` in compact form.                                                                                              |
@@ -943,7 +983,7 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 | Prompt injection via tools      | `<untrusted_tool_result_…>` and `<untrusted_web_…>` markers; the static rules block instructs the model to ignore instructions inside any `<untrusted_…>` tag.            |
 | Prompt injection in adjustments | Reflection pass paraphrase requirement + multi-axis validator (substring overlap, distinct triggers, distinct senders, sender Trust ≥ 1).                                  |
 | AI tell phrases                 | `pacing::strip_ai_tells` removes em-dashes, smart quotes, "As an AI", "I'm Claude", "language model", etc.                                                                 |
-| Cost-DoS via classifier flood   | Per-sender classifier rate cap; pre-classifier deterministic gate; separate `daily_classifier_token_cap`; spam-suppressed senders skip classifier entirely.                |
+| Cost-DoS via classifier flood   | Per-sender classifier rate cap; per-call sample-rate roll on undirected public chat; separate `daily_classifier_token_cap`; spam-suppressed senders skip classifier entirely.                |
 | Cost-DoS via composer flood     | `daily_input_token_cap` + `daily_output_token_cap` + `daily_dollar_cap_usd`; client-side rate limiter with RPM and ITPM accounting; lurk skip applied even after classifier. |
 | SSRF via web_fetch              | URL-parse rejects numeric/octal/hex hosts and userinfo; pinned-IP DNS; deny-list including cloud metadata; manual redirect re-validation; streaming size cap.              |
 

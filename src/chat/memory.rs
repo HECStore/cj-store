@@ -286,16 +286,19 @@ pub fn operator_trust3_expired(player_md: &str) -> bool {
     false
 }
 
-/// Count `bot_out` history records that are replies-to-this-player or
+/// Count bot-output history records that are replies-to-this-player or
 /// whispers-with-this-player, across the most recent N UTC days. Returns
 /// `(interactions, distinct_days_count)`. Used by [`compute_trust`] to
 /// derive Trust 1/2.
 ///
 /// Records are JSON lines under `<history_dir>/<YYYY-MM-DD>.jsonl`. A
 /// record matches if its `target_uuid` equals `target_uuid`, OR its
-/// `target` field equals `target_username_lc` (case-insensitive). The
-/// `kind` must be `bot_out` exactly — `bot_chat`/`bot_whisper` are not
-/// counted here unless they carry the literal `bot_out` kind.
+/// `target` field equals `target_username_lc` (case-insensitive). Any of
+/// `bot_out`, `bot_chat`, or `bot_whisper` count as a bot-output record
+/// — CHAT.md describes the conceptual kind as `bot_out`, but the writer
+/// emits the more specific `bot_chat`/`bot_whisper` labels for log
+/// readability. Treating all three uniformly here keeps the trust
+/// ladder from being silently pinned at 0.
 pub fn count_interactions_for_uuid(
     history_dir: &Path,
     target_uuid: &str,
@@ -318,7 +321,7 @@ pub fn count_interactions_for_uuid(
                 Err(_) => continue,
             };
             let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
-            if kind != "bot_out" {
+            if !matches!(kind, "bot_out" | "bot_chat" | "bot_whisper") {
                 continue;
             }
             let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
@@ -379,7 +382,7 @@ mod tests {
 
     /// Scratch directory unique to this process, with the chat layout
     /// underneath. Cleanup is best-effort via Drop.
-    struct Scratch(PathBuf, PathBuf, PathBuf, PathBuf);
+    struct Scratch(PathBuf, PathBuf);
 
     impl Scratch {
         fn new(name: &str) -> Self {
@@ -393,9 +396,7 @@ mod tests {
             fs::create_dir_all(&base).unwrap();
             let players = base.join("players");
             fs::create_dir_all(&players).unwrap();
-            let mem = base.join("memory.md");
-            let idx = players.join("_index.json");
-            Self(base, players, mem, idx)
+            Self(base, players)
         }
     }
 
@@ -645,5 +646,44 @@ mod tests {
             count_interactions_for_uuid(&history, target_uuid, "steve", 7);
         assert_eq!(i, 3);
         assert_eq!(d, 2);
+    }
+
+    #[test]
+    fn count_interactions_accepts_bot_chat_and_bot_whisper_kinds() {
+        // Regression: the writer emits `bot_chat`/`bot_whisper`, but this
+        // counter only matched `bot_out` — the trust ladder was silently
+        // pinned at 0 in production. All three kinds must count.
+        let scratch = Scratch::new("count-bot-kinds");
+        let history = scratch.0.join("history");
+        fs::create_dir_all(&history).unwrap();
+        let today = chrono::Utc::now().date_naive();
+        let target_uuid = "11111111-2222-3333-4444-555555555555";
+        let path = history.join(format!("{}.jsonl", today.format("%Y-%m-%d")));
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "kind": "bot_chat",
+                "target": "Steve",
+                "target_uuid": target_uuid,
+            }),
+            serde_json::json!({
+                "kind": "bot_whisper",
+                "target": "Steve",
+                "target_uuid": target_uuid,
+            }),
+            serde_json::json!({
+                "kind": "bot_out",
+                "target": "Steve",
+                "target_uuid": target_uuid,
+            }),
+            // Wrong kind — must not count.
+            serde_json::json!({
+                "kind": "public",
+                "sender": "Steve",
+            }),
+        );
+        fs::write(&path, body).unwrap();
+        let (i, _) = count_interactions_for_uuid(&history, target_uuid, "steve", 7);
+        assert_eq!(i, 3);
     }
 }

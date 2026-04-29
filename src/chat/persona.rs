@@ -287,7 +287,7 @@ pub async fn generate(
             role: Role::User,
             content: user,
         }],
-        temperature: Some(0.9),
+        temperature: None,
         tools: vec![],
     };
 

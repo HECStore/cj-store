@@ -9,9 +9,13 @@
 //! and this module is the executable mirror. The accompanying tests pin every
 //! rule.
 //!
-//! Phase 6 layer: addressee/dyad detection ([`classify_window`]) and spam
-//! guard ([`SpamGuard`]). Both are pure / deterministic, threaded through
-//! the chat task by the caller.
+//! Phase 6 layer: spam guard ([`SpamGuard`]). Pure / deterministic,
+//! threaded through the chat task by the caller. (Dyad detection used
+//! to live here as a hard pre-filter; it was removed because the
+//! classifier already has the recent window and persona context, and a
+//! hard "stay silent during 1-on-1s" rule incorrectly suppressed
+//! 1-on-1s the bot was itself part of, and stopped the bot from
+//! chiming in on genuinely interesting conversations between others.)
 
 /// Where an inbound whisper should be routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,78 +216,10 @@ fn levenshtein(a: &[u8], b: &[u8]) -> usize {
     prev[n]
 }
 
-// ===== Dyad / open-chat detection ==============================
-
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::messages::{ChatEvent, ChatEventKind};
-
-/// Result of [`classify_window`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChannelClass {
-    /// ≥3 distinct senders in the window — free-for-all; classifier
-    /// alone decides whether to respond.
-    OpenChat,
-    /// Two senders dominate the window with at least 2 transitions
-    /// between them; the bot stays silent unless directly addressed.
-    Dyad {
-        speaker_a: String,
-        speaker_b: String,
-    },
-    /// Window is too small to classify (fewer than 8 entries) and
-    /// nothing else matches; default to open-chat behavior (no
-    /// suppression).
-    NotEnoughData,
-}
-
-/// Classify the recent N events as open-chat, dyad, or
-/// not-enough-data.
-///
-/// `window` is expected to be the last 8 events for the channel, in
-/// arrival order.
-pub fn classify_window(window: &[ChatEvent]) -> ChannelClass {
-    if window.len() < 8 {
-        // The dyad rule explicitly looks at "last 8 slots"; smaller
-        // windows fall through to open-chat behavior.
-        return ChannelClass::NotEnoughData;
-    }
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for ev in window {
-        *counts.entry(ev.sender.as_str()).or_insert(0) += 1;
-    }
-    let distinct = counts.len();
-    if distinct >= 3 {
-        return ChannelClass::OpenChat;
-    }
-    if distinct < 2 {
-        return ChannelClass::NotEnoughData;
-    }
-    // Exactly two distinct senders — check the dyad criteria
-    // (≥6 of 8, ≥2 transitions).
-    let mut iter = counts.iter();
-    let (a_name, a_count) = iter.next().unwrap();
-    let (b_name, b_count) = iter.next().unwrap();
-    if a_count + b_count < 6 {
-        return ChannelClass::OpenChat;
-    }
-    let mut transitions = 0;
-    for w in window.windows(2) {
-        if w[0].sender != w[1].sender
-            && (w[0].sender == *a_name || w[0].sender == *b_name)
-            && (w[1].sender == *a_name || w[1].sender == *b_name)
-        {
-            transitions += 1;
-        }
-    }
-    if transitions < 2 {
-        return ChannelClass::OpenChat;
-    }
-    ChannelClass::Dyad {
-        speaker_a: a_name.to_string(),
-        speaker_b: b_name.to_string(),
-    }
-}
+use crate::messages::ChatEvent;
 
 // ===== Spam guard ==============================================
 
@@ -374,6 +310,44 @@ impl SpamGuard {
             .get(sender)
             .and_then(|s| s.cooldown_until)
             .is_some_and(|u| now < u)
+    }
+
+    /// Drop sender entries whose sliding windows have aged out AND
+    /// whose cooldown has expired. `record` only ages the queues for the
+    /// CURRENT event's sender, so a player who sent once and never came
+    /// back leaves a `SenderState` entry in the map indefinitely. Prune
+    /// must actively age the queues for every sender so a long-running
+    /// bot on a busy server doesn't grow `by_sender` unbounded.
+    ///
+    /// Uses a conservative 60-second age cutoff (the longest window
+    /// `record` cares about — the near-duplicate watch list). Slightly
+    /// later than a sender's actual `spam_window_secs` means a few extra
+    /// entries hang around briefly; the alternative would be threading
+    /// the window-secs config through every prune call.
+    pub fn prune(&mut self, now: Instant) {
+        let max_age = Duration::from_secs(60);
+        self.by_sender.retain(|_, s| {
+            // Cooldown expired?
+            if let Some(u) = s.cooldown_until
+                && now >= u
+            {
+                s.cooldown_until = None;
+            }
+            // Drain aged-out timestamps and contents.
+            while let Some(&t) = s.timestamps.front() {
+                if now.duration_since(t) > max_age {
+                    s.timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+            s.last_contents
+                .retain(|(t, _)| now.duration_since(*t) <= max_age);
+            // Keep if anything load-bearing remains.
+            s.cooldown_until.is_some()
+                || !s.timestamps.is_empty()
+                || !s.last_contents.is_empty()
+        });
     }
 
     /// Operator-managed blocklist short-circuit. The caller has
@@ -613,7 +587,13 @@ pub fn is_reply_to_other_speaker(
     if candidates.is_empty() {
         return false;
     }
-    let head = &lower[..lower.len().min(16)];
+    // Slice on a UTF-8 char boundary so a leading multi-byte codepoint
+    // (e.g. an emoji) cannot panic the chat task with a mid-codepoint cut.
+    let mut head_end = lower.len().min(16);
+    while head_end > 0 && !lower.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let head = &lower[..head_end];
     for name in &candidates {
         let needle = format!("@{name}");
         if head.contains(&needle) {
@@ -644,6 +624,7 @@ pub fn levenshtein_ratio(a: &str, b: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::ChatEventKind;
 
     fn default_prefixes() -> Vec<String> {
         crate::config::ChatConfig::default().command_prefixes
@@ -936,73 +917,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn classify_returns_not_enough_data_for_short_window() {
-        let w = vec![ev("A", "x"); 5];
-        assert_eq!(classify_window(&w), ChannelClass::NotEnoughData);
-    }
-
-    #[test]
-    fn classify_open_chat_with_three_distinct_senders() {
-        let w = vec![
-            ev("A", "1"),
-            ev("B", "2"),
-            ev("A", "3"),
-            ev("C", "4"),
-            ev("B", "5"),
-            ev("A", "6"),
-            ev("C", "7"),
-            ev("B", "8"),
-        ];
-        assert_eq!(classify_window(&w), ChannelClass::OpenChat);
-    }
-
-    #[test]
-    fn classify_dyad_when_two_alternating_speakers_dominate() {
-        let w = vec![
-            ev("A", "1"),
-            ev("B", "2"),
-            ev("A", "3"),
-            ev("B", "4"),
-            ev("A", "5"),
-            ev("B", "6"),
-            ev("A", "7"),
-            ev("B", "8"),
-        ];
-        match classify_window(&w) {
-            ChannelClass::Dyad {
-                speaker_a,
-                speaker_b,
-            } => {
-                let names = [speaker_a.as_str(), speaker_b.as_str()];
-                assert!(names.contains(&"A") && names.contains(&"B"));
-            }
-            other => panic!("expected dyad, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_open_chat_when_two_speakers_dont_alternate() {
-        // 8 entries, 2 distinct senders, but only one transition: AAAAAAAAB.
-        // Wait that's 9 entries — let's do 7 As + 1 B.
-        let mut w = vec![ev("A", "x"); 7];
-        w.push(ev("B", "x"));
-        // Only 1 transition between A and B; CHAT.md requires ≥ 2.
-        assert_eq!(classify_window(&w), ChannelClass::OpenChat);
-    }
-
-    #[test]
-    fn classify_open_chat_when_two_speakers_dont_dominate() {
-        // 2 distinct senders BUT count_a + count_b < 6 — impossible
-        // with only 2 distinct senders in 8 slots, but the count check
-        // belt-and-braces. Test with 1 sender = passes count check
-        // trivially? Actually 1 sender gets caught by `distinct < 2 → NotEnoughData`.
-        // Skip — covered by the not-enough-data path.
-        let w = vec![ev("A", "x"); 8];
-        // Single sender: distinct = 1 < 2, falls through.
-        assert_eq!(classify_window(&w), ChannelClass::NotEnoughData);
-    }
-
     // ===== Phase 6: SpamGuard =============================================
 
     #[test]
@@ -1095,6 +1009,47 @@ mod tests {
         bl.insert("alice".to_string());
         assert!(SpamGuard::is_blocklisted("alice", None, &bl));
         assert!(!SpamGuard::is_blocklisted("bob", None, &bl));
+    }
+
+    #[test]
+    fn spam_guard_prune_drops_aged_out_senders() {
+        // Sender entries must not accumulate forever — once their
+        // sliding window has fully aged out and there's no active
+        // cooldown, prune must drop them.
+        let mut g = SpamGuard::new();
+        let t0 = Instant::now();
+        let ev_alice = ev("Alice", "hi");
+        let ev_bob = ev("Bob", "yo");
+        let _ = g.record(&ev_alice, 5, 30, 300, t0);
+        let _ = g.record(&ev_bob, 5, 30, 300, t0);
+        // Step well past the 60 s near-duplicate window AND the 30 s
+        // sliding window, then prune. Both entries should drop.
+        let later = t0 + Duration::from_secs(120);
+        g.prune(later);
+        assert_eq!(g.by_sender.len(), 0, "aged-out entries must be pruned");
+    }
+
+    #[test]
+    fn spam_guard_prune_keeps_senders_in_active_cooldown() {
+        // A sender currently in cooldown must NOT be pruned even if
+        // their sliding window has aged out — the cooldown is the
+        // load-bearing state.
+        let mut g = SpamGuard::new();
+        let t0 = Instant::now();
+        let event = ev("Alice", "hi");
+        // Trip cooldown: 6 messages > 5 in 30s → cooldown 300s.
+        for i in 0..6 {
+            let mut e = event.clone();
+            e.content = format!("m{i}");
+            let _ = g.record(&e, 5, 30, 300, t0);
+        }
+        assert!(g.is_suppressed("Alice", t0));
+        // Long after the sliding window cleared but well within the
+        // 300 s cooldown — entry must survive prune.
+        let later = t0 + Duration::from_secs(120);
+        g.prune(later);
+        assert!(g.by_sender.contains_key("Alice"));
+        assert!(g.is_suppressed("Alice", later));
     }
 
     #[test]

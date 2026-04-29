@@ -30,17 +30,34 @@ pub enum StoreError {
     #[error("Bot not connected")]
     BotDisconnected,
 
-    /// Trade or chest op timed out; the `u64` is the timeout duration in **seconds**.
-    #[error("Trade timed out after {0}s")]
-    TradeTimeout(u64),
+    /// Trade or chest op timed out; `after_ms` is the timeout duration in **milliseconds**.
+    #[error("Trade timed out after {after_ms}ms")]
+    TradeTimeout { after_ms: u64 },
 
     /// Bot returned a structured trade-failure reason.
     #[error("Trade rejected: {0}")]
     TradeRejected(String),
 
-    /// Generic bot-side or channel error (e.g., `RecvError` on the response channel).
+    /// `bot_tx.send(...)` mpsc `SendError` — the channel to the bot is closed
+    /// (bot task panicked or already shut down). Distinct from
+    /// `BotResponseDropped` (oneshot side) and `BotReportedError`
+    /// (bot returned a structured failure).
     #[error("Bot operation failed: {0}")]
-    BotError(String),
+    BotSendFailed(String),
+
+    /// `oneshot::Receiver` `RecvError` — the bot dropped the response
+    /// `Sender` before sending a reply (typically because the bot task
+    /// crashed mid-operation). Distinct from `BotSendFailed` (mpsc side)
+    /// and `BotReportedError` (bot returned a structured failure).
+    #[error("Bot operation failed: {0}")]
+    BotResponseDropped(String),
+
+    /// Bot completed the round-trip but returned a structured `Err(String)`
+    /// in its Whisper-response payload — i.e. the bot itself reported the
+    /// failure reason. Distinct from `BotSendFailed` /
+    /// `BotResponseDropped`, which are transport-layer failures.
+    #[error("Bot operation failed: {0}")]
+    BotReportedError(String),
 
     /// Player-facing input validation failure (rendered to whisper).
     #[error("Validation failed: {0}")]

@@ -86,7 +86,7 @@ pub async fn send_message_to_player(
 
     rx.await
         .map_err(|_| crate::error::StoreError::BotDisconnected)?
-        .map_err(crate::error::StoreError::BotError)
+        .map_err(crate::error::StoreError::BotReportedError)
 }
 
 /// Helper to format transfer summaries (excludes coordinates for security).

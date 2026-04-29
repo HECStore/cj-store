@@ -69,14 +69,27 @@ pub struct ApiKey(String);
 
 impl ApiKey {
     /// Construct from the value of the env var named in
-    /// `chat.api_key_env`. Empty / whitespace-only keys are rejected
-    /// loud — caller logs at error and self-disables.
+    /// `chat.api_key_env`. The process environment is checked first;
+    /// if the var is unset there, `.env` is read directly as a fallback
+    /// (this avoids relying on `dotenvy::dotenv()` having successfully
+    /// propagated `set_var` across threads — see Rust 2024 + glibc
+    /// `setenv`/`getenv` cross-thread visibility caveats).
+    /// Empty / whitespace-only keys are rejected loud — caller logs at
+    /// error and self-disables.
     pub fn from_env(env_var: &str) -> Result<Self, String> {
-        match std::env::var(env_var) {
-            Ok(v) if !v.trim().is_empty() => Ok(ApiKey(v)),
-            Ok(_) => Err(format!("env var {env_var} is set but empty")),
-            Err(_) => Err(format!("env var {env_var} is not set")),
+        if let Ok(v) = std::env::var(env_var)
+            && !v.trim().is_empty()
+        {
+            return Ok(ApiKey(v));
         }
+        if let Ok(iter) = dotenvy::dotenv_iter() {
+            for (k, v) in iter.flatten() {
+                if k == env_var && !v.trim().is_empty() {
+                    return Ok(ApiKey(v));
+                }
+            }
+        }
+        Err(format!("env var {env_var} not set in process env or .env file"))
     }
 
     /// Test-only constructor. Production code must use `from_env`.

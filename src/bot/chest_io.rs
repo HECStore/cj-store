@@ -24,6 +24,15 @@ use crate::types::Position;
 /// this prefix and are retried with the normal shorter cadence.
 const CHUNK_NOT_LOADED_PREFIX: &str = "[chunk-not-loaded] ";
 
+/// Error prefix used to tag the "chest opened server-side but azalea couldn't
+/// decode the `container_set_content` packet" failure — usually an item-NBT
+/// parse error inside `simdnbt` (e.g. "Invalid root type 1") that prevents the
+/// `WaitingForInventoryOpen` marker from being removed even though the server
+/// already sent OpenScreen and `inventory.id` is non-zero. Retrying just hits
+/// the same packet again, so `open_chest_container` short-circuits on this
+/// prefix instead of burning the full retry budget on identical 15s timeouts.
+const PACKET_DECODE_PREFIX: &str = "[packet-decode] ";
+
 /// Locate the first shulker box in the player-inventory portion of an open
 /// double-chest container view.
 ///
@@ -342,7 +351,39 @@ async fn open_chest_container_once(
             // vanished — tag as transient so the retry loop waits for the chunk.
             let world = client.world();
             let still_loaded = world.read().get_block_state(chest_pos).is_some();
-            let prefix = if still_loaded { "" } else { CHUNK_NOT_LOADED_PREFIX };
+
+            // Distinguish "server never opened the chest" from "server opened the
+            // chest but azalea couldn't decode the contents". azalea sets
+            // `inventory.id` to the new window id when it processes the OpenScreen
+            // packet, BEFORE the (separate) ContainerSetContent packet that removes
+            // the `WaitingForInventoryOpen` marker. If a ContainerSetContent fails
+            // to decode (e.g. simdnbt "Invalid root type 1" on item components) the
+            // marker stays attached forever — `wait_for_container_open` times out
+            // even though the chest is open server-side. Detecting this lets us
+            // (a) close the orphan so the server isn't left with a phantom open
+            // window, and (b) tag the error so the retry loop doesn't burn the
+            // full 3×15s budget on a deterministic decode failure.
+            let inventory_handle = client.get_inventory();
+            let opened_window_id = inventory_handle.id();
+            let prefix = if !still_loaded {
+                CHUNK_NOT_LOADED_PREFIX
+            } else if opened_window_id != 0 {
+                // Force-close the orphan window. ContainerHandleRef::close sends a
+                // ServerboundContainerClose packet; the server then drops its
+                // window state so the next attempt starts clean.
+                warn!(
+                    "open_chest_container_once: Chest at ({}, {}, {}) opened server-side \
+                    (window id {}) but azalea couldn't decode the contents — closing \
+                    orphan window. This is usually a `container_set_content` NBT decode \
+                    error (e.g. \"Invalid root type 1\") triggered by an item in this chest \
+                    whose component data this azalea/ViaProxy build can't parse.",
+                    chest_pos.x, chest_pos.y, chest_pos.z, opened_window_id
+                );
+                inventory_handle.close();
+                PACKET_DECODE_PREFIX
+            } else {
+                ""
+            };
             Err(format!(
                 "{}Failed to open chest at ({}, {}, {}) after {}s timeout",
                 prefix, chest_pos.x, chest_pos.y, chest_pos.z, timeout_secs
@@ -465,6 +506,11 @@ pub async fn open_chest_container(
                         chest_pos.x, chest_pos.y, chest_pos.z, max_retries
                     );
                 }
+                // Short-circuit on packet-decode failures: the server consistently
+                // sends the same unparseable item-NBT for this chest, so retrying
+                // burns 15s per attempt with no chance of recovery. Surface the
+                // real cause to the order layer immediately instead.
+                let is_decode_failure = e.starts_with(PACKET_DECODE_PREFIX);
                 last_error = e;
                 warn!(
                     "open_chest_container: Attempt {}/{} FAILED at ({}, {}, {}): {}",
@@ -475,6 +521,25 @@ pub async fn open_chest_container(
                     chest_pos.z,
                     last_error
                 );
+                if is_decode_failure {
+                    let clean_error = last_error
+                        .strip_prefix(PACKET_DECODE_PREFIX)
+                        .unwrap_or(&last_error);
+                    error!(
+                        "open_chest_container: ABORTING retries at ({}, {}, {}) — chest opened \
+                        server-side but azalea/simdnbt couldn't decode the contents packet. \
+                        Retrying will hit the same item-NBT every time. \
+                        Last error: {}",
+                        chest_pos.x, chest_pos.y, chest_pos.z, clean_error
+                    );
+                    return Err(format!(
+                        "Chest at ({}, {}, {}) opened on server but its contents packet \
+                        could not be decoded by azalea (item-NBT parse error). The chest \
+                        likely contains an item this azalea/ViaProxy build can't parse. \
+                        Underlying: {}",
+                        chest_pos.x, chest_pos.y, chest_pos.z, clean_error
+                    ));
+                }
             }
         }
         attempt += 1;

@@ -23,8 +23,10 @@ pub mod shulker;
 pub mod trade;
 
 use azalea::account::Account;
+use azalea::player::GameProfileComponent;
 use azalea::prelude::*;
 use azalea::{Client, Event};
+use azalea_viaversion::ViaVersionPlugin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
@@ -165,6 +167,19 @@ pub struct Bot {
     /// (trade-only operator). Used today only to fire
     /// `ChatCommand::BotDisconnected` on `Event::Disconnect`.
     pub chat_cmd_tx: Option<mpsc::Sender<ChatCommand>>,
+    /// Cached ViaProxy plugin handle, started exactly once at bot
+    /// construction time and cloned into every `ClientBuilder` on reconnect.
+    ///
+    /// `azalea_viaversion::ViaVersionPlugin::start` spawns a fresh `java -jar
+    /// ViaProxy.jar` subprocess on every call AND retains no handle to it
+    /// (the inner `tokio::spawn` owns the `Child` forever with no
+    /// `kill_on_drop`), so calling `start` per-reconnect leaks one Java VM
+    /// per cycle — each holds ~30 MB RES / 700 MB VIRT and never exits.
+    /// Caching the plugin and `Clone`-ing it (the type derives `Clone`)
+    /// keeps exactly one ViaProxy alive for the lifetime of the bot process,
+    /// and every reconnect's `ClientBuilder` shares it via the same
+    /// `bind_addr`.
+    pub via_plugin: ViaVersionPlugin,
 }
 
 /// Channels and shared state passed from `main` into [`bot_task`].
@@ -206,6 +221,13 @@ impl Bot {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let account = Account::microsoft(&account_email).await?;
 
+        // Spawn ViaProxy exactly once for the lifetime of the bot process.
+        // See the `via_plugin` field doc for why per-reconnect spawning would
+        // leak one Java VM per cycle.
+        info!("[Bot] Starting ViaProxy (one-shot, target version {})", connection::VIA_TARGET_VERSION);
+        let via_plugin = ViaVersionPlugin::start(connection::VIA_TARGET_VERSION).await;
+        info!("[Bot] ViaProxy started");
+
         Ok(Self {
             client: Arc::new(RwLock::new(None)),
             account,
@@ -226,6 +248,7 @@ impl Bot {
             history_drops: Arc::new(parking_lot::Mutex::new(0)),
             in_critical_section: channels.in_critical_section,
             chat_cmd_tx: channels.chat_cmd_tx,
+            via_plugin,
         })
     }
 
@@ -889,6 +912,45 @@ pub(crate) async fn handle_event_fn(
     handle_event(client, event, &mut state).await
 }
 
+/// Populate `state.bot_username` from the `GameProfileComponent`, if available.
+///
+/// The component is inserted via a Bevy command from the login packet handler,
+/// so it can be missing when `Event::Init` fires (commands apply on the next
+/// schedule pass). `Client::profile` panics in that window — we use the
+/// fallible accessor and silently skip if it isn't ready, expecting a later
+/// event (e.g. `Event::Spawn`) to fill it in.
+async fn populate_bot_username(client: &Client, state: &mut BotState, source: &str) {
+    // Extract and drop the (non-Send) ECS read guard before any await,
+    // otherwise the resulting future fails the `Send` bound azalea's
+    // event handler requires.
+    let username = match client.get_component::<GameProfileComponent>() {
+        Some(profile) => profile.name.clone(),
+        None => {
+            debug!(
+                "[Event::{}] GameProfileComponent not yet attached; skipping bot_username population",
+                source
+            );
+            return;
+        }
+    };
+
+    let mut guard = state.bot_username.write().await;
+    if let Some(prev) = guard.as_ref() {
+        if prev == &username {
+            return;
+        }
+        warn!(
+            cached = %prev,
+            actual = %username,
+            "[Event::{}] bot_username diverged from cached tentative value; actual wins",
+            source
+        );
+    }
+    *guard = Some(username.clone());
+    drop(guard);
+    info!("[Event::{}] bot_username populated: {}", source, username);
+}
+
 async fn handle_event(client: Client, event: Event, state: &mut BotState) -> anyhow::Result<()> {
     match event {
         Event::Init => {
@@ -898,10 +960,22 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             state.connecting.store(false, Ordering::SeqCst);
             // CHAT.md: populate bot_username from the Mojang account
             // profile once login completes. The chat module observes this
-            // and refuses to compose until it is `Some(_)`.
-            let username = client.profile().name.clone();
-            *state.bot_username.write().await = Some(username.clone());
-            debug!("[Event] bot_username populated: {}", username);
+            // and refuses to compose until it is `Some(_)`. If chat already
+            // seeded a tentative value from cached state, warn on divergence —
+            // the actual value wins, but a mismatch means events processed
+            // in the pre-Init window were filtered against the wrong identity.
+            //
+            // GameProfileComponent is added by a Bevy command from the login
+            // packet handler; when Init fires the deferred command may not have
+            // applied yet, so use the fallible accessor and let `Event::Spawn`
+            // fill it in if it isn't ready here.
+            populate_bot_username(&client, state, "Init").await;
+        }
+        Event::Spawn => {
+            // Fallback path for `bot_username`: by Spawn the GameProfileComponent
+            // is guaranteed attached. If Init populated it already this is a
+            // no-op (write only on transition to `Some` or on divergence).
+            populate_bot_username(&client, state, "Spawn").await;
         }
         Event::Chat(m) => {
             let message_text = m.message().to_string();
@@ -913,11 +987,22 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
             // chat-events channel + history mpsc.
             let parsed = parse_chat_line(&m, &message_text);
 
-            // Log whispers at info level (existing behavior).
-            if let Some(ref p) = parsed
-                && p.kind == ChatEventKind::Whisper
-            {
-                info!("Received whisper from {}: {}", p.sender, p.content);
+            // Log every parsed line at info so operators can see what's
+            // reaching the chat decision pipeline. Unparseable lines
+            // (system broadcasts, plugin output) log at debug only.
+            match &parsed {
+                Some(p) if p.kind == ChatEventKind::Whisper => {
+                    info!("Received whisper from {}: {}", p.sender, p.content);
+                }
+                Some(p) => {
+                    info!("Received public chat from {}: {}", p.sender, p.content);
+                }
+                None => {
+                    tracing::debug!(
+                        "Chat line had no parseable sender, skipping: {}",
+                        message_text
+                    );
+                }
             }
 
             // Step 1: legacy chat_tx publish FIRST — trade-failure
@@ -1031,47 +1116,128 @@ struct ParsedChat {
 }
 
 /// Parse a single Azalea `ChatPacket` into a [`ParsedChat`]. Returns
-/// `None` for messages with no recognizable sender — typically
-/// system/server lines that aren't player chat.
+/// `None` only when no sender can be derived — system broadcasts,
+/// overlay messages, etc.
+///
+/// We delegate to Azalea's [`ChatPacket::split_sender_and_content`],
+/// which already handles every common server format (signed player
+/// chat, vanilla `<player> text`, essentials `[player -> me] text`,
+/// 2b2t-style `player whispers: text`, Hypixel `From [Rank] player:`)
+/// and returns `(None, _)` only for unparseable system lines. The
+/// whisper-vs-public split uses [`ChatPacket::is_whisper`].
+///
+/// Server-broadcast salvage: some servers emit join announcements with a
+/// non-username sender tag (e.g. literal `"1"` on certain anarchy
+/// proxies). When the parsed sender doesn't fit the Mojang shape we
+/// scan the content for a join cue + a Mojang-shaped username — if we
+/// find one we rewrite the event so it looks like a public chat line
+/// from the joining player. Downstream the chat-AI can decide whether
+/// to greet, instead of the line being silently dropped as system noise.
 fn parse_chat_line(
-    message: &azalea::client_chat::ChatPacket,
-    message_text: &str,
+    message: &azalea::chat::ChatPacket,
+    _message_text: &str,
 ) -> Option<ParsedChat> {
-    let sender = message.sender()?;
-
-    // Whisper detection: look for "whispers:" anywhere in the line. This
-    // is server-format-specific but matches the existing detection in
-    // `handle_chat_message` (the previous implementation).
-    if let Some(pos) = message_text.find("whispers:") {
-        let content = message_text[pos + "whispers:".len()..].trim().to_string();
-        if content.is_empty() {
-            return None;
-        }
-        return Some(ParsedChat {
-            kind: ChatEventKind::Whisper,
-            sender,
-            content,
-        });
+    let (sender, content) = message.split_sender_and_content();
+    let sender = sender?;
+    if content.trim().is_empty() {
+        return None;
     }
-
-    // Public chat: best-effort extraction of "<sender> content". If the
-    // server format doesn't include the angle-bracketed prefix, fall back
-    // to using the raw message text. The chat module is robust to either.
-    let content = if let Some(rest) = message_text.split_once('>').map(|(_, r)| r.trim()) {
-        if rest.is_empty() {
-            message_text.to_string()
-        } else {
-            rest.to_string()
-        }
+    let kind = if message.is_whisper() {
+        ChatEventKind::Whisper
     } else {
-        message_text.to_string()
+        ChatEventKind::Public
     };
 
+    // System-shaped sender — try the join-broadcast salvage. Any sender
+    // that doesn't pass the Mojang `[A-Za-z0-9_]{3,16}` shape is a
+    // candidate (covers literal "1", "[Server]", "+", etc.).
+    let mojang_ok = sender.len() >= 3
+        && sender.len() <= 16
+        && sender.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !mojang_ok && kind == ChatEventKind::Public {
+        if let Some(joiner) = parse_join_broadcast(&content) {
+            tracing::info!(
+                raw_sender = %sender,
+                joiner = %joiner,
+                raw_content = %content,
+                "[Event] join broadcast salvaged from system sender; routing as public chat from joiner"
+            );
+            return Some(ParsedChat {
+                kind: ChatEventKind::Public,
+                sender: joiner,
+                content: "*just joined the server*".to_string(),
+            });
+        }
+        // Not a recognized join shape — log once at debug for triage and
+        // fall through; the chat module's system-pseudo-sender filter
+        // will drop it without a response.
+        tracing::debug!(
+            raw_sender = %sender,
+            raw_content = %content,
+            "[Event] non-Mojang sender; passing through (will be filtered as system pseudo-sender downstream)"
+        );
+    }
+
     Some(ParsedChat {
-        kind: ChatEventKind::Public,
+        kind,
         sender,
         content,
     })
+}
+
+/// Try to extract the joining player's name from a server-side join
+/// broadcast. Returns `Some(name)` when the content carries a join cue
+/// (`joined`, `connected`, `logged in`, etc.) AND a single Mojang-shaped
+/// username can be picked out unambiguously. Best-effort and forgiving:
+/// false positives are tolerable because the chat-AI gets the final say
+/// on whether to greet.
+///
+/// Recognized shapes (case-insensitive on cues, exact on the username):
+/// - `Foo joined the game`, `Foo has joined`, `Foo connected`
+/// - `+ Foo`, `[+] Foo` (proxy/2b2t-style join markers)
+/// - `Welcome Foo` / `Welcome, Foo` (server-driven greeter plugins)
+fn parse_join_broadcast(content: &str) -> Option<String> {
+    let lc = content.to_lowercase();
+    let has_cue = lc.contains("joined")
+        || lc.contains("connected")
+        || lc.contains("logged in")
+        || lc.contains("welcome")
+        || lc.starts_with("+ ")
+        || lc.starts_with("[+]");
+    if !has_cue {
+        return None;
+    }
+    // Walk the content collecting Mojang-shaped tokens. Stop words
+    // ("welcome", "joined", "the", etc.) get filtered so we don't
+    // accidentally pick a verb when no real username is present. We
+    // accept the FIRST username-shaped token that isn't a stop word —
+    // every recognized shape above places the joiner at the front of
+    // the cue, so first-match is the right heuristic.
+    const STOP_WORDS: &[&str] = &[
+        "the", "a", "an", "joined", "join", "joins", "connected",
+        "connect", "connects", "logged", "log", "logs", "welcome",
+        "welcomes", "welcomed", "back", "in", "to", "game", "server",
+        "player", "newbie",
+    ];
+    for raw in content.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if raw.len() < 3 || raw.len() > 16 {
+            continue;
+        }
+        if !raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let lc_tok = raw.to_lowercase();
+        if STOP_WORDS.contains(&lc_tok.as_str()) {
+            continue;
+        }
+        // Reject pure-digit tokens — proxies sometimes prefix with a
+        // numeric tag ("1 Foo joined").
+        if raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        return Some(raw.to_string());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1133,6 +1299,49 @@ mod tests {
             .try_read()
             .expect("client RwLock should not be poisoned");
         assert!(guard.is_none(), "new BotState must have no attached Client");
+    }
+
+    #[test]
+    fn parse_join_broadcast_extracts_username_for_common_cues() {
+        for (line, expected) in &[
+            ("Foo joined the game", "Foo"),
+            ("Foo has joined", "Foo"),
+            ("Foo connected", "Foo"),
+            ("Foo logged in", "Foo"),
+            ("+ Foo", "Foo"),
+            ("[+] Foo", "Foo"),
+            ("Welcome Foo to the server", "Foo"),
+            ("Welcome, Foo!", "Foo"),
+        ] {
+            assert_eq!(
+                parse_join_broadcast(line).as_deref(),
+                Some(*expected),
+                "input: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_join_broadcast_skips_proxy_numeric_prefix() {
+        // Some proxies emit "1 Foo joined the game" where "1" is a tag; the
+        // joiner is the first non-numeric Mojang-shaped token.
+        assert_eq!(
+            parse_join_broadcast("1 Foo joined the game").as_deref(),
+            Some("Foo")
+        );
+    }
+
+    #[test]
+    fn parse_join_broadcast_returns_none_without_join_cue() {
+        // Plain chat must not be misclassified as a join.
+        assert!(parse_join_broadcast("hello everyone").is_none());
+        assert!(parse_join_broadcast("Foo said hi").is_none());
+    }
+
+    #[test]
+    fn parse_join_broadcast_returns_none_when_only_stop_words_present() {
+        // "joined the game" with no name must not invent one.
+        assert!(parse_join_broadcast("joined the game").is_none());
     }
 
     #[test]

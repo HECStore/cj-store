@@ -18,7 +18,6 @@
 //! clock-jump-safe (a backward jump won't reset) because we compare
 //! calendar days, not durations.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -75,6 +74,13 @@ pub struct ChatState {
     pub dry_run_runtime_override: bool,
     pub moderation_backoff_until: Option<String>,
     pub model_404_backoff_until: Option<String>,
+    /// Set when the composer hits an Anthropic-side 429 / 5xx after the
+    /// in-call retry budget is exhausted. Composer dispatch short-circuits
+    /// while the timer is in the future so we don't keep slamming a
+    /// throttled bucket with fresh requests. Cleared automatically once
+    /// the timestamp is in the past.
+    #[serde(default)]
+    pub composer_throttle_backoff_until: Option<String>,
     pub persona_regen_cooldown_until: Option<String>,
     /// Number of history events dropped today by the publisher-side
     /// `try_send` path.
@@ -83,18 +89,6 @@ pub struct ChatState {
     /// Reset at the same daily boundary as the token meter.
     #[serde(default)]
     pub web_fetches_today: u32,
-    /// CHAT.md — per-sender spam-meter snapshot. Persisted on every
-    /// state save so cooldowns survive restarts.
-    #[serde(default)]
-    pub spam_meter_snapshot: BTreeMap<String, SpamSnapshot>,
-    /// CHAT.md — UUID -> ISO UTC of the last bot reply to the player.
-    /// Used by the trust ladder and "active speaker" gating.
-    #[serde(default)]
-    pub last_replied_at_per_player: BTreeMap<String, String>,
-    /// CHAT.md — depth of the background UUID-resolve queue. Surfaced
-    /// in `Chat: status`.
-    #[serde(default)]
-    pub uuid_resolve_queue_depth: u32,
     /// CHAT.md — day (YYYY-MM-DD UTC) the retention sweep last fired.
     /// Used by the "first event each new UTC day" auto-trigger.
     #[serde(default)]
@@ -118,18 +112,6 @@ pub struct ChatState {
     pub last_persona_regenerated_at: Option<String>,
 }
 
-/// Per-sender spam-meter snapshot stored in `state.json`. The runtime
-/// `SpamGuard` re-hydrates from this on startup.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct SpamSnapshot {
-    /// Recent message receipt timestamps as ISO UTC.
-    #[serde(default)]
-    pub msgs: Vec<String>,
-    /// ISO UTC when the cooldown ends, if active.
-    #[serde(default)]
-    pub cooldown_until: Option<String>,
-}
-
 /// Snapshot of a single API call for `Chat: status`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct LastCallSummary {
@@ -150,12 +132,10 @@ impl Default for ChatState {
             dry_run_runtime_override: false,
             moderation_backoff_until: None,
             model_404_backoff_until: None,
+            composer_throttle_backoff_until: None,
             persona_regen_cooldown_until: None,
             history_drops_today: 0,
             web_fetches_today: 0,
-            spam_meter_snapshot: BTreeMap::new(),
-            last_replied_at_per_player: BTreeMap::new(),
-            uuid_resolve_queue_depth: 0,
             last_sweep_day: None,
             last_reflection_at: None,
             update_self_memory_today: 0,
@@ -172,8 +152,18 @@ fn today_utc() -> String {
 impl ChatState {
     /// Load `state.json`, falling back to the default on any error. The
     /// loader refuses to start on unknown versions and instead returns
-    /// the default — operators see a warning in the log; the on-disk
-    /// file is preserved for inspection.
+    /// the default — operators see a warning in the log.
+    ///
+    /// Version-mismatch handling differs by direction:
+    /// - **Future-version files** (`version > STATE_VERSION`, i.e. written
+    ///   by a newer build) are renamed to `<original>.bak.v<found_version>`
+    ///   before returning the default, so a subsequent save by this older
+    ///   binary cannot silently clobber the future-format data. If the
+    ///   rename fails the loader still returns the default and startup
+    ///   proceeds (the next save will overwrite).
+    /// - **Older-version files** and **unparseable files** are left in
+    ///   place — those have a sensible upgrade story / are useful for
+    ///   inspection.
     pub fn load_or_default() -> io::Result<Self> {
         let p = Path::new(STATE_FILE);
         if !p.exists() {
@@ -182,6 +172,31 @@ impl ChatState {
         let s = fs::read_to_string(p)?;
         match serde_json::from_str::<ChatState>(&s) {
             Ok(state) if state.version == STATE_VERSION => Ok(state),
+            Ok(other) if other.version > STATE_VERSION => {
+                // Future-version file: move it aside so the older binary's
+                // first save doesn't overwrite future-format data.
+                let sidecar = format!("{}.bak.v{}", STATE_FILE, other.version);
+                match fs::rename(p, &sidecar) {
+                    Ok(()) => {
+                        warn!(
+                            on_disk_version = other.version,
+                            expected = STATE_VERSION,
+                            sidecar = %sidecar,
+                            "state.json was written by a newer build; moved aside and starting fresh"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            on_disk_version = other.version,
+                            expected = STATE_VERSION,
+                            error = %e,
+                            sidecar = %sidecar,
+                            "state.json was written by a newer build; failed to move aside, starting fresh anyway (next save will overwrite)"
+                        );
+                    }
+                }
+                Ok(Self::default())
+            }
             Ok(other) => {
                 warn!(
                     on_disk_version = other.version,
@@ -211,8 +226,14 @@ impl ChatState {
     }
 
     /// Test seam — `roll_to_today` calls this with `chrono::Utc::now()`.
+    /// Forward-only: a call backdated to an earlier day (e.g. a composer
+    /// call that started before midnight UTC and is now recorded after
+    /// midnight, after some other call has already rolled the meter)
+    /// must NOT wipe the current day's counters. The backdated usage is
+    /// folded into the live day instead — slight misattribution, but no
+    /// data loss.
     pub(crate) fn roll_to_day(&mut self, today: &str) {
-        if self.last_meter_day_utc != today {
+        if today > self.last_meter_day_utc.as_str() {
             info!(
                 from = %self.last_meter_day_utc,
                 to = today,
@@ -302,7 +323,9 @@ impl ChatState {
             self.tokens_today.composer_input.saturating_add(input_tokens);
         self.tokens_today.composer_output =
             self.tokens_today.composer_output.saturating_add(output_tokens);
-        self.tokens_today.estimated_usd += usd;
+        if usd.is_finite() && usd >= 0.0 {
+            self.tokens_today.estimated_usd += usd;
+        }
     }
 
     pub fn record_classifier(
@@ -321,7 +344,9 @@ impl ChatState {
             .tokens_today
             .classifier_output
             .saturating_add(output_tokens);
-        self.tokens_today.estimated_usd += usd;
+        if usd.is_finite() && usd >= 0.0 {
+            self.tokens_today.estimated_usd += usd;
+        }
     }
 }
 
@@ -384,22 +409,16 @@ mod tests {
 
     #[test]
     fn roll_to_day_does_not_reset_on_backward_jump() {
-        // Monotonic-clock-jump safety: "today" going backward
-        // should NOT reset counters. We model this by passing a yesterday
-        // string when state's last_meter_day_utc is today.
+        // A backdated record (e.g. a composer call that started before
+        // midnight UTC and is recorded after another call has already
+        // rolled the meter) must NOT wipe the current day's counters.
+        // The backdated usage folds into the live day instead.
         let mut s = ChatState::default();
         s.tokens_today.composer_input = 50;
         s.last_meter_day_utc = "2025-01-02".to_string();
-        // Caller passing yesterday is unusual but possible if a delayed
-        // call's "started_day" lags. The implementation rolls forward
-        // unconditionally on date inequality — so this DOES reset.
-        // The protection is "compare calendar days, not durations":
-        // there is no underflow risk regardless of direction. Document
-        // the actual behavior here so future readers don't mistake the
-        // CHAT.md comment for a stronger guarantee than it provides.
         s.roll_to_day("2025-01-01");
-        assert_eq!(s.tokens_today, TokensToday::default());
-        assert_eq!(s.last_meter_day_utc, "2025-01-01");
+        assert_eq!(s.tokens_today.composer_input, 50);
+        assert_eq!(s.last_meter_day_utc, "2025-01-02");
     }
 
     #[test]
@@ -418,21 +437,33 @@ mod tests {
     }
 
     #[test]
+    fn record_composer_ignores_nan_usd() {
+        // A NaN propagating into estimated_usd would poison the daily
+        // USD cap forever (NaN comparisons are unordered, so new_usd >
+        // cap evaluates false). The recorder must silently drop it.
+        let mut s = ChatState::default();
+        let day = s.last_meter_day_utc.clone();
+        s.record_composer(&day, 1000, 200, f64::NAN);
+        assert_eq!(s.tokens_today.estimated_usd, 0.0);
+        assert_eq!(s.tokens_today.composer_input, 1000);
+        assert_eq!(s.tokens_today.composer_output, 200);
+    }
+
+    #[test]
     fn record_composer_attributes_to_started_day() {
         // CHAT.md: tokens count against the day the call STARTED, not
-        // finished. If the dispatch day was yesterday, recording today
-        // should not zero counters.
+        // finished. If the dispatch day was today, recording today is
+        // straightforward — counters increment. The forward-only roll
+        // means a backdated record folds into the current day rather
+        // than resetting the meter to yesterday and losing data.
         let mut s = ChatState::default();
         s.last_meter_day_utc = "2025-01-02".to_string();
         s.tokens_today.composer_input = 1000;
-        // Call started yesterday; record now.
+        // Call started yesterday; record now. Backdated → no roll, fold
+        // into today's bucket so the 1000 already accumulated isn't lost.
         s.record_composer("2025-01-01", 500, 100, 0.05);
-        // The state was rolled to 2025-01-01 (started day) → counters
-        // zeroed → then incremented. So the on-the-record-day count is
-        // 500. Yesterday's earlier 1000 is gone, but we never claimed
-        // multi-day overlap; this captures the started-day attribution.
-        assert_eq!(s.tokens_today.composer_input, 500);
-        assert_eq!(s.last_meter_day_utc, "2025-01-01");
+        assert_eq!(s.tokens_today.composer_input, 1500);
+        assert_eq!(s.last_meter_day_utc, "2025-01-02");
     }
 
     // ---- cap checks -------------------------------------------------------

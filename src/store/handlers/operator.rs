@@ -80,13 +80,13 @@ pub async fn handle_additem_order(
     if let Err(e) = trade_send_result {
         error!("[Additem] failed to send trade instruction: operator={} item={} qty={} err={}",
             player_name, item, quantity, e);
-        return Err(StoreError::BotError(format!("Failed to send trade instruction to bot: {}", e)));
+        return Err(StoreError::BotSendFailed(format!("Failed to send trade instruction to bot: {}", e)));
     }
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
-        .map_err(|_| StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000))?
-        .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
+        .map_err(|_| StoreError::TradeTimeout { after_ms: store.config.trade_timeout_ms })?
+        .map_err(|e| StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)))?;
     if let Err(err) = &trade_result {
         return utils::send_message_to_player(
             store,
@@ -179,7 +179,7 @@ pub async fn handle_additem_order(
             );
             
             let (rb_tx, rb_rx) = tokio::sync::oneshot::channel();
-            let _ = store.bot_tx
+            let rb_send_result = store.bot_tx
                 .send(crate::messages::BotInstruction::TradeWithPlayer {
                     target_username: player_name.to_string(),
                     bot_offers: vec![TradeItem {
@@ -194,7 +194,19 @@ pub async fn handle_additem_order(
                     respond_to: rb_tx,
                 })
                 .await;
-            
+
+            if let Err(e) = rb_send_result {
+                error!(
+                    "[Additem] CRITICAL: return-to-operator bot_tx send failure (mpsc receiver gone) — \
+                    {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} err={}",
+                    items_in_bot_inventory, item, player_name, items_deposited, e
+                );
+                return Err(StoreError::BotSendFailed(format!(
+                    "Failed to send return-to-operator trade instruction after deposit failure ({} {} stuck in bot): {}",
+                    items_in_bot_inventory, item, e
+                )));
+            }
+
             match tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), rb_rx).await {
                 Ok(Ok(Ok(_))) => {
                     info!(
@@ -210,16 +222,47 @@ pub async fn handle_additem_order(
                         ),
                     ).await;
                 }
-                _ => {
+                Ok(Ok(Err(err))) => {
                     error!(
-                        "[Additem] CRITICAL: return-to-operator trade failed, {} item(s) of '{}' stuck in bot inventory; operator={} deposited={}",
-                        items_in_bot_inventory, item, player_name, items_deposited
+                        "[Additem] CRITICAL: return-to-operator trade rejected by bot (structured failure) — \
+                        {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} bot_err={}",
+                        items_in_bot_inventory, item, player_name, items_deposited, err
                     );
                     return utils::send_message_to_player(
                         store,
                         player_name,
                         &format!(
-                            "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory! Contact administrator. {} items were stored.",
+                            "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (bot rejected return trade: {}). Contact administrator. {} items were stored.",
+                            failed_reason, items_in_bot_inventory, err, items_deposited
+                        ),
+                    ).await;
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        "[Additem] CRITICAL: return-to-operator oneshot dropped before reply (bot dropped response sender, likely crashed) — \
+                        {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} err={}",
+                        items_in_bot_inventory, item, player_name, items_deposited, e
+                    );
+                    return utils::send_message_to_player(
+                        store,
+                        player_name,
+                        &format!(
+                            "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (bot dropped response). Contact administrator. {} items were stored.",
+                            failed_reason, items_in_bot_inventory, items_deposited
+                        ),
+                    ).await;
+                }
+                Err(_) => {
+                    error!(
+                        "[Additem] CRITICAL: return-to-operator trade timed out after {}ms — \
+                        {} item(s) of '{}' stuck in bot inventory; operator={} deposited={}",
+                        store.config.trade_timeout_ms, items_in_bot_inventory, item, player_name, items_deposited
+                    );
+                    return utils::send_message_to_player(
+                        store,
+                        player_name,
+                        &format!(
+                            "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (return trade timed out). Contact administrator. {} items were stored.",
                             failed_reason, items_in_bot_inventory, items_deposited
                         ),
                     ).await;
@@ -377,12 +420,12 @@ pub async fn handle_removeitem_order(
                 respond_to: tx,
             })
             .await
-            .map_err(|e| StoreError::BotError(format!("Failed to send chest instruction to bot: {}", e)))?;
+            .map_err(|e| StoreError::BotSendFailed(format!("Failed to send chest instruction to bot: {}", e)))?;
 
         let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
             .await
-            .map_err(|_| StoreError::TradeTimeout(CHEST_OP_TIMEOUT_SECS))?
-            .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
+            .map_err(|_| StoreError::TradeTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) })?
+            .map_err(|e| StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)))?;
 
         match bot_result {
             Err(err) => {
@@ -447,13 +490,13 @@ pub async fn handle_removeitem_order(
                 rb.operations_failed,
             );
         }
-        return Err(StoreError::BotError(format!("Failed to send trade instruction to bot: {}", e)));
+        return Err(StoreError::BotSendFailed(format!("Failed to send trade instruction to bot: {}", e)));
     }
 
     let trade_result = tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), trade_rx)
         .await
-        .map_err(|_| StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000))?
-        .map_err(|e| StoreError::BotError(format!("Bot response dropped: {}", e)))?;
+        .map_err(|_| StoreError::TradeTimeout { after_ms: store.config.trade_timeout_ms })?
+        .map_err(|e| StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)))?;
 
     if let Err(err) = &trade_result {
         warn!("[Removeitem] trade failed, rolling back to storage: operator={} item={} qty={} err={}",

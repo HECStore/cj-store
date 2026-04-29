@@ -54,10 +54,21 @@ const LINE_MAX_BYTES: usize = 64 * 1024;
 struct HistoryRecord<'a> {
     /// UTC ISO-8601 timestamp.
     ts: String,
-    /// "public" | "whisper" | "bot_out" | "dropped".
+    /// "public" | "whisper" | "bot_chat" | "bot_whisper" | "dropped".
     kind: &'a str,
     sender: &'a str,
     content: &'a str,
+    /// Recipient username for bot_out records (whisper target, or the
+    /// player the bot is replying to in public chat). Read by trust
+    /// derivation in `memory::count_interactions_for_uuid` and by the
+    /// GDPR forget-player scrub. Omitted when not applicable so legacy
+    /// inbound records stay shape-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    /// Recipient UUID for bot_out records when known. Same readers as
+    /// `target`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_uuid: Option<&'a str>,
     /// Marker that this record was emitted by the bot itself.
     /// Lets later searches attribute lines to the bot even when they were
     /// observed during the pre-Init window where username comparison is
@@ -116,16 +127,24 @@ fn encode_event(event: &ChatEvent, is_bot: bool) -> String {
         ChatEventKind::Public => "public",
         ChatEventKind::Whisper => "whisper",
     };
-    encode_with_kind(event, kind, is_bot)
+    encode_with_kind(event, kind, is_bot, None, None)
 }
 
-fn encode_with_kind(event: &ChatEvent, kind: &str, is_bot: bool) -> String {
+fn encode_with_kind(
+    event: &ChatEvent,
+    kind: &str,
+    is_bot: bool,
+    target: Option<&str>,
+    target_uuid: Option<&str>,
+) -> String {
     let (content, truncated) = truncate_utf8(&event.content, CONTENT_MAX_BYTES);
     let rec = HistoryRecord {
         ts: iso_utc(event.recv_at),
         kind,
         sender: &event.sender,
         content,
+        target,
+        target_uuid,
         is_bot,
         truncated_content: truncated,
     };
@@ -165,6 +184,12 @@ fn encode_with_kind(event: &ChatEvent, kind: &str, is_bot: bool) -> String {
 /// tagging). Called from the chat task whenever it sends chat or a
 /// whisper. The kind is recorded as `bot_chat` / `bot_whisper`
 /// distinctly so log readers can filter.
+///
+/// `target` and `target_uuid` identify the player the bot is replying
+/// to (whisper recipient, or the addressee in public chat). They are
+/// stored as structured fields so trust derivation
+/// ([`crate::chat::memory::count_interactions_for_uuid`]) and the GDPR
+/// scrub can attribute the record without parsing the content text.
 pub fn append_bot_output(
     bot_username: &str,
     target: Option<&str>,
@@ -174,15 +199,11 @@ pub fn append_bot_output(
     let event = ChatEvent {
         kind: if is_whisper { ChatEventKind::Whisper } else { ChatEventKind::Public },
         sender: bot_username.to_string(),
-        content: if let Some(t) = target {
-            format!("(to {t}) {content}")
-        } else {
-            content.to_string()
-        },
+        content: content.to_string(),
         recv_at: SystemTime::now(),
     };
     let kind_label = if is_whisper { "bot_whisper" } else { "bot_chat" };
-    let line = encode_with_kind(&event, kind_label, /* is_bot */ true);
+    let line = encode_with_kind(&event, kind_label, /* is_bot */ true, target, None);
     let path = file_for(event.recv_at);
     if let Err(e) = append_line(&path, &line) {
         error!(path = %path.display(), error = %e, "[ChatHistory] bot-output append failed");
@@ -221,9 +242,6 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// the task drains the channel silently — no JSONL files are created on
 /// disk for trade-only operators. Senders never see a `try_send` failure
 /// (the receiver stays alive) but nothing reaches the filesystem.
-///
-// TODO(integrator): adjust `main.rs` callsite to forward `chat_config.enabled`
-// here so trade-only operators don't accumulate plaintext chat history.
 pub async fn writer_task(mut history_rx: mpsc::Receiver<ChatEvent>, chat_enabled: bool) {
     if !chat_enabled {
         info!("[ChatHistory] chat disabled — writer task draining silently, no on-disk history");

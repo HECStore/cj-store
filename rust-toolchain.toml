@@ -1,6 +1,11 @@
 [toolchain]
 # This project uses Azalea, which may require nightly depending on its
-# transitive dependencies (SIMD crates / feature gates). We pin to nightly
-# to keep builds consistent.
-channel = "nightly"
+# transitive dependencies (SIMD crates / feature gates). Nightly is also
+# required because `.cargo/config.toml` sets `-Zshare-generics=y`, which
+# is a nightly-only flag.
+#
+# The channel is pinned to a specific dated nightly so CI, contributors,
+# and the maintainer all build against the same toolchain. Bump the date
+# deliberately when upstream needs a newer nightly — do not let it drift.
+channel = "nightly-2026-04-21"
 profile = "default"

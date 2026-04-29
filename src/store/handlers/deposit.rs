@@ -163,7 +163,7 @@ pub async fn handle_deposit_balance_queued(
             error = %e,
             "Deposit failed to send trade instruction"
         );
-        return Err(StoreError::BotError(format!(
+        return Err(StoreError::BotSendFailed(format!(
             "Failed to send trade instruction to bot: {}",
             e
         )));
@@ -183,7 +183,7 @@ pub async fn handle_deposit_balance_queued(
                 error = %e,
                 "Deposit trade channel dropped"
             );
-            return Err(StoreError::BotError(format!("Bot response dropped: {}", e)));
+            return Err(StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)));
         }
         Err(_) => {
             error!(
@@ -192,7 +192,7 @@ pub async fn handle_deposit_balance_queued(
                 timeout_ms = store.config.trade_timeout_ms,
                 "Deposit trade timed out"
             );
-            return Err(StoreError::TradeTimeout(store.config.trade_timeout_ms / 1000));
+            return Err(StoreError::TradeTimeout { after_ms: store.config.trade_timeout_ms });
         }
     };
 

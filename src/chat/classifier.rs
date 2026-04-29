@@ -35,10 +35,14 @@ pub enum GateVerdict {
 /// many events were filtered and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Heuristic: not directly addressed, no question marker, no recent
-    /// interaction within `chat.recent_speaker_secs`.
+    /// Defensive self-echo guard — the event sender matches the live bot
+    /// username. The pre-filter normally catches this; the gate keeps a
+    /// duplicate check so a single regression upstream can't trigger a
+    /// classifier call against the bot's own line.
     PreClassifierSkip,
-    /// Heuristic gate passed but the per-call sample rate rolled "skip".
+    /// Per-call sample roll said skip on an undirected public message.
+    /// Direct addresses, whispers, questions, and recent-speaker
+    /// continuations bypass the sample roll.
     SampleRate,
     /// Per-sender per-minute classifier cap exhausted.
     PerSenderCap,
@@ -127,12 +131,20 @@ pub fn is_question_shaped(content: &str) -> bool {
 /// pass just the live `bot_username`; Phase 6 will broaden to nicknames
 /// from `persona.md`.
 pub fn is_direct_address(content: &str, bare_word_eligible_names: &[String]) -> bool {
-    // `@<name>` anywhere in the first 16 chars.
-    let head = if content.len() > 16 {
-        &content[..16]
-    } else {
-        content
-    };
+    // `@<name>` anywhere in the first `AT_HANDLE_HEAD_BYTES` bytes, rounded
+    // down to a UTF-8 char boundary so a leading emoji
+    // (e.g. "🎉🎉🎉🎉🎉hi @bot…") cannot panic the chat task with a
+    // mid-codepoint slice. The cap is wide enough to admit a typical
+    // leading greeting ("hi everyone, ") before the `@`-handle while still
+    // bounded so the function does not match `@name` arbitrarily deep into
+    // long messages — preserving the "prefix-style" addressing convention
+    // mirrored in `is_reply_to_other_speaker` (conversation.rs).
+    const AT_HANDLE_HEAD_BYTES: usize = 32;
+    let mut head_end = content.len().min(AT_HANDLE_HEAD_BYTES);
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let head = &content[..head_end];
     if head.contains('@') {
         for name in bare_word_eligible_names {
             // Form `@name` (case-insensitive) — name must follow `@`.
@@ -162,13 +174,18 @@ pub fn is_direct_address(content: &str, bare_word_eligible_names: &[String]) -> 
 
 /// Decide whether to dispatch the event to the classifier.
 ///
-/// Returns [`GateVerdict::Classify`] only when ALL of the following hold:
+/// Returns [`GateVerdict::Classify`] when:
 ///
-/// 1. Heuristic gate: directly addressed, OR question-shaped, OR sender
-///    interacted with the bot in the last `recent_speaker_secs`.
-/// 2. Per-sender per-minute cap not yet exceeded.
-/// 3. Random sample roll succeeds (at the configured sample rate; direct
-///    addresses bypass the sample roll).
+/// 1. Per-sender per-minute cap not yet exceeded.
+/// 2. Whisper, direct address, question, or recent-speaker continuation —
+///    these bypass the sample roll. Otherwise the configured sample rate
+///    decides whether undirected public chat reaches the classifier.
+///
+/// Why no hard heuristic skip: the classifier (Haiku) is cheap, and the
+/// persona/prompt guidance handles "should I respond?" better than any
+/// keyword list. Dropping every non-keyword message at the gate made the
+/// bot look broken on greetings and short bare-name calls. The
+/// per-sender cap + sample rate still cap classifier load.
 ///
 /// `sample_roll` is a function that returns a uniform-random `f32` in
 /// `[0.0, 1.0)` — caller-supplied so tests can use a deterministic value.
@@ -204,15 +221,20 @@ pub fn classifier_gate(
     // Bot username goes into the bare-word match set unless it's
     // dictionary-conflicted; the caller is responsible for that filter
     // (passes the empty list when the name is in common-words.txt).
-    let directly_addressed =
-        is_direct_address(&event.content, bare_word_eligible_names);
+    // Whispers count as direct address regardless of content — a player
+    // who DM'd the bot is by definition reaching out to it, even if the
+    // message text is just "hi".
+    let directly_addressed = event.kind == ChatEventKind::Whisper
+        || is_direct_address(&event.content, bare_word_eligible_names);
 
     let question = is_question_shaped(&event.content);
 
-    let heuristic_pass = directly_addressed || question || sender_recent_speaker;
-    if !heuristic_pass {
-        return GateVerdict::Skip(SkipReason::PreClassifierSkip);
-    }
+    // Strong-signal events bypass the sample roll: direct address,
+    // questions, whispers, and continuing a conversation the sender was
+    // already part of. Everything else goes through the sample-rate cap
+    // so undirected public chat doesn't burn the per-day classifier
+    // budget on every line.
+    let strong_signal = directly_addressed || question || sender_recent_speaker;
 
     // Per-sender cap. Direct addresses still count against it but the cap
     // is generous enough (default 3/min) that legitimate addressed-burst
@@ -221,10 +243,10 @@ pub fn classifier_gate(
         return GateVerdict::Skip(SkipReason::PerSenderCap);
     }
 
-    // Sample rate — bypassed for direct addresses (CHAT.md: direct
-    // addresses bypass dyad/silence guards; same spirit applies here so
-    // we don't accidentally drop a "@bot, you online?").
-    if !directly_addressed
+    // Sample roll — only applied to undirected public chat. The
+    // classifier (cheap Haiku) gets the final "respond?" call via prompt
+    // guidance.
+    if !strong_signal
         && (event.kind == ChatEventKind::Public)
         && sample_roll() >= config.classifier_sample_rate
     {
@@ -253,8 +275,11 @@ pub struct Verdict {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiCallout {
     pub detected: bool,
+    // Haiku emits `null` here when `detected` is false. `#[serde(default)]`
+    // alone covers a missing field but not an explicit null, so the field
+    // is wrapped in `Option` to accept both shapes.
     #[serde(default)]
-    pub trigger: String,
+    pub trigger: Option<String>,
 }
 
 /// Two-block system prompt for the classifier. Returns
@@ -275,8 +300,30 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
          \"ai_callout\": {\"detected\": <true|false>, \"trigger\": \"<verbatim quote if true>\"}\n}\n\
          \n\
          Guidance:\n\
-         - The bot stays in character (see persona summary). It is OK to stay \
-           silent on most messages — humans don't reply to everything.\n\
+         - The bot stays in character (see persona summary). Humans don't \
+           reply to everything — silence is fine when there's nothing to add.\n\
+         - If the bot was itself a recent speaker in the history slice, the bot \
+           is part of the conversation. Treat continuations naturally — respond \
+           when the new message is a reply to or relevant to the bot's own line.\n\
+         - If two OTHER players are mid-1-on-1 (the bot is not one of the two \
+           recent speakers), default to staying out of it. BUT chime in when the \
+           bot has something genuinely worth adding: a useful fact, a callback, \
+           a relevant joke, correction, or experience. Don't interrupt for the \
+           sake of interrupting — chime in only when the contribution is more \
+           interesting than the silence.\n\
+         - When a message contains something genuinely interesting (an unusual \
+           claim, a fun topic, something the persona has an opinion on), lean \
+           toward responding even without direct address.\n\
+         - Greetings (\"hi\", \"hey\", \"hello\", \"yo\", \"sup\") deserve a reply \
+           more often than not — even a one-word acknowledgment counts. People \
+           feel ignored when they're not greeted back, and the persona is \
+           someone who's *in* the chat, not a silent NPC.\n\
+         - Join broadcasts arrive as messages where the content is exactly \
+           \"*just joined the server*\" (literal asterisks). The sender field \
+           is the joining player's name. Decide naturally — a casual \"welcome\" \
+           or \"hey <name>\" is often appropriate, especially if the persona \
+           knows them or the channel has been quiet, but don't greet every \
+           single join if the server is bursty.\n\
          - Set ai_callout.detected = true ONLY when a player accuses the bot of \
            being AI / scripted / a robot. Quote the exact trigger.\n\
          - Confidence reflects how sure you are about responding/not — not how \
@@ -348,7 +395,7 @@ pub fn build_request(
                 cache_control: None,
             }],
         }],
-        temperature: Some(0.0),
+        temperature: None,
         tools: vec![],
     }
 }
@@ -406,13 +453,15 @@ pub fn write_pending_adjustment(
 ) {
     use std::fs::OpenOptions;
     use std::io::Write;
+    // Single `now()` so `ts` and `observed_day_utc` cannot disagree
+    // across a midnight-UTC tick.
+    let now = chrono::Utc::now();
     let entry = crate::chat::reflection::PendingEntry {
-        ts: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ts: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         trigger: trigger.to_string(),
         sender: sender.to_string(),
         sender_uuid: sender_uuid.map(str::to_string),
-        observed_day_utc: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        observed_day_utc: now.format("%Y-%m-%d").to_string(),
     };
     let line = match serde_json::to_string(&entry) {
         Ok(s) => s,
@@ -518,6 +567,33 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_prefix_does_not_panic_at_byte_16() {
+        // Regression: head was sliced as `&content[..16]`. With a leading
+        // emoji a codepoint can straddle byte 16 and panic the chat task.
+        // 5 × "🎉" (4 bytes each = 20 bytes) followed by an at-handle —
+        // byte index 16 falls mid-codepoint of the 5th emoji.
+        let names = vec!["TradeBot".to_string()];
+        let _ = is_direct_address("🎉🎉🎉🎉🎉hello @TradeBot", &names);
+        // Also exercise a case where the @-handle lives inside the first
+        // 16 bytes once a multi-byte char is present.
+        assert!(is_direct_address("é @TradeBot hi there", &names));
+    }
+
+    #[test]
+    fn at_handle_within_head_bound_matches() {
+        // Regression: a leading greeting like "hi everyone, " pushes the
+        // `@`-handle past byte 16 but still within the widened
+        // AT_HANDLE_HEAD_BYTES cap (32). The cap encodes a "prefix-style
+        // addressing" intent — the @-handle should still register as a
+        // direct address when it follows a normal-length greeting.
+        let names = vec!["TradeBot".to_string()];
+        assert!(is_direct_address(
+            "hi everyone, are you online @TradeBot please?",
+            &names,
+        ));
+    }
+
+    #[test]
     fn empty_name_list_means_no_direct_address() {
         // Caller passes an empty list when the bot name is dictionary-
         // conflicted; no message can register as direct address.
@@ -603,8 +679,11 @@ mod tests {
     }
 
     #[test]
-    fn no_signal_message_skipped_at_pre_classifier() {
-        // No question, no direct address, no recent interaction. Must skip.
+    fn no_signal_message_classifies_when_sample_roll_passes() {
+        // No question, no direct address, no recent interaction. Under the
+        // softer gate the sample roll is what gates undirected public chat
+        // — when it passes, the message reaches Haiku so the
+        // persona-driven prompt can decide whether to greet / chime in.
         let event = ev("the weather is nice today", "Alice");
         let mut counter = PerSenderCounter::new();
         let v = classifier_gate(
@@ -618,7 +697,49 @@ mod tests {
             Instant::now(),
             always_pass,
         );
-        assert_eq!(v, GateVerdict::Skip(SkipReason::PreClassifierSkip));
+        assert_eq!(v, GateVerdict::Classify);
+    }
+
+    #[test]
+    fn no_signal_message_skipped_when_sample_says_skip() {
+        // The sample roll is now the *only* cost firewall for undirected
+        // public chat. When it fails, the gate must still skip with the
+        // sample-rate reason (not the old PreClassifierSkip).
+        let event = ev("the weather is nice today", "Alice");
+        let mut counter = PerSenderCounter::new();
+        let v = classifier_gate(
+            &event,
+            Some("TradeBot"),
+            &[],
+            false,
+            false,
+            &cfg(),
+            &mut counter,
+            Instant::now(),
+            always_skip,
+        );
+        assert_eq!(v, GateVerdict::Skip(SkipReason::SampleRate));
+    }
+
+    #[test]
+    fn bare_greeting_reaches_classifier_when_sample_passes() {
+        // Regression: a bare "hi" from a non-recent speaker used to be
+        // dropped at the heuristic gate. Now it must reach Haiku so the
+        // persona can decide whether to greet back.
+        let event = ev("hi", "Alice");
+        let mut counter = PerSenderCounter::new();
+        let v = classifier_gate(
+            &event,
+            Some("TradeBot"),
+            &[],
+            false,
+            false,
+            &cfg(),
+            &mut counter,
+            Instant::now(),
+            always_pass,
+        );
+        assert_eq!(v, GateVerdict::Classify);
     }
 
     #[test]
@@ -659,7 +780,12 @@ mod tests {
     }
 
     #[test]
-    fn question_skipped_when_sample_says_skip() {
+    fn question_bypasses_sample_roll() {
+        // Questions are strong-signal and reach the classifier even when
+        // the sample roll says skip. This is the engagement-tuning fix:
+        // dropping a clear "anyone selling diamonds?" because of a random
+        // sample miss made the bot look broken on perfectly reasonable
+        // chat.
         let event = ev("anyone selling diamonds?", "Alice");
         let mut counter = PerSenderCounter::new();
         let v = classifier_gate(
@@ -673,7 +799,7 @@ mod tests {
             Instant::now(),
             always_skip,
         );
-        assert_eq!(v, GateVerdict::Skip(SkipReason::SampleRate));
+        assert_eq!(v, GateVerdict::Classify);
     }
 
     #[test]
@@ -770,7 +896,17 @@ mod tests {
         let v = parse_verdict(raw).unwrap();
         let ac = v.ai_callout.unwrap();
         assert!(ac.detected);
-        assert_eq!(ac.trigger, "you sound like a bot");
+        assert_eq!(ac.trigger.as_deref(), Some("you sound like a bot"));
+    }
+
+    #[test]
+    fn parse_verdict_accepts_null_trigger_when_not_detected() {
+        // Haiku emits `"trigger": null` instead of `""` when detected=false.
+        let raw = r#"{"respond": false, "confidence": 0.5, "reason": "n/a", "urgency": "low", "ai_callout": {"detected": false, "trigger": null}}"#;
+        let v = parse_verdict(raw).unwrap();
+        let ac = v.ai_callout.unwrap();
+        assert!(!ac.detected);
+        assert!(ac.trigger.is_none());
     }
 
     #[test]

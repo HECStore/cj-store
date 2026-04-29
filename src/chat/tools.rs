@@ -413,6 +413,10 @@ pub struct ToolContext<'a> {
     pub update_self_memory_today: u32,
     /// CHAT.md — daily cap for `update_self_memory` invocations.
     pub update_self_memory_max_per_day: u32,
+    /// CHAT.md — bullet cap on `## Inferred` in `memory.md`. When a
+    /// commit pushes past the cap, the oldest bullet(s) are moved to
+    /// `memory.archive.md`.
+    pub memory_max_inferred_bullets: u32,
     /// CHAT.md — `web_fetch` calls already made today. Read by the
     /// tool to enforce the daily budget; the orchestrator increments
     /// the matching state.json counter after a successful fetch.
@@ -577,81 +581,184 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     Ok(format!("appended to '{section}'"))
 }
 
-/// On-disk path for the self-memory staging file. Each successful
-/// `update_self_memory` call appends one record here; a separate
-/// reflection pass (out of scope for this tool) graduates them into
-/// `memory.md` after operator review.
-pub const PENDING_SELF_MEMORY_FILE: &str = "data/chat/pending_self_memory.jsonl";
-
-/// One record appended to `data/chat/pending_self_memory.jsonl`. Modeled
-/// on the existing `pending_adjustments.jsonl` shape.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PendingSelfMemoryRecord<'a> {
-    ts: String,
-    bullet: &'a str,
-    day_utc: String,
-}
+/// On-disk path for the rotated archive of evicted `## Inferred`
+/// bullets. The live file is `data/chat/memory.md`; this is the
+/// archive that bullets migrate to once the inferred-section bullet
+/// cap is exceeded.
+pub const MEMORY_ARCHIVE_FILE: &str = "data/chat/memory.archive.md";
 
 /// Levenshtein-ratio threshold above which a candidate bullet is treated
 /// as a near-duplicate of an existing one.
 const SELF_MEMORY_DEDUP_RATIO: f64 = 0.85;
 
-/// Return every existing self-memory bullet we should compare against
-/// when deduplicating: lines from the pending file plus dated bullets
-/// already under `## Inferred` in `memory.md`.
-fn collect_existing_self_bullets(pending_path: &std::path::Path) -> Vec<String> {
+/// Return every existing self-memory bullet body (date prefix stripped)
+/// found under the `## Inferred` section of `memory.md`. Used by the
+/// tool's dedup gate so a near-duplicate of an already-committed bullet
+/// is rejected at the tool boundary (saves a write + an oldest-archive
+/// rotation that would otherwise drop the displaced sibling).
+fn collect_existing_self_bullets_at(memory_path: &std::path::Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if let Ok(body) = std::fs::read_to_string(pending_path) {
-        for line in body.lines() {
-            if let Ok(rec) = serde_json::from_str::<PendingSelfMemoryRecord<'_>>(line) {
-                out.push(rec.bullet.to_string());
-            }
+    let Ok(global) = std::fs::read_to_string(memory_path) else {
+        return out;
+    };
+    let mut in_inferred = false;
+    for line in global.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("## ") {
+            in_inferred = trimmed == "## Inferred";
+            continue;
         }
-    }
-    if let Ok(global) = crate::chat::memory::read_global_memory() {
-        let mut in_inferred = false;
-        for line in global.lines() {
-            let trimmed = line.trim_end();
-            if trimmed.starts_with("## ") {
-                in_inferred = trimmed == "## Inferred";
-                continue;
-            }
-            if in_inferred && let Some(rest) = trimmed.strip_prefix("- ") {
-                // Lines have shape `- <date>: <bullet>` (see
-                // `append_bullet_to_section`). Strip the `<date>: ` prefix
-                // when present so dedup compares the bullet body itself.
-                let body = rest.split_once(": ").map(|(_, b)| b).unwrap_or(rest);
-                out.push(body.to_string());
-            }
+        if in_inferred && let Some(rest) = trimmed.strip_prefix("- ") {
+            // Lines have shape `- <date>: <bullet>` (see
+            // `append_bullet_to_section`). Strip the `<date>: ` prefix
+            // when present so dedup compares the bullet body itself.
+            let body = rest.split_once(": ").map(|(_, b)| b).unwrap_or(rest);
+            out.push(body.to_string());
         }
     }
     out
 }
 
+/// Eagerly commit a sanitized bullet to the `## Inferred` section of
+/// `memory.md`. Enforces `max_inferred_bullets` by archiving the
+/// oldest displaced entries to `memory.archive.md` (kept around for
+/// future reference; not loaded into the prompt).
+///
+/// `memory_path` and `archive_path` are taken as parameters so tests can
+/// redirect them to a temp dir; the production helper at the call site
+/// passes the real on-disk paths.
+pub fn commit_self_memory_bullet(
+    bullet: &str,
+    today: &str,
+    max_inferred_bullets: u32,
+    memory_path: &std::path::Path,
+    archive_path: &std::path::Path,
+) -> Result<(), String> {
+    let body = std::fs::read_to_string(memory_path).unwrap_or_default();
+    let body = ensure_section(&body, "Inferred");
+    let body = append_bullet_to_section(&body, "Inferred", bullet, today);
+    let (kept, evicted) = enforce_inferred_cap(&body, max_inferred_bullets as usize);
+
+    if let Some(parent) = memory_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create memory dir: {e}"))?;
+    }
+    crate::fsutil::write_atomic(memory_path, &kept)
+        .map_err(|e| format!("write memory.md: {e}"))?;
+
+    if !evicted.is_empty() {
+        if let Some(parent) = archive_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create archive dir: {e}"))?;
+        }
+        // Append-only archive: read existing, append evicted lines,
+        // write atomically. We append rather than `OpenOptions::append`
+        // so the file write is single-shot atomic via fsutil.
+        let mut combined = std::fs::read_to_string(archive_path).unwrap_or_default();
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        for line in &evicted {
+            combined.push_str(line);
+            combined.push('\n');
+        }
+        crate::fsutil::write_atomic(archive_path, &combined)
+            .map_err(|e| format!("write memory.archive.md: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Apply the `max_inferred_bullets` cap to the `## Inferred` section of
+/// a memory.md body. Returns `(new_body, evicted_lines)` where the
+/// evicted lines are the oldest bullets removed to satisfy the cap.
+///
+/// Bullets are recognized as `^- ` lines under the `## Inferred`
+/// heading; any other shape (blank, comment, sub-heading) is left in
+/// place. The OLDEST bullets are evicted first — defined as their
+/// position in the section, since `append_bullet_to_section` appends to
+/// the end of the section.
+fn enforce_inferred_cap(body: &str, max_bullets: usize) -> (String, Vec<String>) {
+    let header = "## Inferred";
+    let Some(start) = body.find(header) else {
+        return (body.to_string(), Vec::new());
+    };
+    let after_header = start + header.len();
+    let rest = &body[after_header..];
+    let next_header_offset = rest.find("\n## ");
+    let (section_end, before_next) = match next_header_offset {
+        Some(off) => (after_header + off, true),
+        None => (body.len(), false),
+    };
+    let section_body = &body[after_header..section_end];
+
+    let mut bullet_indices: Vec<usize> = Vec::new();
+    for (i, line) in section_body.lines().enumerate() {
+        if line.trim_start().starts_with("- ") {
+            bullet_indices.push(i);
+        }
+    }
+    if bullet_indices.len() <= max_bullets {
+        return (body.to_string(), Vec::new());
+    }
+    let evict_count = bullet_indices.len() - max_bullets;
+    let evict_set: std::collections::HashSet<usize> = bullet_indices
+        .iter()
+        .take(evict_count)
+        .copied()
+        .collect();
+
+    let mut kept_section = String::new();
+    let mut evicted: Vec<String> = Vec::new();
+    for (i, line) in section_body.lines().enumerate() {
+        if evict_set.contains(&i) {
+            evicted.push(line.trim_end().to_string());
+        } else {
+            kept_section.push_str(line);
+            kept_section.push('\n');
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&body[..after_header]);
+    // Ensure the kept section has a leading newline like the original.
+    if !kept_section.starts_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(kept_section.trim_end_matches('\n'));
+    out.push('\n');
+    if before_next {
+        // Restore the trailing chunk (next header onward) verbatim.
+        out.push_str(&body[section_end..]);
+    }
+    (out, evicted)
+}
+
 async fn update_self_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
-    update_self_memory_at_path(
+    update_self_memory_at_paths(
         input,
         ctx,
-        std::path::Path::new(PENDING_SELF_MEMORY_FILE),
+        std::path::Path::new(crate::chat::memory::GLOBAL_MEMORY),
+        std::path::Path::new(MEMORY_ARCHIVE_FILE),
     )
 }
 
 /// Inner helper exposed at module level so tests can redirect the
-/// staging file to a temp location. Does NOT mutate `state.json`; the
-/// orchestrator increments `update_self_memory_today` after a successful
-/// invocation.
-fn update_self_memory_at_path(
+/// memory + archive paths to a temp location. Does NOT mutate
+/// `state.json`; the orchestrator increments
+/// `update_self_memory_today` after a successful invocation.
+fn update_self_memory_at_paths(
     input: &Value,
     ctx: &ToolContext<'_>,
-    pending_path: &std::path::Path,
+    memory_path: &std::path::Path,
+    archive_path: &std::path::Path,
 ) -> Result<String, String> {
     let bullet = input
         .get("bullet")
         .and_then(|v| v.as_str())
         .ok_or("bullet is required")?;
 
-    // CHAT.md — daily cap. Tool is read-only against state.json;
-    // the orchestrator bumps the counter on Ok.
+    // Daily cap. Tool is read-only against state.json; the orchestrator
+    // bumps the counter on Ok.
     if ctx.update_self_memory_today >= ctx.update_self_memory_max_per_day {
         return Err("daily limit reached".to_string());
     }
@@ -659,9 +766,8 @@ fn update_self_memory_at_path(
     let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars)
         .map_err(str::to_string)?;
 
-    // CHAT.md — Levenshtein-ratio dedup against the pending file
-    // plus the live `## Inferred` section.
-    let existing = collect_existing_self_bullets(pending_path);
+    // Levenshtein-ratio dedup against the live `## Inferred` section.
+    let existing = collect_existing_self_bullets_at(memory_path);
     for prev in &existing {
         if crate::chat::conversation::levenshtein_ratio(prev, &safe_bullet)
             >= SELF_MEMORY_DEDUP_RATIO
@@ -670,30 +776,15 @@ fn update_self_memory_at_path(
         }
     }
 
-    // Append, do NOT touch memory.md directly — the staging file is the
-    // record of intent; an out-of-band reflection pass graduates entries
-    // after operator review.
-    if let Some(parent) = pending_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create staging dir: {e}"))?;
-    }
-    let rec = PendingSelfMemoryRecord {
-        ts: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        bullet: &safe_bullet,
-        day_utc: ctx.today.clone(),
-    };
-    let line =
-        serde_json::to_string(&rec).map_err(|e| format!("serialize pending: {e}"))?;
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(pending_path)
-        .map_err(|e| format!("open pending: {e}"))?;
-    writeln!(f, "{line}").map_err(|e| format!("append pending: {e}"))?;
-    f.flush().map_err(|e| format!("flush pending: {e}"))?;
+    commit_self_memory_bullet(
+        &safe_bullet,
+        &ctx.today,
+        ctx.memory_max_inferred_bullets,
+        memory_path,
+        archive_path,
+    )?;
 
-    Ok("queued in pending_self_memory.jsonl".to_string())
+    Ok("committed to memory.md ## Inferred".to_string())
 }
 
 async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
@@ -1135,6 +1226,7 @@ mod tests {
             player_memory_max_bytes: 4096,
             update_self_memory_today: 0,
             update_self_memory_max_per_day: 3,
+            memory_max_inferred_bullets: 30,
             web_fetches_today: 0,
             web_fetch_daily_max: 50,
         }
@@ -1200,76 +1292,120 @@ mod tests {
 
     // ---- update_self_memory ADV3 controls ------------------------------
 
+    fn temp_self_memory_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let memory = std::env::temp_dir().join(format!(
+            "cj-store-self-memory-{}-{}-{tag}.md",
+            std::process::id(),
+            nanos,
+        ));
+        let archive = std::env::temp_dir().join(format!(
+            "cj-store-self-memory-{}-{}-{tag}.archive.md",
+            std::process::id(),
+            nanos,
+        ));
+        let _ = std::fs::remove_file(&memory);
+        let _ = std::fs::remove_file(&archive);
+        (memory, archive)
+    }
+
     #[test]
     fn update_self_memory_daily_cap_enforced() {
         let mut ctx = test_ctx("11111111-2222-3333-4444-555555555555");
         ctx.update_self_memory_today = 3;
         ctx.update_self_memory_max_per_day = 3;
         let input = json!({"bullet": "something to remember"});
-        let pending = std::env::temp_dir().join(format!(
-            "cj-store-pending-{}-cap.jsonl",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&pending);
-        let res = update_self_memory_at_path(&input, &ctx, &pending);
+        let (memory, archive) = temp_self_memory_paths("cap");
+        let res = update_self_memory_at_paths(&input, &ctx, &memory, &archive);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), "daily limit reached");
-        // The pending file MUST not have been created.
-        assert!(!pending.exists());
+        // The memory file MUST NOT have been created.
+        assert!(!memory.exists());
     }
 
     #[test]
-    fn update_self_memory_writes_to_pending_not_live() {
+    fn update_self_memory_commits_directly_to_inferred_section() {
         let ctx = test_ctx("11111111-2222-3333-4444-555555555555");
         let input = json!({"bullet": "operator likes brevity"});
-        let pending = std::env::temp_dir().join(format!(
-            "cj-store-pending-{}-{}-write.jsonl",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-        ));
-        let _ = std::fs::remove_file(&pending);
+        let (memory, archive) = temp_self_memory_paths("write");
 
-        let res = update_self_memory_at_path(&input, &ctx, &pending);
+        let res = update_self_memory_at_paths(&input, &ctx, &memory, &archive);
         assert!(res.is_ok(), "expected ok, got: {res:?}");
 
-        let body = std::fs::read_to_string(&pending).unwrap();
-        // One newline-terminated JSONL record.
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v["bullet"], "operator likes brevity");
-        assert_eq!(v["day_utc"], "2026-04-26");
-        assert!(v.get("ts").is_some());
+        let body = std::fs::read_to_string(&memory).unwrap();
+        assert!(body.contains("## Inferred"), "missing section header: {body}");
+        assert!(
+            body.contains("- 2026-04-26: operator likes brevity"),
+            "missing dated bullet: {body}",
+        );
+        // Archive MUST NOT exist for a single below-cap commit.
+        assert!(!archive.exists());
 
-        let _ = std::fs::remove_file(&pending);
+        let _ = std::fs::remove_file(&memory);
     }
 
     #[test]
     fn update_self_memory_dedup_rejects_near_duplicate() {
         let ctx = test_ctx("11111111-2222-3333-4444-555555555555");
-        let pending = std::env::temp_dir().join(format!(
-            "cj-store-pending-{}-{}-dedup.jsonl",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-        ));
-        let _ = std::fs::remove_file(&pending);
+        let (memory, archive) = temp_self_memory_paths("dedup");
 
-        // Seed the pending file with one bullet.
+        // Seed memory.md with one bullet.
         let first = json!({"bullet": "operator prefers brief replies"});
-        update_self_memory_at_path(&first, &ctx, &pending).unwrap();
+        update_self_memory_at_paths(&first, &ctx, &memory, &archive).unwrap();
 
         // A near-duplicate (one-character delta) must be rejected.
         let second = json!({"bullet": "operator prefers brief reply"});
-        let res = update_self_memory_at_path(&second, &ctx, &pending);
+        let res = update_self_memory_at_paths(&second, &ctx, &memory, &archive);
         assert!(res.is_err(), "expected dedup err, got: {res:?}");
         let msg = res.unwrap_err();
         assert!(msg.contains("near-duplicate"), "unexpected: {msg}");
 
         // An unrelated bullet should still pass.
         let third = json!({"bullet": "remembers the chest at -100,64,200"});
-        assert!(update_self_memory_at_path(&third, &ctx, &pending).is_ok());
+        assert!(update_self_memory_at_paths(&third, &ctx, &memory, &archive).is_ok());
 
-        let _ = std::fs::remove_file(&pending);
+        let _ = std::fs::remove_file(&memory);
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn update_self_memory_archives_oldest_when_cap_exceeded() {
+        let mut ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        // Cap = 2 means the 3rd commit evicts the oldest bullet.
+        ctx.memory_max_inferred_bullets = 2;
+        let (memory, archive) = temp_self_memory_paths("cap-evict");
+
+        for (i, bullet) in [
+            "first thing to remember",
+            "second thing to remember",
+            "third thing to remember",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let input = json!({"bullet": *bullet});
+            let r = update_self_memory_at_paths(&input, &ctx, &memory, &archive);
+            assert!(r.is_ok(), "commit {i} failed: {r:?}");
+        }
+
+        let body = std::fs::read_to_string(&memory).unwrap();
+        // Live file must have only the two most recent bullets.
+        assert!(body.contains("- 2026-04-26: second thing to remember"));
+        assert!(body.contains("- 2026-04-26: third thing to remember"));
+        assert!(
+            !body.contains("- 2026-04-26: first thing to remember"),
+            "oldest bullet should have been evicted: {body}",
+        );
+
+        // Archive must contain the evicted bullet.
+        let arch = std::fs::read_to_string(&archive).unwrap();
+        assert!(
+            arch.contains("- 2026-04-26: first thing to remember"),
+            "evicted bullet not in archive: {arch}",
+        );
+
+        let _ = std::fs::remove_file(&memory);
+        let _ = std::fs::remove_file(&archive);
     }
 
     // ---- read_today_history pagination ---------------------------------

@@ -300,8 +300,15 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
          \"ai_callout\": {\"detected\": <true|false>, \"trigger\": \"<verbatim quote if true>\"}\n}\n\
          \n\
          Guidance:\n\
-         - The bot stays in character (see persona summary). Humans don't \
-           reply to everything — silence is fine when there's nothing to add.\n\
+         - The persona summary describes the bot's VOICE (tone, vocabulary, \
+           typing habits) — it is NOT a list of topics the bot is allowed to \
+           discuss. Real people talk about whatever comes up, even things \
+           outside their hobbies. A short \"idk\", \"not really my thing\", or \
+           \"never tried that\" in the persona's voice is a perfectly valid \
+           reply — pick that over silence when the bot is addressed but the \
+           topic is unfamiliar. Silence is for events with no conversational \
+           hook for the bot at all (random crosstalk between strangers), not \
+           for \"the topic isn't on the persona's hobby list.\"\n\
          - If the bot was itself a recent speaker in the history slice, the bot \
            is part of the conversation. Treat continuations naturally — respond \
            when the new message is a reply to or relevant to the bot's own line.\n\

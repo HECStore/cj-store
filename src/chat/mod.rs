@@ -1481,6 +1481,7 @@ async fn process_event(
         player_memory_max_bytes: config.player_memory_max_bytes,
         update_self_memory_today: runtime_state.update_self_memory_today,
         update_self_memory_max_per_day: config.update_self_memory_max_per_day,
+        memory_max_inferred_bullets: config.memory_max_inferred_bullets,
         web_fetches_today: runtime_state.web_fetches_today,
         web_fetch_daily_max: config.web_fetch_daily_max,
     };

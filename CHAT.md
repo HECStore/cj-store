@@ -451,15 +451,18 @@ Growth + poisoning controls:
 - **Section allow-list.** `update_self_memory` writes only to
   `## Inferred`. Operator-managed sections are off-limits.
 - **Daily cap.** `chat.update_self_memory_max_per_day` (default 3).
-- **Bullet cap.** `chat.memory_max_inferred_bullets` (default 30);
-  oldest bullets archive to `memory.archive.md` (not loaded into the
-  prompt).
+- **Bullet cap.** `chat.memory_max_inferred_bullets` (default 30); when
+  a commit pushes past the cap the oldest bullet(s) are evicted to
+  `memory.archive.md` (not loaded into the prompt) in the same write.
 - **Dedup.** Levenshtein ratio ≥ 0.85 against any existing live bullet
-  drops the new bullet, with the existing bullet's date bumped to
-  today.
-- **Reflection-style validation.** Direct writes go to a pending file;
-  a Haiku validator pass consolidates them on the same trigger
-  conditions as adjustments.
+  in `## Inferred` rejects the new bullet at the tool boundary.
+- **Eager commit.** A successful `update_self_memory` call writes the
+  sanitized, date-prefixed bullet directly to `memory.md` in the same
+  composer turn — no pending file, no second-stage Haiku validator.
+  The composer (Opus 4.7) is the editorial gate; the tool-side
+  sanitization + dedup + daily cap are sufficient because each bullet
+  is bounded, deduped, and capped per-call. Decision JSONL records the
+  full call (input, outcome) for audit.
 - **Sanitization.** Bullets matching `(?i)^trust\s*:` or containing
   `## ` are rejected.
 
@@ -613,7 +616,7 @@ through [`fsutil::write_atomic`](src/fsutil.rs) (or append for JSONL).
 | `read_my_memory`       | —                                       | Returns full `memory.md`. Usually redundant with the system prompt; provided for explicit re-fetch.                                                                                            |
 | `read_player_memory`   | `uuid` OR `username`                    | **Cross-player firewall**: returns `"access denied"` unless `resolved_uuid == current_event.sender.uuid`. Operator can flip `chat.cross_player_reads = true` for trusted single-tenant servers. |
 | `update_player_memory` | `uuid`, `section`, `bullet`             | **Sender binding**: `uuid` argument must equal sender's UUID; cross-player writes rejected unconditionally (no override). Section allow-list: `Stated preferences`, `Inferred`, `Topics & history`, `Do not mention`. Bullet sanitized; ISO-date-prefixed. |
-| `update_self_memory`   | `bullet`                                | Appends a bullet under `## Inferred` of `memory.md`. Daily cap, dedup, sanitization apply.                                                                                                     |
+| `update_self_memory`   | `bullet`                                | Eagerly commits a bullet under `## Inferred` of `memory.md` in the same composer turn (no pending-file stage). Daily cap, Levenshtein dedup against `## Inferred`, and sanitization gate the write; bullets evicted past `memory_max_inferred_bullets` roll over to `memory.archive.md`. |
 | `read_today_history`   | `since_event_ts?`, `limit_lines?`       | Returns today's JSONL, capped at `chat.tools_history_max_bytes` (default 32 KB ≈ 8 K input tokens). Pagination via `since_event_ts`. Most recent first.                                        |
 | `search_history`       | `query`, `days_back`                    | Substring search **scoped strictly to `data/chat/history/*.jsonl`**. Returns up to 50 matches, each capped at 1 KB. Streaming line scan via `tokio::task::spawn_blocking`.                     |
 | `web_search`           | `query`                                 | Anthropic native server-tool `web_search_20250305` if available; otherwise returns `"not available"`.                                                                                          |
@@ -800,7 +803,6 @@ data/
     adjustments.archive.md        ← archived oldest bullets when adjustments.md exceeds the cap
     state.json                    ← runtime state mirror (last_replied_at, token meter, etc.)
     pending_adjustments.jsonl     ← classifier-stage call-out drafts awaiting reflection
-    pending_self_memory.jsonl     ← composer-stage update_self_memory drafts awaiting validation
     operator_audit.jsonl          ← Trust-3 toggles, GDPR forget-player events
     blocklist.txt                 ← operator-managed: senders to ignore entirely
     common_words.txt              ← words that downgrade bare-word direct-address (e.g. "Sky")
@@ -935,8 +937,11 @@ startup and at the first event observed each new UTC day:
   sidecars.
 - `decisions/<date>.jsonl` older than `chat.decisions_retention_days`
   (default 30).
-- `pending_adjustments.<UTC>.jsonl` and `pending_self_memory.<UTC>.jsonl`
-  older than the same retention window.
+- `pending_adjustments.<UTC>.jsonl` older than the same retention
+  window. (`pending_self_memory.<UTC>.jsonl` archives are vestigial —
+  `update_self_memory` now commits eagerly to `memory.md`, so no new
+  rotated archives are produced; the sweep still cleans any leftover
+  pre-migration files.)
 - `persona.md.<UTC>` archives, capped by **count**
   (`chat.persona_archive_max`, default 10) rather than age.
 - `adjustments.archive.md` and `memory.archive.md` rotation: when they

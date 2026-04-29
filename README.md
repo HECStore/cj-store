@@ -18,7 +18,7 @@ atomically to JSON under `data/`.
 | Doc                                  | What's in it                                                                    |
 | ------------------------------------ | ------------------------------------------------------------------------------- |
 | [ARCHITECTURE.md](ARCHITECTURE.md)   | Runtime topology, trade state machine, AMM pricing, rollback, storage model    |
-| [COMMANDS.md](COMMANDS.md)           | Player + operator whisper commands and the 16-option CLI menu                  |
+| [COMMANDS.md](COMMANDS.md)           | Player + operator whisper commands and the operator CLI menu                   |
 | [DATA_SCHEMA.md](DATA_SCHEMA.md)     | Every JSON file under `data/` — config, pairs, users, storage, queue, journal  |
 | [DEVELOPMENT.md](DEVELOPMENT.md)     | Build setup, error model, item IDs, testing, known limitations, perf tuning    |
 | [RECOVERY.md](RECOVERY.md)           | Operator runbook — corrupted pairs, stuck journal, orphaned shulker, troubleshooting |

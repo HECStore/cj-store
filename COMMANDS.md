@@ -83,9 +83,11 @@ to the AMM reserve; no in-game diamonds move.
 
 ## CLI menu (operator interface)
 
-Blocking dialoguer menu in [src/cli.rs](src/cli.rs) — 16 entries. All
-prompts go through `with_retry` so a transient terminal-I/O error (e.g.
-EINTR on resize) is retried rather than killing the CLI.
+Blocking dialoguer menu in [src/cli.rs](src/cli.rs) — 15 base entries +
+Exit (16 total) when chat is disabled; 31 base/chat entries + Exit
+(32 total) when chat is enabled. All prompts go through `with_retry`
+so a transient terminal-I/O error (e.g. EINTR on resize) is retried
+rather than killing the CLI.
 
 > Numbering below is **1-based** (how the menu renders to the operator).
 > In [src/cli.rs](src/cli.rs) the items are 0-indexed, so "option 15
@@ -127,7 +129,37 @@ EINTR on resize) is retried rather than killing the CLI.
     stock off), run through
     [RECOVERY.md § 4](RECOVERY.md#4-interrupted-datacurrent_tradejson)
     first.
-16. **Exit** — graceful shutdown (≈ 5–6 s; see
-    [ARCHITECTURE.md § Shutdown sequence](ARCHITECTURE.md#shutdown-sequence)).
-    Pending queue entries in `data/queue.json` are preserved and resume
-    on the next startup.
+
+When chat is enabled the [Chat CLI entries](#chat-cli-entries-when-chat-is-enabled)
+listed below are appended here (positions 16–31). **Exit** is appended
+last in either configuration, so its rendered position shifts from 16
+(chat off) to 32 (chat on).
+
+- **Exit** — graceful shutdown (≈ 5–6 s; see
+  [ARCHITECTURE.md § Shutdown sequence](ARCHITECTURE.md#shutdown-sequence)).
+  Pending queue entries in `data/queue.json` are preserved and resume
+  on the next startup.
+
+### Chat CLI entries (when chat is enabled)
+
+Appended after **Clear stuck order** (positions 16–31) when the chat
+subsystem is wired in. The labels below are the exact dispatch keys
+from [src/cli.rs](src/cli.rs); see [CHAT.md § "CLI commands"](CHAT.md#cli-commands)
+for full per-entry semantics.
+
+- `Chat: status`
+- `Chat: pause`
+- `Chat: resume`
+- `Chat: toggle dry-run`
+- `Chat: clear moderation backoff`
+- `Chat: run retention sweep`
+- `Chat: run reflection now`
+- `Chat: show today's decision log (last N)`
+- `Chat: show token spend today`
+- `Chat: replay event <event_ts>`
+- `Chat: reset player memory <username>`
+- `Chat: dump player memory <username>`
+- `Chat: set operator trust <username>`
+- `Chat: clear operator trust <username>`
+- `Chat: regenerate persona`
+- `Chat: forget player <username>`

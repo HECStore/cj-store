@@ -56,7 +56,7 @@ pub async fn handle_player_command(
     // Mojang round-trip. Keyed by the lowercased raw name; since UUIDs are
     // 36-char dashed strings, they cannot collide with the 3-16 char
     // alphanumeric+underscore usernames that reach this point.
-    let name_key = player_name.to_lowercase();
+    let name_key = format!("n:{}", player_name.to_lowercase());
     if let Err(wait_duration) = store.rate_limiter.check(&name_key) {
         let wait_secs = wait_duration.as_secs_f64();
         let msg = if wait_secs < 1.0 {
@@ -80,7 +80,8 @@ pub async fn handle_player_command(
 
     // Rate-limit check precedes parsing so malformed spam still counts
     // toward the per-user cooldown.
-    if let Err(wait_duration) = store.rate_limiter.check(&user_uuid) {
+    let uuid_key = format!("u:{}", user_uuid);
+    if let Err(wait_duration) = store.rate_limiter.check(&uuid_key) {
         let wait_secs = wait_duration.as_secs_f64();
         let msg = if wait_secs < 1.0 {
             format!("Please wait {:.1}s before sending another message.", wait_secs)

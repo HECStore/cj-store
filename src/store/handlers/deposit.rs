@@ -3,6 +3,7 @@
 use tracing::{debug, error, info, warn};
 
 use super::super::{Store, state, utils};
+use crate::constants::MAX_TRADE_DIAMONDS;
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
@@ -61,13 +62,6 @@ pub async fn handle_deposit_balance_queued(
         "Deposit starting"
     );
     state::assert_invariants(store, "pre-deposit-balance", false)?;
-
-    // Minecraft's vanilla trade UI exposes 12 offer slots (4x3 grid); each
-    // slot holds at most one 64-stack of diamonds, so a single trade can move
-    // at most 768 diamonds. We reject larger requests at the handler rather
-    // than silently truncating so the player isn't surprised by a partial
-    // transaction.
-    const MAX_TRADE_DIAMONDS: i32 = 12 * 64; // 768
 
     let (diamonds_to_trade, is_flexible) = match amount {
         Some(amt) => {
@@ -140,64 +134,22 @@ pub async fn handle_deposit_balance_queued(
         flexible = is_flexible,
         "Deposit initiating trade"
     );
-    let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
-    let send_result = store
-        .bot_tx
-        .send(crate::messages::BotInstruction::TradeWithPlayer {
-            target_username: player_name.to_string(),
-            bot_offers: vec![],
-            player_offers: vec![crate::messages::TradeItem {
-                item: "diamond".to_string(),
-                amount: if is_flexible { 1 } else { diamonds_to_trade },
-            }],
-            require_exact_amount: false,
-            flexible_validation: is_flexible,
-            respond_to: trade_tx,
-        })
-        .await;
-
-    if let Err(e) = send_result {
-        error!(
-            player = player_name,
-            uuid = %user_uuid,
-            error = %e,
-            "Deposit failed to send trade instruction"
-        );
-        return Err(StoreError::BotSendFailed(format!(
-            "Failed to send trade instruction to bot: {}",
-            e
-        )));
-    }
-
-    let trade_result = match tokio::time::timeout(
-        tokio::time::Duration::from_millis(store.config.trade_timeout_ms),
-        trade_rx,
+    let actual_received = match super::super::orders::perform_trade(
+        store,
+        player_name,
+        vec![],
+        vec![crate::messages::TradeItem {
+            item: "diamond".to_string(),
+            amount: if is_flexible { 1 } else { diamonds_to_trade },
+        }],
+        false,        // require_exact_amount
+        is_flexible,  // flexible_validation
+        "[Deposit]",
     )
     .await
     {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            error!(
-                player = player_name,
-                uuid = %user_uuid,
-                error = %e,
-                "Deposit trade channel dropped"
-            );
-            return Err(StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)));
-        }
-        Err(_) => {
-            error!(
-                player = player_name,
-                uuid = %user_uuid,
-                timeout_ms = store.config.trade_timeout_ms,
-                "Deposit trade timed out"
-            );
-            return Err(StoreError::TradeTimeout { after_ms: store.config.trade_timeout_ms });
-        }
-    };
-
-    let actual_received = match trade_result {
-        Err(err) => {
+        Ok(received) => received,
+        Err(StoreError::TradeRejected(err)) => {
             warn!(
                 player = player_name,
                 uuid = %user_uuid,
@@ -211,7 +163,7 @@ pub async fn handle_deposit_balance_queued(
             )
             .await;
         }
-        Ok(received) => received,
+        Err(other) => return Err(other),
     };
 
     let diamonds_actually_received: i32 = actual_received

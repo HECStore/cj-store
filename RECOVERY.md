@@ -244,8 +244,11 @@ being popped from the queue but before reaching a terminal state.
 
 **Symptoms**
 
-- Startup log shows a warning from `Store::new` about a leftover trade
-  state file.
+- Startup log shows an error-level log line from `Store::new` about a
+  leftover trade state file. The verbatim message is
+  `Found interrupted trade on startup: {state}. The previous session crashed mid-trade - operator should inspect in-world state ...`
+  (emitted via `tracing::error!`, not `warn!` — filtering by WARN will
+  miss it).
 - A player reports their last buy/sell "never finished" — no trade
   confirmation, no balance change, but items moved.
 - While the bot is still running, the log shows an error line
@@ -253,6 +256,14 @@ being popped from the queue but before reaching a terminal state.
   `ORDER_HARD_TIMEOUT_SECS` (15 min) guard fired because inner timeouts
   never returned. The order remains marked as stuck; no automatic
   recovery happens.
+
+> [!WARNING]
+> Current behavior: `Store::new` calls `trade_state::clear_persisted()`
+> on the next startup, so `data/current_trade.json` is **deleted on the
+> first restart** after the crash. Operators must read/copy the file
+> **before restarting** the bot, or recover it from a `data.bak.*`
+> snapshot — once the bot has come back up, the only on-disk evidence of
+> the interrupted trade is gone.
 
 > [!TIP]
 > If the *only* symptom is that the queue has stopped advancing (no
@@ -301,10 +312,34 @@ The bot had started moving items out of storage but had not opened the
 trade GUI. No player-side effect yet.
 
 1. Stop the bot.
-2. Follow [§ 2 Option A steps 2–4](#2-stuck-datajournaljson-entry)
-   (reseat shulker, reconcile via `audit-state`).
-3. Delete `data/current_trade.json` — the order is cancelled.
-4. Inform the player no trade happened; no balance change needed.
+2. Read/copy `data/current_trade.json` aside (the §2 restart will delete
+   it via `Store::new` auto-clear).
+3. Branch on whether the journal also has a leftover entry:
+   - **If the journal has a leftover entry** (you'll see the §2
+     `[Journal] loaded leftover entry: …` startup line — i.e. the crash
+     happened *inside* a chest op): follow
+     [§ 2 Option A steps 2–4](#2-stuck-datajournaljson-entry) against
+     that entry (reseat the shulker named by the journal, reconcile via
+     `audit-state`).
+   - **Otherwise** (no journal entry — the crash happened *between* two
+     chest ops in the withdrawal plan, so the journal had already been
+     cleared by the previous successful op): the journal can't tell you
+     what to fix, but the saved copy of `data/current_trade.json` can.
+     The `Withdrawing` variant carries a `plan: Vec<ChestTransfer>` (the
+     full list of chest→shulker transfers the bot was about to execute —
+     see [src/store/trade_state.rs](src/store/trade_state.rs)). Walk
+     each entry in `plan`, decode its `chest_id`/`slot_index` via the
+     [Terminology & decoding](#terminology--decoding) table, and
+     physically reseat any shulker from those slots that's now on the
+     station, in the bot's inventory, or on the floor — putting it back
+     into the slot the plan entry names.
+4. Restart the bot and run `audit-state` from the CLI to verify pair
+   `item_stock` matches chest sums; if it doesn't, drop down to
+   [§ 2 Option B](#2-stuck-datajournaljson-entry) for the affected pair.
+5. Confirm `data/current_trade.json` is absent — the restart already
+   cleared it; if it still exists because you skipped the restart, delete
+   it now. The order is cancelled.
+6. Inform the player no trade happened; no balance change needed.
 
 ### Phase: `Trading`
 
@@ -313,7 +348,9 @@ almost always reconstruct whether the trade confirmed by looking at the
 bot's inventory — reach for player reports only if that's ambiguous.
 
 1. Stop the bot.
-2. **Physical inventory check first.** Look at the bot's inventory and
+2. Read/copy `data/current_trade.json` aside (any §2 restart invoked
+   below will delete it via `Store::new` auto-clear).
+3. **Physical inventory check first.** Look at the bot's inventory and
    the buffer chest (if configured). The "bot offers" half of the trade
    either:
    - is still in the bot's inventory → the trade **never confirmed**.
@@ -324,10 +361,12 @@ bot's inventory — reach for player reports only if that's ambiguous.
      [Commit math table](#commit-math) for the
      order's type. (Note: storage counts were *not* synced back after the
      crash, so run `audit-state` after restart.)
-3. **Only if step 2 is ambiguous**, contact the affected player. If they
+4. **Only if step 3 is ambiguous**, contact the affected player. If they
    say the trade went through, treat as committed; otherwise treat as
    cancelled. Server logs can corroborate either way.
-4. Delete `data/current_trade.json`.
+5. Confirm `data/current_trade.json` is absent — any §2 restart already
+   cleared it; if it still exists because you skipped the restart, delete
+   it now.
 
 ### Phase: `Depositing`
 
@@ -336,20 +375,24 @@ when it crashed. This is the most common crash point because it involves
 multiple chest ops.
 
 1. Stop the bot.
-2. Read `trade_result.items_received` from `current_trade.json` — that
-   is what the player actually sent. Compare against `deposit_plan`
-   (what the bot intended to deposit).
-3. Go into the world, find any shulkers on the station / in the bot /
+2. Read/copy `data/current_trade.json` aside BEFORE any restart (any §2
+   restart invoked below will delete it via `Store::new` auto-clear).
+3. Read `trade_result.items_received` from the copy of
+   `current_trade.json` — that is what the player actually sent. Compare
+   against `deposit_plan` (what the bot intended to deposit).
+4. Go into the world, find any shulkers on the station / in the bot /
    on the floor near the destination chest, and put them in the chest
    slot named by the relevant plan entry.
-4. Manually mirror the commit using the [Commit math table](#commit-math)
+5. Manually mirror the commit using the [Commit math table](#commit-math)
    at the top of this section — apply the row for this order's type to
    `data/pairs/<item>.json` and `data/users/<uuid>.json`.
-5. Append a manual entry to `data/trades/<now>.json` matching the
+6. Append a manual entry to `data/trades/<now>.json` matching the
    completed trade so the audit log isn't missing it. Shape is in
    [DATA_SCHEMA.md](DATA_SCHEMA.md#datatradestimestampjson).
-6. Delete `data/current_trade.json`.
-7. Start the bot and run `audit-state` — it must report no drift.
+7. Confirm `data/current_trade.json` is absent — any §2 restart already
+   cleared it; if it still exists because you skipped the restart, delete
+   it now.
+8. Start the bot and run `audit-state` — it must report no drift.
 
 ### Phase: `Committed` / `RolledBack`
 
@@ -362,9 +405,12 @@ so usually nothing is missing.
 Don't just delete the file blindly, though:
 
 1. Stop the bot.
-2. Open `data/current_trade.json`. Note the `order` body (item, quantity,
-   user, `order_type`).
-3. For `Committed`: branch on `order.order_type`, because buys and sells
+2. Read/copy `data/current_trade.json` aside BEFORE any restart (any §2
+   or §Depositing restart invoked below will delete it via `Store::new`
+   auto-clear).
+3. Open the copy of `data/current_trade.json`. Note the `order` body
+   (item, quantity, user, `order_type`).
+4. For `Committed`: branch on `order.order_type`, because buys and sells
    take different paths to this terminal state:
    - **`Buy` orders.** Items already changed hands during the `Trading`
      GUI exchange (the player handed over diamonds, the bot handed over
@@ -380,10 +426,12 @@ Don't just delete the file blindly, though:
      for `Sell`; if reconciliation is needed (counts disagree, audit
      reports drift), follow the [Phase: `Depositing`](#phase-depositing)
      procedure to find any stray shulkers and mirror the commit.
-4. For `RolledBack`: verify the ledger is *unchanged* (no pair or
+5. For `RolledBack`: verify the ledger is *unchanged* (no pair or
    balance update for this order), and that no stray shulker is in the
    bot's inventory or on the station (section 3 if there is).
-5. Delete `data/current_trade.json`.
+6. Confirm `data/current_trade.json` is absent — any §2 or §Depositing
+   restart already cleared it; if it still exists because you skipped
+   the restart, delete it now.
 
 ---
 
@@ -391,18 +439,43 @@ Don't just delete the file blindly, though:
 
 **Symptoms**
 
-- On startup the Store logs `PENDING ORDERS LOST: failed to load order
-  queue, starting fresh: …` at `error` level.
-- A file named `data/queue.json.corrupt-<RFC3339>` appears next to the
-  now-empty `data/queue.json`.
+- On startup the Store logs **two** error-level lines, in this order.
+  The queue-side line fires FIRST (during `OrderQueue::load_from` in
+  [src/store/queue.rs](src/store/queue.rs)) and carries the more useful
+  detail — the sidecar path the bad bytes were moved to:
+  `[Queue] PENDING ORDERS LOST: corrupt queue file {path:?} moved to {sidecar:?}; parse error: {e}`.
+  The Store-level line follows from `Store::new` in
+  [src/store/mod.rs](src/store/mod.rs) once the queue load returns the
+  error: `PENDING ORDERS LOST: failed to load order queue, starting
+  fresh: {e}`. Grep for either string — but if you only have the second
+  one, the sidecar path you actually need is in the first.
+- A file named `data/queue.json.corrupt-<stamp>` appears next to the
+  now-empty `data/queue.json`. The `<stamp>` is an RFC3339 timestamp
+  with every `:` replaced by `-` (because Windows / NTFS reject `:` in
+  filenames; the colon-stripping happens in
+  [src/store/queue.rs](src/store/queue.rs) right before the rename), so
+  on disk you'll see something like
+  `data/queue.json.corrupt-2026-04-29T15-30-45.123456789+00-00` rather
+  than the canonical RFC3339 form.
 - Players whose orders were queued before the restart see no evidence of
   them; their queue positions are gone.
 
 **Fix**
 
-1. `OrderQueue::load_from` already moved the bad bytes out of the way
-   into `data/queue.json.corrupt-<stamp>` so they are not overwritten by
-   the next save. Open that sidecar to see what was queued.
+1. In the common case, `OrderQueue::load_from` already moved the bad
+   bytes out of the way into `data/queue.json.corrupt-<stamp>` so they
+   are not overwritten by the next save — open that sidecar to see what
+   was queued. **Rare branch:** if the rename itself failed (permissions,
+   the sidecar path was already taken, the disk filled up between the
+   parse error and the rename, etc.), no sidecar is created and the
+   queue-side log line is the alternate form
+   `[Queue] PENDING ORDERS LOST: corrupt queue file {path:?}; parse error: {e}; failed to move to {sidecar:?}: {rename_err}`.
+   In that case the bad bytes are still sitting at `data/queue.json` —
+   the next queue mutation (any add/pop/cancel) will rewrite
+   `data/queue.json` and overwrite the bad bytes — move them aside before
+   restarting if you want to keep them (e.g.
+   `mv data/queue.json data/queue.json.bad`). Operators should grep for
+   **both** queue-side messages, not just the moved-to-sidecar form.
 2. If the JSON is recoverable by eye (e.g. a trailing comma, a truncated
    last entry), repair it and rename it back to `data/queue.json` **while
    the bot is stopped**. On restart the queue is loaded as normal.
@@ -411,7 +484,8 @@ Don't just delete the file blindly, though:
    sidecar at least until every caller has re-queued; it is the only
    surviving record of the lost IDs.
 4. Do not edit `data/queue.json` while the bot is running — writes are
-   atomic but a concurrent hand-edit will race the next autosave.
+   atomic, but a concurrent hand-edit will race the next queue mutation
+   (add/pop/cancel/clear-stuck-order).
 
 **Why this can happen**: hand-edit typo, disk full during an atomic
 write (rare), or a half-synced backup restore that left the queue file

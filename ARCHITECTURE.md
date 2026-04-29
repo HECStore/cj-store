@@ -510,20 +510,37 @@ resets on bot restart.
 - **2 s minimum** between commands from the same player.
 - **Exponential backoff** on violations: 2 s → 4 s → 8 s → 16 s → 32 s, capped
   at 60 s.
-- **Reset after 30 s idle** — violation count returns to 0.
+- **Reset after 90 s idle** — violation count returns to 0.
 - Periodic cleanup (`CLEANUP_INTERVAL_SECS`, 1 h) prunes stale per-user state.
+- **Two-stage gating with key namespacing**: the dispatcher checks a cheap
+  per-name gate (`n:<lowercased-username>`) BEFORE the Mojang UUID lookup
+  so a spammer cannot bypass the cooldown by inventing many distinct
+  usernames; once the UUID resolves, a second gate (`u:<uuid>`) keys on
+  the canonical identity. The limiter itself treats keys as opaque strings
+  — the `n:`/`u:` prefixes are a caller convention to keep the two gates
+  in disjoint slots.
+- **Log fields on rejection**: the rejection-path `warn!` emits
+  `violations` (clamped at the saturation threshold for log readability)
+  plus a `saturated` boolean indicating the cooldown is pinned at MAX;
+  the stored counter continues accumulating unbounded.
 
 Example:
 
 ```
 Player: buy cobblestone 64      [allowed]
 Player: buy iron_ingot 32       [too fast - within 2s]
-Bot: Please wait 1.5s before sending another message.
+Bot: Please wait 3.5s before sending another message.   [post-increment: 4s cooldown - 0.5s elapsed]
 Player: buy iron_ingot 32       [still too fast]
-Bot: Please wait 3.8s before sending another message.  [doubled wait]
+Bot: Please wait 7.8s before sending another message.   [doubled wait]
 [Player waits]
 Player: buy iron_ingot 32       [allowed after waiting]
 ```
+
+The wait values are computed against the *post-increment* cooldown so the
+number is "honest": waiting exactly the duration the bot reports is enough
+to clear the throttle. (Returning the pre-increment cooldown would tell
+the player to wait the old, shorter window, then reject them again because
+their cooldown has already escalated.)
 
 ## Trade protocol (`/trade`)
 

@@ -6,7 +6,7 @@
 //! - Base cooldown: 2 seconds between messages
 //! - Each violation doubles the required wait time (2s -> 4s -> 8s -> 16s...)
 //! - Maximum cooldown caps at 60 seconds
-//! - After 30 seconds of no messages, violation count resets
+//! - After RATE_LIMIT_RESET_AFTER_MS of idleness, violation count resets
 //!
 //! ## Usage
 //! ```ignore
@@ -18,6 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
@@ -27,6 +28,23 @@ use crate::constants::{
     RATE_LIMIT_MAX_COOLDOWN_MS,
     RATE_LIMIT_RESET_AFTER_MS,
 };
+
+/// Smallest violation count at which `calculate_cooldown` is already pinned at
+/// `RATE_LIMIT_MAX_COOLDOWN_MS`. Any value beyond this point produces the same
+/// cooldown, so for log-readability we cap the displayed `violations` field at
+/// this threshold and surface a separate `saturated` boolean instead of letting
+/// the displayed counter grow unboundedly.
+///
+/// Hand-picked: with `RATE_LIMIT_BASE_COOLDOWN_MS = 2_000` and
+/// `RATE_LIMIT_MAX_COOLDOWN_MS = 60_000`, `2_000 << 5 = 64_000 >= 60_000`,
+/// so 5 is the smallest shift that pins the cooldown at MAX. A `const`
+/// assertion below ties this to the constants so a future tuning of either
+/// value will fail the build rather than silently desync.
+const SATURATION_THRESHOLD: u32 = 5;
+const _: () = assert!(
+    RATE_LIMIT_BASE_COOLDOWN_MS << SATURATION_THRESHOLD >= RATE_LIMIT_MAX_COOLDOWN_MS,
+    "SATURATION_THRESHOLD must be large enough that the exponential cooldown is pinned at MAX"
+);
 
 /// Tracks rate limit state for a single user
 #[derive(Debug, Clone)]
@@ -77,6 +95,32 @@ fn calculate_cooldown(violations: u32) -> Duration {
     Duration::from_millis(cooldown_ms.min(RATE_LIMIT_MAX_COOLDOWN_MS))
 }
 
+/// Clamp a `cleanup_stale` threshold to the `RATE_LIMIT_MAX_COOLDOWN_MS` floor.
+///
+/// If the input is already `>= MAX_COOLDOWN`, it is returned unchanged.
+/// Otherwise it is raised to `MAX_COOLDOWN`, and a one-shot `warn!` is emitted
+/// so a misconfiguration surfaces in production logs without becoming a
+/// per-call spam source.
+///
+/// The `debug_assert!` for misuse lives in `cleanup_stale` itself; this helper
+/// implements only the release-build clamp+warn so it remains testable in
+/// both build modes.
+fn clamp_stale_threshold(stale_threshold: Duration) -> Duration {
+    let floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+    let clamped = stale_threshold.max(floor);
+    if stale_threshold < clamped {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                original_threshold_ms = stale_threshold.as_millis() as u64,
+                clamped_threshold_ms = clamped.as_millis() as u64,
+                "[RateLimit] cleanup_stale threshold below RATE_LIMIT_MAX_COOLDOWN_MS; clamping to floor to preserve actively-throttled users"
+            );
+        }
+    }
+    clamped
+}
+
 impl RateLimiter {
     pub fn new() -> Self {
         Self {
@@ -92,23 +136,41 @@ impl RateLimiter {
     /// # Returns
     /// * `Ok(())` - User can proceed with their message
     /// * `Err(Duration)` - User must wait this long before sending another message
+    ///
+    /// # Key namespacing
+    /// Callers may use a `prefix:` namespacing convention on keys (e.g. `n:`
+    /// for usernames, `u:` for UUIDs) to keep semantically distinct gates
+    /// from sharing a slot in the limiter's map. The limiter itself treats
+    /// the key as an opaque string.
     pub fn check(&mut self, user_uuid: &str) -> Result<(), Duration> {
         let now = Instant::now();
 
-        let user_limit = self.limits.entry(user_uuid.to_string()).or_insert_with(|| {
-            // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
-            // so the `elapsed >= required_cooldown` check below always passes on
-            // the very first message; without this, a new user would be treated
-            // as having "just messaged" at entry creation and be rejected.
-            // `checked_sub` guards against the (Windows/Linux-impossible but
-            // platform-allowed) case of `Instant` subtraction underflowing near
-            // process start; falling back to `now` means the first message would
-            // be rejected, which is preferable to a panic.
-            let mut limit = UserRateLimit::new();
-            let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
-            limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
-            limit
-        });
+        // Single-lookup match on `get_mut(&str)`: the warm path (entry already
+        // exists) returns the existing `&mut UserRateLimit` directly with NO
+        // `String` allocation — `get_mut(&str)` borrows the key. The cold path
+        // pays one extra hash lookup for the post-insert re-fetch, which is
+        // unavoidable due to the borrow checker but irrelevant in practice
+        // (cold path runs once per user lifetime).
+        let user_limit = match self.limits.get_mut(user_uuid) {
+            Some(limit) => limit,
+            None => {
+                // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
+                // so the `elapsed >= required_cooldown` check below always passes on
+                // the very first message; without this, a new user would be treated
+                // as having "just messaged" at entry creation and be rejected.
+                // `checked_sub` guards against the (Windows/Linux-impossible but
+                // platform-allowed) case of `Instant` subtraction underflowing near
+                // process start; falling back to `now` means the first message would
+                // be rejected, which is preferable to a panic.
+                let mut limit = UserRateLimit::new();
+                let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
+                limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
+                self.limits.insert(user_uuid.to_string(), limit);
+                self.limits
+                    .get_mut(user_uuid)
+                    .expect("just inserted")
+            }
+        };
 
         let elapsed = now.duration_since(user_limit.last_message_time);
 
@@ -129,10 +191,27 @@ impl RateLimiter {
             // `saturating_add` guards against wrap-around from a pathological
             // spammer; the cooldown itself is capped in `calculate_cooldown`.
             user_limit.consecutive_violations = user_limit.consecutive_violations.saturating_add(1);
-            let remaining = required_cooldown - elapsed;
+            // Compute the wait against the POST-increment cooldown so the
+            // number we hand back is "honest": a player told to wait W and who
+            // actually waits W will be accepted on their next try. Using the
+            // pre-increment cooldown would tell them to wait the old (shorter)
+            // window, then reject them again because their cooldown has
+            // already escalated. `saturating_sub` is correct here because at
+            // the cap the new and old cooldowns are equal, so `elapsed` may
+            // exceed `new_required` by a hair.
+            let new_required = calculate_cooldown(user_limit.consecutive_violations);
+            let remaining = new_required.saturating_sub(elapsed);
+            // Cap the DISPLAYED violations counter at `SATURATION_THRESHOLD`
+            // (the point at which `calculate_cooldown` is already pinned at
+            // MAX). The stored counter is left unchanged — tests rely on it
+            // accumulating — but readers of the log get a meaningful number
+            // plus a `saturated` flag indicating "the cooldown has been at
+            // MAX for at least one cycle", which is the operationally
+            // interesting signal.
             warn!(
                 user_uuid = %user_uuid,
-                violations = user_limit.consecutive_violations,
+                violations = user_limit.consecutive_violations.min(SATURATION_THRESHOLD),
+                saturated = user_limit.consecutive_violations > SATURATION_THRESHOLD,
                 wait_ms = remaining.as_millis() as u64,
                 "[RateLimit] Violation recorded"
             );
@@ -154,6 +233,12 @@ impl RateLimiter {
             stale_threshold,
             RATE_LIMIT_MAX_COOLDOWN_MS,
         );
+        // Defense-in-depth for release builds: clamp the threshold to the
+        // MAX_COOLDOWN floor so a misconfigured caller can't silently strip
+        // violation counters from active spammers. The helper also emits a
+        // one-shot warning on the first observed violation so the
+        // misconfiguration surfaces in production logs.
+        let stale_threshold = clamp_stale_threshold(stale_threshold);
         let now = Instant::now();
         let before = self.limits.len();
         self.limits.retain(|_, limit| {
@@ -267,7 +352,7 @@ mod tests {
         assert_eq!(limiter.violations_for("user1"), Some(1));
 
         // Advance time past the 4s cooldown (violation 1) but short of the
-        // 30s reset window.
+        // 90s reset window.
         assert!(limiter.backdate("user1", Duration::from_secs(5)));
         assert!(limiter.check("user1").is_ok());
         assert_eq!(
@@ -297,15 +382,37 @@ mod tests {
     fn rejected_wait_does_not_exceed_current_cooldown() {
         let mut limiter = RateLimiter::new();
         let _ = limiter.check("user1");
-        // At 0 violations the required cooldown is 2s; an immediate retry's
-        // remaining wait must not exceed that.
+        // The rejection branch now reports the wait against the POST-increment
+        // cooldown (1 violation -> 4s) so the value is "honest": waiting that
+        // long actually clears the throttle. The bound therefore reflects the
+        // escalated cooldown rather than the base cooldown.
+        let escalated = calculate_cooldown(1);
         match limiter.check("user1") {
             Err(wait) => assert!(
-                wait <= Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS),
-                "wait {wait:?} exceeds base cooldown"
+                wait <= escalated,
+                "wait {wait:?} exceeds escalated cooldown {escalated:?}"
             ),
             Ok(()) => panic!("expected rejection"),
         }
+    }
+
+    #[test]
+    fn waiting_the_returned_duration_unblocks_next_check() {
+        // "Honest wait" invariant: after a rejection that returned wait W,
+        // backdating `last_message_time` so it is W farther in the past must
+        // make the next `check` succeed. Otherwise the player is told to wait
+        // a duration that, when obeyed, still gets them rejected.
+        let mut limiter = RateLimiter::new();
+        let _ = limiter.check("user1");
+        let wait = match limiter.check("user1") {
+            Err(w) => w,
+            Ok(()) => panic!("expected rejection"),
+        };
+        assert!(limiter.backdate("user1", wait));
+        assert!(
+            limiter.check("user1").is_ok(),
+            "next check after honoring returned wait must succeed"
+        );
     }
 
     #[test]
@@ -389,5 +496,40 @@ mod tests {
     fn default_produces_empty_limiter() {
         let limiter = RateLimiter::default();
         assert_eq!(limiter.len(), 0);
+    }
+
+    #[test]
+    fn clamp_stale_threshold_returns_input_when_at_or_above_max() {
+        // At-floor input: returned unchanged.
+        let at_floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+        assert_eq!(clamp_stale_threshold(at_floor), at_floor);
+
+        // Above-floor input: returned unchanged. Use a realistic production
+        // threshold so the assertion ties to actual deployment configuration.
+        let above_floor = Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS);
+        assert!(above_floor >= at_floor, "test precondition");
+        assert_eq!(clamp_stale_threshold(above_floor), above_floor);
+
+        // Far-above-floor input: still unchanged.
+        let way_above = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS * 100);
+        assert_eq!(clamp_stale_threshold(way_above), way_above);
+    }
+
+    #[test]
+    fn clamp_stale_threshold_raises_below_max_inputs_to_floor() {
+        // Below-floor inputs must be raised to AT LEAST MAX_COOLDOWN. We
+        // assert `>= floor` rather than `== floor` so this test stays
+        // resilient if the helper later switches to (e.g.) `MAX_COOLDOWN * 2`
+        // as the safety floor.
+        let floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+
+        let zero = Duration::from_millis(0);
+        assert!(clamp_stale_threshold(zero) >= floor);
+
+        let just_under = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS - 1);
+        assert!(clamp_stale_threshold(just_under) >= floor);
+
+        let way_under = Duration::from_millis(1);
+        assert!(clamp_stale_threshold(way_under) >= floor);
     }
 }

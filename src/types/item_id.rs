@@ -13,7 +13,7 @@
 use std::borrow::Borrow;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// A normalized, non-empty item identifier.
 ///
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// Implements `Deref<Target = str>` so it can be passed to any function
 /// expecting `&str` via deref coercion, and `Borrow<str>` so it works as a
 /// `HashMap<String, _>` lookup key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ItemId(String);
 
@@ -41,11 +41,17 @@ impl ItemId {
     /// Create a new `ItemId`, normalizing the `minecraft:` prefix.
     ///
     /// Returns `Err` if the resulting identifier is empty (e.g. bare
-    /// `"minecraft:"` or `""`).
+    /// `"minecraft:"` or `""`), or if it contains any character that is not
+    /// ASCII alphanumeric or `_`. This rejects path traversal (`..`, `/`,
+    /// `\`), control characters, and Unicode lookalikes such as Cyrillic `с`
+    /// that visually resemble Latin letters.
     pub fn new(raw: &str) -> Result<Self, &'static str> {
         let normalized = raw.strip_prefix("minecraft:").unwrap_or(raw);
         if normalized.is_empty() {
             return Err("empty item ID");
+        }
+        if !normalized.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err("item id contains forbidden character");
         }
         Ok(Self(normalized.to_string()))
     }
@@ -127,6 +133,24 @@ impl PartialEq<String> for ItemId {
 impl From<ItemId> for String {
     fn from(id: ItemId) -> Self {
         id.0
+    }
+}
+
+/// Custom `Deserialize` that routes through [`ItemId::new`] so the
+/// normalization invariant (prefix-stripped, non-empty, ASCII-alphanumeric +
+/// `_` only) holds for values loaded from JSON. The empty-string sentinel
+/// [`ItemId::EMPTY`] is preserved as a special case so existing on-disk data
+/// with empty `item` fields (unassigned chest slots) continues to load.
+impl<'de> Deserialize<'de> for ItemId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        if raw.is_empty() {
+            return Ok(ItemId::EMPTY);
+        }
+        ItemId::new(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -234,5 +258,89 @@ mod tests {
         let id = ItemId::default();
         assert!(id.is_empty());
         assert_eq!(id, ItemId::EMPTY);
+    }
+
+    #[test]
+    fn rejects_path_traversal_dotdot() {
+        assert!(ItemId::new("..").is_err());
+        assert!(ItemId::new("../etc").is_err());
+    }
+
+    #[test]
+    fn rejects_forward_slash() {
+        assert!(ItemId::new("foo/bar").is_err());
+        assert!(ItemId::new("/").is_err());
+    }
+
+    #[test]
+    fn rejects_backslash() {
+        assert!(ItemId::new("foo\\bar").is_err());
+        assert!(ItemId::new("\\").is_err());
+    }
+
+    #[test]
+    fn rejects_leading_dot() {
+        assert!(ItemId::new(".hidden").is_err());
+        assert!(ItemId::new(".").is_err());
+    }
+
+    #[test]
+    fn rejects_control_char() {
+        assert!(ItemId::new("\x00").is_err());
+        assert!(ItemId::new("foo\x00bar").is_err());
+    }
+
+    #[test]
+    fn rejects_cyrillic_lookalike() {
+        // Cyrillic "с" (U+0441) looks like Latin "c" but is multi-byte UTF-8.
+        // Must be rejected to prevent homograph confusion.
+        assert!(ItemId::new("\u{0441}obblestone").is_err());
+        assert!(ItemId::new("\u{0441}").is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_path_traversal() {
+        let result: Result<ItemId, _> = serde_json::from_str("\"../etc\"");
+        assert!(result.is_err(), "deserializing \"../etc\" must be Err");
+    }
+
+    #[test]
+    fn deserialize_routes_through_new() {
+        // Various forbidden inputs must all fail at the deserialization layer.
+        assert!(serde_json::from_str::<ItemId>("\"foo/bar\"").is_err());
+        assert!(serde_json::from_str::<ItemId>("\"foo\\\\bar\"").is_err());
+        assert!(serde_json::from_str::<ItemId>("\".hidden\"").is_err());
+        assert!(serde_json::from_str::<ItemId>("\"\u{0441}obblestone\"").is_err());
+    }
+
+    #[test]
+    fn deserialize_strips_minecraft_prefix() {
+        // The custom impl must still go through new(), which strips the prefix.
+        let id: ItemId = serde_json::from_str("\"minecraft:diamond\"").unwrap();
+        assert_eq!(id.as_str(), "diamond");
+    }
+
+    #[test]
+    fn deserialize_preserves_empty_sentinel() {
+        // Existing on-disk data uses "" for unassigned chest slots.
+        let id: ItemId = serde_json::from_str("\"\"").unwrap();
+        assert_eq!(id, ItemId::EMPTY);
+    }
+
+    #[test]
+    fn accepts_real_item_ids() {
+        // Sample of items currently in on-disk data.
+        for raw in [
+            "cobblestone",
+            "iron_ingot",
+            "diamond",
+            "gold_ingot",
+            "gunpowder",
+            "stone",
+            "music_disc_11",
+            "overflow",
+        ] {
+            assert!(ItemId::new(raw).is_ok(), "should accept real item id: {raw}");
+        }
     }
 }

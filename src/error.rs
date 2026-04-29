@@ -14,6 +14,8 @@
 //! into `ValidationError` regardless of its real category, hiding the
 //! migration work we already did to give errors meaningful types.
 
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -30,9 +32,13 @@ pub enum StoreError {
     #[error("Bot not connected")]
     BotDisconnected,
 
-    /// Trade or chest op timed out; `after_ms` is the timeout duration in **milliseconds**.
+    /// Trade GUI handoff timed out; `after_ms` is the timeout duration in **milliseconds**.
     #[error("Trade timed out after {after_ms}ms")]
     TradeTimeout { after_ms: u64 },
+
+    /// Chest open/close (interact-with-chest-and-sync) operation timed out; `after_ms` is the timeout duration in **milliseconds**.
+    #[error("Chest operation timed out after {after_ms}ms")]
+    ChestTimeout { after_ms: u64 },
 
     /// Bot returned a structured trade-failure reason.
     #[error("Trade rejected: {0}")]
@@ -42,14 +48,14 @@ pub enum StoreError {
     /// (bot task panicked or already shut down). Distinct from
     /// `BotResponseDropped` (oneshot side) and `BotReportedError`
     /// (bot returned a structured failure).
-    #[error("Bot operation failed: {0}")]
+    #[error("Failed to send instruction to bot: {0}")]
     BotSendFailed(String),
 
     /// `oneshot::Receiver` `RecvError` — the bot dropped the response
     /// `Sender` before sending a reply (typically because the bot task
     /// crashed mid-operation). Distinct from `BotSendFailed` (mpsc side)
     /// and `BotReportedError` (bot returned a structured failure).
-    #[error("Bot operation failed: {0}")]
+    #[error("Bot response channel dropped: {0}")]
     BotResponseDropped(String),
 
     /// Bot completed the round-trip but returned a structured `Err(String)`
@@ -63,7 +69,7 @@ pub enum StoreError {
     #[error("Validation failed: {0}")]
     ValidationError(String),
 
-    /// Bot reported a chest action failure (after timeouts have been re-routed to `TradeTimeout`).
+    /// Bot reported a chest action failure (after timeouts have been re-routed to `ChestTimeout`).
     #[error("Chest operation failed: {0}")]
     ChestOp(String),
 
@@ -74,6 +80,36 @@ pub enum StoreError {
     /// Public coercion point: any handler that gains an `io::Result` can `?`-propagate it directly.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl StoreError {
+    /// Sanitized, player-facing rendering of this error.
+    ///
+    /// Distinct from `Display` (which is the full diagnostic string used for
+    /// logs): variants whose inner data is author-controlled and known to be
+    /// safe to whisper verbatim (`ValidationError`, `TradeRejected`,
+    /// `ChestOp`) pass their inner string through; every other variant
+    /// collapses to a generic message so internal call-site identifiers
+    /// (e.g. `"pay/payer-balance"`) and transport-level details never leak
+    /// to players.
+    pub fn user_message(&self) -> Cow<'static, str> {
+        const GENERIC: &str = "Internal error. Please retry; the operator has been notified.";
+        match self {
+            StoreError::ValidationError(s)
+            | StoreError::TradeRejected(s)
+            | StoreError::ChestOp(s) => Cow::Owned(s.clone()),
+            StoreError::UnknownPair { .. }
+            | StoreError::UnknownUser { .. }
+            | StoreError::InvariantViolation(_)
+            | StoreError::BotSendFailed(_)
+            | StoreError::BotResponseDropped(_)
+            | StoreError::BotReportedError(_)
+            | StoreError::Io(_)
+            | StoreError::TradeTimeout { .. }
+            | StoreError::ChestTimeout { .. }
+            | StoreError::BotDisconnected => Cow::Borrowed(GENERIC),
+        }
+    }
 }
 
 impl From<StoreError> for String {

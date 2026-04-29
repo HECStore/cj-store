@@ -3,7 +3,7 @@
 use tracing::{debug, error, info, warn};
 
 use super::super::{Store, state, utils};
-use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
+use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE, MAX_TRADE_DIAMONDS};
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
@@ -63,9 +63,6 @@ pub async fn handle_withdraw_balance_queued(
         "Withdraw starting"
     );
     state::assert_invariants(store, "pre-withdraw-balance", false)?;
-
-    // 12 trade-window slots * 64 items per stack = 768 diamonds per trade.
-    const MAX_TRADE_DIAMONDS: i32 = 12 * 64;
 
     let user_uuid = crate::mojang::resolve_user_uuid(player_name)
         .await
@@ -128,20 +125,23 @@ pub async fn handle_withdraw_balance_queued(
         .await;
     }
 
-    let withdraw_msg = if whole_diamonds > 0 {
-        format!("Withdraw {:.2} diamonds: You'll receive {} diamonds in trade.", amount, whole_diamonds)
-    } else {
-        format!("Withdraw {:.2} diamonds: Amount too small for trade (must be at least 1 whole diamond).", amount)
-    };
-    utils::send_message_to_player(store, player_name, &withdraw_msg).await?;
-
     if whole_diamonds <= 0 {
         return utils::send_message_to_player(
             store,
             player_name,
-            "Withdraw requires at least 1 whole diamond. Use a larger amount.",
-        ).await;
+            &format!(
+                "Withdraw {:.2}: amount must be at least 1 whole diamond (got {}).",
+                amount, whole_diamonds
+            ),
+        )
+        .await;
     }
+
+    let withdraw_msg = format!(
+        "Withdraw {:.2} diamonds: You'll receive {} diamonds in trade.",
+        amount, whole_diamonds
+    );
+    utils::send_message_to_player(store, player_name, &withdraw_msg).await?;
 
     store.advance_trade(|s| s.begin_withdrawal(vec![]));
 
@@ -149,7 +149,7 @@ pub async fn handle_withdraw_balance_queued(
     // here: if the trade fails we roll diamonds back into storage, and because
     // the ledger was never touched there is nothing to restore on the balance
     // side.
-    if whole_diamonds > 0 {
+    {
         let (withdraw_plan, preview_withdrawn) =
             store.storage.simulate_withdraw_plan("diamond", whole_diamonds);
 
@@ -215,10 +215,7 @@ pub async fn handle_withdraw_balance_queued(
                     chest_id = t.chest_id,
                     "Withdraw: failed to send chest instruction: {}", e
                 );
-                return Err(StoreError::BotSendFailed(format!(
-                    "Failed to send chest instruction to bot: {}",
-                    e
-                )));
+                return Err(StoreError::BotSendFailed(e.to_string()));
             }
 
             let bot_result = match tokio::time::timeout(
@@ -235,7 +232,7 @@ pub async fn handle_withdraw_balance_queued(
                         chest_id = t.chest_id,
                         "Withdraw: chest response channel dropped: {}", e
                     );
-                    return Err(StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)));
+                    return Err(StoreError::BotResponseDropped(e.to_string()));
                 }
                 Err(_) => {
                     error!(
@@ -245,7 +242,7 @@ pub async fn handle_withdraw_balance_queued(
                         timeout_secs = CHEST_OP_TIMEOUT_SECS,
                         "Withdraw: timed out waiting for bot chest operation"
                     );
-                    return Err(StoreError::TradeTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
+                    return Err(StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
                 }
             };
 
@@ -290,14 +287,10 @@ pub async fn handle_withdraw_balance_queued(
     let trade_send_result = store.bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
             target_username: player_name.to_string(),
-            bot_offers: if whole_diamonds > 0 {
-                vec![crate::messages::TradeItem {
-                    item: "diamond".to_string(),
-                    amount: whole_diamonds,
-                }]
-            } else {
-                vec![]
-            },
+            bot_offers: vec![crate::messages::TradeItem {
+                item: "diamond".to_string(),
+                amount: whole_diamonds,
+            }],
             player_offers: vec![],
             require_exact_amount: false,
             flexible_validation: false,
@@ -320,10 +313,7 @@ pub async fn handle_withdraw_balance_queued(
             "[Withdraw] trade-send-failed",
         )
         .await;
-        return Err(StoreError::BotSendFailed(format!(
-            "Failed to send trade instruction to bot: {}",
-            e
-        )));
+        return Err(StoreError::BotSendFailed(e.to_string()));
     }
 
     let trade_result = match tokio::time::timeout(

@@ -256,10 +256,13 @@ Pending orders waiting to be processed. Survives restarts. See
 - `queued_at` is RFC 3339 UTC.
 - Length capped by `MAX_QUEUE_SIZE = 128` globally; 8 per user.
 - On corrupt-JSON load (`InvalidData`), `OrderQueue::load_from` renames the
-  bad file to `data/queue.json.corrupt-<RFC3339>` before starting with an
+  bad file to `data/queue.json.corrupt-<stamp>` before starting with an
   empty queue, so the raw bytes survive for forensic recovery instead of
-  being overwritten by the next `save()`. The Store logs this as an
-  `error!` with a `PENDING ORDERS LOST` marker.
+  being overwritten by the next `save()`. `<stamp>` is an RFC 3339
+  timestamp with every `:` replaced by `-` (Windows/NTFS reject `:` in
+  filenames; the colon-stripping happens in [src/store/queue.rs](src/store/queue.rs)),
+  so on disk you'll see e.g. `data/queue.json.corrupt-2026-04-29T15-30-45.123456789+00-00`.
+  The Store logs this as an `error!` with a `PENDING ORDERS LOST` marker.
 
 ## `data/journal.json`
 

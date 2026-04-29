@@ -111,6 +111,15 @@ pub const FEE_MAX: f64 = 1.0;
 
 pub const MAX_TRANSACTION_QUANTITY: i32 = 1_000_000;
 
+/// Maximum diamonds movable in a single trade.
+///
+/// Minecraft's vanilla trade UI exposes 12 offer slots (4x3 grid); each
+/// slot holds at most one 64-stack of diamonds, so a single trade can move
+/// at most 768 diamonds. We reject larger requests at the handler rather
+/// than silently truncating so the player isn't surprised by a partial
+/// transaction.
+pub const MAX_TRADE_DIAMONDS: i32 = 12 * 64;
+
 /// Minimum reserve before price calculation becomes unreliable.
 /// Pricing formulas typically divide by reserve; values this small cause
 /// numerical blow-up and unrealistic prices, so the bot should refuse to
@@ -156,7 +165,14 @@ pub const UUID_CACHE_TTL_SECS: u64 = 300;
 pub const RATE_LIMIT_MAX_COOLDOWN_MS: u64 = 60_000;
 
 /// After this duration of no messages, `consecutive_violations` resets to 0.
-pub const RATE_LIMIT_RESET_AFTER_MS: u64 = 30_000;
+pub const RATE_LIMIT_RESET_AFTER_MS: u64 = 90_000;
+
+// Invariant: the idle-reset window must be at least as long as the maximum
+// cooldown. Otherwise a spammer pinned at the cap could fall idle for less
+// than their cooldown, get violations wiped to 0, and resume at the base
+// cooldown — defeating the escalating-backoff design (see the rationale in
+// `RateLimiter::check`). Enforced at compile time to prevent future drift.
+const _: () = assert!(RATE_LIMIT_RESET_AFTER_MS >= RATE_LIMIT_MAX_COOLDOWN_MS);
 
 /// Interval between periodic maintenance sweeps (seconds).
 /// Hourly is frequent enough to keep caches bounded under normal load

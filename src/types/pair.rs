@@ -79,7 +79,7 @@ impl Pair {
     /// Builds the on-disk path for a pair file, applying filename sanitization
     /// so the same item name always maps to the same path regardless of whether
     /// the caller passes "minecraft:gunpowder" or "gunpowder".
-    fn get_pair_file_path(item_name: &str) -> PathBuf {
+    pub(crate) fn get_pair_file_path(item_name: &str) -> PathBuf {
         let sanitized_name = Self::sanitize_item_name_for_filename(item_name);
         PathBuf::from(Self::PAIRS_DIR).join(format!("{sanitized_name}.json"))
     }

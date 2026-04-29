@@ -90,7 +90,7 @@ pub(crate) async fn execute_chest_transfers(
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 error!(phase = log_tag, chest_id = t.chest_id, "Channel dropped: {}", e);
-                return Err(StoreError::BotResponseDropped(format!("Bot response dropped: {}", e)));
+                return Err(StoreError::BotResponseDropped(e.to_string()));
             }
             Err(_) => {
                 error!(
@@ -101,7 +101,7 @@ pub(crate) async fn execute_chest_transfers(
                     timeout_secs = CHEST_OP_TIMEOUT_SECS,
                     "Chest operation timed out"
                 );
-                return Err(StoreError::TradeTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
+                return Err(StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
             }
         };
 
@@ -175,7 +175,7 @@ pub(crate) async fn perform_trade(
     })?
     .map_err(|e| {
         error!(phase = log_tag, player = %target_username, "Trade channel dropped: {}", e);
-        StoreError::BotResponseDropped(format!("Bot response dropped: {}", e))
+        StoreError::BotResponseDropped(e.to_string())
     })?;
 
     trade_result.map_err(StoreError::TradeRejected)

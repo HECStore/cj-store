@@ -32,7 +32,7 @@ architectural layer. They meet at the Store boundary.
 `assert_invariants` returns. See [src/error.rs](src/error.rs) for the
 canonical variant list; at time of writing the variants are
 `UnknownPair`, `UnknownUser`, `BotDisconnected`, `TradeTimeout`,
-`TradeRejected`, `BotSendFailed`, `BotResponseDropped`,
+`ChestTimeout`, `TradeRejected`, `BotSendFailed`, `BotResponseDropped`,
 `BotReportedError`, `ValidationError`, `ChestOp`,
 `InvariantViolation`, and `Io`. Only `From<StoreError> for String` is
 implemented (so handlers can stringify at the outermost whisper-pipeline
@@ -72,12 +72,18 @@ recovered). The usual async discipline — never hold the guard across
 
 - **`ItemId` newtype** ([src/types/item_id.rs](src/types/item_id.rs)) wraps
   every item-referencing field (`Pair::item`, `Chest::item`, `Order::item`,
-  `Trade::item`, `ChestTransfer::item`). Construction strips `minecraft:`
-  and rejects empty strings, so normalization bugs are compile errors.
+  `Trade::item`, `ChestTransfer::item`). `ItemId::new` strips `minecraft:`
+  and rejects both empty strings and any character that is not ASCII
+  alphanumeric or `_`. This blocks path traversal (`..`, `/`, `\`),
+  control characters, and Unicode lookalikes (e.g. Cyrillic `с`) at
+  parse time, so normalization bugs are compile errors.
 - **Serde**: `#[serde(transparent)]` keeps the on-disk form a bare string
   — JSON sees `"item": "diamond"`, not `"item": { "0": "diamond" }` or any
   other tagged shape — so the newtype is fully backwards compatible with
-  pre-newtype data files.
+  pre-newtype data files. Deserialization routes through `ItemId::new` so
+  hand-edited data files with forbidden characters fail to load rather
+  than silently producing a malformed `ItemId` (the `""` sentinel for an
+  unassigned chest slot is preserved).
 - **Bot interaction**: `ItemId::with_minecraft_prefix()` re-adds the prefix
   when matching Azalea item IDs.
 - **Player input**: both `diamond` and `minecraft:diamond` are accepted.

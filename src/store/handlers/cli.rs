@@ -282,9 +282,9 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
 
                 store.pairs.remove(&normalized_item);
 
-                let file_path = format!("data/pairs/{}.json", normalized_item);
+                let file_path = crate::types::Pair::get_pair_file_path(&normalized_item);
                 if let Err(e) = std::fs::remove_file(&file_path) {
-                    warn!("[CLI-Store] Failed to remove pair file {}: {} (pair removed from memory anyway)", file_path, e);
+                    warn!("[CLI-Store] Failed to remove pair file {}: {} (pair removed from memory anyway)", file_path.display(), e);
                 }
 
                 store.dirty = true;

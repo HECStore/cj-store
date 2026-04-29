@@ -1,0 +1,38 @@
+[package]
+name = "azalea-viaversion"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/azalea-rs/azalea-viaversion"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dependencies]
+anyhow = "1.0"
+async-compat = "0.2.5"
+# LOCAL VENDOR EDIT (do not upstream): pin to the same `1.21.11` branch the
+# parent project uses, so cargo unifies this dep with the parent's
+# `azalea = { git = "...", branch = "1.21.11" }` into a single git source
+# instead of compiling two azalea instances. See parent Cargo.toml for the
+# full rationale and link to the upstream bug (ViaProxy 1.21.9 → 26.1
+# `container_set_content` decode failure).
+azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11", default-features = false, features = [
+  "online-mode",
+] }
+futures-util = "0.3"
+kdam = "0.6"
+lazy-regex = "3.4"
+minecraft_folder_path = "0.1"
+reqwest = { version = "0.13.1", default-features = false, features = [
+  "rustls",
+  "stream",
+] }
+semver = "1.0"
+tokio = { version = "1.47.1", features = ["process"] }
+tracing = "0.1"

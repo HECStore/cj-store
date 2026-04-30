@@ -305,7 +305,7 @@ pub async fn handle_withdraw_balance_queued(
             amount = whole_diamonds,
             "Withdraw: failed to send trade instruction, rolling diamonds back to storage: {}", e
         );
-        let _ = super::super::rollback::rollback_amount_to_storage(
+        let rb = super::super::rollback::rollback_amount_to_storage(
             store,
             "diamond",
             whole_diamonds,
@@ -313,6 +313,16 @@ pub async fn handle_withdraw_balance_queued(
             "[Withdraw] trade-send-failed",
         )
         .await;
+        if rb.has_failures() {
+            warn!(
+                uuid = %user_uuid,
+                player = player_name,
+                operations_failed = rb.operations_failed,
+                items_unplanned = rb.items_unplanned,
+                items_returned = rb.items_returned,
+                "Withdraw: rollback after trade-send failure was partial — items may remain on bot"
+            );
+        }
         return Err(StoreError::BotSendFailed(e.to_string()));
     }
 
@@ -330,7 +340,7 @@ pub async fn handle_withdraw_balance_queued(
                 amount = whole_diamonds,
                 "Withdraw: trade response channel dropped, rolling diamonds back to storage: {}", e
             );
-            let _ = super::super::rollback::rollback_amount_to_storage(
+            let rb = super::super::rollback::rollback_amount_to_storage(
                 store,
                 "diamond",
                 whole_diamonds,
@@ -338,10 +348,14 @@ pub async fn handle_withdraw_balance_queued(
                 "[Withdraw] channel-dropped",
             )
             .await;
+            let suffix = match rb.partial_message() {
+                Some(detail) => format!(" Rollback partial: {}.", detail),
+                None => String::new(),
+            };
             return utils::send_message_to_player(
                 store,
                 player_name,
-                &format!("Withdraw aborted: bot response dropped: {}", e),
+                &format!("Withdraw aborted: bot response dropped: {}.{}", e, suffix),
             )
             .await;
         }
@@ -353,7 +367,7 @@ pub async fn handle_withdraw_balance_queued(
                 timeout_ms = store.config.trade_timeout_ms,
                 "Withdraw: trade timed out, rolling diamonds back to storage"
             );
-            let _ = super::super::rollback::rollback_amount_to_storage(
+            let rb = super::super::rollback::rollback_amount_to_storage(
                 store,
                 "diamond",
                 whole_diamonds,
@@ -361,12 +375,17 @@ pub async fn handle_withdraw_balance_queued(
                 "[Withdraw] timeout",
             )
             .await;
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                "Withdraw aborted: bot timed out waiting for trade completion. Diamonds returned to storage.",
-            )
-            .await;
+            let msg = match rb.partial_message() {
+                Some(detail) => format!(
+                    "Withdraw aborted: bot timed out waiting for trade completion. Rollback partial: {}.",
+                    detail
+                ),
+                None => {
+                    "Withdraw aborted: bot timed out waiting for trade completion. Diamonds returned to storage."
+                        .to_string()
+                }
+            };
+            return utils::send_message_to_player(store, player_name, &msg).await;
         }
     };
 
@@ -377,7 +396,7 @@ pub async fn handle_withdraw_balance_queued(
             amount = whole_diamonds,
             "Withdraw: trade failed, rolling diamonds back to storage: {}", err
         );
-        let _ = super::super::rollback::rollback_amount_to_storage(
+        let rb = super::super::rollback::rollback_amount_to_storage(
             store,
             "diamond",
             whole_diamonds,
@@ -385,13 +404,17 @@ pub async fn handle_withdraw_balance_queued(
             "[Withdraw] trade-failed",
         )
         .await;
-
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            &format!("Withdraw aborted: trade failed: {}. Diamonds returned to storage.", err),
-        )
-        .await;
+        let msg = match rb.partial_message() {
+            Some(detail) => format!(
+                "Withdraw aborted: trade failed: {}. Rollback partial: {}.",
+                err, detail
+            ),
+            None => format!(
+                "Withdraw aborted: trade failed: {}. Diamonds returned to storage.",
+                err
+            ),
+        };
+        return utils::send_message_to_player(store, player_name, &msg).await;
     }
 
     // Trade succeeded: decrement the ledger balance now that the diamonds are

@@ -24,16 +24,49 @@
 //!   (tool_result inlining etc.) cannot regress.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{LineWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, error, info, warn};
 
 use crate::messages::{ChatEvent, ChatEventKind};
+
+/// Item flowing through the history mpsc. Local to this module so we
+/// don't widen `ChatEvent` (which is the broadcast type for every
+/// downstream subscriber) with bot-output–only fields like `is_bot`,
+/// `target`, `target_uuid`. Inbound chat events stay shape-identical;
+/// bot-output records carry their extra fields here and get serialized
+/// in the writer task on a non-runtime-blocking path.
+#[derive(Debug)]
+pub enum HistoryItem {
+    /// An inbound chat event observed on `Event::Chat` — public or whisper.
+    Inbound(ChatEvent),
+    /// A line the bot itself emitted (chat or whisper). The fields mirror
+    /// what the old synchronous `append_bot_output` would have written.
+    BotOut {
+        /// Pre-resolved kind label: `"bot_chat"` or `"bot_whisper"`.
+        kind_label: &'static str,
+        /// Recipient username (whisper target, or addressee in public chat).
+        target: Option<String>,
+        /// Recipient UUID, when known.
+        target_uuid: Option<String>,
+        /// Bot's own Minecraft username at send time.
+        sender: String,
+        /// Outbound content as sent.
+        content: String,
+        /// Time the line was emitted (used for `ts` and per-day file
+        /// selection — captured in the bot task, not the writer, so the
+        /// timestamp is monotonic with the actual send).
+        recv_at: DateTime<Utc>,
+        /// True for whisper lines.
+        is_whisper: bool,
+    },
+}
 
 /// Root directory of the chat history JSONL files.
 pub const HISTORY_DIR: &str = "data/chat/history";
@@ -180,9 +213,9 @@ fn encode_with_kind(
     line
 }
 
-/// Synchronously append a "bot_out" record (CHAT.md `is_bot`
-/// tagging). Called from the chat task whenever it sends chat or a
-/// whisper. The kind is recorded as `bot_chat` / `bot_whisper`
+/// Enqueue a "bot_out" record (CHAT.md `is_bot` tagging) onto the
+/// history mpsc. Called from the bot's tokio task whenever it sends
+/// chat or a whisper. The kind is recorded as `bot_chat` / `bot_whisper`
 /// distinctly so log readers can filter.
 ///
 /// `target` and `target_uuid` identify the player the bot is replying
@@ -190,24 +223,29 @@ fn encode_with_kind(
 /// stored as structured fields so trust derivation
 /// ([`crate::chat::memory::count_interactions_for_uuid`]) and the GDPR
 /// scrub can attribute the record without parsing the content text.
-pub fn append_bot_output(
+///
+/// Uses `try_send` so a full channel cannot reintroduce blocking on the
+/// runtime worker — the same drop discipline as the inbound path. The
+/// caller (bot task) is expected to mirror the existing inbound drop
+/// counter; the `TrySendError` is returned so it can be observed.
+pub fn enqueue_bot_output(
+    history_tx: &mpsc::Sender<HistoryItem>,
     bot_username: &str,
     target: Option<&str>,
     content: &str,
     is_whisper: bool,
-) {
-    let event = ChatEvent {
-        kind: if is_whisper { ChatEventKind::Whisper } else { ChatEventKind::Public },
+) -> Result<(), TrySendError<HistoryItem>> {
+    let kind_label = if is_whisper { "bot_whisper" } else { "bot_chat" };
+    let recv_at: DateTime<Utc> = SystemTime::now().into();
+    history_tx.try_send(HistoryItem::BotOut {
+        kind_label,
+        target: target.map(|s| s.to_string()),
+        target_uuid: None,
         sender: bot_username.to_string(),
         content: content.to_string(),
-        recv_at: SystemTime::now(),
-    };
-    let kind_label = if is_whisper { "bot_whisper" } else { "bot_chat" };
-    let line = encode_with_kind(&event, kind_label, /* is_bot */ true, target, None);
-    let path = file_for(event.recv_at);
-    if let Err(e) = append_line(&path, &line) {
-        error!(path = %path.display(), error = %e, "[ChatHistory] bot-output append failed");
-    }
+        recv_at,
+        is_whisper,
+    })
 }
 
 /// Append one line to the per-day JSONL file. Creates the directory and
@@ -222,8 +260,14 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
         .append(true)
         .open(path)?;
     f.write_all(line.as_bytes())?;
-    f.flush()?;
     Ok(())
+}
+
+/// Per-day file path for `date` (UTC). Mirrors [`file_for`] but works
+/// directly against a `NaiveDate` so the writer task can compare/format
+/// without round-tripping through `SystemTime`.
+fn file_for_date(date: NaiveDate) -> PathBuf {
+    PathBuf::from(HISTORY_DIR).join(format!("{}.jsonl", date.format("%Y-%m-%d")))
 }
 
 /// History writer task: drains [`ChatEvent`]s from the publisher-side mpsc
@@ -242,7 +286,7 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// the task drains the channel silently — no JSONL files are created on
 /// disk for trade-only operators. Senders never see a `try_send` failure
 /// (the receiver stays alive) but nothing reaches the filesystem.
-pub async fn writer_task(mut history_rx: mpsc::Receiver<ChatEvent>, chat_enabled: bool) {
+pub async fn writer_task(mut history_rx: mpsc::Receiver<HistoryItem>, chat_enabled: bool) {
     if !chat_enabled {
         info!("[ChatHistory] chat disabled — writer task draining silently, no on-disk history");
         // Drain so producers' `try_send` calls keep succeeding; we just
@@ -252,23 +296,121 @@ pub async fn writer_task(mut history_rx: mpsc::Receiver<ChatEvent>, chat_enabled
         return;
     }
     info!("[ChatHistory] writer task starting (path: {})", HISTORY_DIR);
-    while let Some(event) = history_rx.recv().await {
-        let line = encode_event(&event, /* is_bot */ false);
-        let path = file_for(event.recv_at);
-        if let Err(e) = append_line(&path, &line) {
+    // Cache the currently open per-day file so steady state is one
+    // `write` syscall per event rather than open+write+close. We rotate
+    // (drop the old `LineWriter` so its Drop flushes, then open the new
+    // path) only when the UTC date crosses. `LineWriter` — not
+    // `BufWriter` — is required: it flushes on every `\n`, preserving
+    // per-line read-after-write durability for in-process readers
+    // (`memory::count_interactions_for_uuid`, `tools::recent_history_tool`,
+    // `tools::search_history_tool`, `mod::scrub_history_for_player`).
+    let mut cache: Option<(NaiveDate, LineWriter<std::fs::File>)> = None;
+    while let Some(item) = history_rx.recv().await {
+        // Compute the encoded line + the UTC date the line belongs to.
+        // For both variants we go through `encode_with_kind` so the
+        // on-disk shape and truncation discipline match exactly.
+        let (line, today, kind_dbg, sender_dbg) = match item {
+            HistoryItem::Inbound(event) => {
+                let line = encode_event(&event, /* is_bot */ false);
+                let today: NaiveDate = DateTime::<Utc>::from(event.recv_at).date_naive();
+                let kind_dbg = match event.kind {
+                    ChatEventKind::Public => "public",
+                    ChatEventKind::Whisper => "whisper",
+                };
+                (line, today, kind_dbg, event.sender)
+            }
+            HistoryItem::BotOut {
+                kind_label,
+                target,
+                target_uuid,
+                sender,
+                content,
+                recv_at,
+                is_whisper,
+            } => {
+                // Synthesize a transient ChatEvent so we can reuse the
+                // existing per-field truncation + serialization path —
+                // the on-disk shape is identical to the old
+                // `append_bot_output` output.
+                let event = ChatEvent {
+                    kind: if is_whisper {
+                        ChatEventKind::Whisper
+                    } else {
+                        ChatEventKind::Public
+                    },
+                    sender,
+                    content,
+                    recv_at: SystemTime::from(recv_at),
+                };
+                let line = encode_with_kind(
+                    &event,
+                    kind_label,
+                    /* is_bot */ true,
+                    target.as_deref(),
+                    target_uuid.as_deref(),
+                );
+                let today = recv_at.date_naive();
+                (line, today, kind_label, event.sender)
+            }
+        };
+
+        // Lazily open / rotate. Drop the old `LineWriter` first so its
+        // Drop runs flush()+close before we touch a new path.
+        let needs_open = match &cache {
+            Some((cached_date, _)) => *cached_date != today,
+            None => true,
+        };
+        if needs_open {
+            cache = None;
+            let path = file_for_date(today);
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        "[ChatHistory] mkdir failed; event dropped"
+                    );
+                    continue;
+                }
+            }
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => {
+                    cache = Some((today, LineWriter::new(f)));
+                }
+                Err(e) => {
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        "[ChatHistory] open failed; event dropped"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let (_date, writer) = cache.as_mut().expect("cache populated above");
+        if let Err(e) = writer.write_all(line.as_bytes()) {
+            // The encoded line already terminates in `\n`, so on success
+            // `LineWriter` has flushed the buffer to the underlying file.
             error!(
-                path = %path.display(),
+                path = %file_for_date(today).display(),
                 error = %e,
                 "[ChatHistory] append failed; event dropped"
             );
+            // A failed write may have left the writer in a degraded state;
+            // drop it so the next event re-opens cleanly.
+            cache = None;
         } else {
             debug!(
-                kind = ?event.kind,
-                sender = %event.sender,
+                kind = %kind_dbg,
+                sender = %sender_dbg,
                 "[ChatHistory] appended"
             );
         }
     }
+    // Receiver closed: dropping `cache` here flushes+closes the final
+    // `LineWriter`. Explicit for clarity.
+    drop(cache);
     info!("[ChatHistory] history channel closed, writer task exiting");
 }
 
@@ -362,14 +504,14 @@ mod tests {
         // task's externally-visible behavior instead: events are accepted
         // (try_send succeeds, the receiver stays live), and the task
         // returns promptly once the sender is dropped.
-        let (tx, rx) = mpsc::channel::<ChatEvent>(8);
+        let (tx, rx) = mpsc::channel::<HistoryItem>(8);
         let handle = tokio::spawn(writer_task(rx, /* chat_enabled */ false));
 
         // Push a handful of events. If the task were running the enabled
         // body, these would still succeed but each would also trigger a
         // disk write. With chat_enabled=false we simply drain and discard.
         for i in 0..5 {
-            tx.try_send(fixed_event(&format!("evt-{i}")))
+            tx.try_send(HistoryItem::Inbound(fixed_event(&format!("evt-{i}"))))
                 .expect("try_send should succeed against the live drain task");
         }
         drop(tx);

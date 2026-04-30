@@ -34,7 +34,7 @@
 //! integration coverage will land.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -263,8 +263,12 @@ pub enum ClientError {
     /// Model not found (HTTP 404). Caller should engage a 1-hour backoff.
     ModelNotFound { model: String },
     /// Rate limited / 5xx after retries are exhausted. Caller can retry
-    /// later but should not loop tightly.
-    Throttled { status: u16 },
+    /// later but should not loop tightly. `retry_after_ms` carries the
+    /// server's hint (from `retry-after` or
+    /// `anthropic-ratelimit-*-reset` headers) clamped to a sane ceiling
+    /// so the retry loop honors Anthropic's bucket-reset rather than
+    /// re-entering before the window opens.
+    Throttled { status: u16, retry_after_ms: Option<u64> },
     /// 4xx other than 401/404 — the request is malformed in a way that
     /// won't be fixed by retrying.
     BadRequest { status: u16, message: String },
@@ -281,7 +285,20 @@ impl fmt::Display for ClientError {
             ClientError::Transport(s) => write!(f, "transport: {s}"),
             ClientError::Auth => write!(f, "anthropic auth failed (401)"),
             ClientError::ModelNotFound { model } => write!(f, "model not found: {model}"),
-            ClientError::Throttled { status } => write!(f, "throttled / 5xx (status={status})"),
+            ClientError::Throttled { status, retry_after_ms } => match retry_after_ms {
+                // The "upstream-throttled" prefix is a stable marker the
+                // chat orchestrator uses to discriminate genuine 429/5xx
+                // upstream throttle from a `Transport(_)` error that the
+                // retry layer happens to map to status=503 internally
+                // (see `call_with_retry` in this module). Don't change the
+                // marker without updating `composer_throttle_backoff_until`
+                // gate site in `src/chat/mod.rs`.
+                Some(ms) => write!(
+                    f,
+                    "upstream-throttled / 5xx (status={status}, retry_after_ms={ms})"
+                ),
+                None => write!(f, "upstream-throttled / 5xx (status={status})"),
+            },
             ClientError::BadRequest { status, message } => {
                 write!(f, "bad request (status={status}): {message}")
             }
@@ -377,6 +394,11 @@ pub async fn send_one(
             .map_err(|e| ClientError::Decode(e.to_string()));
     }
 
+    // Capture rate-limit hint headers BEFORE consuming the body. Once
+    // `response.text().await` is awaited the response is moved and the
+    // headers are gone — extract first, parse later.
+    let retry_after_hint_ms = parse_retry_after_hint(response.headers());
+
     // Non-2xx — read body once for logging, then map to error variant.
     let body = response.text().await.unwrap_or_default();
     let safe = sanitize_for_log(&body);
@@ -404,10 +426,12 @@ pub async fn send_one(
             tracing::warn!(
                 status = %status,
                 body = %safe,
+                retry_after_ms = ?retry_after_hint_ms,
                 "[Chat] anthropic throttled / 5xx"
             );
             Err(ClientError::Throttled {
                 status: status.as_u16(),
+                retry_after_ms: retry_after_hint_ms,
             })
         }
         s => {
@@ -437,6 +461,72 @@ pub async fn send_one(
             })
         }
     }
+}
+
+/// Upper bound on a server-supplied retry-after hint. Larger values are
+/// clamped down so a single throttle response can't blow through the
+/// 30 s overall retry budget — leaves room for at least one useful
+/// retry attempt within budget.
+const RETRY_AFTER_HINT_MAX_MS: u64 = 8_000;
+
+/// Extract a retry-after hint (in milliseconds) from response headers.
+/// Inspects `retry-after` (decimal seconds; HTTP-date per RFC 7231
+/// §7.1.3 also accepted via `httpdate`-style parsing if present) and
+/// the Anthropic-specific `anthropic-ratelimit-requests-reset` /
+/// `anthropic-ratelimit-tokens-reset` (RFC 3339 timestamps), and
+/// returns the SMALLEST valid hint, clamped to
+/// [`RETRY_AFTER_HINT_MAX_MS`]. Returns `None` if no header parses.
+///
+/// Garbage / negative / past-due values are ignored rather than
+/// treated as zero — falling back to the exponential schedule is safer
+/// than re-firing immediately on a malformed header.
+fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let mut candidate_ms: Option<u64> = None;
+    let bump = |cur: &mut Option<u64>, new: u64| {
+        let clamped = new.min(RETRY_AFTER_HINT_MAX_MS);
+        match *cur {
+            Some(prev) if prev <= clamped => {}
+            _ => *cur = Some(clamped),
+        }
+    };
+
+    if let Some(v) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
+        let trimmed = v.trim();
+        // Try decimal seconds first (Anthropic's typical form).
+        if let Ok(secs) = trimmed.parse::<u64>() {
+            bump(&mut candidate_ms, secs.saturating_mul(1_000));
+        } else if let Ok(secs_f) = trimmed.parse::<f64>() {
+            if secs_f.is_finite() && secs_f >= 0.0 {
+                let ms = (secs_f * 1_000.0) as u64;
+                bump(&mut candidate_ms, ms);
+            }
+        } else if let Ok(when) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+            // RFC 7231 §7.1.3 HTTP-date: prefer chrono's RFC 2822
+            // parser (HTTP-date is a constrained subset).
+            let now = chrono::Utc::now();
+            let delta = when.with_timezone(&chrono::Utc) - now;
+            if let Ok(secs) = u64::try_from(delta.num_seconds().max(0)) {
+                bump(&mut candidate_ms, secs.saturating_mul(1_000));
+            }
+        }
+    }
+
+    for header_name in [
+        "anthropic-ratelimit-requests-reset",
+        "anthropic-ratelimit-tokens-reset",
+    ] {
+        if let Some(v) = headers.get(header_name).and_then(|v| v.to_str().ok())
+            && let Ok(when) = chrono::DateTime::parse_from_rfc3339(v.trim())
+        {
+            let now = chrono::Utc::now();
+            let delta = when.with_timezone(&chrono::Utc) - now;
+            if let Ok(secs) = u64::try_from(delta.num_seconds().max(0)) {
+                bump(&mut candidate_ms, secs.saturating_mul(1_000));
+            }
+        }
+    }
+
+    candidate_ms
 }
 
 /// True if a 4xx response body indicates the extended-cache-ttl beta is
@@ -559,31 +649,62 @@ pub async fn call_with_retry(
                     );
                     continue;
                 }
-                let status = match &e {
-                    ClientError::Throttled { status } => *status,
-                    ClientError::Auth => 401,
-                    ClientError::ModelNotFound { .. } => 404,
-                    ClientError::BadRequest { status, .. } => *status,
-                    ClientError::Transport(_) => 503, // treat as retryable transient
-                    ClientError::Decode(_) => 0,
+                let (status, server_hint_ms) = match &e {
+                    ClientError::Throttled { status, retry_after_ms } => {
+                        (*status, *retry_after_ms)
+                    }
+                    ClientError::Auth => (401, None),
+                    ClientError::ModelNotFound { .. } => (404, None),
+                    ClientError::BadRequest { status, .. } => (*status, None),
+                    ClientError::Transport(_) => {
+                        tracing::debug!(error = %e, "[Chat] treating transport error as retryable");
+                        (503, None) // retryable transient
+                    }
+                    ClientError::Decode(_) => (0, None),
                     ClientError::RateLimited { .. } => return Err(e),
                 };
                 let decision = retry_decision(status, attempt);
                 match decision {
                     RetryDecision::Stop => return Err(e),
-                    RetryDecision::Retry { delay_ms } => {
-                        if started.elapsed() + std::time::Duration::from_millis(delay_ms)
+                    RetryDecision::Retry { min_ms, max_ms } => {
+                        // Prefer the server's hint over the exponential
+                        // schedule when present. A blind exponential
+                        // sleep can re-fire before Anthropic's bucket
+                        // resets and produce 429 spirals — the whole
+                        // reason this hint plumbing exists.
+                        //
+                        // The server hint is honored AS-IS (clamped only
+                        // against the bucket-reset ceiling and the
+                        // remaining budget). Jitter is reserved for the
+                        // exponential fallback — we don't smear a
+                        // protocol-supplied wait window because that
+                        // would defeat the point of the hint.
+                        let remaining = budget.saturating_sub(started.elapsed());
+                        // Worst-case upper bound on the actual sleep.
+                        // Used by the budget guard so a sample landing
+                        // at the high end of the range still fits.
+                        let (chosen_ms, max_sleep_ms) = match server_hint_ms {
+                            Some(hint) => {
+                                let h = hint
+                                    .min(RETRY_AFTER_HINT_MAX_MS)
+                                    .min(remaining.as_millis() as u64);
+                                (h, h)
+                            }
+                            None => (jittered_delay_ms(min_ms, max_ms), max_ms),
+                        };
+                        if started.elapsed() + std::time::Duration::from_millis(max_sleep_ms)
                             > budget
                         {
                             return Err(e);
                         }
                         tracing::warn!(
                             attempt,
-                            delay_ms,
+                            delay_ms = chosen_ms,
+                            server_hint_ms = ?server_hint_ms,
                             error = %e,
                             "[Chat] retrying anthropic call"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(chosen_ms)).await;
                         attempt += 1;
                     }
                 }
@@ -596,10 +717,19 @@ pub async fn call_with_retry(
 
 /// Decision for one retry attempt. Pure function — no clock, no I/O —
 /// so the policy can be unit-tested without sleeping.
+///
+/// `Retry` carries a `[min_ms, max_ms]` range rather than a single
+/// `delay_ms` so callers can sample a jittered sleep at the actual
+/// retry point. The pure decision stays deterministic; the RNG sample
+/// happens in `call_with_retry`. ±25% around the exponential schedule
+/// desynchronizes concurrent callers (composer + classifier +
+/// reflection share one Anthropic key) so they don't all wake in
+/// lockstep at t+1000ms / t+2000ms after a shared 429.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryDecision {
-    /// Sleep this many milliseconds and try again.
-    Retry { delay_ms: u64 },
+    /// Sleep a value from `[min_ms, max_ms]` (inclusive) and try again.
+    /// `min_ms == max_ms` is allowed — used for non-jittered hints.
+    Retry { min_ms: u64, max_ms: u64 },
     /// Stop. The error is final.
     Stop,
 }
@@ -608,6 +738,11 @@ pub enum RetryDecision {
 /// number (0-indexed). CHAT.md: exponential backoff on
 /// `429, 500, 502, 503, 504`, capped at 3 attempts, total wall-clock
 /// budget 30 s.
+///
+/// The returned range is `±25%` around the canonical `1_000 << attempt`
+/// schedule (attempt 0 -> [750, 1250] ms; attempt 1 -> [1500, 2500] ms).
+/// `call_with_retry` samples uniformly within the range to break
+/// thundering-herd retry alignment across concurrent callers.
 pub fn retry_decision(status: u16, attempt: u32) -> RetryDecision {
     if attempt >= 2 {
         // Already retried twice; this is the third attempt — no more.
@@ -620,8 +755,48 @@ pub fn retry_decision(status: u16, attempt: u32) -> RetryDecision {
     // 1s, 2s, 4s — but the docstring caps total at 30s. `attempt` is
     // bounded by the early-return at the top (≥ 2 stops), so the shift
     // is at most 1, and `1_000 << 1 = 2_000`. No overflow risk.
-    let delay_ms = 1_000u64 << attempt;
-    RetryDecision::Retry { delay_ms }
+    let base_ms = 1_000u64 << attempt;
+    // ±25% jitter window. base/4 is exact for the schedule's powers of
+    // two (250 / 500), so no floating-point rounding noise.
+    let jitter = base_ms / 4;
+    RetryDecision::Retry {
+        min_ms: base_ms - jitter,
+        max_ms: base_ms + jitter,
+    }
+}
+
+/// Process-local PRNG state. Seeded lazily from system nanos + a
+/// per-call counter and advanced with xorshift64*. Used only for retry
+/// jitter — does NOT need cryptographic quality, only cross-caller
+/// decorrelation. Kept inline so `client.rs` does not pull in the
+/// `rand` crate (not a direct Cargo.toml dep).
+fn jittered_delay_ms(min_ms: u64, max_ms: u64) -> u64 {
+    if min_ms >= max_ms {
+        return min_ms;
+    }
+    static SEED: AtomicU64 = AtomicU64::new(0);
+    // Mix monotonic system nanos with a unique-per-call counter so
+    // simultaneous callers in the same process get distinct samples
+    // even on platforms with coarse clock resolution.
+    let counter = SEED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // xorshift64* — single round is enough for a uniform pick in a
+    // small range; the high bits are well-mixed.
+    let mut x = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(counter.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    if x == 0 {
+        x = 0xDEAD_BEEF_CAFE_BABE;
+    }
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    let span = max_ms - min_ms + 1;
+    min_ms + (r % span)
 }
 
 // ---- Per-model rate limiter -------------------------------
@@ -1053,15 +1228,29 @@ mod tests {
     // ---- Retry policy ---------------------------------------------------
 
     #[test]
-    fn retry_decision_first_attempt_429_retries_at_1s() {
+    fn retry_decision_first_attempt_429_retries_in_jitter_window() {
+        // ±25% around 1000 ms => [750, 1250].
         let v = retry_decision(429, 0);
-        assert_eq!(v, RetryDecision::Retry { delay_ms: 1_000 });
+        assert_eq!(
+            v,
+            RetryDecision::Retry {
+                min_ms: 750,
+                max_ms: 1_250,
+            }
+        );
     }
 
     #[test]
-    fn retry_decision_second_attempt_429_retries_at_2s() {
+    fn retry_decision_second_attempt_429_retries_in_jitter_window() {
+        // ±25% around 2000 ms => [1500, 2500].
         let v = retry_decision(429, 1);
-        assert_eq!(v, RetryDecision::Retry { delay_ms: 2_000 });
+        assert_eq!(
+            v,
+            RetryDecision::Retry {
+                min_ms: 1_500,
+                max_ms: 2_500,
+            }
+        );
     }
 
     #[test]
@@ -1076,7 +1265,10 @@ mod tests {
         for status in [500, 502, 503, 504] {
             assert_eq!(
                 retry_decision(status, 0),
-                RetryDecision::Retry { delay_ms: 1_000 }
+                RetryDecision::Retry {
+                    min_ms: 750,
+                    max_ms: 1_250,
+                }
             );
         }
     }
@@ -1096,6 +1288,167 @@ mod tests {
     #[test]
     fn retry_decision_does_not_retry_400() {
         assert_eq!(retry_decision(400, 0), RetryDecision::Stop);
+    }
+
+    // ---- retry-after hint plumbing -------------------------------------
+
+    /// Compute the delay `call_with_retry` would actually sleep for,
+    /// given a fresh attempt with the supplied throttle error and a
+    /// fully-fresh 30 s budget. Mirrors the selection logic in
+    /// `call_with_retry` exactly so we can unit-test the policy without
+    /// spinning up a real HTTP fixture. Returns the sampled value and
+    /// the worst-case upper bound used by the budget guard.
+    fn pick_delay_ms(
+        status: u16,
+        server_hint_ms: Option<u64>,
+        attempt: u32,
+    ) -> Option<(u64, u64)> {
+        let RetryDecision::Retry { min_ms, max_ms } = retry_decision(status, attempt) else {
+            return None;
+        };
+        let remaining_ms = 30_000u64;
+        let (chosen, max_sleep) = match server_hint_ms {
+            Some(hint) => {
+                let h = hint.min(RETRY_AFTER_HINT_MAX_MS).min(remaining_ms);
+                (h, h)
+            }
+            None => (jittered_delay_ms(min_ms, max_ms), max_ms),
+        };
+        Some((chosen, max_sleep))
+    }
+
+    #[test]
+    fn server_hint_wins_over_exponential() {
+        // Hint of 3s should be honored even when the schedule says 1s.
+        let (chosen, max_sleep) =
+            pick_delay_ms(429, Some(3_000), 0).expect("retryable");
+        assert_eq!(chosen, 3_000);
+        // Server hint is NOT jittered — caller honors as-is.
+        assert_eq!(max_sleep, 3_000);
+        // Even on the second attempt where exponential would say 2s,
+        // a smaller server hint still wins on the same path.
+        let (chosen2, _) = pick_delay_ms(429, Some(5_000), 1).expect("retryable");
+        assert_eq!(chosen2, 5_000);
+    }
+
+    #[test]
+    fn missing_or_garbage_retry_after_falls_back_to_exponential() {
+        // No hint => exponential ±25% (attempt 0 is in [750, 1250] ms).
+        let (chosen, max_sleep) = pick_delay_ms(429, None, 0).expect("retryable");
+        assert!(
+            (750..=1_250).contains(&chosen),
+            "attempt 0 jitter window [750, 1250]; got {chosen}"
+        );
+        assert_eq!(max_sleep, 1_250);
+
+        // The header parser drops garbage and returns None — confirm
+        // that a HeaderMap full of nonsense yields no hint.
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "definitely-not-a-number".parse().unwrap());
+        h.insert(
+            "anthropic-ratelimit-requests-reset",
+            "not-a-timestamp".parse().unwrap(),
+        );
+        h.insert(
+            "anthropic-ratelimit-tokens-reset",
+            "also-bogus".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after_hint(&h), None);
+
+        // And the second attempt still picks exponential ±25% when no
+        // hint is supplied — window [1500, 2500] ms.
+        let (chosen2, max_sleep2) = pick_delay_ms(429, None, 1).expect("retryable");
+        assert!(
+            (1_500..=2_500).contains(&chosen2),
+            "attempt 1 jitter window [1500, 2500]; got {chosen2}"
+        );
+        assert_eq!(max_sleep2, 2_500);
+    }
+
+    #[test]
+    fn oversized_retry_after_is_clamped() {
+        // A hint of 60s gets clamped to RETRY_AFTER_HINT_MAX_MS (8s).
+        let (chosen, _) = pick_delay_ms(429, Some(60_000), 0).expect("retryable");
+        assert_eq!(chosen, RETRY_AFTER_HINT_MAX_MS);
+
+        // The clamping also happens at parse time when reading the
+        // header, so end-to-end an absurd `retry-after: 600` becomes 8s.
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "600".parse().unwrap());
+        let parsed = parse_retry_after_hint(&h).expect("integer seconds");
+        assert_eq!(parsed, RETRY_AFTER_HINT_MAX_MS);
+    }
+
+    #[test]
+    fn jitter_sample_stays_within_range_and_varies() {
+        // The PRNG should never produce a sample outside [min, max] and
+        // should produce more than one distinct value over many draws —
+        // proving consecutive callers don't wake in lockstep.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let v = jittered_delay_ms(750, 1_250);
+            assert!(
+                (750..=1_250).contains(&v),
+                "sample {v} outside [750, 1250]"
+            );
+            seen.insert(v);
+        }
+        assert!(
+            seen.len() > 5,
+            "jitter PRNG appears stuck — only {} distinct values across 200 draws",
+            seen.len()
+        );
+    }
+
+    #[test]
+    fn jitter_with_zero_span_returns_min() {
+        // Degenerate case used by the server-hint path which feeds
+        // min == max — must not panic and must return that exact value.
+        assert_eq!(jittered_delay_ms(2_000, 2_000), 2_000);
+        // And min > max is treated as the same degenerate case.
+        assert_eq!(jittered_delay_ms(3_000, 1_000), 3_000);
+    }
+
+    #[test]
+    fn parse_retry_after_picks_smallest_valid_hint() {
+        // When multiple headers are present the smallest wins so we
+        // honor the tightest reset window.
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "5".parse().unwrap());
+        let near = (chrono::Utc::now() + chrono::Duration::seconds(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        h.insert(
+            "anthropic-ratelimit-requests-reset",
+            near.parse().unwrap(),
+        );
+        let parsed = parse_retry_after_hint(&h).expect("hint");
+        // ~2s from the RFC3339 header should win over the 5s integer.
+        assert!(parsed <= 2_500, "expected ~2s, got {parsed}");
+    }
+
+    #[test]
+    fn throttled_display_contains_throttled_substring() {
+        // The chat orchestrator's composer-throttle gate substring-matches
+        // on this string (see `composer_throttle_backoff_until` site in
+        // `src/chat/mod.rs`). Both variants of the Display output must
+        // keep the literal "upstream-throttled" marker — a unique tag
+        // chosen so a `Transport(_)` error mapped to status=503 inside
+        // the retry layer can NOT silently engage the composer cooldown.
+        let with_hint = ClientError::Throttled {
+            status: 429,
+            retry_after_ms: Some(2_000),
+        };
+        let no_hint = ClientError::Throttled {
+            status: 503,
+            retry_after_ms: None,
+        };
+        assert!(format!("{with_hint}").contains("upstream-throttled"));
+        assert!(format!("{no_hint}").contains("upstream-throttled"));
+        // And the Transport variant — which the retry layer maps to
+        // status=503 — must NOT include the marker; that's the bug this
+        // marker was introduced to prevent.
+        let transport = ClientError::Transport("dns lookup failed".to_string());
+        assert!(!format!("{transport}").contains("upstream-throttled"));
     }
 
     // ---- Log sanitization ----------------------------------------------

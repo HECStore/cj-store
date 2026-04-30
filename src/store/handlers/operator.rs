@@ -588,8 +588,11 @@ pub async fn handle_add_currency(
     let user_uuid = crate::mojang::resolve_user_uuid(player_name)
         .await
         .map_err(StoreError::ValidationError)?;
-    utils::ensure_user_exists(store, player_name, &user_uuid);
 
+    // Validate inputs BEFORE recording the operator as a user. A rejected
+    // request must leave the store untouched (dirty unchanged); creating
+    // the user row first would dirty the store on every malformed
+    // operator command.
     if !store.pairs.contains_key(item) {
         return utils::send_message_to_player(
             store,
@@ -603,6 +606,8 @@ pub async fn handle_add_currency(
         return utils::send_message_to_player(store, player_name, "Amount must be positive")
             .await;
     }
+
+    utils::ensure_user_exists(store, player_name, &user_uuid);
 
     let reserve_before = store.pairs.get(item).map(|p| p.currency_stock).unwrap_or(0.0);
     info!(
@@ -666,8 +671,11 @@ pub async fn handle_remove_currency(
     let user_uuid = crate::mojang::resolve_user_uuid(player_name)
         .await
         .map_err(StoreError::ValidationError)?;
-    utils::ensure_user_exists(store, player_name, &user_uuid);
 
+    // Validate inputs BEFORE recording the operator as a user. A rejected
+    // request must leave the store untouched (dirty unchanged); creating
+    // the user row first would dirty the store on every malformed
+    // operator command.
     if !store.pairs.contains_key(item) {
         return utils::send_message_to_player(
             store,
@@ -695,6 +703,8 @@ pub async fn handle_remove_currency(
         )
         .await;
     }
+
+    utils::ensure_user_exists(store, player_name, &user_uuid);
 
     info!(
         "[RemoveCurrency] start: operator={} uuid={} item={} amount={:.2} reserve_before={:.2}",

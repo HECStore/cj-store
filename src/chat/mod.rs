@@ -1509,9 +1509,14 @@ async fn process_event(
             // Anthropic-side 429 / 5xx that exhausted the retry budget:
             // pause composer dispatch for `composer_throttle_backoff_secs`
             // so the next event doesn't immediately re-race the same
-            // throttled bucket. Detected via the surface string emitted by
-            // `ClientError::Throttled`.
-            if config.composer_throttle_backoff_secs > 0 && e.contains("throttled") {
+            // throttled bucket. Detected via the unique "upstream-throttled"
+            // marker emitted by `ClientError::Throttled`'s Display impl —
+            // intentionally NOT a generic "throttled" substring, because
+            // `ClientError::Transport(_)` (DNS / TLS / ECONNREFUSED) is
+            // mapped to status=503 inside `call_with_retry` for retry
+            // bookkeeping and would otherwise silently engage this 60s
+            // cooldown on every flaky-network blip. See `client.rs`.
+            if config.composer_throttle_backoff_secs > 0 && e.contains("upstream-throttled") {
                 let until = state::iso_utc(
                     chrono::Utc::now()
                         + chrono::Duration::seconds(

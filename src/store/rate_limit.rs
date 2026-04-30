@@ -49,8 +49,17 @@ const _: () = assert!(
 /// Tracks rate limit state for a single user
 #[derive(Debug, Clone)]
 struct UserRateLimit {
-    /// When the user last sent a message
+    /// When the user last sent a message that was ACCEPTED. Used to gate the
+    /// per-message cooldown.
     last_message_time: Instant,
+    /// When the user last *attempted* a message (accepted OR rejected). Used
+    /// to gate the violation-count reset window: the doc promises that the
+    /// counter clears after RATE_LIMIT_RESET_AFTER_MS of idleness, where
+    /// idleness means "no attempts at all", not "no accepted attempts".
+    /// Without this, a continuous spammer would have their violations reset
+    /// every ~90s while still spamming, because `last_message_time` stays
+    /// frozen at the last accepted message.
+    last_attempt_time: Instant,
     /// Number of consecutive rate limit violations
     consecutive_violations: u32,
 }
@@ -58,10 +67,13 @@ struct UserRateLimit {
 impl UserRateLimit {
     /// Create a fresh tracking entry. `last_message_time` is seeded to "now",
     /// but `RateLimiter::check` overrides it on insert so a first-time user
-    /// is not instantly rate limited.
+    /// is not instantly rate limited. `last_attempt_time` is left at "now"
+    /// so a brand-new user is not falsely treated as having been idle.
     fn new() -> Self {
+        let now = Instant::now();
         Self {
-            last_message_time: Instant::now(),
+            last_message_time: now,
+            last_attempt_time: now,
             consecutive_violations: 0,
         }
     }
@@ -165,6 +177,12 @@ impl RateLimiter {
                 let mut limit = UserRateLimit::new();
                 let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
                 limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
+                // `last_attempt_time` stays at `now` (NOT backdated): a brand
+                // new user has just attempted their first message, so they
+                // are not idle. Backdating this would let the very first
+                // rejected attempt also clear violations on a phantom "idle"
+                // window that never actually occurred.
+                limit.last_attempt_time = now;
                 self.limits.insert(user_uuid.to_string(), limit);
                 self.limits
                     .get_mut(user_uuid)
@@ -174,9 +192,17 @@ impl RateLimiter {
 
         let elapsed = now.duration_since(user_limit.last_message_time);
 
-        if elapsed >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) {
+        // Compute idleness from `last_attempt_time` (BEFORE we update it
+        // below) so a continuous spammer cannot self-forgive: every rejected
+        // attempt also bumps `last_attempt_time`, keeping the idle window
+        // from ever being satisfied while spam is ongoing.
+        let attempt_elapsed = now.duration_since(user_limit.last_attempt_time);
+        if attempt_elapsed >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) {
             user_limit.consecutive_violations = 0;
         }
+        // Stamp the attempt now, AFTER reading the prior value, so this call
+        // counts as "an attempt just happened" for the next call's idle check.
+        user_limit.last_attempt_time = now;
 
         let required_cooldown = calculate_cooldown(user_limit.consecutive_violations);
 
@@ -255,13 +281,18 @@ impl RateLimiter {
         }
     }
 
-    /// Test-only: backdate a user's `last_message_time` by `by` so time-dependent
-    /// paths (reset window, staleness) can be exercised without real sleeps.
+    /// Test-only: backdate a user's `last_message_time` AND `last_attempt_time`
+    /// by `by` so time-dependent paths (reset window, staleness) can be
+    /// exercised without real sleeps. Both fields shift in lockstep so the
+    /// synthetic "time travel" matches what would happen in real wall-clock
+    /// time — otherwise tests would be probing internal accounting rather
+    /// than externally observable behavior.
     /// Returns false if the user has no entry yet.
     #[cfg(test)]
     fn backdate(&mut self, user_uuid: &str, by: Duration) -> bool {
         if let Some(limit) = self.limits.get_mut(user_uuid) {
             limit.last_message_time -= by;
+            limit.last_attempt_time -= by;
             true
         } else {
             false
@@ -376,6 +407,61 @@ mod tests {
         ));
         assert!(limiter.check("user1").is_ok());
         assert_eq!(limiter.violations_for("user1"), Some(0));
+    }
+
+    #[test]
+    fn continuous_spam_does_not_self_forgive_after_reset_window() {
+        // Regression: previously the violation-reset check used elapsed time
+        // since the last ACCEPTED message. A user spamming continuously left
+        // `last_message_time` frozen at their last accepted message, and
+        // after RATE_LIMIT_RESET_AFTER_MS of nonstop rejection their
+        // violations would silently reset to 0 — with the next attempt
+        // accepted under the BASE 2s cooldown, then re-accumulating from 0.
+        //
+        // The fix tracks `last_attempt_time` (bumped on every check, accepted
+        // or rejected) and uses THAT for the idle-window check, so violations
+        // never reset while attempts keep coming.
+        //
+        // Note: even with the fix, a spammer DOES get one accept per
+        // MAX_COOLDOWN window (because `elapsed` against `last_message_time`
+        // crosses MAX_COOLDOWN), but each such accept preserves the
+        // violation count, so the next attempt still hits the escalated
+        // cooldown. The bug-regression signal is that violations do NOT
+        // silently reset to 0 mid-spam.
+        let mut limiter = RateLimiter::new();
+        let _ = limiter.check("spammer"); // accepted, violations stays 0
+        let _ = limiter.check("spammer"); // rejected, violations -> 1
+        assert!(
+            limiter.violations_for("spammer").unwrap() >= 1,
+            "precondition: at least one rejection recorded"
+        );
+
+        // Simulate spam at 1s intervals across more than RATE_LIMIT_RESET_AFTER_MS
+        // of synthetic time. Pre-fix: violations would silently reset to 0 once
+        // accumulated `elapsed` against last_message_time crossed RESET_AFTER.
+        // Post-fix: violations accumulate without reset.
+        let step = Duration::from_secs(1);
+        let total_window =
+            Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) + Duration::from_secs(10);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < total_window {
+            assert!(limiter.backdate("spammer", step));
+            let _ = limiter.check("spammer");
+            elapsed += step;
+        }
+
+        // Pre-fix: violations would have reset at the ~90s mark and only
+        // re-accumulated for the trailing ~10s, leaving violations near
+        // single digits. Post-fix: violations accumulate across the entire
+        // ~100-iteration loop minus a small number of MAX_COOLDOWN-window
+        // accepts (~2), staying well above the pre-fix ceiling.
+        let violations = limiter.violations_for("spammer").unwrap();
+        assert!(
+            violations > 30,
+            "continuous spam over the reset window must NOT silently reset \
+             violations; got {violations}. Pre-fix bug would leave this in \
+             single digits."
+        );
     }
 
     #[test]

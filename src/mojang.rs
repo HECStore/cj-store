@@ -157,31 +157,65 @@ mod tests {
 
     #[test]
     fn uuid_cache_lookup_uses_lowercased_key() {
-        // resolve_user_uuid lowercases before inserting, so lookup callers
-        // must also lowercase — verify the contract holds for "steve".
+        // The cache stores keys lowercased; `lookup_cached_uuid` lowercases
+        // the lookup argument. Verify mixed-case callers all resolve to the
+        // same cached entry — this is the contract chat/mod.rs:718 relies on
+        // when handling whatever capitalisation a sender's name arrives in.
         clear_uuid_cache();
-        let cache = uuid_cache();
         let uuid = "00000000-0000-0000-0000-000000000002".to_string();
 
-        cache.lock().insert("steve".to_string(), (uuid.clone(), Instant::now()));
+        uuid_cache()
+            .lock()
+            .insert("steve".to_string(), (uuid.clone(), Instant::now()));
 
-        let hit = cache.lock().get("steve").cloned();
-        assert_eq!(hit.map(|(u, _)| u), Some(uuid));
+        assert_eq!(lookup_cached_uuid("steve"), Some(uuid.clone()));
+        assert_eq!(lookup_cached_uuid("Steve"), Some(uuid.clone()));
+        assert_eq!(lookup_cached_uuid("STEVE"), Some(uuid));
     }
 
     #[test]
-    fn uuid_cache_entry_older_than_ttl_is_treated_as_stale() {
+    fn lookup_cached_uuid_returns_none_on_miss() {
         clear_uuid_cache();
-        let cache = uuid_cache();
-        let key = "expiredplayer".to_string();
-        let uuid = "00000000-0000-0000-0000-000000000003".to_string();
+        assert_eq!(lookup_cached_uuid("nobody_here"), None);
+    }
 
-        let old_instant = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
-        cache.lock().insert(key.clone(), (uuid, old_instant));
+    #[test]
+    fn lookup_cached_uuid_returns_cached_value_on_hit() {
+        clear_uuid_cache();
+        let uuid = "00000000-0000-0000-0000-0000000000aa".to_string();
+        uuid_cache()
+            .lock()
+            .insert("alice".to_string(), (uuid.clone(), Instant::now()));
 
-        let entry = cache.lock().get(&key).cloned().unwrap();
-        let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
-        assert!(entry.1.elapsed() >= ttl, "Entry should be past TTL");
+        assert_eq!(lookup_cached_uuid("alice"), Some(uuid));
+    }
+
+    #[test]
+    fn lookup_cached_uuid_lowercases_mixed_case_lookups() {
+        // Insert under the lowercase key the production path uses, then
+        // confirm every casing variant the chat layer might pass routes to
+        // the same entry.
+        clear_uuid_cache();
+        let uuid = "00000000-0000-0000-0000-0000000000bb".to_string();
+        uuid_cache()
+            .lock()
+            .insert("steve".to_string(), (uuid.clone(), Instant::now()));
+
+        assert_eq!(lookup_cached_uuid("Steve"), Some(uuid.clone()));
+        assert_eq!(lookup_cached_uuid("STEVE"), Some(uuid.clone()));
+        assert_eq!(lookup_cached_uuid("steve"), Some(uuid));
+    }
+
+    #[test]
+    fn lookup_cached_uuid_rejects_stale_entries() {
+        clear_uuid_cache();
+        let uuid = "00000000-0000-0000-0000-0000000000cc".to_string();
+        let stale_ts = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
+        uuid_cache()
+            .lock()
+            .insert("ghost".to_string(), (uuid, stale_ts));
+
+        assert_eq!(lookup_cached_uuid("ghost"), None);
     }
 
     #[test]
@@ -226,5 +260,52 @@ mod tests {
 
         clear_uuid_cache();
         assert!(cache.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_user_uuid_cfg_test_branch_pads_and_truncates_deterministically() {
+        // Mirror the production cfg(test) recipe so we never hand-count.
+        fn expected_test_uuid(username: &str) -> String {
+            let trimmed: String = username.chars().take(12).collect();
+            format!("00000000-0000-0000-0000-{:0>12}", trimmed)
+        }
+
+        // (a) normal short username — left-padded with zeros.
+        let abc = "abc";
+        assert_eq!(
+            resolve_user_uuid(abc).await.unwrap(),
+            expected_test_uuid(abc),
+        );
+        assert_eq!(
+            resolve_user_uuid(abc).await.unwrap(),
+            "00000000-0000-0000-0000-000000000abc",
+        );
+
+        // (b) "steve" — pinned because other tests in the crate rely on it.
+        let steve = "steve";
+        assert_eq!(
+            resolve_user_uuid(steve).await.unwrap(),
+            expected_test_uuid(steve),
+        );
+        assert_eq!(
+            resolve_user_uuid(steve).await.unwrap(),
+            "00000000-0000-0000-0000-0000000steve",
+        );
+
+        // (c) exactly-12-char username — no padding, no truncation.
+        let twelve = "abcdefghijkl";
+        assert_eq!(twelve.chars().count(), 12);
+        assert_eq!(
+            resolve_user_uuid(twelve).await.unwrap(),
+            expected_test_uuid(twelve),
+        );
+
+        // (d) >12-char username — demonstrates truncation. The truncated
+        // value is "averylonguse" (first 12 chars of "averylongusername").
+        let long = "averylongusername";
+        assert_eq!(
+            resolve_user_uuid(long).await.unwrap(),
+            expected_test_uuid(long),
+        );
     }
 }

@@ -5,6 +5,9 @@
 .env
 .env.*
 !.env.example
+# Cargo registry tokens (cargo login writes here; .cargo/ is partially tracked via config.toml)
+.cargo/credentials
+.cargo/credentials.toml
 
 # Claude Code
 .claude/settings.local.json

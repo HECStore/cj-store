@@ -33,11 +33,6 @@ pub const PATHFINDING_TIMEOUT_MS: u64 = 60_000;
 
 pub const DELAY_SHORT_MS: u64 = 100;
 
-/// Interval between pathfinding position checks (milliseconds).
-/// Shorter intervals mean faster reaction to "arrived at goal", at the cost
-/// of extra lock-acquire churn on the entity position component.
-pub const PATHFINDING_CHECK_INTERVAL_MS: u64 = 100;
-
 pub const DELAY_MEDIUM_MS: u64 = 200;
 
 /// Delay after a click / interact that updates container state.

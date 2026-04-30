@@ -3,13 +3,15 @@
 //! Provides pathfinding utilities for navigating the bot to node/chest positions
 //! with automatic retry logic.
 
+use std::time::Duration;
+
 use azalea::BlockPos;
 use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::PathfinderClientExt;
 use tracing::{debug, info, warn};
 
 use crate::constants::{
-    DELAY_MEDIUM_MS, NAVIGATION_MAX_RETRIES, PATHFINDING_CHECK_INTERVAL_MS,
+    DELAY_MEDIUM_MS, NAVIGATION_MAX_RETRIES,
     RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay,
 };
 use crate::types::{Chest, Position};
@@ -58,43 +60,57 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
         dx, dy, dz
     );
 
-    client.goto(BlockPosGoal(target_block)).await;
-
-    // Wait for pathfinding to complete (timeout from config)
+    // Bound the goto future with an external deadline. Azalea's
+    // `wait_until_goto_target_reached` has no internal timeout, so an
+    // unreachable goal would otherwise hang the task indefinitely until the
+    // upstream order watchdog fires. On `Elapsed` we must use
+    // `force_stop_pathfinding` (not `stop_pathfinding`) — the non-force
+    // variant defers the abort to the next movement boundary, which leaves
+    // pathfinding state dirty for the next retry.
     let pathfinding_wait_ms = bot.pathfinding_timeout_ms;
-    let max_checks = (pathfinding_wait_ms / PATHFINDING_CHECK_INTERVAL_MS) as usize;
-    let mut checks = 0;
-    while checks < max_checks {
-        tokio::time::sleep(tokio::time::Duration::from_millis(PATHFINDING_CHECK_INTERVAL_MS)).await;
-        let new_pos = client.entity().position();
-        let new_block = BlockPos::from(new_pos);
-        let new_dx = (new_block.x - target_block.x).abs();
-        let new_dy = (new_block.y - target_block.y).abs();
-        let new_dz = (new_block.z - target_block.z).abs();
-        // Same zero-tolerance rule as above: Azalea's pathfinder may report
-        // "done" when standing on an adjacent block, but for node P we require
-        // the exact block before considering navigation successful.
-        if new_dx == 0 && new_dy == 0 && new_dz == 0 {
-            info!(
-                "Reached exact target ({}, {}, {}) - position: ({}, {}, {})",
-                target.x, target.y, target.z,
-                new_block.x, new_block.y, new_block.z
-            );
-            return Ok(true);
-        }
-        checks += 1;
-    }
+    let goto_result = tokio::time::timeout(
+        Duration::from_millis(pathfinding_wait_ms),
+        client.goto(BlockPosGoal(target_block)),
+    ).await;
 
-    let final_pos = client.entity().position();
-    let final_block = BlockPos::from(final_pos);
-    warn!(
-        "Pathfinding timeout after {}ms - target: ({}, {}, {}), current: ({}, {}, {})",
-        pathfinding_wait_ms,
-        target_block.x, target_block.y, target_block.z,
-        final_block.x, final_block.y, final_block.z
-    );
-    
-    Ok(false) // Timed out, didn't reach target
+    match goto_result {
+        Ok(()) => {
+            // BlockPosGoal::success requires exact equality, so when goto
+            // returns cleanly the bot is either exactly at target or
+            // pathfinding was externally aborted. A polling loop after this
+            // point cannot improve on a single read.
+            let final_block = BlockPos::from(client.entity().position());
+            if final_block == target_block {
+                info!(
+                    "Reached exact target ({}, {}, {}) - position: ({}, {}, {})",
+                    target.x, target.y, target.z,
+                    final_block.x, final_block.y, final_block.z
+                );
+                Ok(true)
+            } else {
+                warn!(
+                    "Pathfinding ended off-target - target: ({}, {}, {}), current: ({}, {}, {})",
+                    target_block.x, target_block.y, target_block.z,
+                    final_block.x, final_block.y, final_block.z
+                );
+                Ok(false)
+            }
+        }
+        Err(_elapsed) => {
+            // Force-abort and yield once so the StopPathfindingEvent has a
+            // chance to be processed before the caller schedules a retry.
+            client.force_stop_pathfinding();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let final_block = BlockPos::from(client.entity().position());
+            warn!(
+                "Pathfinding timeout after {}ms - target: ({}, {}, {}), current: ({}, {}, {})",
+                pathfinding_wait_ms,
+                target_block.x, target_block.y, target_block.z,
+                final_block.x, final_block.y, final_block.z
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Navigate to a position using pathfinding with retry logic.

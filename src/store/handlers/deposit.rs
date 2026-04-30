@@ -199,6 +199,7 @@ pub async fn handle_deposit_balance_queued(
             player = player_name,
             uuid = %user_uuid,
             failed_steps = rb.operations_failed,
+            items_unplanned = rb.items_unplanned,
             diamonds = diamonds_actually_received,
             "Deposit storage write partially failed; some diamonds may remain in bot inventory"
         );

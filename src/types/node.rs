@@ -26,6 +26,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{CHESTS_PER_NODE, NODE_SPACING};
+use crate::error::StoreError;
 use crate::fsutil::write_atomic;
 use crate::types::chest::Chest;
 use crate::types::ItemId;
@@ -96,18 +97,25 @@ impl Node {
     /// For node 0, the reserved chest invariants (chest 0 = diamond,
     /// chest 1 = overflow) are re-enforced even on load in case the file was
     /// edited manually, and any correction is persisted back to disk.
-    pub fn load(id: i32, storage_position: &Position) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(id: i32, storage_position: &Position) -> Result<Self, StoreError> {
         let file_path = format!("data/storage/{}.json", id);
 
         if !Path::new(&file_path).exists() {
-            return Err(format!("Node file not found: {}", file_path).into());
+            return Err(StoreError::InvariantViolation(format!(
+                "Node file not found: {}",
+                file_path
+            )));
         }
 
         let json_data = fs::read_to_string(&file_path)?;
-        let mut node: Node = serde_json::from_str(&json_data)?;
+        let mut node: Node = serde_json::from_str(&json_data)
+            .map_err(|e| StoreError::InvariantViolation(format!("Failed to parse node {}: {}", id, e)))?;
 
         if node.id != id {
-            return Err(format!("Node ID mismatch: expected {}, got {}", id, node.id).into());
+            return Err(StoreError::InvariantViolation(format!(
+                "Node ID mismatch: expected {}, got {}",
+                id, node.id
+            )));
         }
 
         // Recompute positions from the current storage origin (see doc comment).
@@ -117,13 +125,12 @@ impl Node {
         }
 
         if node.chests.len() != CHESTS_PER_NODE {
-            return Err(format!(
+            return Err(StoreError::InvariantViolation(format!(
                 "Node {} has {} chests, expected {}",
                 id,
                 node.chests.len(),
                 CHESTS_PER_NODE
-            )
-            .into());
+            )));
         }
 
         node.chests.sort_by_key(|chest| chest.index);
@@ -168,7 +175,7 @@ impl Node {
     ///
     /// Uses [`write_atomic`] (write-to-temp + rename) so a crash mid-write
     /// cannot leave a partially-written node file on disk.
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self) -> Result<(), StoreError> {
         let file_path = format!("data/storage/{}.json", self.id);
 
         if let Some(parent_dir) = Path::new(&file_path).parent()
@@ -176,7 +183,8 @@ impl Node {
                 fs::create_dir_all(parent_dir)?;
             }
 
-        let json_data = serde_json::to_string_pretty(self)?;
+        let json_data = serde_json::to_string_pretty(self)
+            .map_err(|e| StoreError::InvariantViolation(format!("Failed to serialize node {}: {}", self.id, e)))?;
         write_atomic(&file_path, &json_data)?;
 
         tracing::debug!(

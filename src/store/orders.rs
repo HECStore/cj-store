@@ -459,13 +459,12 @@ pub async fn handle_buy_order(
                 "[Buy]",
             )
             .await;
-            let rollback_msg = if rb.has_failures() {
-                format!(
-                    "Buy aborted: trade failed: {}. Rollback: {} items returned, {} operations failed - some items may remain in bot inventory.",
-                    err, rb.items_returned, rb.operations_failed
-                )
-            } else {
-                format!("Buy aborted: trade failed: {} (items rolled back to storage)", err)
+            let rollback_msg = match rb.partial_message() {
+                Some(detail) => format!(
+                    "Buy aborted: trade failed: {}. Rollback partial: {}.",
+                    err, detail
+                ),
+                None => format!("Buy aborted: trade failed: {} (items rolled back to storage)", err),
             };
             return utils::send_message_to_player(store, player_name, &rollback_msg).await;
         }
@@ -519,6 +518,7 @@ pub async fn handle_buy_order(
                     player = %player_name,
                     diamonds_received,
                     operations_failed = rb.operations_failed,
+                    items_unplanned = rb.items_unplanned,
                     "Failed to deposit some received diamonds into storage after insufficient payment"
                 );
             }
@@ -552,7 +552,13 @@ pub async fn handle_buy_order(
         )
         .await;
         if rb.has_failures() {
-            warn!(phase = "buy.diamond_deposit", player = %player_name, operations_failed = rb.operations_failed, "Failed to deposit some diamonds into storage");
+            warn!(
+                phase = "buy.diamond_deposit",
+                player = %player_name,
+                operations_failed = rb.operations_failed,
+                items_unplanned = rb.items_unplanned,
+                "Failed to deposit some diamonds into storage"
+            );
         }
     }
 
@@ -880,7 +886,7 @@ pub async fn handle_sell_order(
     let actual_received = match trade_result {
         Err(err) => {
             warn!(phase = "sell.rollback", player = %player_name, item = %item, "Sell trade failed: {}", err);
-            let _ = rollback::rollback_amount_to_storage(
+            let rb = rollback::rollback_amount_to_storage(
                 store,
                 "diamond",
                 plan.whole_diamonds,
@@ -888,12 +894,17 @@ pub async fn handle_sell_order(
                 "[Sell] diamond",
             )
             .await;
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!("Sell aborted: trade failed: {}. Diamonds returned to storage.", err),
-            )
-            .await;
+            let msg = match rb.partial_message() {
+                Some(detail) => format!(
+                    "Sell aborted: trade failed: {}. Rollback partial: {}.",
+                    err, detail
+                ),
+                None => format!(
+                    "Sell aborted: trade failed: {}. Diamonds returned to storage.",
+                    err
+                ),
+            };
+            return utils::send_message_to_player(store, player_name, &msg).await;
         }
         Ok(r) => r,
     };
@@ -916,7 +927,7 @@ pub async fn handle_sell_order(
             received = items_received,
             "Sell validation failed: item count mismatch"
         );
-        let _ = rollback::rollback_amount_to_storage(
+        let rb_validation = rollback::rollback_amount_to_storage(
             store,
             "diamond",
             plan.whole_diamonds,
@@ -924,6 +935,16 @@ pub async fn handle_sell_order(
             "[Sell] validation-failed",
         )
         .await;
+        if rb_validation.has_failures() {
+            warn!(
+                phase = "sell.validation",
+                player = %player_name,
+                operations_failed = rb_validation.operations_failed,
+                items_unplanned = rb_validation.items_unplanned,
+                items_returned = rb_validation.items_returned,
+                "Sell: rollback after validation failure was partial — diamonds may remain on bot"
+            );
+        }
         if items_received > 0 {
             let _ = perform_trade(
                 store,

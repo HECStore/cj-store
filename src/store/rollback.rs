@@ -34,6 +34,11 @@ pub struct RollbackResult {
     /// reconcile). Timeout, channel-drop, and bot-error branches do NOT
     /// credit this counter: physical state is unknown, so we don't claim it.
     pub items_returned: i32,
+    /// Items the planner could NOT place anywhere — storage is full, the item
+    /// has no reserved chests, or there are zero growable nodes. These items
+    /// remain physically on the bot; no chest step was even attempted for them.
+    /// Distinct from `operations_failed`, which counts per-step bot errors.
+    pub items_unplanned: i32,
     /// Number of per-chest deposit steps that completed cleanly.
     pub operations_succeeded: usize,
     /// Number of per-chest deposit steps that failed (send error, timeout,
@@ -42,9 +47,41 @@ pub struct RollbackResult {
 }
 
 impl RollbackResult {
-    /// True if at least one chest operation reported failure.
+    /// True if at least one chest operation reported failure OR the planner
+    /// could not place every item. Both conditions mean items may still be in
+    /// the bot's inventory and operator attention may be required.
     pub fn has_failures(&self) -> bool {
-        self.operations_failed > 0
+        self.operations_failed > 0 || self.items_unplanned > 0
+    }
+
+    /// If the rollback ended with items still on the bot (per-step failures
+    /// and/or planner shortfall), return a short, player-facing suffix
+    /// describing the residue. Returns `None` on a fully clean rollback so
+    /// callers can use the "(items rolled back to storage)" wording.
+    ///
+    /// Designed to be appended to a handler's failure-path message; the
+    /// caller still chooses the leading verb ("Buy aborted: …", "Sell aborted: …").
+    pub fn partial_message(&self) -> Option<String> {
+        if !self.has_failures() {
+            return None;
+        }
+        let stuck = self.items_unplanned;
+        let failed = self.operations_failed;
+        let returned = self.items_returned;
+        let mut parts: Vec<String> = Vec::new();
+        if returned > 0 {
+            parts.push(format!("{} returned to storage", returned));
+        }
+        if failed > 0 {
+            parts.push(format!("{} chest operation(s) failed", failed));
+        }
+        if stuck > 0 {
+            parts.push(format!(
+                "{} item(s) could not be placed and remain on the bot — investigate manually",
+                stuck
+            ));
+        }
+        Some(parts.join("; "))
     }
 }
 
@@ -131,7 +168,18 @@ pub async fn deposit_transfers(
                 context, step_num, total_steps, chest_id, t.amount, item, e
             );
             result.operations_failed += 1;
-            continue;
+            // mpsc Sender::send returning Err is permanent (receiver dropped).
+            // Short-circuit: every remaining step would log the same error for
+            // one root cause. Mark the truly-not-yet-attempted tail as failed.
+            let skipped = transfers.len().saturating_sub(step_num);
+            if skipped > 0 {
+                result.operations_failed += skipped;
+            }
+            error!(
+                "{} Rollback step {}/{} chest {} bot channel closed; aborting after this step, {} subsequent step(s) marked failed: {}",
+                context, step_num, total_steps, chest_id, skipped, e
+            );
+            break;
         }
 
         match tokio::time::timeout(
@@ -234,21 +282,23 @@ pub async fn rollback_amount_to_storage(
     // Non-mutating planner: avoids cloning storage; `apply_chest_sync` re-syncs
     // the authoritative state per successful step in `deposit_transfers`.
     let (plan, planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
-    if planned < amount {
+    let unplanned = (amount - planned).max(0);
+    if unplanned > 0 {
         // Deposit plan could not accommodate every item (storage is full or
         // `item` has no reserved chests left). Items for which no slot was
         // planned will remain in the bot's inventory — flag this so an operator
         // can free space or manually reconcile.
         warn!(
             "{} Rollback under-planned: only {} of {} x {} will be deposited (remaining {} stay in bot inventory)",
-            context,
-            planned,
-            amount,
-            item,
-            amount - planned
+            context, planned, amount, item, unplanned
         );
     }
-    deposit_transfers(store, &plan, item, stack_size, context).await
+    // Populate `items_unplanned` here, BEFORE delegating: `deposit_transfers`
+    // is also called by buy/operator handlers with caller-supplied plans where
+    // an "unplanned shortfall" is not a meaningful concept.
+    let mut result = deposit_transfers(store, &plan, item, stack_size, context).await;
+    result.items_unplanned = unplanned;
+    result
 }
 
 #[cfg(test)]
@@ -382,13 +432,23 @@ mod tests {
 
     #[test]
     fn has_failures_returns_false_when_no_operations_failed() {
-        let r = RollbackResult { items_returned: 5, operations_succeeded: 2, operations_failed: 0 };
+        let r = RollbackResult {
+            items_returned: 5,
+            operations_succeeded: 2,
+            operations_failed: 0,
+            ..Default::default()
+        };
         assert!(!r.has_failures());
     }
 
     #[test]
     fn has_failures_returns_true_when_any_operation_failed() {
-        let r = RollbackResult { items_returned: 0, operations_succeeded: 0, operations_failed: 1 };
+        let r = RollbackResult {
+            items_returned: 0,
+            operations_succeeded: 0,
+            operations_failed: 1,
+            ..Default::default()
+        };
         assert!(r.has_failures());
     }
 
@@ -426,16 +486,25 @@ mod tests {
 
     #[tokio::test]
     async fn deposit_transfers_counts_send_failure_when_receiver_dropped() {
-        // Drop the receiver BEFORE calling — bot_tx.send() returns Err.
+        // Drop the receiver BEFORE calling — bot_tx.send() returns Err on the
+        // very first step. The function must short-circuit (channel-drop is
+        // permanent) and mark all remaining steps as failed without retrying.
         let (tx, rx) = mpsc::channel(4);
         drop(rx);
         let mut store = make_store(tx, single_node_storage("cobblestone"));
 
-        let plan = vec![transfer(2, "cobblestone", 10)];
+        let plan = vec![
+            transfer(2, "cobblestone", 10),
+            transfer(2, "cobblestone", 7),
+            transfer(2, "cobblestone", 3),
+        ];
         let result = deposit_transfers(&mut store, &plan, "cobblestone", 64, "[Test]").await;
 
         assert_eq!(result.operations_succeeded, 0);
-        assert_eq!(result.operations_failed, 1);
+        assert_eq!(
+            result.operations_failed, 3,
+            "all 3 steps must be counted as failed even though only the first was attempted"
+        );
         assert_eq!(result.items_returned, 0);
         assert!(result.has_failures());
     }
@@ -553,5 +622,42 @@ mod tests {
         assert!(!result.has_failures());
         assert_eq!(result.items_returned, 50);
         assert!(result.operations_succeeded >= 1);
+    }
+
+    #[tokio::test]
+    async fn under_plan_is_surfaced_as_failure() {
+        // Storage with NO nodes at all — `simulate_deposit_plan` cannot place
+        // anything, so the planner returns an empty plan and a planned-total of
+        // zero. Before this fix `rollback_amount_to_storage` returned a
+        // `Default::default()` `RollbackResult` and `has_failures()` was false,
+        // so callers cheerfully told the player "items returned to storage"
+        // while the items were physically still on the bot.
+        //
+        // We deliberately use empty-Storage rather than a "full chest" fixture:
+        // `simulate_deposit_plan` falls through to allocate empty chests in any
+        // node it can find, so a full-chest scenario won't actually trigger
+        // under-planning in the presence of free chests.
+        let origin = Position { x: 0, y: 64, z: 0 };
+        let storage = Storage::new(&origin); // zero nodes
+        let (tx, _rx) = mpsc::channel(4);
+        let mut store = make_store(tx, storage);
+
+        let result =
+            rollback_amount_to_storage(&mut store, "cobblestone", 5, 64, "[Test]").await;
+
+        assert_eq!(result.items_unplanned, 5, "all 5 items must be flagged unplanned");
+        assert_eq!(
+            result.operations_failed, 0,
+            "no per-step failure occurred — only a planning shortfall"
+        );
+        assert_eq!(result.items_returned, 0, "no items were physically returned");
+        assert!(
+            result.has_failures(),
+            "planning shortfall must surface via has_failures()"
+        );
+        assert!(
+            result.partial_message().is_some(),
+            "partial_message() must yield a string when items remain on the bot"
+        );
     }
 }

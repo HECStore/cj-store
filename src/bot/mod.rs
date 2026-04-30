@@ -77,8 +77,10 @@ pub struct BotState {
     pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
     /// Mpsc to the dedicated history writer task. Used
     /// with `try_send`, never `await`, so a hostile flood cannot block
-    /// `bot_task`.
-    pub history_tx: mpsc::Sender<ChatEvent>,
+    /// `bot_task`. Carries [`crate::chat::history::HistoryItem`] so
+    /// inbound chat events and bot-emitted lines share one channel
+    /// without leaking bot-only fields onto the broadcast `ChatEvent`.
+    pub history_tx: mpsc::Sender<crate::chat::history::HistoryItem>,
     /// Live Minecraft username, populated on `Event::Init` and cleared on
     /// `Event::Disconnect`. Read-only by chat.
     pub bot_username: Arc<RwLock<Option<String>>>,
@@ -150,7 +152,7 @@ pub struct Bot {
     /// chat lines here for chat_task to consume.
     pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
     /// Mpsc to the chat history writer. `try_send` only.
-    pub history_tx: mpsc::Sender<ChatEvent>,
+    pub history_tx: mpsc::Sender<crate::chat::history::HistoryItem>,
     /// Live Minecraft username. `None` while disconnected or
     /// pre-Init.
     pub bot_username: Arc<RwLock<Option<String>>>,
@@ -188,7 +190,7 @@ pub struct Bot {
 /// chat-related shared state (Phase 1+) does not balloon every call site.
 pub struct BotChannels {
     pub chat_events_tx: Arc<broadcast::Sender<ChatEvent>>,
-    pub history_tx: mpsc::Sender<ChatEvent>,
+    pub history_tx: mpsc::Sender<crate::chat::history::HistoryItem>,
     pub bot_username: Arc<RwLock<Option<String>>>,
     pub chat_config: Arc<ChatConfig>,
     pub in_critical_section: Arc<AtomicBool>,
@@ -465,16 +467,30 @@ pub async fn bot_task(
             } => {
                 let result = bot.send_whisper(&target, &message).await;
                 // Tag bot output to history so tool-time history searches
-                // can attribute messages back to the bot.
+                // can attribute messages back to the bot. Routed via the
+                // history mpsc (try_send) so the per-line file open/write
+                // stays off this runtime worker.
                 if result.is_ok()
                     && let Some(name) = bot.bot_username.read().await.as_ref()
-                {
-                    crate::chat::history::append_bot_output(
+                    && let Err(e) = crate::chat::history::enqueue_bot_output(
+                        &bot.history_tx,
                         name,
                         Some(&target),
                         &message,
                         /* is_whisper */ true,
-                    );
+                    )
+                {
+                    let mut drops = bot.history_drops.lock();
+                    *drops += 1;
+                    let count = *drops;
+                    drop(drops);
+                    if count == 1 || count.is_multiple_of(60) {
+                        warn!(
+                            history_drops = count,
+                            error = ?e,
+                            "[Bot] history mpsc try_send failed for bot whisper output; durable history degraded"
+                        );
+                    }
                 }
                 if respond_to.send(result).is_err() {
                     warn!(
@@ -492,13 +508,25 @@ pub async fn bot_task(
                 let result = bot.send_chat_message(&content).await;
                 if result.is_ok()
                     && let Some(name) = bot.bot_username.read().await.as_ref()
-                {
-                    crate::chat::history::append_bot_output(
+                    && let Err(e) = crate::chat::history::enqueue_bot_output(
+                        &bot.history_tx,
                         name,
                         None,
                         &content,
                         /* is_whisper */ false,
-                    );
+                    )
+                {
+                    let mut drops = bot.history_drops.lock();
+                    *drops += 1;
+                    let count = *drops;
+                    drop(drops);
+                    if count == 1 || count.is_multiple_of(60) {
+                        warn!(
+                            history_drops = count,
+                            error = ?e,
+                            "[Bot] history mpsc try_send failed for bot chat output; durable history degraded"
+                        );
+                    }
                 }
                 if respond_to.send(result).is_err() {
                     warn!("[Bot] SendChat response channel dropped before ack");
@@ -1017,7 +1045,10 @@ async fn handle_event(client: Client, event: Event, state: &mut BotState) -> any
                     content: p.content.clone(),
                     recv_at: std::time::SystemTime::now(),
                 };
-                if let Err(e) = state.history_tx.try_send(event.clone()) {
+                if let Err(e) = state
+                    .history_tx
+                    .try_send(crate::chat::history::HistoryItem::Inbound(event.clone()))
+                {
                     // Channel full or closed — increment drop counter and
                     // emit at most one warn per 60 s to bound log volume
                     // under sustained flooding.

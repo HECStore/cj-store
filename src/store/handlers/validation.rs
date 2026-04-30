@@ -16,10 +16,10 @@ pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
         return Err("Item name cannot be empty. Example: buy cobblestone 64".to_string());
     }
 
-    if ItemId::new(item).is_err() {
-        return Err("Invalid item name. Example items: cobblestone, iron_ingot, diamond".to_string());
-    }
-
+    // Per-character check runs BEFORE `ItemId::new` so the more specific
+    // "invalid character '<c>'" message wins over `ItemId::new`'s generic
+    // "forbidden character" rejection. Players trying `iron-ingot` see
+    // exactly which character is the problem.
     for c in item.chars() {
         if !c.is_ascii_alphanumeric() && c != '_' && c != ':' {
             return Err(format!(
@@ -27,6 +27,10 @@ pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
                 c
             ));
         }
+    }
+
+    if ItemId::new(item).is_err() {
+        return Err("Invalid item name. Example items: cobblestone, iron_ingot, diamond".to_string());
     }
 
     Ok(())

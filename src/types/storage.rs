@@ -96,7 +96,7 @@ impl Storage {
     /// Persists every node to `data/storage/{node_id}.json`.
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         for node in &self.nodes {
-            node.save()?;
+            node.save().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         }
         tracing::debug!(nodes = self.nodes.len(), "[Storage] saved all nodes");
         Ok(())

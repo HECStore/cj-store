@@ -136,7 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (chat_events_tx, _chat_events_rx_root) =
                 broadcast::channel::<ChatEvent>(2048);
             let chat_events_tx = Arc::new(chat_events_tx);
-            let (history_tx, history_rx) = mpsc::channel::<ChatEvent>(4096);
+            let (history_tx, history_rx) =
+                mpsc::channel::<crate::chat::history::HistoryItem>(4096);
             let (chat_cmd_tx, chat_cmd_rx) = mpsc::channel::<ChatCommand>(64);
             let in_critical_section = Arc::new(AtomicBool::new(false));
             let bot_username = Arc::new(RwLock::new(None));

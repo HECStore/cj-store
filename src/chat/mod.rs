@@ -1098,7 +1098,7 @@ async fn process_event(
 
     // direct-address detection — common-words downgrade enforced.
     // Whispers always count as direct contact: the player explicitly
-    // DM'd the bot, so a bare "hi" should bypass dyad / lurk / silence
+    // DM'd the bot, so a bare "hi" should bypass dyad / silence
     // guards just like an `@bot ping` in public chat does. The candidate
     // names are the persona's chosen name and nicknames PLUS the bot's
     // live Minecraft username — players will use whichever they know.
@@ -1325,23 +1325,6 @@ async fn process_event(
 
     if !verdict.respond || verdict.confidence < config.classifier_min_confidence {
         return Ok(());
-    }
-
-    // / CON4 lurk skip — applied AFTER classifier said respond,
-    // BEFORE composer dispatch. Bypassed for direct-address events
-    // (CHAT.md explicitly: real players miss messages but always answer
-    // when called by name).
-    if !directly_addressed {
-        let mut rng_unit = rand_unit_f32;
-        if pacing::roll_lurk_skip(config.lurk_probability, &mut rng_unit) {
-            decisions::write(
-                &decisions::DecisionRecord::new("lurk_skip")
-                    .with_sender(&event.sender)
-                    .with_event_ts(event.recv_at)
-                    .with_reason("post_classifier_lurk"),
-            );
-            return Ok(());
-        }
     }
 
     // model-404 backoff — short-circuit composer if a recent 404

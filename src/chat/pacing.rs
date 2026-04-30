@@ -183,19 +183,6 @@ pub fn lowercase_first_per_sentence(reply: &str) -> String {
     out
 }
 
-/// CHAT.md / CON4 — probabilistic skip even when the classifier says
-/// "respond". Real players miss messages they could reply to. The caller
-/// MUST bypass this for direct-address events; this function does not
-/// know about that gate.
-///
-/// `rng_unit` returns a uniform `[0.0, 1.0)` draw; `lurk_probability` is
-/// clamped defensively into the same range.
-pub fn roll_lurk_skip(lurk_probability: f32, rng_unit: &mut impl FnMut() -> f32) -> bool {
-    let p = lurk_probability.clamp(0.0, 1.0);
-    let r = (rng_unit)().clamp(0.0, 1.0);
-    r < p
-}
-
 /// CHAT.md — active-hours gate. Returns true if the current UTC hour
 /// is within the configured active-hours window. `None` = always on.
 /// The matching helper `crate::config::within_active_hours_utc` lives

@@ -126,8 +126,6 @@ pub struct ChatConfig {
     pub typing_delay_floor_ms: u32,
     #[serde(default = "default_chat_typing_delay_max_ms")]
     pub typing_delay_max_ms: u32,
-    #[serde(default = "default_chat_lurk_probability")]
-    pub lurk_probability: f32,
 
     // Memory growth
     #[serde(default = "default_chat_adjustments_max_bullets")]
@@ -266,7 +264,6 @@ impl Default for ChatConfig {
             typing_delay_jitter_ms: default_chat_typing_delay_jitter_ms(),
             typing_delay_floor_ms: default_chat_typing_delay_floor_ms(),
             typing_delay_max_ms: default_chat_typing_delay_max_ms(),
-            lurk_probability: default_chat_lurk_probability(),
             adjustments_max_bullets: default_chat_adjustments_max_bullets(),
             player_memory_max_bytes: default_chat_player_memory_max_bytes(),
             update_bullet_max_chars: default_chat_update_bullet_max_chars(),
@@ -332,7 +329,6 @@ fn default_chat_typing_delay_per_char_ms() -> u32 { 60 }
 fn default_chat_typing_delay_jitter_ms() -> u32 { 250 }
 fn default_chat_typing_delay_floor_ms() -> u32 { 400 }
 fn default_chat_typing_delay_max_ms() -> u32 { 12_000 }
-fn default_chat_lurk_probability() -> f32 { 0.15 }
 fn default_chat_adjustments_max_bullets() -> u32 { 50 }
 fn default_chat_player_memory_max_bytes() -> u32 { 4096 }
 fn default_chat_update_bullet_max_chars() -> u32 { 280 }
@@ -427,12 +423,6 @@ impl ChatConfig {
             ));
         }
 
-        if !(0.0..=1.0).contains(&self.lurk_probability) {
-            errors.push(format!(
-                "lurk_probability must be in [0.0, 1.0] (got {})",
-                self.lurk_probability
-            ));
-        }
         if self.composer_max_chars > 240 {
             errors.push(format!(
                 "composer_max_chars must be <= 240 (got {})",

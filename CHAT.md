@@ -221,9 +221,6 @@ chat_task (subscriber):
     ├── ai_callout.detected → pending_adjustments.jsonl
     ├── respond=false OR confidence<min                          ── drop
     ▼
-  pacing::roll_lurk_skip                                          ── skip
-    (bypassed when directly addressed)
-    ▼
   composer.rs (Opus 4.7 + tool-use loop)
     ├── composer-throttle backoff (after upstream 429/5xx)       ── skip
     ├── system prompt: rules + persona + memory + adjustments
@@ -990,7 +987,7 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Instant replies                 | Typing delay (`typing_delay_*`) with Gaussian jitter and a post-jitter floor.                                                                                              |
 | Perfect grammar                 | Persona-driven typo rate, capitalization habits, sentence-length distribution.                                                                                             |
-| Always responding               | Lurk probability + classifier pre-filter + per-sender classifier rate cap.                                                                                                 |
+| Always responding               | Classifier pre-filter (sample-rate roll on undirected public chat) + per-sender classifier rate cap.                                                                       |
 | Knowing too much                | Cross-player firewall on `read_player_memory` + Trust-gated proactive references; Trust 3 is the only level allowed to reference cross-player history.                    |
 | Style drift                     | `persona.md` is not LLM-writable; no `update_persona` tool exists.                                                                                                         |
 | Predictable timing              | Gaussian jitter on typing delay; `max_replies_per_minute` cap.                                                                                                             |
@@ -1002,7 +999,7 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 | Prompt injection in adjustments | Reflection pass paraphrase requirement + multi-axis validator (substring overlap, distinct triggers, distinct senders, sender Trust ≥ 1).                                  |
 | AI tell phrases                 | `pacing::strip_ai_tells` removes em-dashes, smart quotes, "As an AI", "I'm Claude", "language model", etc.                                                                 |
 | Cost-DoS via classifier flood   | Per-sender classifier rate cap; per-call sample-rate roll on undirected public chat; separate `daily_classifier_token_cap`; spam-suppressed senders skip classifier entirely.                |
-| Cost-DoS via composer flood     | `daily_input_token_cap` + `daily_output_token_cap` + `daily_dollar_cap_usd`; client-side rate limiter with RPM and ITPM accounting; lurk skip applied even after classifier. |
+| Cost-DoS via composer flood     | `daily_input_token_cap` + `daily_output_token_cap` + `daily_dollar_cap_usd`; client-side rate limiter with RPM and ITPM accounting; classifier pre-filter gates composer dispatch. |
 | SSRF via web_fetch              | URL-parse rejects numeric/octal/hex hosts and userinfo; pinned-IP DNS; deny-list including cloud metadata; manual redirect re-validation; streaming size cap.              |
 
 ## Where to start reading

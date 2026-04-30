@@ -7,8 +7,9 @@
 //! Single-process append-only: the chat task is the only writer.
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -16,6 +17,12 @@ use serde::Serialize;
 use tracing::{debug, error};
 
 pub const DECISIONS_DIR: &str = "data/chat/decisions";
+
+/// Per-day cached file handle for the decisions JSONL writer. The cache
+/// key is the full `PathBuf` returned by `file_for()`, which rotates only
+/// at UTC midnight, so in steady state every `write()` reuses the same
+/// handle and avoids the per-call open() + create_dir_all syscalls.
+static DAY_FILE_CACHE: Mutex<Option<(PathBuf, std::fs::File)>> = Mutex::new(None);
 
 /// One JSONL record. Open-shape — callers stuff arbitrary metadata into
 /// `extra`, which is flattened into the top-level object. Required
@@ -57,12 +64,19 @@ pub struct DecisionRecord {
     /// Open-ended map for kind-specific fields.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Single source of truth for the instant this record was created.
+    /// Used to derive both the rfc3339 `ts` string and the day-file path
+    /// in [`write`], so a midnight-boundary tick can never split them.
+    /// Skipped during serialization — wire format is unchanged.
+    #[serde(skip)]
+    created: SystemTime,
 }
 
 impl DecisionRecord {
     pub fn new(kind: &'static str) -> Self {
+        let now = SystemTime::now();
         Self {
-            ts: iso_utc(SystemTime::now()),
+            ts: iso_utc(now),
             kind,
             sender: None,
             event_ts: None,
@@ -74,6 +88,7 @@ impl DecisionRecord {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
             extra: serde_json::Map::new(),
+            created: now,
         }
     }
 
@@ -134,11 +149,45 @@ fn file_for(t: SystemTime) -> PathBuf {
     PathBuf::from(DECISIONS_DIR).join(format!("{date}.jsonl"))
 }
 
+/// Return an owned handle for `path`, reusing the cached day-file handle
+/// when its key matches. On any open() / try_clone() / dir-create failure
+/// we fall back to a fresh per-call open so a transient filesystem error
+/// can't poison the cache or wedge the writer.
+fn open_or_reuse(path: &Path) -> io::Result<std::fs::File> {
+    // Lock is held only across the open()/clone(); dropped before the
+    // caller's actual write_all to keep contention minimal.
+    let mut guard = DAY_FILE_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some((cached_path, cached_file)) = guard.as_ref()
+        && cached_path == path
+        && let Ok(clone) = cached_file.try_clone()
+    {
+        return Ok(clone);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    match file.try_clone() {
+        Ok(clone) => {
+            *guard = Some((path.to_path_buf(), file));
+            Ok(clone)
+        }
+        Err(_) => {
+            // try_clone failed — don't poison the cache; just return the
+            // fresh handle so the caller can still write.
+            *guard = None;
+            Ok(file)
+        }
+    }
+}
+
 /// Append a record to the per-day decisions JSONL. Errors are logged
 /// at error level but never propagated — a disk hiccup must not stop
 /// the chat task.
 pub fn write(record: &DecisionRecord) {
-    let path = file_for(SystemTime::now());
+    let path = file_for(record.created);
     let line = match serde_json::to_string(record) {
         Ok(s) => s,
         Err(e) => {
@@ -146,15 +195,10 @@ pub fn write(record: &DecisionRecord) {
             return;
         }
     };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        error!(path = %path.display(), error = %e, "decision dir create failed");
-        return;
-    }
-    match OpenOptions::new().create(true).append(true).open(&path) {
+    match open_or_reuse(&path) {
         Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{line}") {
+            let line = format!("{line}\n");
+            if let Err(e) = f.write_all(line.as_bytes()) {
                 error!(path = %path.display(), error = %e, "decision append failed");
             } else {
                 debug!(kind = record.kind, "decision logged");

@@ -1,7 +1,7 @@
 ---
 name: improve
 description: |
-  Probabilistic / sampled improvement sweep of the current codebase, project, or app. Spawns N parallel spotter subagents (default 16) that each sample one random aspect (a function, struct, pattern, doc section, project META, etc.) and propose 1+ concrete improvements with rationale — one big change, several smaller ones, or a mix, depending on what they actually find in the sampled area. Each spotter report is then adversarially challenged by K more subagents (default 2) that read the same target and produce their own adjusted list — confirming, refining, replacing, or rejecting each proposal, and adding any the spotter missed. Finally synthesizes one deduplicated, prioritized improvement list and EXECUTES every accepted improvement via fixer subagents — running them in parallel when their file sets are provably disjoint, serially otherwise. Improvements may target any file (code, docs, configs, schemas, CI, etc.); after execution a drift-reconciliation sweep fixes anything on either side that no longer matches (code ↔ docs, code ↔ configs, etc.).
+  Probabilistic / sampled improvement sweep of the current codebase, project, or app. Begins by asking the user two upfront scoping questions — a minimum severity floor and the areas of focus — both defaulting to "no filter" so accepting defaults reproduces the skill's prior behavior. Then spawns N parallel spotter subagents (default 16) that each sample one random aspect (a function, struct, pattern, doc section, project META, etc.) and propose 1+ concrete improvements with rationale — one big change, several smaller ones, or a mix, depending on what they actually find in the sampled area. Each spotter report is then adversarially challenged by K more subagents (default 2) that read the same target and produce their own adjusted list — confirming, refining, replacing, or rejecting each proposal, and adding any the spotter missed. Finally synthesizes one deduplicated, prioritized improvement list and EXECUTES every accepted improvement via fixer subagents — running them in parallel when their file sets are provably disjoint, serially otherwise. Improvements may target any file (code, docs, configs, schemas, CI, etc.); after execution a drift-reconciliation sweep fixes anything on either side that no longer matches (code ↔ docs, code ↔ configs, etc.).
 
   Optional args: `/improve` uses defaults; `/improve N` overrides spotter count (e.g. `/improve 8`); `/improve N K` overrides both spotter count and adversaries-per-spotter (e.g. `/improve 32 4`). Add the literal token `dry` anywhere in the args (e.g. `/improve dry`, `/improve 8 dry`, `/improve 32 4 dry`) to stop after synthesis — produce the prioritized plan but do NOT execute any fixer subagents. Useful for previewing before committing to edits.
 
@@ -44,9 +44,10 @@ The `dry` token may appear before, between, or after the numeric args — `/impr
 
 ## Flow at a glance
 
-1. Spawn **N spotter subagents** in parallel (background). Each picks one random target area and reports 1+ concrete improvement proposals (one big change, several smaller ones, or a mix — quality over quantity).
+0. **Ask the user** for a minimum severity floor and the areas of focus before any subagent launches. Defaults (`nit` floor + `all` areas) are no-op, so accepting defaults reproduces prior behavior.
+1. Spawn **N spotter subagents** in parallel (background). Each picks one random target area (drawn from the user-restricted pool) and reports 1+ concrete improvement proposals (one big change, several smaller ones, or a mix — quality over quantity).
 2. As each spotter report arrives, immediately spawn **K adversarial subagents** in parallel (background) that independently review the spotter's *whole list* and produce their own adjusted lists. (If K = 0, skip this step.)
-3. When all N originals have all K adversarial adjustments back (each tuple = one spotter list + K adversary lists; total proposal count is variable), synthesize one deduplicated, prioritized improvement plan.
+3. When all N originals have all K adversarial adjustments back (each tuple = one spotter list + K adversary lists; total proposal count is variable), synthesize one deduplicated, prioritized improvement plan. Candidates whose final severity is below the Step 0 floor are routed to `Skip`.
 4. **Execute** the plan: dispatch fixer subagents for each accepted improvement. Batch improvements whose file sets are provably disjoint into parallel waves; run anything that might touch overlapping files serially. (Skipped when dry mode is on.)
 5. After execution, run a **drift-reconciliation sweep** to bring everything that references the edited files back into sync — in either direction (code ↔ docs, code ↔ configs, schemas, examples, CI, etc.). Skipped when dry mode is on, or when Step 4 edited no files. Then report results to the user.
 
@@ -54,9 +55,27 @@ Do not wait for all spotters before launching adversaries. Eager spawning is a h
 
 ---
 
+## Step 0 — Confirm scope with user
+
+Before launching any subagents, ask the user two questions in a single `AskUserQuestion` call to scope the sweep. (If the run is genuinely non-interactive — e.g. invoked by another skill or hook with no user attached — fall back to defaults silently and proceed.)
+
+1. **Minimum severity floor** — which severity to treat as the lowest worth executing. Options, ordered from least to most severe: `nit` (no filter — keep everything; **default**), `low`, `medium`, `high`, `critical`. Candidates whose final post-synthesis severity (Step 3c) falls strictly below this floor are routed to `Skip` in Step 3d regardless of multiplicity. The floor is inclusive — picking `medium` keeps `medium`, `high`, and `critical` candidates and skips `low` and `nit`.
+2. **Areas to focus on** — which slice of the category hint pool (the bulleted list in Step 1) to sample from. Options: `all` (full pool; **default**), or a free-text answer that you map loosely to one or more entries in the pool — e.g. `security, performance, tests`, or `docs and project META`, or `the storage subsystem and its tests`. Loose mapping is fine: pick every pool entry whose meaning overlaps the user's answer; always retain the wildcard entry as a fallback so spotters have somewhere to fall back to when N exceeds the matched subset.
+
+Defaults (`nit` floor + `all` areas) are no-op — accepting both means no filtering and reproduces the skill's prior behavior. Run Step 0 even when `dry` mode is on; the questions scope what gets synthesized, not just what executes. Persist both answers locally in the run state and pass them through:
+
+- **Severity floor** — checked at Step 3d's Skip rules. Below-floor candidates are still surfaced in the per-proposal overview (so the user sees what was filtered) but never executed.
+- **Areas** — restrict the category hint pool used to seed Step 1 spotters. Spotters still pick their own concrete target *within* the assigned hint.
+
+After receiving the answers, briefly echo them back in one line (e.g. `_Scope: severity ≥ medium, areas = [security, tests, performance]; sweeping now…_`) so the user sees how the inputs were interpreted before subagents launch.
+
+---
+
 ## Step 1 — Launch N spotters in parallel
 
-In a single message, call the Agent tool **N times** with `subagent_type: general-purpose` and `run_in_background: true`. Give each spotter a different **category hint** so the sample spreads across the project. Suggested pool — if N ≤ pool size, sample N distinct hints; if N > pool size, use each hint once and fill the remainder with the wildcard:
+In a single message, call the Agent tool **N times** with `subagent_type: general-purpose` and `run_in_background: true`. Give each spotter a different **category hint** so the sample spreads across the project.
+
+**Build the available pool** by filtering the suggested pool below using the user's `areas` answer from Step 0: when the answer is `all`, use the full pool; when the user picked a subset, keep only the entries whose meaning overlaps that subset, and always retain the wildcard entry as a fallback. Then — if N ≤ pool size, sample N distinct hints from the available pool; if N > pool size, use each available hint once and fill the remainder with the wildcard. Suggested pool:
 
 - a specific function or method
 - a specific struct / class / type / enum
@@ -239,6 +258,7 @@ Assign each surviving candidate to one of:
 - **P1 — Do in this sweep.** Severity critical or high that didn't clear the P0 bar (a single agent surfaced it without independent corroboration), or severity medium. Clear, concrete, low-regression-risk changes.
 - **P2 — Do if cheap.** Severity low or nit. Cosmetic/taste cleanups land here.
 - **Skip.** Any of:
+  - the candidate's resolved severity is **strictly below the user-chosen severity floor** from Step 0 (severity ordering, low-to-high: `nit` < `low` < `medium` < `high` < `critical`; a floor of `medium` keeps medium/high/critical and skips low/nit; a floor of `nit` is no-op since nothing is below it). This Skip reason is checked first and overrides the others — a below-floor candidate is `Skip` regardless of multiplicity, replace coverage, or peer-review votes. Surface the candidate in the per-proposal overview with `→ Skip (below floor)` so the user sees what was filtered, but do not execute it. Or:
   - the proposal is too vague after consolidation to write a fixer prompt for, or
   - an adversary's `replace` candidate for the same area is also in the plan and clearly supersedes this one (executing both would be redundant or conflicting), or
   - the candidate is a *spotter* proposal that had at least one adversary review it (i.e. K ≥ 1 and the adversaries weren't all malformed) and every adversary that DID review it voted `replace` or `reject` (no single `confirm` or `refine`). The replace candidates from the same proposal proceed normally; the spotter's own CHANGE lands at Skip because the adversaries collectively said "real issue but not this fix" yet didn't reach strict-majority reject — the surviving replace(s) are the better candidate(s) to execute. (Does not apply when K = 0, since there were no peer reviews; does not apply when every adversary on the tuple was malformed, since no peer actually weighed in.)
@@ -451,6 +471,7 @@ One sentence: `_This was a random sample, not a complete pass — re-run /improv
 
 ## Hard rules
 
+- **Step 0 always runs first** (interactive runs only). Ask the user for a minimum severity floor and the areas of focus before launching any subagents — including in `dry` mode. Defaults (`nit` floor + `all` areas) are no-op and reproduce prior behavior; non-default answers filter what synthesis surfaces (severity floor at 3d) and what spotters sample (area subset of the category hint pool at Step 1). When the run is genuinely non-interactive (no user available), fall back to defaults silently and proceed.
 - **N spotters, parallel, background.** One message, N Agent calls. Default N = 16; override from first positional argument.
 - **K adversaries per spotter, eager.** Spawn them the moment the spotter returns, not in a batch at the end. Default K = 2; override from second positional argument. K = 0 skips the adversarial pass entirely.
 - **Spotters return 1+ proposals.** Each spotter's report is a list — one big change, several small ones, or a mix, sized to whatever the sampled target area actually warrants. Quality over quantity; don't pad to a number, don't stop at one if more genuinely deserve calling out. Each proposal must stand alone (a fixer is spawned per accepted proposal, and they may execute in parallel).

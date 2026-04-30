@@ -411,41 +411,7 @@ pub fn build_request(
 /// may emit text outside the JSON block (despite instruction); we
 /// extract the first balanced `{...}` block we see and parse that.
 pub fn parse_verdict(text: &str) -> Result<Verdict, String> {
-    // Find first '{', then scan to the matching '}' tracking string
-    // literals. Robust enough for Haiku's typical output.
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')
-        .ok_or_else(|| "no '{' in classifier output".to_string())?;
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut end = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i + 1);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| "unbalanced JSON in classifier output".to_string())?;
-    let json = &text[start..end];
+    let json = super::extract_first_json_object(text, "classifier")?;
     serde_json::from_str::<Verdict>(json)
         .map_err(|e| format!("classifier verdict parse failed: {e}"))
 }

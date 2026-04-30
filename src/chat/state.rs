@@ -110,6 +110,14 @@ pub struct ChatState {
     /// `Chat: status`.
     #[serde(default)]
     pub last_persona_regenerated_at: Option<String>,
+    /// Cached copy of the last successfully-written serialized JSON.
+    /// Used by [`ChatState::save`] to short-circuit redundant atomic
+    /// rewrites when no field has actually changed since the last save.
+    /// Never serialized to disk — the file is documented as
+    /// operator-editable only when the chat task is stopped, so the
+    /// cache stays in sync with disk for the lifetime of the process.
+    #[serde(skip)]
+    last_saved_json: Option<String>,
 }
 
 /// Snapshot of a single API call for `Chat: status`.
@@ -141,6 +149,7 @@ impl Default for ChatState {
             update_self_memory_today: 0,
             last_composer_call: None,
             last_persona_regenerated_at: None,
+            last_saved_json: None,
         }
     }
 }
@@ -212,9 +221,21 @@ impl ChatState {
         }
     }
 
-    pub fn save(&self) -> io::Result<()> {
+    pub fn save(&mut self) -> io::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        write_atomic(STATE_FILE, &json)
+        // Short-circuit if the freshly-serialized output is byte-identical
+        // to the last successful write. Many event paths (system pseudo-
+        // senders, blocklisted senders, paused-tick saves) flow through
+        // `process_event` and call `save()` without mutating any field;
+        // skipping the atomic rewrite avoids a redundant fsync per event
+        // under AV/indexer pressure on Windows. Safe because state.json
+        // is operator-editable only when the chat task is stopped.
+        if self.last_saved_json.as_deref() == Some(json.as_str()) {
+            return Ok(());
+        }
+        write_atomic(STATE_FILE, &json)?;
+        self.last_saved_json = Some(json);
+        Ok(())
     }
 
     /// Roll the per-day counters forward if today's UTC date is past

@@ -239,7 +239,9 @@ chat_task (subscriber):
     ├── compute_typing_delay (base + per_char + Gaussian jitter)
     ├── tokio::time::sleep
     ├── recheck_after_sleep: max_replies_per_minute,
-    │                        min_silence_secs (exempt direct address),
+    │                        min_silence_secs (public-chat &
+    │                          non-direct only; whispers + direct
+    │                          addresses bypass),
     │                        in_critical_section (always applied)
     ▼
   BotInstruction::SendChat (public) or Whisper (DM)
@@ -412,11 +414,16 @@ all senders treated as Trust 3) — the operator decides.
 
 After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
 
-1. Strip telltale tokens listed in `pacing::ai_tells` — built-in seed
-   (em-dashes, smart quotes, leading/trailing markdown markers, `"As an
-   AI"`, `"I cannot"`, `"I'm Claude"`, `"language model"`) plus
+1. Strip telltale tokens via `pacing::strip_ai_tells`, then apply
    operator regex in `data/chat/strip_patterns.txt`. If persona declares
    "lowercase-by-default", lowercase first-of-sentence.
+   - Literal-substring strip using `pacing::BUILT_IN_AI_TELLS`, which
+     is exactly six entries: `"As an AI"`, `"as an AI"`, `"I cannot"`,
+     `"I'm Claude"`, `"I am Claude"`, `"language model"`.
+   - Unicode normalization hard-coded inside `strip_ai_tells` (not in
+     the seed list): smart quotes `\u{201c}\u{201d}\u{2018}\u{2019}` →
+     ASCII `"`/`'`; em-dash `\u{2014}` → `" - "`; en-dash `\u{2013}` →
+     `"-"`.
 2. Truncate at `composer_max_chars` (default 240; Minecraft chat allows
    256 with margin for the username prefix).
 3. If empty after stripping → silent.
@@ -429,10 +436,12 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
 6. **Post-sleep recheck** (the slept reply might be stale by the time
    it would send):
    - `max_replies_per_minute` — always applied.
-   - `min_silence_secs` — exempted when this reply is to a
-     directly-addressed event. Otherwise an unrelated bot send during
-     the typing-delay sleep would silently drop a directly-addressed
-     reply.
+   - `min_silence_secs` — applied only to public-chat replies that are
+     NOT directly addressed; whispers (DMs / `is_public_chat == false`)
+     and direct addresses both bypass the floor. The gate exists to
+     dampen public-chat noise, not throttle one-to-one conversations,
+     so an unrelated bot send during the typing-delay sleep cannot
+     silently drop a directly-addressed reply or a DM.
    - `in_critical_section.load(Acquire)` — always applied. A composer
      started before a trade and finishing during it must not fire chat
      mid-trade-step.

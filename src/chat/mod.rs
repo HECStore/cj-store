@@ -1990,6 +1990,53 @@ fn read_adjustments_or_empty() -> String {
     memory::read_adjustments().unwrap_or_default()
 }
 
+/// Extract the first balanced `{...}` substring from `text`. Used by
+/// the classifier and reflection parsers to recover JSON from LLM
+/// responses that may include prose around the JSON block. Tracks
+/// string literals (with `\\` escaping) so braces inside strings do
+/// not confuse the depth counter. `ctx` is interpolated into the
+/// error messages (e.g. `"classifier"`, `"reflection"`).
+pub(super) fn extract_first_json_object<'a>(
+    text: &'a str,
+    ctx: &str,
+) -> Result<&'a str, String> {
+    let bytes = text.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|&b| b == b'{')
+        .ok_or_else(|| format!("no '{{' in {ctx} output"))?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.ok_or_else(|| format!("unbalanced JSON in {ctx} output"))?;
+    Ok(&text[start..end])
+}
+
 /// Read the trailing `n` lines of today's history JSONL. Returns
 /// empty on missing file.
 async fn recent_history_slice_blocking(n: usize) -> String {

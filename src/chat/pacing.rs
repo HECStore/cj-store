@@ -105,20 +105,48 @@ pub const BUILT_IN_AI_TELLS: &[&str] = &[
 /// This is a literal-substring strip — nothing fancy. Operators who want
 /// regex matching extend `strip_patterns.txt` (Phase 8).
 pub fn strip_ai_tells(reply: &str) -> String {
-    let mut out = reply.to_string();
-    for tell in BUILT_IN_AI_TELLS {
-        // Two-pass with case variants would be tighter but produces the
-        // same effect since BUILT_IN_AI_TELLS already includes both cases.
-        out = out.replace(tell, "");
-    }
-    // Smart quotes → straight, em-dash → " - "
-    out = out
+    // Unicode-normalize FIRST so that smart-apostrophe variants like
+    // "I\u{2019}m Claude" collapse to the literal ASCII forms that
+    // BUILT_IN_AI_TELLS matches against. None of the seed tells contain
+    // smart quotes or em-dashes, so this reordering can't mask any
+    // existing matches.
+    let mut out = reply
         .replace('\u{201c}', "\"")
         .replace('\u{201d}', "\"")
         .replace('\u{2018}', "'")
         .replace('\u{2019}', "'")
         .replace('\u{2014}', " - ")
         .replace('\u{2013}', "-");
+    for tell in BUILT_IN_AI_TELLS {
+        // Two-pass with case variants would be tighter but produces the
+        // same effect since BUILT_IN_AI_TELLS already includes both cases.
+        out = out.replace(tell, "");
+    }
+    // Cleanup pass — collapse the punctuation/whitespace debris left
+    // behind when a tell is excised mid-sentence. The rules below are
+    // fixed points (a second pass is a no-op) so idempotence is
+    // preserved.
+    // 1. Collapse runs of 2+ ASCII spaces into a single space. We avoid
+    //    `char::is_whitespace` here so newlines survive untouched.
+    while out.contains("  ") {
+        out = out.replace("  ", " ");
+    }
+    // 2. Collapse "<space><sentence-punct>" into the bare punctuation.
+    for pair in &[" ,", " .", " ;", " :", " !", " ?"] {
+        let bare = &pair[1..];
+        while out.contains(pair) {
+            out = out.replace(pair, bare);
+        }
+    }
+    // 3. Trim leading runs of `,;:` plus leading ASCII whitespace.
+    //    Leading `.` is preserved so an intentional "..." opener
+    //    survives.
+    let trimmed_start = out
+        .find(|c: char| !matches!(c, ',' | ';' | ':' | ' ' | '\t' | '\r' | '\n'))
+        .unwrap_or(out.len());
+    if trimmed_start > 0 {
+        out.drain(..trimmed_start);
+    }
     out
 }
 
@@ -309,6 +337,41 @@ mod tests {
         let once = strip_ai_tells("As an AI I cannot help.");
         let twice = strip_ai_tells(&once);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn strip_trims_leading_comma_orphan_after_tell_removal() {
+        // After "As an AI" is excised the remaining ", I think..." would
+        // start with a comma — the normalization pass must trim that so
+        // the reply opens with "I".
+        let s = strip_ai_tells("As an AI, I think this is fine.");
+        assert!(
+            s.starts_with('I'),
+            "expected reply to start with 'I', got {s:?}"
+        );
+    }
+
+    #[test]
+    fn strip_collapses_mid_sentence_orphan_comma() {
+        // After stripping "As an AI" the input becomes
+        // "Hello. , I will help.". The " ," collapse rule pulls the
+        // comma flush against the preceding period.
+        let s = strip_ai_tells("Hello. As an AI, I will help.");
+        assert!(
+            !s.contains(" , "),
+            "reply still contains ' , ' debris: {s:?}"
+        );
+        assert_eq!(s, "Hello., I will help.");
+    }
+
+    #[test]
+    fn strip_catches_smart_apostrophe_identity_tells() {
+        // Claude virtually always emits U+2019 for the apostrophe; the
+        // normalization pass must run before the substring loop so that
+        // "I\u{2019}m Claude" is collapsed to "I'm Claude" and stripped.
+        let s = strip_ai_tells("I\u{2019}m Claude, here.");
+        assert!(!s.contains("I'm Claude"));
+        assert!(!s.contains("Claude"));
     }
 
     // ---- truncate_to_chat_limit ----------------------------------------

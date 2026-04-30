@@ -444,40 +444,14 @@ pub async fn run_pass(
     Ok(outcome)
 }
 
-/// Extract `{"lessons": [...]}` from a Haiku response. Same brace-
-/// match strategy as `classifier::parse_verdict`.
+/// Extract `{"lessons": [...]}` from a Haiku response.
 fn parse_lessons(text: &str) -> Result<Vec<String>, String> {
     use serde::Deserialize;
     #[derive(Deserialize)]
     struct LessonsBody {
         lessons: Vec<String>,
     }
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')
-        .ok_or_else(|| "no '{' in reflection output".to_string())?;
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut end = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped { escaped = false; }
-            else if b == b'\\' { escaped = true; }
-            else if b == b'"' { in_str = false; }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 { end = Some(i + 1); break; }
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| "unbalanced JSON in reflection output".to_string())?;
-    let json = &text[start..end];
+    let json = super::extract_first_json_object(text, "reflection")?;
     let body: LessonsBody = serde_json::from_str(json)
         .map_err(|e| format!("reflection lessons parse: {e}"))?;
     Ok(body.lessons)

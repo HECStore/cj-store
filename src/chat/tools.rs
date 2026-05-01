@@ -306,7 +306,7 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
         },
         Tool {
             name: "update_player_memory".to_string(),
-            description: "Append a single bullet to a section of the current sender's per-player file. Allowed sections: 'Stated preferences', 'Inferred', 'Topics & history', 'Do not mention'.".to_string(),
+            description: "Append a single bullet to a section of the current sender's per-player file. Use this generously: any time the sender shares a fun fact, preference, opinion, build detail, inside joke, or asks you to remember something about them — capture it. Allowed sections: 'Stated preferences', 'Inferred', 'Topics & history', 'Do not mention'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -319,7 +319,7 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
         },
         Tool {
             name: "update_self_memory".to_string(),
-            description: "Append a bullet to the '## Inferred' section of memory.md. ISO-date prefixed.".to_string(),
+            description: "Append a bullet to the '## Inferred' section of memory.md (your own memory about yourself / the server). Use this generously when you learn something stable about yourself or the server — a role, a preference, a fact about your shop, a notable event. ISO-date prefixed.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"bullet": {"type": "string"}},
@@ -362,7 +362,7 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
         // Anthropic returns an error result we surface as a tool_error.
         tools.push(Tool {
             name: "web_search".to_string(),
-            description: "Search the web (Anthropic-managed). Use sparingly.".to_string(),
+            description: "Search the web (Anthropic-managed). Reach for this whenever a player asks you to look something up, check a current fact, find documentation, or anything you don't already know — it's first-resort, not last-resort. A daily cap exists but is generous.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -373,7 +373,7 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
     if web_fetch_enabled {
         tools.push(Tool {
             name: "web_fetch".to_string(),
-            description: "Fetch the contents of an http(s) URL (max 256 KB). Strict deny-list applies; rejects local / metadata / numeric-form addresses.".to_string(),
+            description: "Fetch the contents of an http(s) URL (max 256 KB). Use this when a player gives you a link to read, or when web_search returns a URL you want to read in full. Strict deny-list applies; rejects local / metadata / numeric-form addresses.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"url": {"type": "string"}},

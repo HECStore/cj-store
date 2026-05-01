@@ -73,6 +73,21 @@ pub struct ChatConfig {
     pub composer_model: String,
     #[serde(default = "default_chat_classifier_model")]
     pub classifier_model: String,
+    /// Sampling temperature for the composer call. Anthropic accepts
+    /// `0.0..=1.0`; values outside that range are clamped at request
+    /// time. `None` (omitted in JSON) sends no temperature field, so
+    /// the API uses the model's own default (1.0 for current Sonnet
+    /// / Opus). Default is `0.8` — slightly tighter than 1.0 keeps the
+    /// persona voice consistent across replies without flattening
+    /// variation.
+    #[serde(default = "default_chat_composer_temperature")]
+    pub composer_temperature: Option<f32>,
+    /// Sampling temperature for the classifier. Default `0.0` because
+    /// the classifier must emit a single JSON object — determinism
+    /// matters more than variety. Override with `null` to fall back to
+    /// the API default if a future classifier model needs spread.
+    #[serde(default = "default_chat_classifier_temperature")]
+    pub classifier_temperature: Option<f32>,
     #[serde(default)]
     pub persona_seed: String,
 
@@ -233,6 +248,40 @@ pub struct ChatConfig {
     /// again.
     #[serde(default = "default_chat_composer_throttle_backoff_secs")]
     pub composer_throttle_backoff_secs: u32,
+
+    // Proactive thread continuation
+    /// When `true`, the chat task fires a periodic tick that may
+    /// initiate a composer turn even if no new chat event arrived —
+    /// letting the bot keep an active conversation alive (drive a
+    /// thread, ask a follow-up, change subject) when the partner has
+    /// gone quiet for a stretch. Disabled by default; opt-in.
+    #[serde(default)]
+    pub proactive_threading_enabled: bool,
+    /// Seconds between proactive-tick checks. Each check evaluates all
+    /// gates and rolls the probability — most checks decide to do
+    /// nothing. Default 30 s.
+    #[serde(default = "default_chat_proactive_tick_secs")]
+    pub proactive_tick_secs: u32,
+    /// A proactive tick will not fire unless the bot has been silent
+    /// for at least this many seconds. Prevents the bot from speaking
+    /// twice in quick succession.
+    #[serde(default = "default_chat_proactive_min_secs_since_bot")]
+    pub proactive_min_secs_since_bot: u32,
+    /// A proactive tick will not fire until this many seconds have
+    /// passed since the conversation partner's last message. Lets a
+    /// real reply land first if one is coming.
+    #[serde(default = "default_chat_proactive_min_secs_since_partner")]
+    pub proactive_min_secs_since_partner: u32,
+    /// Above this gap, the conversation is considered dead — proactive
+    /// ticks do not try to revive it. Default 5 minutes.
+    #[serde(default = "default_chat_proactive_max_secs_since_partner")]
+    pub proactive_max_secs_since_partner: u32,
+    /// Probability (0-100) that a tick which passes every other gate
+    /// actually fires the composer. The remaining percent stays
+    /// silent. Default 20 % — enough to nudge a thread along without
+    /// flooding.
+    #[serde(default = "default_chat_proactive_probability_pct")]
+    pub proactive_probability_pct: u32,
 }
 
 impl Default for ChatConfig {
@@ -243,6 +292,8 @@ impl Default for ChatConfig {
             api_key_env: default_chat_api_key_env(),
             composer_model: default_chat_composer_model(),
             classifier_model: default_chat_classifier_model(),
+            composer_temperature: default_chat_composer_temperature(),
+            classifier_temperature: default_chat_classifier_temperature(),
             persona_seed: String::new(),
             command_prefixes: default_chat_command_prefixes(),
             command_typo_max_distance: default_chat_command_typo_max_distance(),
@@ -303,6 +354,12 @@ impl Default for ChatConfig {
             moderation_backoff_secs: default_chat_moderation_backoff_secs(),
             persona_regen_cooldown_secs: default_chat_persona_regen_cooldown_secs(),
             composer_throttle_backoff_secs: default_chat_composer_throttle_backoff_secs(),
+            proactive_threading_enabled: false,
+            proactive_tick_secs: default_chat_proactive_tick_secs(),
+            proactive_min_secs_since_bot: default_chat_proactive_min_secs_since_bot(),
+            proactive_min_secs_since_partner: default_chat_proactive_min_secs_since_partner(),
+            proactive_max_secs_since_partner: default_chat_proactive_max_secs_since_partner(),
+            proactive_probability_pct: default_chat_proactive_probability_pct(),
         }
     }
 }
@@ -310,8 +367,10 @@ impl Default for ChatConfig {
 fn default_chat_enabled() -> bool { false }
 fn default_chat_dry_run() -> bool { false }
 fn default_chat_api_key_env() -> String { "ANTHROPIC_API_KEY".to_string() }
-fn default_chat_composer_model() -> String { "claude-opus-4-7".to_string() }
+fn default_chat_composer_model() -> String { "claude-sonnet-4-6".to_string() }
 fn default_chat_classifier_model() -> String { "claude-haiku-4-5-20251001".to_string() }
+fn default_chat_composer_temperature() -> Option<f32> { Some(0.8) }
+fn default_chat_classifier_temperature() -> Option<f32> { Some(0.0) }
 fn default_chat_command_typo_max_distance() -> u32 { 2 }
 fn default_chat_daily_input_token_cap() -> u64 { 2_000_000 }
 fn default_chat_daily_output_token_cap() -> u64 { 200_000 }
@@ -366,6 +425,11 @@ fn default_chat_hash_uuids_in_decisions() -> bool { true }
 fn default_chat_moderation_backoff_secs() -> u32 { 86_400 }
 fn default_chat_persona_regen_cooldown_secs() -> u32 { 86_400 }
 fn default_chat_composer_throttle_backoff_secs() -> u32 { 60 }
+fn default_chat_proactive_tick_secs() -> u32 { 30 }
+fn default_chat_proactive_min_secs_since_bot() -> u32 { 30 }
+fn default_chat_proactive_min_secs_since_partner() -> u32 { 15 }
+fn default_chat_proactive_max_secs_since_partner() -> u32 { 300 }
+fn default_chat_proactive_probability_pct() -> u32 { 20 }
 
 impl ChatConfig {
     /// Validate the chat-config invariants. Returns a single human-readable
@@ -467,6 +531,40 @@ impl ChatConfig {
             errors.push(format!(
                 "active_hours_utc components must be in [0, 24) (got {start}, {end})"
             ));
+        }
+
+        // Proactive thread continuation. Most fields are bounded by
+        // `evaluate_proactive_tick`'s defensive clamping, but operator
+        // typos (`probability_pct: 200`, `min > max`, zero tick period)
+        // should surface at config-load time instead of becoming a
+        // silent always-skip or always-fire.
+        if self.proactive_threading_enabled && self.proactive_tick_secs == 0 {
+            errors.push("proactive_tick_secs must be > 0 when proactive_threading_enabled".to_string());
+        }
+        if self.proactive_probability_pct > 100 {
+            errors.push(format!(
+                "proactive_probability_pct must be in [0, 100] (got {})",
+                self.proactive_probability_pct
+            ));
+        }
+        if self.proactive_min_secs_since_partner >= self.proactive_max_secs_since_partner {
+            errors.push(format!(
+                "proactive_min_secs_since_partner ({}) must be < proactive_max_secs_since_partner ({})",
+                self.proactive_min_secs_since_partner,
+                self.proactive_max_secs_since_partner,
+            ));
+        }
+        for (name, val) in [
+            ("composer_temperature", self.composer_temperature),
+            ("classifier_temperature", self.classifier_temperature),
+        ] {
+            if let Some(t) = val
+                && (!t.is_finite() || !(0.0..=1.0).contains(&t))
+            {
+                errors.push(format!(
+                    "{name} must be a finite value in [0.0, 1.0] (got {t})"
+                ));
+            }
         }
 
         if errors.is_empty() {

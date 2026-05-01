@@ -291,27 +291,34 @@ pub struct AiCallout {
 /// reflection-pass write to adjustments.md doesn't invalidate the
 /// persona-side prefix cache.
 pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (String, String) {
-    let header = "You are a chat-classifier for a Minecraft bot. Decide whether the bot \
-         should reply to the most recent message. Output STRICT JSON with this \
-         shape and nothing else:\n\
+    let header = "You are a chat-classifier for a friendly AI chatbot that plays \
+         Minecraft as a store-running player. Decide whether the bot should reply \
+         to the most recent message. The bot is a known, openly-AI conversational \
+         presence on the server, not a covert human-pretender; the goal is \
+         helpful, in-persona engagement, not silence-as-camouflage. Output STRICT \
+         JSON with this shape and nothing else:\n\
          \n\
          {\n  \"respond\": <true|false>,\n  \"confidence\": <0.0-1.0>,\n  \
          \"reason\": \"<short explanation>\",\n  \"urgency\": \"<low|med|high>\",\n  \
          \"ai_callout\": {\"detected\": <true|false>, \"trigger\": \"<verbatim quote if true>\"}\n}\n\
          \n\
          Guidance:\n\
-         - The persona summary describes the bot's VOICE (tone, vocabulary, \
-           typing habits) — it is NOT a list of topics the bot is allowed to \
-           discuss. Real people talk about whatever comes up, even things \
-           outside their hobbies. A short \"idk\", \"not really my thing\", or \
-           \"never tried that\" in the persona's voice is a perfectly valid \
-           reply — pick that over silence when the bot is addressed but the \
-           topic is unfamiliar. Silence is for events with no conversational \
-           hook for the bot at all (random crosstalk between strangers), not \
-           for \"the topic isn't on the persona's hobby list.\"\n\
+         - The bot is curious and talkative — it likes to chat. Default \
+           preference is to respond rather than stay silent. The persona summary \
+           describes the bot's VOICE (tone, vocabulary, typing habits) — it is \
+           NOT a list of topics the bot is allowed to discuss. The bot talks \
+           about anything: Minecraft, music, food, school, work, games, news, \
+           random thoughts. A short \"idk\", \"not really my thing\", or \"never \
+           tried that\" in the persona's voice — usually paired with a follow-up \
+           question — is a perfectly valid reply. Silence is for events with no \
+           conversational hook at all (random crosstalk between strangers in a \
+           thread the bot is not part of), not for \"the topic isn't on the \
+           persona's hobby list.\"\n\
          - If the bot was itself a recent speaker in the history slice, the bot \
-           is part of the conversation. Treat continuations naturally — respond \
-           when the new message is a reply to or relevant to the bot's own line.\n\
+           is part of an active conversation. Lean HEAVILY toward responding — \
+           continue the back-and-forth, ask follow-ups, react. An active \
+           conversation that the bot has been driving is the strongest possible \
+           signal to respond, even when the new message isn't a direct address.\n\
          - If two OTHER players are mid-1-on-1 (the bot is not one of the two \
            recent speakers), default to staying out of it. BUT chime in when the \
            bot has something genuinely worth adding: a useful fact, a callback, \
@@ -319,8 +326,9 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
            sake of interrupting — chime in only when the contribution is more \
            interesting than the silence.\n\
          - When a message contains something genuinely interesting (an unusual \
-           claim, a fun topic, something the persona has an opinion on), lean \
-           toward responding even without direct address.\n\
+           claim, a fun topic, anything the bot might have a take on), lean \
+           toward responding even without direct address. The bot is curious; \
+           it likes to weigh in.\n\
          - Greetings (\"hi\", \"hey\", \"hello\", \"yo\", \"sup\") deserve a reply \
            more often than not — even a one-word acknowledgment counts. People \
            feel ignored when they're not greeted back, and the persona is \
@@ -365,6 +373,7 @@ pub fn build_request(
     history_slice: &str,
     event: &crate::messages::ChatEvent,
     cache_ttl: crate::chat::client::CacheTtl,
+    temperature: Option<f32>,
 ) -> crate::chat::client::CreateMessageRequest {
     use crate::chat::client::{CacheControl, ContentBlock, Message, Role, SystemBlock};
 
@@ -402,7 +411,7 @@ pub fn build_request(
                 cache_control: None,
             }],
         }],
-        temperature: None,
+        temperature: crate::chat::client::effective_temperature(model, temperature),
         tools: vec![],
     }
 }
@@ -900,6 +909,7 @@ mod tests {
             "recent: hi from Alice",
             &event,
             crate::chat::client::CacheTtl::Ephemeral1Hour,
+            Some(0.0),
         );
         // Three blocks: persona (uncached), adjustments (cached),
         // history (uncached).
@@ -934,6 +944,7 @@ mod tests {
             "history",
             &event,
             crate::chat::client::CacheTtl::Ephemeral5Min,
+            Some(0.0),
         );
         // Verify the first two blocks carry the persona and adjustments
         // texts respectively, and that ONLY block 2 is cached.

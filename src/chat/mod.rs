@@ -119,7 +119,7 @@ pub async fn chat_task(
         Ok(Some(b)) => b,
         Ok(None) => {
             info!("[Chat] persona.md missing, generating from seed");
-            match persona::generate(&api_key, &config.persona_seed, &config.composer_model, &[]).await {
+            match persona::generate(&api_key, &config.persona_seed, &config.composer_model, config.composer_temperature, &[]).await {
                 Ok(b) => b,
                 Err(e) => {
                     error!(error = %e, "[Chat] persona generation failed; chat self-disabling");
@@ -236,6 +236,27 @@ pub async fn chat_task(
         config.classifier_itpm_max,
         config.rate_limit_wait_max_secs,
     );
+
+    // Proactive-thread tick. Disabled by default — when
+    // `chat.proactive_threading_enabled = true` the loop fires a periodic
+    // tick that may initiate a composer turn even with no inbound event,
+    // letting the bot continue an active conversation that has gone
+    // quiet. When disabled, the option is `None` and the select arm
+    // resolves to `pending()` (never wakes), so the disabled path adds
+    // zero overhead.
+    //
+    // `interval_at(now + period, ...)` skips the eager t=0 tick that
+    // `interval()` produces by default; `MissedTickBehavior::Delay`
+    // prevents catch-up bursts when the loop was busy on a long composer
+    // call (we want pacing, not back-to-back ticks).
+    let mut proactive_interval = if config.proactive_threading_enabled {
+        let period = Duration::from_secs(config.proactive_tick_secs.max(1) as u64);
+        let mut int = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        int.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(int)
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -378,6 +399,7 @@ pub async fn chat_task(
                             &trust,
                             &validator,
                             &today_iso,
+                            config.classifier_temperature,
                         )
                         .await;
                         if let Ok(ref outcome) = result {
@@ -554,6 +576,7 @@ pub async fn chat_task(
                             &api_key,
                             &config.persona_seed,
                             &config.composer_model,
+                            config.composer_temperature,
                             &[],
                         )
                         .await
@@ -734,6 +757,7 @@ pub async fn chat_task(
                                     &trust_for_sender,
                                     &validator,
                                     &today_iso,
+                                    config.classifier_temperature,
                                 )
                                 .await;
                                 match auto_result {
@@ -929,6 +953,181 @@ pub async fn chat_task(
                         // `unused mut` lint by binding-touch on shutdown.
                         let _ = &mut persona_body;
                         return;
+                    }
+                }
+            }
+            _ = async {
+                if let Some(int) = proactive_interval.as_mut() {
+                    int.tick().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                // Proactive-thread tick. Pre-checks each emit a
+                // `proactive_skip` decision-log entry rather than silently
+                // `continue`ing — operators tuning the gate thresholds
+                // need every fast-reject visible in `decisions.jsonl`.
+                if runtime_state.paused {
+                    decisions::write(
+                        &decisions::DecisionRecord::new("proactive_skip")
+                            .with_reason("paused"),
+                    );
+                    continue;
+                }
+                if in_critical_section.load(Ordering::Acquire) {
+                    decisions::write(
+                        &decisions::DecisionRecord::new("proactive_skip")
+                            .with_reason("in_critical_section"),
+                    );
+                    continue;
+                }
+                if client::is_model_404_backed_off(
+                    runtime_state.model_404_backoff_until.as_deref(),
+                ) {
+                    decisions::write(
+                        &decisions::DecisionRecord::new("proactive_skip")
+                            .with_reason("model_404_backoff"),
+                    );
+                    continue;
+                }
+                if let Some(ref until) = runtime_state.composer_throttle_backoff_until
+                    && let Ok(t) = chrono::DateTime::parse_from_rfc3339(until)
+                    && t.with_timezone(&chrono::Utc) > chrono::Utc::now()
+                {
+                    decisions::write(
+                        &decisions::DecisionRecord::new("proactive_skip")
+                            .with_reason("composer_throttle_backoff"),
+                    );
+                    continue;
+                }
+                // Active-hours gate — same shape as the per-event Public
+                // path. A bot configured for `active_hours_utc = (8, 22)`
+                // must not fire at 3 AM.
+                if !pacing::within_active_hours_now(config.active_hours_utc) {
+                    decisions::write(
+                        &decisions::DecisionRecord::new("proactive_skip")
+                            .with_reason("outside_active_hours"),
+                    );
+                    continue;
+                }
+                // Bot username unresolved (early in startup). With an
+                // empty fallback the partner-finder would treat any
+                // sender as "non-bot" — including the bot's own name
+                // once events with `is_bot: true` land in the window.
+                // Skip explicitly so it's auditable.
+                let bot_user = match bot_username.read().await.clone() {
+                    Some(u) if !u.is_empty() => u,
+                    _ => {
+                        decisions::write(
+                            &decisions::DecisionRecord::new("proactive_skip")
+                                .with_reason("bot_username_unresolved"),
+                        );
+                        continue;
+                    }
+                };
+
+                // Pick the partner: most-recent non-bot, non-system event
+                // in the window, with a SystemTime delta to "now".
+                let now_st = std::time::SystemTime::now();
+                let partner_candidate: Option<(String, u64)> = window
+                    .iter()
+                    .rev()
+                    .find(|ev| {
+                        !ev.sender.eq_ignore_ascii_case(&bot_user)
+                            && !conversation::is_system_pseudo_sender(
+                                &ev.sender,
+                                &system_senders_re,
+                                &system_senders_exact,
+                            )
+                    })
+                    .map(|ev| {
+                        let secs = now_st
+                            .duration_since(ev.recv_at)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        (ev.sender.clone(), secs)
+                    });
+
+                let secs_bot = last_bot_send_at
+                    .map(|t| Instant::now().saturating_duration_since(t).as_secs());
+                // Snapshot candidate timings BEFORE handing the option
+                // to the evaluator (which consumes it on the Fire path).
+                let partner_for_log = partner_candidate.clone();
+
+                let decision = conversation::evaluate_proactive_tick(
+                    secs_bot,
+                    partner_candidate,
+                    config.proactive_min_secs_since_bot,
+                    config.proactive_min_secs_since_partner,
+                    config.proactive_max_secs_since_partner,
+                    config.proactive_probability_pct,
+                    rand_unit_f32(),
+                );
+                match decision {
+                    conversation::ProactiveDecision::Skip(reason) => {
+                        // Operators tuning the gate thresholds want the
+                        // exact timings the gate saw, even on skip — so
+                        // they can answer "would this have fired had I
+                        // lowered the partner floor by 5s?" without
+                        // re-running the bot. `secs_since_last_bot_send`
+                        // and the partner timing are `null` if not
+                        // applicable to that skip reason.
+                        let mut rec = decisions::DecisionRecord::new("proactive_skip")
+                            .with_reason(reason)
+                            .extra(
+                                "secs_since_last_bot_send",
+                                secs_bot
+                                    .map(serde_json::Value::from)
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                        if let Some((ref name, secs)) = partner_for_log {
+                            rec = rec
+                                .with_sender(name)
+                                .extra(
+                                    "their_last_msg_secs_ago",
+                                    serde_json::Value::from(secs),
+                                );
+                        }
+                        decisions::write(&rec);
+                    }
+                    conversation::ProactiveDecision::Fire(partner) => {
+                        // Partner identified and gates passed. The
+                        // composer-side dispatch (loading the partner's
+                        // per-player memory, building a synthetic user
+                        // message that tells the model the convo state,
+                        // running pacing/send) is the next slice of work
+                        // — for now we record the decision so operators
+                        // can audit how often gates would fire and tune
+                        // the probability / time thresholds before any
+                        // tokens are spent.
+                        //
+                        // When `process_self_tick` lands it MUST also
+                        // gate on: `daily caps (USD/tokens)`,
+                        // `recent_bot_send_times` (max-replies-per-min),
+                        // `spam_guard.is_suppressed(&partner)`,
+                        // `spam_guard.is_blocklisted(&partner)`,
+                        // `dry_run`. The synthetic event fed to the
+                        // composer MUST NOT be inserted into `window`
+                        // (would re-trigger itself on the next tick) and
+                        // MUST NOT update `last_bot_send_at` until after
+                        // a successful real send.
+                        info!(
+                            partner = %partner.username,
+                            secs_ago = partner.their_last_msg_secs_ago,
+                            "[Chat] proactive tick would fire (composer dispatch not yet wired)"
+                        );
+                        decisions::write(
+                            &decisions::DecisionRecord::new("proactive_fire_pending")
+                                .with_sender(&partner.username)
+                                .extra(
+                                    "their_last_msg_secs_ago",
+                                    serde_json::Value::from(partner.their_last_msg_secs_ago),
+                                )
+                                .extra(
+                                    "secs_since_last_bot_send",
+                                    serde_json::Value::from(secs_bot.unwrap_or(0)),
+                                ),
+                        );
                     }
                 }
             }
@@ -1229,6 +1428,7 @@ async fn process_event(
         &history_slice,
         event,
         cache_ttl,
+        config.classifier_temperature,
     );
     // Local rate limiter — burns the wait budget before the network call so
     // 429 spirals from the API never reach us. Token estimate is the same
@@ -1436,7 +1636,7 @@ async fn process_event(
     let req = composer::build_request(
         config.composer_model.clone(),
         320,
-        None,
+        config.composer_temperature,
         &snapshot,
         user_content,
         tools::tool_definitions(config.web_search_enabled, config.web_fetch_enabled),
@@ -1567,6 +1767,13 @@ async fn process_event(
     let Some(reply) = run.reply else {
         return Ok(());
     };
+    // Defensive reasoning strip — the composer system prompt forbids
+    // chain-of-thought in the visible reply, but a backstop here
+    // prevents any leaked `<thinking>` block or "Reasoning:" preamble
+    // from reaching a player. Runs before `strip_ai_tells` so that
+    // reasoning lines holding AI-tell phrases vanish whole rather than
+    // being half-stripped into incoherent debris.
+    let reply = pacing::strip_reasoning(&reply);
     let reply = pacing::strip_ai_tells(&reply);
     // Apply persona-driven capitalization habit (CHAT.md): a persona that
     // self-describes as lowercase-by-default lowercases every
@@ -1579,6 +1786,21 @@ async fn process_event(
     };
     let reply = pacing::truncate_to_chat_limit(&reply, config.composer_max_chars as usize);
     if reply.trim().is_empty() {
+        return Ok(());
+    }
+
+    // Hardcoded slash-prefix guard: a reply starting with `/` would be
+    // interpreted by the server as a command (e.g. `/tp accept`,
+    // `/msg`, `/kill`). The chat module is not a command surface — all
+    // trade actions go through the Store whisper pipeline — so any
+    // composer output that begins with a slash is dropped unconditionally.
+    if reply.trim_start().starts_with('/') {
+        decisions::write(
+            &decisions::DecisionRecord::new("reply_blocked")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason("leading_slash"),
+        );
         return Ok(());
     }
 

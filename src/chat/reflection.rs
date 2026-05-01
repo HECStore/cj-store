@@ -327,6 +327,7 @@ pub async fn run_pass(
     trust_for_sender: &(dyn Fn(&str) -> u8 + Sync),
     validator: &MultiAxisValidator,
     today: &str,
+    classifier_temperature: Option<f32>,
 ) -> Result<ReflectionOutcome, String> {
     let mut outcome = ReflectionOutcome::default();
     if pending.is_empty() {
@@ -383,7 +384,10 @@ pub async fn run_pass(
                 cache_control: None,
             }],
         }],
-        temperature: None,
+        temperature: crate::chat::client::effective_temperature(
+            classifier_model,
+            classifier_temperature,
+        ),
         tools: vec![],
     };
 

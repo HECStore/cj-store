@@ -8,11 +8,18 @@ peer to `store`, `bot`, and `cli`. Disabled by default behind
 [DATA_SCHEMA.md](DATA_SCHEMA.md); for operator runbooks see
 [RECOVERY.md](RECOVERY.md).
 
-The chat module observes in-game chat (public + whisper) and produces
-human-plausible replies via Anthropic Claude — Opus 4.7 for composition,
-Haiku 4.5 for cheap classification. It maintains durable per-player and
-global memory across restarts, learns from AI call-outs, and paces its
-output so it does not look automated.
+The chat module is the bot's conversational layer — an openly-AI
+chatbot that plays Minecraft as a store-running player. It observes
+in-game chat (public + whisper) and produces friendly, in-persona
+replies via Anthropic Claude — Sonnet 4.6 for composition, Haiku 4.5
+for cheap classification. The goal is helpful conversational presence:
+greetings, banter, answering questions about the shop or the server,
+helping players when they ask.
+It maintains durable per-player and global memory across restarts,
+learns from style feedback, and paces its output so it reads like a
+Minecraft player chatting rather than a flood of formal-assistant prose.
+The bot is *not* trying to pass as human — if asked, it answers
+honestly that it is an AI.
 
 ## Hard architectural invariants
 
@@ -21,8 +28,10 @@ output so it does not look automated.
 > balances, pending orders, trade history, or pair reserves. The
 > `chat_task` signature carries only `bot_tx`, channels, an
 > `Arc<AtomicBool>` "busy" flag, and the bot's username — nothing more.
-> A chat reply that mentions a balance or an order is both a privacy
-> leak and an instant detection vector; preserve this gap when extending.
+> A chat reply that mentions a balance or an order is a privacy leak —
+> the bot has no business confirming, in public chat or even in DMs,
+> what another player owns or has traded. Preserve this gap when
+> extending.
 
 Companion invariants:
 
@@ -32,7 +41,9 @@ Companion invariants:
   routing](#whisper-routing)) — so a freeform DM never reaches Store and
   gets `"Unknown command"` back while also being answered by chat.
 - **`persona.md` is operator-managed.** No tool exposed to the composer
-  can write it. Persona drift is detection vector #1.
+  can write it. The persona is a style guide (voice, tempo, slang) that
+  defines the bot's character; an LLM-writable persona would drift
+  into inconsistent, off-tone replies and erode trust with regulars.
 
 ## Module shape
 
@@ -41,7 +52,7 @@ src/chat/
   mod.rs            chat_task entry point + per-event orchestration
   client.rs         Anthropic API client (reqwest, prompt caching, retry, rate limits)
   classifier.rs     Haiku-based "should I respond?" pre-filter
-  composer.rs       Opus 4.7 reply generator + tool-use loop
+  composer.rs       Sonnet 4.6 reply generator + tool-use loop
   tools.rs          Tool handlers (memory r/w, history search, web fetch/search)
   memory.rs         Global + per-player memory file I/O, trust derivation
   history.rs        Daily JSONL chat log: writer task, search
@@ -221,7 +232,7 @@ chat_task (subscriber):
     ├── ai_callout.detected → pending_adjustments.jsonl
     ├── respond=false OR confidence<min                          ── drop
     ▼
-  composer.rs (Opus 4.7 + tool-use loop)
+  composer.rs (Sonnet 4.6 + tool-use loop)
     ├── composer-throttle backoff (after upstream 429/5xx)       ── skip
     ├── system prompt: rules + persona + memory + adjustments
     │                  + per-player memory + history slice + event
@@ -411,7 +422,23 @@ all senders treated as Trust 3) — the operator decides.
 
 After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
 
-1. Strip telltale tokens via `pacing::strip_ai_tells`, then apply
+1. **Reasoning strip via `pacing::strip_reasoning`.** Defensive backstop
+   for chain-of-thought leaks: the composer system prompt forbids
+   `<thinking>...</thinking>` / `<reasoning>...</reasoning>` blocks and
+   `Thinking:` / `Reasoning:` preamble lines, but a thinking-capable
+   model (currently `claude-sonnet-4-6`) occasionally emits them anyway,
+   in full or partially mixed with the real reply. This pass excises
+   them before any later step runs:
+   - Recognized container tags (case-insensitive): `thinking`, `think`,
+     `reasoning`, `reason`, `analysis`, `scratchpad`, `monologue`. The
+     opening tag, closing tag, and everything between them are dropped.
+   - Unclosed opening tag → drop from the tag to end-of-input. The
+     model produced reasoning and never reached a real reply; better
+     silent than half-leaked thoughts.
+   - Whole lines starting with one of `thinking:`, `reasoning:`,
+     `analysis:`, `internal:`, `internal monologue:`, `scratchpad:`
+     (after trimming leading whitespace, case-insensitive) are dropped.
+2. Strip telltale tokens via `pacing::strip_ai_tells`, then apply
    operator regex in `data/chat/strip_patterns.txt`. If persona declares
    "lowercase-by-default", lowercase first-of-sentence.
    - Literal-substring strip using `pacing::BUILT_IN_AI_TELLS`, which
@@ -421,16 +448,22 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
      the seed list): smart quotes `\u{201c}\u{201d}\u{2018}\u{2019}` →
      ASCII `"`/`'`; em-dash `\u{2014}` → `" - "`; en-dash `\u{2013}` →
      `"-"`.
-2. Truncate at `composer_max_chars` (default 240; Minecraft chat allows
+3. Truncate at `composer_max_chars` (default 240; Minecraft chat allows
    256 with margin for the username prefix).
-3. If empty after stripping → silent.
-4. Compute typing delay:
+4. If empty after stripping → silent.
+5. **Leading-slash guard.** If the trimmed reply begins with `/` it is
+   dropped unconditionally with `decisions.jsonl` reason
+   `leading_slash`. The chat module is not a command surface — all
+   trade actions go through the Store whisper pipeline — so a
+   composer-emitted `/tp accept`, `/msg`, `/kill`, etc. must never
+   reach the server. Hardcoded, not configurable.
+6. Compute typing delay:
    `delay = clamp(base + per_char × len + Gaussian(0, σ),
                   typing_delay_floor_ms, typing_delay_max_ms)`. The
    Gaussian can yield negative values; the floor (default 400 ms)
    keeps replies from arriving instantly.
-5. `tokio::time::sleep(delay)`.
-6. **Post-sleep recheck** (the slept reply might be stale by the time
+7. `tokio::time::sleep(delay)`.
+8. **Post-sleep recheck** (the slept reply might be stale by the time
    it would send):
    - `max_replies_per_minute` — always applied.
    - `min_silence_secs` — applied only to public-chat replies that are
@@ -442,9 +475,66 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
    - `in_critical_section.load(Acquire)` — always applied. A composer
      started before a trade and finishing during it must not fire chat
      mid-trade-step.
-7. `BotInstruction::SendChat` (public) or `Whisper` (DM).
-8. Update `last_bot_send_at`, append the bot's own line to history
-   JSONL with `is_bot: true`.
+9. `BotInstruction::SendChat` (public) or `Whisper` (DM).
+10. Update `last_bot_send_at`, append the bot's own line to history
+    JSONL with `is_bot: true`.
+
+## Proactive thread continuation
+
+Disabled by default behind `chat.proactive_threading_enabled = false`.
+When enabled, the chat task adds a third arm to its `tokio::select!`:
+a periodic [`tokio::time::interval`](https://docs.rs/tokio) tick that
+may initiate a composer turn even when no inbound chat event arrived.
+The motivation is conversational: when the bot has been chatting with
+a player and the partner goes quiet, the bot can ask a follow-up,
+share an opinion, or change the subject — driving the thread instead
+of only reacting.
+
+Gate stack (every gate must pass before the composer fires):
+
+1. **Pause / critical-section / model-404 / composer-throttle** — same
+   global short-circuits as the per-event pipeline. Skip with the
+   same decision-log reasons.
+2. **`evaluate_proactive_tick`**
+   ([conversation.rs](src/chat/conversation.rs)) — pure function with
+   four sub-gates:
+   - `secs_since_last_bot_send ≥ proactive_min_secs_since_bot`
+     (default 30) — bot has been silent long enough that another line
+     wouldn't be flooding.
+   - The most-recent non-bot, non-system event in the recent window
+     identifies the partner.
+   - `partner_secs_ago ≥ proactive_min_secs_since_partner`
+     (default 15) — let a real reply land first if one is coming.
+   - `partner_secs_ago ≤ proactive_max_secs_since_partner`
+     (default 300, i.e. 5 min) — above this the conversation is dead
+     and proactive ticks shouldn't try to revive it.
+   - Probability roll: `random < proactive_probability_pct / 100`
+     (default 20 %). Most ticks that pass every other gate still stay
+     silent; the roll prevents the bot from feeling clockwork.
+3. **Decision log.** Both Skip and Fire write to
+   `data/chat/decisions/<day>.jsonl` with `kind: "proactive_skip"` or
+   `kind: "proactive_fire_pending"`. Skip records carry `reason` —
+   one of `bot_never_spoke`, `bot_too_recent`, `no_partner_in_window`,
+   `partner_too_recent`, `partner_too_stale`, `probability_roll` —
+   so operators can audit how often gates would fire and tune
+   thresholds before any tokens are spent.
+
+Status today: gate evaluation, decision logging, and tick wiring are
+in place. The composer-side dispatch (loading the partner's per-player
+memory, building a synthetic user message that tells the model the
+conversation state, running pacing/send) is the next slice of work
+and currently logs `proactive_fire_pending` instead of calling
+Anthropic. With `proactive_threading_enabled = false` (the default),
+the entire arm resolves to `pending()` and adds zero overhead.
+
+| Knob                                | Default | What it does                                                                 |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------- |
+| `proactive_threading_enabled`       | `false` | Master switch.                                                                |
+| `proactive_tick_secs`               | 30      | Seconds between gate-evaluation checks.                                       |
+| `proactive_min_secs_since_bot`      | 30      | Bot must have been silent for at least this long.                             |
+| `proactive_min_secs_since_partner`  | 15      | Partner's last message must be at least this old (let real replies land).     |
+| `proactive_max_secs_since_partner`  | 300     | Above this, the convo is dead — don't try to revive.                          |
+| `proactive_probability_pct`         | 20      | Probability (0-100) that an otherwise-passing tick actually fires.            |
 
 ## Memory model
 
@@ -453,8 +543,21 @@ Three layers, each loaded into the composer system prompt.
 ### Global memory — `memory.md`
 
 LLM-writable via `update_self_memory`. Contains server name + rules,
-notable events (operator-seeded), the bot's own backstory consistent
-with persona, and a hard "never claim / never do" list.
+notable events (operator-seeded), the bot's stable in-world facts
+(shop location, what it sells, base coords if shareable, recurring
+events it runs) consistent with the persona, and a hard "never claim /
+never do" list (no fabricated real-world physical facts, no leaking
+other players' data, etc.).
+
+**Commit posture: aggressive.** The composer system prompt instructs
+the model to call `update_self_memory` / `update_player_memory`
+generously — any time a player shares something fun, insightful, or
+worth remembering, and *always* when a player explicitly asks
+("remember that…", "don't forget…", "call me X from now on"). Memory
+is what makes future conversations richer; the daily cap is the only
+soft brake, and most days it goes unused. The growth/poisoning controls
+below let us be aggressive about commit volume without letting bad
+data accumulate.
 
 Growth + poisoning controls:
 
@@ -469,7 +572,7 @@ Growth + poisoning controls:
 - **Eager commit.** A successful `update_self_memory` call writes the
   sanitized, date-prefixed bullet directly to `memory.md` in the same
   composer turn — no pending file, no second-stage Haiku validator.
-  The composer (Opus 4.7) is the editorial gate; the tool-side
+  The composer (Sonnet 4.6) is the editorial gate; the tool-side
   sanitization + dedup + daily cap are sufficient because each bullet
   is bounded, deduped, and capped per-call. Decision JSONL records the
   full call (input, outcome) for audit.
@@ -560,7 +663,7 @@ Per-file growth control:
 ### Persona — `persona.md` (operator-editable, NOT LLM-writable)
 
 - Generated once on first run from `chat.persona_seed` via a one-shot
-  Opus call: name, age range, region/timezone bias, hobbies, vocabulary
+  composer-model call: name, age range, region/timezone bias, hobbies, vocabulary
   tics, typo rate, capitalization habits, emoji frequency,
   sentence-length distribution.
 - **Generation timing.** `chat_task` blocks on a synchronous
@@ -620,6 +723,16 @@ reflection write does not invalidate the cache mid-call.
 
 Anthropic tool use ([tools.rs](src/chat/tools.rs)). All disk writes go
 through [`fsutil::write_atomic`](src/fsutil.rs) (or append for JSONL).
+
+**Tool-use posture: eager.** The composer system prompt instructs the
+model to reach for tools first-resort rather than last-resort. When a
+player asks "look this up" / "what's the current X" / "check this
+URL" / "find Y" — `web_search` and `web_fetch` are the right answer,
+not "I can't browse." Same for `search_history` when a player
+references something said before. The tool descriptions in
+[tools.rs](src/chat/tools.rs) mirror this framing so the schemas the
+model sees agree with the system prompt; the daily caps
+(`web_fetch_daily_max`, etc.) are the brake, not the tool description.
 
 | Tool                   | Inputs                                  | Behavior                                                                                                                                                                                       |
 | ---------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -688,6 +801,23 @@ incomplete; defenses cover:
   force cache writes on every quiet-period composer call with no hit;
   the 1-hour variant costs 2× write but amortizes 12× longer. Falls
   back to 5-minute with a one-time warning if the beta is rejected.
+- **Temperature** is configured per-call via `chat.composer_temperature`
+  (default `0.8`) and `chat.classifier_temperature` (default `0.0`).
+  The composer wants enough variation to keep the persona voice from
+  flattening across replies; the classifier emits a JSON object and
+  rewards determinism. Both are `Option<f32>` — `null` in JSON omits
+  the temperature field, falling back to the model's API default
+  (1.0 for the current Sonnet / Opus / Haiku tiers).
+  - **Opus carve-out**: any model ID containing `"opus"` runs without
+    an explicit temperature regardless of the configured value. The
+    Opus 4.x family interacts poorly with explicit temperature in
+    combination with its reasoning behavior; sending `None` lets the
+    API default settle that. [`client::effective_temperature`](src/chat/client.rs)
+    is the single canonical resolver — composer and classifier
+    `build_request` both route through it.
+  - Values outside Anthropic's accepted `[0.0, 1.0]` range are clamped
+    at request time, so a misconfig surfaces as a slightly-different
+    sample rather than a 400 from the API.
 - **Client-side rate limiter**: per-model token bucket with both RPM
   and ITPM (input-tokens-per-minute) accounting:
 
@@ -733,7 +863,7 @@ incomplete; defenses cover:
     of {token cap, USD cap} wins.
   - **Validation**: `daily_dollar_cap_usd > 30.0` requires
     `chat.acknowledge_high_spend = true`. Soft-fence against accidentally
-    enabling Opus-level spend.
+    enabling high-spend models.
   - **Startup spend-estimate log line** (INFO level):
     `[Chat] daily caps: input=2M tokens (~$30/day), output=200K tokens
      (~$15/day), classifier=500K tokens (~$0.50/day), USD cap: $5.00.
@@ -981,23 +1111,30 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 | `Chat: resume after moderation backoff`          | Clears `state.moderation_backoff_until`.                                                                                               |
 | `Chat: pause` / `Chat: resume`                   | Toggles `state.paused`, observed at the top of the chat decision pipeline.                                                              |
 
-## Detection vectors and how each is addressed
+## Behavior guards and threat mitigations
 
-| Vector                          | Mitigation                                                                                                                                                                |
+The bot is openly an AI, so the goal of these guards is **good chat
+hygiene + safety**, not detection-evasion. Some columns (typing
+delay, typo rate) exist to keep replies tonally appropriate for a
+Minecraft chat — paragraph-length formal-assistant replies feel as
+out-of-place as zero-typo perfect grammar. Others (rate caps, prompt
+injection defense, SSRF defense) are real safety/cost guards.
+
+| Concern                         | Mitigation                                                                                                                                                                |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Instant replies                 | Typing delay (`typing_delay_*`) with Gaussian jitter and a post-jitter floor.                                                                                              |
-| Perfect grammar                 | Persona-driven typo rate, capitalization habits, sentence-length distribution.                                                                                             |
-| Always responding               | Classifier pre-filter (sample-rate roll on undirected public chat) + per-sender classifier rate cap.                                                                       |
-| Knowing too much                | Cross-player firewall on `read_player_memory` + Trust-gated proactive references; Trust 3 is the only level allowed to reference cross-player history.                    |
-| Style drift                     | `persona.md` is not LLM-writable; no `update_persona` tool exists.                                                                                                         |
-| Predictable timing              | Gaussian jitter on typing delay; `max_replies_per_minute` cap.                                                                                                             |
+| Instant replies feel robotic    | Typing delay (`typing_delay_*`) with Gaussian jitter and a post-jitter floor.                                                                                              |
+| Formal-assistant prose          | Persona-driven typo rate, capitalization habits, sentence-length distribution — keeps replies in Minecraft-chat tempo, not ChatGPT register.                               |
+| Replying to everything          | Classifier pre-filter (sample-rate roll on undirected public chat) + per-sender classifier rate cap. The bot is conversational, not a chatbot that floods every line.    |
+| Leaking cross-player data       | Cross-player firewall on `read_player_memory` + Trust-gated proactive references; Trust 3 is the only level allowed to reference cross-player history.                    |
+| Persona / voice drift           | `persona.md` is not LLM-writable; no `update_persona` tool exists.                                                                                                         |
+| Reply flood / spam              | Gaussian jitter on typing delay; `max_replies_per_minute` cap.                                                                                                             |
 | Talking through trades          | `in_critical_section` flag suppresses public chat and defers whispers up to 30 s.                                                                                          |
 | Being muted but still talking   | Moderation-event parser → 24-h backoff (`chat.moderation_backoff_secs`).                                                                                                   |
 | Echo loop                       | Self-echo guard on bot username; spam guard on the same external username flipping ≥ 4 messages in 10 s.                                                                   |
 | Prompt injection in chat        | Nonce-tagged `<untrusted_chat_…>` wrappers; defensive rejection of events containing `<untrusted` (any case) before wrapping.                                              |
 | Prompt injection via tools      | `<untrusted_tool_result_…>` and `<untrusted_web_…>` markers; the static rules block instructs the model to ignore instructions inside any `<untrusted_…>` tag.            |
 | Prompt injection in adjustments | Reflection pass paraphrase requirement + multi-axis validator (substring overlap, distinct triggers, distinct senders, sender Trust ≥ 1).                                  |
-| AI tell phrases                 | `pacing::strip_ai_tells` removes em-dashes, smart quotes, "As an AI", "I'm Claude", "language model", etc.                                                                 |
+| Off-tone phrases                | `pacing::strip_ai_tells` removes em-dashes, smart quotes, "As an AI", "I'm Claude", "language model", etc. — these are tonally wrong for Minecraft chat regardless of identity. |
 | Cost-DoS via classifier flood   | Per-sender classifier rate cap; per-call sample-rate roll on undirected public chat; separate `daily_classifier_token_cap`; spam-suppressed senders skip classifier entirely.                |
 | Cost-DoS via composer flood     | `daily_input_token_cap` + `daily_output_token_cap` + `daily_dollar_cap_usd`; client-side rate limiter with RPM and ITPM accounting; classifier pre-filter gates composer dispatch. |
 | SSRF via web_fetch              | URL-parse rejects numeric/octal/hex hosts and userinfo; pinned-IP DNS; deny-list including cloud metadata; manual redirect re-validation; streaming size cap.              |

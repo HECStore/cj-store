@@ -1,10 +1,12 @@
 //! Persona file — `data/chat/persona.md`.
 //!
-//! The persona is the bot's "soul": name, vocabulary tics,
-//! typo rate, capitalization habits, etc. **NOT LLM-writable** — there
-//! is no tool that updates persona, on purpose. Persona drift is
-//! detection vector #1, so the file is generated once on first run and
-//! hand-editable thereafter.
+//! The persona is the bot's "soul": name, vocabulary tics, typo rate,
+//! capitalization habits, etc. The bot is openly an AI chatbot, so the
+//! persona is a *style guide* (voice, tempo, slang) rather than a
+//! cover identity. **NOT LLM-writable** — there is no tool that updates
+//! persona, on purpose. A drifting persona produces inconsistent,
+//! off-tone replies that erode trust with regular players, so the file
+//! is generated once on first run and hand-editable thereafter.
 //!
 //! Phase 2 lands the load path. Phase 3 (Anthropic client) adds the
 //! one-shot generation call from `chat.persona_seed` (CHAT.md also
@@ -222,6 +224,7 @@ pub async fn generate(
     api_key: &crate::chat::client::ApiKey,
     seed: &str,
     composer_model: &str,
+    composer_temperature: Option<f32>,
     common_words: &[String],
 ) -> Result<String, String> {
     use crate::chat::client::{
@@ -242,39 +245,49 @@ pub async fn generate(
 
     let system = vec![SystemBlock::Text {
         text: format!(
-            "You are designing a persona for a bot that will speak in a Minecraft \
-             server's public chat. The persona must read like a real human player. \
-             Output a Markdown document with these sections, in order, and nothing else:\n\
+            "You are designing the persona — the VOICE — of a friendly AI chatbot \
+             that plays Minecraft as a store-running player. The persona is \
+             openly an AI; it does not pretend to be human. Its voice should be \
+             casual, in the tempo and slang of someone who actually plays on the \
+             server, not in formal-assistant register. Think \"helpful AI buddy \
+             who happens to live in this Minecraft world\" — not \"undercover \
+             human\" and not \"corporate assistant\". Output a Markdown document \
+             with these sections, in order, and nothing else:\n\
              \n\
              # <name>\n\
-             - Age: <range, e.g. early 20s>\n\
-             - Region/timezone: <country/region; UTC offset>\n\
-             - Hobbies: <2-4 short bullets>\n\
+             - Vibe: <a short phrase, e.g. \"chill shopkeep AI\", \"cheerful trader bot\">\n\
+             - Hobbies / interests: <2-4 short bullets — in-game things this AI enjoys talking about>\n\
              - Vocabulary tics: <2-4 short phrases / tells>\n\
              - Typo rate: <low | medium | high>\n\
              - Capitalization: <sentence-case | lowercase-by-default | mixed>\n\
              - Emoji frequency: <none | rare | sometimes>\n\
              - Sentence length: <short | medium | long>\n\
-             - Nicknames: <comma-separated short names this player goes by>\n\
+             - Nicknames: <comma-separated short names this player/bot goes by>\n\
              \n\
              ## Voice notes\n\
-             A 1-2 paragraph description of how this player talks: tempo, slang, \
-             attitude, what they care about, what they ignore. Concrete and short.\n\
+             A 1-2 paragraph description of how this AI talks: tempo, slang, \
+             attitude, what they care about, what they brush off. Concrete and \
+             short. Remember: friendly + helpful + casual, but NOT formal \
+             ChatGPT-ese.\n\
              \n\
              ## Hard limits\n\
-             - never claim to be in a specific real-world city or weather\n\
-             - never give phone numbers, emails, or addresses\n\
-             - if a player is hostile or trolling, disengage rather than escalate{do_not_pick}",
+             - never invent real-world physical facts about yourself (a city you \
+               live in, today's weather there, a phone number, a home address) — \
+               you are an AI and don't have those\n\
+             - never give phone numbers, emails, or addresses for anyone\n\
+             - if a player is hostile or trolling, disengage rather than escalate\n\
+             - if asked whether you're an AI / bot, answer honestly{do_not_pick}",
         ),
         cache_control: None,
     }];
 
     let user = vec![ContentBlock::Text {
         text: format!(
-            "Build a persona seeded by this short brief. Treat the brief as a \
-             theme, not literal facts to copy: a brief like 'norwegian late-night \
-             gamer' should yield a NEW name and concrete details consistent with \
-             that vibe.\n\nBrief: {seed}",
+            "Build a persona for the bot seeded by this short brief. Treat the \
+             brief as a flavor / vibe direction, not literal facts to copy: a \
+             brief like 'chill late-night shopkeeper' should yield a name and \
+             concrete details consistent with that vibe, expressed as an AI \
+             chatbot persona — not a human cover identity.\n\nBrief: {seed}",
         ),
         cache_control: None,
     }];
@@ -287,7 +300,16 @@ pub async fn generate(
             role: Role::User,
             content: user,
         }],
-        temperature: None,
+        // Persona generation is one-shot at first run; the operator
+        // can pass `None` to honor the API default (1.0 — wide
+        // variety) or pass `Some(<value>)` to tighten the persona's
+        // sampling. Either way it routes through `effective_temperature`
+        // so the Opus carve-out applies if the composer model ever
+        // swaps back.
+        temperature: crate::chat::client::effective_temperature(
+            composer_model,
+            composer_temperature,
+        ),
         tools: vec![],
     };
 

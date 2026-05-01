@@ -68,6 +68,15 @@ impl PricingTable {
             },
         );
         rates.insert(
+            "claude-sonnet-4-6".to_string(),
+            ModelRates {
+                input_per_million: 3.0,
+                output_per_million: 15.0,
+                cache_write_per_million: Some(3.75),
+                cache_read_per_million: Some(0.3),
+            },
+        );
+        rates.insert(
             "claude-haiku-4-5-20251001".to_string(),
             ModelRates {
                 input_per_million: 1.0,
@@ -226,10 +235,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_table_includes_opus_and_haiku() {
+    fn default_table_includes_opus_sonnet_and_haiku() {
         let t = PricingTable::default_table();
         assert_eq!(t.version, VERSION);
         assert!(t.rates.contains_key("claude-opus-4-7"));
+        assert!(t.rates.contains_key("claude-sonnet-4-6"));
         assert!(t.rates.contains_key("claude-haiku-4-5-20251001"));
     }
 
@@ -302,5 +312,27 @@ mod tests {
         let h = t.usd_for_tokens("claude-haiku-4-5-20251001", 1_000_000, 0);
         let o = t.usd_for_tokens("claude-opus-4-7", 1_000_000, 0);
         assert!(h < o, "Haiku must be cheaper than Opus per million input tokens");
+    }
+
+    #[test]
+    fn classifier_haiku_costs_less_than_composer_sonnet() {
+        // The composer model swapped from Opus to Sonnet 4.6; Haiku must
+        // remain cheaper than the live composer model so daily-cap math
+        // and the classifier-as-cheap-prefilter assumption still hold.
+        let t = PricingTable::default_table();
+        let h = t.usd_for_tokens("claude-haiku-4-5-20251001", 1_000_000, 0);
+        let s = t.usd_for_tokens("claude-sonnet-4-6", 1_000_000, 0);
+        assert!(h < s, "Haiku must be cheaper than Sonnet per million input tokens");
+    }
+
+    #[test]
+    fn sonnet_costs_less_than_opus() {
+        // Pricing sanity: Sonnet 4.6 is the new default composer
+        // precisely because it's cheaper than Opus 4.7 at comparable
+        // capability for chat workloads.
+        let t = PricingTable::default_table();
+        let s = t.usd_for_call("claude-sonnet-4-6", 1_000_000, 200_000, 0, 0);
+        let o = t.usd_for_call("claude-opus-4-7", 1_000_000, 200_000, 0, 0);
+        assert!(s < o, "Sonnet must be cheaper than Opus on a typical I/O mix");
     }
 }

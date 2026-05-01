@@ -100,6 +100,234 @@ pub const BUILT_IN_AI_TELLS: &[&str] = &[
     "language model",
 ];
 
+/// XML-style reasoning-container tag names recognized by
+/// [`strip_reasoning`]. Matched case-insensitively.
+const REASONING_TAGS: &[&str] = &[
+    "thinking",
+    "think",
+    "reasoning",
+    "reason",
+    "analysis",
+    "scratchpad",
+    "monologue",
+];
+
+/// Line-prefix markers (followed by `:`) that introduce a
+/// reasoning/preamble line. Whole-line strip; matched case-insensitively
+/// after trimming leading whitespace.
+const REASONING_LINE_PREFIXES: &[&str] = &[
+    "thinking:",
+    "reasoning:",
+    "analysis:",
+    "internal:",
+    "internal monologue:",
+    "scratchpad:",
+];
+
+/// Strip chain-of-thought / reasoning markup from a model reply.
+///
+/// The composer system prompt tells the model that its output is sent
+/// verbatim to chat. This is the defensive backstop: if a turn still
+/// emits `<thinking>...</thinking>` or "Reasoning:" preamble, those
+/// fragments are excised before the reply ever reaches a player.
+///
+/// Removed:
+/// - `<thinking>...</thinking>` and the variants in [`REASONING_TAGS`]
+///   (case-insensitive). The opening tag, closing tag, and everything
+///   between them is dropped.
+/// - An unclosed opening tag — content from the tag to end-of-input is
+///   removed, on the assumption the model emitted reasoning and never
+///   produced a real reply.
+/// - Whole lines starting with a known reasoning prefix from
+///   [`REASONING_LINE_PREFIXES`].
+///
+/// The result is trimmed; if everything was reasoning the caller's
+/// "empty after stripping → silent" gate handles the empty string.
+pub fn strip_reasoning(reply: &str) -> String {
+    let mut out = reply.to_string();
+
+    // Pass 1 — strip XML-style reasoning blocks. We maintain a lowered
+    // view alongside `out` and edit both in lock-step; ASCII lowercasing
+    // (`to_ascii_lowercase` — MUST stay this fold, NOT the locale-
+    // dependent `to_lowercase` which is length-changing) is
+    // byte-length preserving, so byte indices in `lower` apply to `out`
+    // unchanged.
+    //
+    // **Code-fence skip.** A `<thinking>` token inside a backtick code
+    // fence (single ` … ` or triple ``` … ``` ) is the bot legitimately
+    // quoting XML markup back at a player who asked about it — not a
+    // chain-of-thought leak. Each iteration finds the earliest
+    // reasoning-tag occurrence outside any fence; if all matches fall
+    // inside fences we're done.
+    loop {
+        let lower = out.to_ascii_lowercase();
+        let fences = code_fence_ranges(&lower);
+
+        // Find the earliest non-fenced opening tag across all reasoning
+        // tag names. Track the close tag alongside so we can excise
+        // open..close in one shot below.
+        let mut earliest: Option<(usize, String, String)> = None;
+        for tag in REASONING_TAGS {
+            let open = format!("<{tag}>");
+            let mut search_from = 0usize;
+            while let Some(rel) = lower[search_from..].find(&open) {
+                let pos = search_from + rel;
+                if range_contains(&fences, pos) {
+                    search_from = pos + open.len();
+                    continue;
+                }
+                if earliest.as_ref().map_or(true, |(s, _, _)| pos < *s) {
+                    earliest = Some((pos, open.clone(), format!("</{tag}>")));
+                }
+                break;
+            }
+        }
+
+        let Some((start, open, close)) = earliest else { break };
+        match lower[start + open.len()..].find(&close) {
+            Some(rel) => {
+                let end = start + open.len() + rel + close.len();
+                out.replace_range(start..end, "");
+                // `lower` is rebuilt at the top of the next iteration
+                // from the freshly-edited `out`.
+            }
+            None => {
+                // Unclosed reasoning block — model likely never produced
+                // a real reply. Drop everything from the opening tag on.
+                out.truncate(start);
+                break;
+            }
+        }
+    }
+
+    // Pass 2 — drop whole lines that begin with a reasoning prefix.
+    // Match against the line with whitespace squeezed around `:` so a
+    // model emitting `Reasoning :` (space before colon) is also caught.
+    let mut kept: Vec<&str> = Vec::new();
+    for line in out.lines() {
+        let lower = line.trim_start().to_ascii_lowercase();
+        let normalized = squeeze_colon_whitespace(&lower);
+        if REASONING_LINE_PREFIXES
+            .iter()
+            .any(|p| normalized.starts_with(p))
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n").trim().to_string()
+}
+
+/// Compute the byte ranges occupied by code fences in `s`. Triple-tick
+/// fences (```` ``` ```` … ```` ``` ````) are recognized first so the
+/// inner backticks of a triple fence don't open spurious single fences.
+/// Single-tick fences (`` ` `` … `` ` ``) cover the remaining ranges.
+/// Both forms include the surrounding ticks so the test
+/// `range_contains(start)` excludes the open marker itself.
+fn code_fence_ranges(s: &str) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    // Pass A — triple-tick fences. Collected separately so the
+    // single-tick pass can consult them without aliasing the final
+    // result vector.
+    let mut triples: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"```" {
+            let open_start = i;
+            let mut j = i + 3;
+            let mut found = false;
+            while j + 3 <= bytes.len() {
+                if &bytes[j..j + 3] == b"```" {
+                    triples.push((open_start, j + 3));
+                    i = j + 3;
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found {
+                // Unclosed triple fence — treat from the opener to EOS
+                // as fenced so a `<thinking>` after a stray ``` cannot
+                // be silently stripped.
+                triples.push((open_start, bytes.len()));
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // Pass B — single-tick fences outside any triple region.
+    let triple_covered =
+        |pos: usize| triples.iter().any(|&(a, b)| a <= pos && pos < b);
+    let mut singles: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'`' && !triple_covered(i) {
+            let open_start = i;
+            let mut j = i + 1;
+            let mut found = false;
+            while j < bytes.len() {
+                if bytes[j] == b'`' && !triple_covered(j) {
+                    singles.push((open_start, j + 1));
+                    i = j + 1;
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !found {
+                // Unclosed single backtick — same defensive choice as
+                // the triple-fence case.
+                singles.push((open_start, bytes.len()));
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    triples.extend(singles);
+    triples
+}
+
+/// True if `pos` lies inside any half-open `[start, end)` range.
+fn range_contains(ranges: &[(usize, usize)], pos: usize) -> bool {
+    ranges.iter().any(|&(a, b)| a <= pos && pos < b)
+}
+
+/// Collapse whitespace immediately before a `:` so that
+/// `"reasoning :"` and `"reasoning  :"` both compare equal to
+/// `"reasoning:"`. Caller-supplied lowered string; ASCII-only logic.
+fn squeeze_colon_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == ' ' || c == '\t' {
+            // Look ahead: only skip whitespace runs that terminate at `:`.
+            let mut peek = iter.clone();
+            while let Some(&next) = peek.peek() {
+                if next == ' ' || next == '\t' {
+                    peek.next();
+                    continue;
+                }
+                break;
+            }
+            if peek.peek() == Some(&':') {
+                // Drop this whitespace; advance the real iterator past it.
+                while let Some(&next) = iter.peek() {
+                    if next == ' ' || next == '\t' {
+                        iter.next();
+                        continue;
+                    }
+                    break;
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Strip AI tells, smart quotes, and em-dashes.
 ///
 /// This is a literal-substring strip — nothing fancy. Operators who want
@@ -359,6 +587,137 @@ mod tests {
         let s = strip_ai_tells("I\u{2019}m Claude, here.");
         assert!(!s.contains("I'm Claude"));
         assert!(!s.contains("Claude"));
+    }
+
+    // ---- strip_reasoning -----------------------------------------------
+
+    #[test]
+    fn strip_reasoning_removes_thinking_block() {
+        let s = strip_reasoning("<thinking>let me consider</thinking>hello");
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn strip_reasoning_handles_mixed_case_tags() {
+        let s = strip_reasoning("<Thinking>blah</Thinking>hi there");
+        assert_eq!(s, "hi there");
+    }
+
+    #[test]
+    fn strip_reasoning_removes_multiline_block() {
+        let s = strip_reasoning("<thinking>step 1\nstep 2\nstep 3</thinking>\nactual reply");
+        assert_eq!(s, "actual reply");
+    }
+
+    #[test]
+    fn strip_reasoning_unclosed_tag_truncates_to_open_tag() {
+        // Model produced reasoning and was cut off (max_tokens, etc.) —
+        // there is no real reply to send.
+        let s = strip_reasoning("preamble <thinking>started reasoning never finished");
+        assert_eq!(s, "preamble");
+    }
+
+    #[test]
+    fn strip_reasoning_handles_multiple_blocks() {
+        let s = strip_reasoning("<thinking>a</thinking>foo<reasoning>b</reasoning>bar");
+        assert_eq!(s, "foobar");
+    }
+
+    #[test]
+    fn strip_reasoning_drops_reasoning_prefix_lines() {
+        let input = "Reasoning: I should be friendly.\nhey what's up";
+        assert_eq!(strip_reasoning(input), "hey what's up");
+    }
+
+    #[test]
+    fn strip_reasoning_drops_thinking_prefix_lines_case_insensitive() {
+        let input = "thinking: ok let me see\nReply text here";
+        assert_eq!(strip_reasoning(input), "Reply text here");
+    }
+
+    #[test]
+    fn strip_reasoning_preserves_pure_reply() {
+        let input = "just a normal reply, no reasoning";
+        assert_eq!(strip_reasoning(input), input);
+    }
+
+    #[test]
+    fn strip_reasoning_returns_empty_when_only_reasoning() {
+        let s = strip_reasoning("<thinking>only reasoning, no reply</thinking>");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn strip_reasoning_handles_think_short_tag() {
+        // Some models prefer <think> over <thinking>.
+        let s = strip_reasoning("<think>hmm</think>yo");
+        assert_eq!(s, "yo");
+    }
+
+    #[test]
+    fn strip_reasoning_is_idempotent() {
+        let once = strip_reasoning("<thinking>x</thinking>Reasoning: y\nhello");
+        let twice = strip_reasoning(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn strip_reasoning_preserves_thinking_inside_single_backticks() {
+        // Player asks about XML; bot quotes their tag back. The
+        // backtick-fenced `<thinking>...</thinking>` is content the bot
+        // is INTENTIONALLY echoing — strip must leave it intact.
+        let s = strip_reasoning("the `<thinking>123</thinking>` block is for cot");
+        assert_eq!(s, "the `<thinking>123</thinking>` block is for cot");
+    }
+
+    #[test]
+    fn strip_reasoning_preserves_thinking_inside_triple_backticks() {
+        let input = "here's the syntax:\n```\n<thinking>do_thing()</thinking>\n```\nthat's it";
+        assert_eq!(strip_reasoning(input), input);
+    }
+
+    #[test]
+    fn strip_reasoning_strips_outside_fence_keeps_inside() {
+        // Mixed: a real leak before the fence and a quoted example
+        // inside. Strip the leak, keep the fenced quote.
+        let input = "<thinking>scratch</thinking>here's how: `<thinking>x</thinking>`";
+        assert_eq!(
+            strip_reasoning(input),
+            "here's how: `<thinking>x</thinking>`"
+        );
+    }
+
+    #[test]
+    fn strip_reasoning_handles_nested_same_tag() {
+        // `<thinking>a<thinking>b</thinking>c</thinking>`. The lazy
+        // close-tag match pairs the first `</thinking>` with the
+        // outermost open, leaving `c</thinking>` as garbage. We
+        // accept that — nested same-tag CoT is exotic — but pin
+        // the behavior so future refactors notice if it changes.
+        let s = strip_reasoning("hi <thinking>a<thinking>b</thinking>c</thinking> there");
+        // After first removal: "hi c</thinking> there".
+        // Then `</thinking>` has no matching open, so loop ends.
+        // No prefix line drop applies. Final: "hi c</thinking> there".
+        assert_eq!(s, "hi c</thinking> there");
+    }
+
+    #[test]
+    fn strip_reasoning_drops_prefix_with_spaced_colon() {
+        // Models commonly emit "Reasoning :" with a space before the colon;
+        // the squeeze pass should normalize that before matching.
+        let s = strip_reasoning("Reasoning : let me think\nactual reply");
+        assert_eq!(s, "actual reply");
+        let s2 = strip_reasoning("thinking  :   stuff\nreply");
+        assert_eq!(s2, "reply");
+    }
+
+    #[test]
+    fn strip_reasoning_does_not_eat_legitimate_thinking_word() {
+        // Lowercase "thinking maybe..." mid-sentence is not a
+        // reasoning marker — only the `Thinking:` colon-prefixed line
+        // form is.
+        let s = strip_reasoning("i was thinking maybe we trade");
+        assert_eq!(s, "i was thinking maybe we trade");
     }
 
     // ---- truncate_to_chat_limit ----------------------------------------

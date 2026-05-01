@@ -141,6 +141,27 @@ impl CacheTtl {
 
 // ---- Request types ------------------------------------------------------
 
+/// Resolve the temperature value to actually wire into the request body.
+///
+/// The Opus 4.x family is run **without** an explicit `temperature` —
+/// the API default is the right setting for Opus and explicit values
+/// can interact poorly with the model's reasoning behavior. Any model
+/// whose ID contains `"opus"` therefore receives `None` regardless of
+/// the configured temperature; everyone else gets the configured
+/// value, clamped to the Anthropic-accepted `[0.0, 1.0]` range.
+///
+/// Non-finite values (`NaN`, `±∞`) collapse to `None` so a misconfig
+/// doesn't propagate into the request body and surface as a 400 from
+/// the API. JSON deserialization can't normally produce these (no
+/// `NaN` literal), but the field is `pub` and a programmatic caller
+/// could pass one.
+pub fn effective_temperature(model: &str, configured: Option<f32>) -> Option<f32> {
+    if model.contains("opus") {
+        return None;
+    }
+    configured.and_then(|t| if t.is_finite() { Some(t.clamp(0.0, 1.0)) } else { None })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateMessageRequest {
     pub model: String,
@@ -1028,6 +1049,52 @@ pub fn sanitize_for_log(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- effective_temperature ------------------------------------------
+
+    #[test]
+    fn effective_temperature_strips_for_opus() {
+        // Any model ID containing "opus" runs without an explicit
+        // temperature, regardless of what the operator configured.
+        assert_eq!(effective_temperature("claude-opus-4-7", Some(0.5)), None);
+        assert_eq!(effective_temperature("claude-opus-4-7", Some(1.0)), None);
+        assert_eq!(effective_temperature("claude-opus-4-7", None), None);
+        // Older opus IDs (e.g. "claude-3-opus-20240229") match too.
+        assert_eq!(effective_temperature("claude-3-opus-20240229", Some(0.7)), None);
+    }
+
+    #[test]
+    fn effective_temperature_passes_through_for_non_opus() {
+        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(0.8)), Some(0.8));
+        assert_eq!(
+            effective_temperature("claude-haiku-4-5-20251001", Some(0.0)),
+            Some(0.0)
+        );
+        assert_eq!(effective_temperature("claude-sonnet-4-6", None), None);
+    }
+
+    #[test]
+    fn effective_temperature_clamps_out_of_range() {
+        // Anthropic accepts 0.0..=1.0; defensively clamp so a misconfig
+        // doesn't surface as a 400 from the API.
+        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(-0.5)), Some(0.0));
+        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(1.7)), Some(1.0));
+    }
+
+    #[test]
+    fn effective_temperature_drops_nonfinite_values() {
+        // NaN / ±∞ would propagate through `clamp` (NaN as the value)
+        // or panic, and either way the API would 400. Collapse to None.
+        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(f32::NAN)), None);
+        assert_eq!(
+            effective_temperature("claude-sonnet-4-6", Some(f32::INFINITY)),
+            None
+        );
+        assert_eq!(
+            effective_temperature("claude-sonnet-4-6", Some(f32::NEG_INFINITY)),
+            None
+        );
+    }
 
     // ---- ApiKey ---------------------------------------------------------
 

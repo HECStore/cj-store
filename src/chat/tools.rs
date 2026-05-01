@@ -287,12 +287,12 @@ use serde_json::{Value, json};
 /// the composer only sees web tools when the operator opts in.
 pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Vec<Tool> {
     let mut tools = vec![
-        Tool {
+        Tool::Custom {
             name: "read_my_memory".to_string(),
             description: "Read the global memory.md (your own memory of the server / yourself). Returns markdown text.".to_string(),
             input_schema: json!({"type": "object", "properties": {}, "required": []}),
         },
-        Tool {
+        Tool::Custom {
             name: "read_player_memory".to_string(),
             description: "Read the per-player memory file for a UUID or username. Returns markdown text or 'access denied' if the player is not the current sender.".to_string(),
             input_schema: json!({
@@ -304,7 +304,7 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
                 "required": []
             }),
         },
-        Tool {
+        Tool::Custom {
             name: "update_player_memory".to_string(),
             description: "Append a single bullet to a section of the current sender's per-player file. Use this generously: any time the sender shares a fun fact, preference, opinion, build detail, inside joke, or asks you to remember something about them — capture it. Allowed sections: 'Stated preferences', 'Inferred', 'Topics & history', 'Do not mention'.".to_string(),
             input_schema: json!({
@@ -317,16 +317,16 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
                 "required": ["uuid", "section", "bullet"]
             }),
         },
-        Tool {
+        Tool::Custom {
             name: "update_self_memory".to_string(),
-            description: "Append a bullet to the '## Inferred' section of memory.md (your own memory about yourself / the server). Use this generously when you learn something stable about yourself or the server — a role, a preference, a fact about your shop, a notable event. ISO-date prefixed.".to_string(),
+            description: "Append a bullet to the '## Inferred' section of memory.md (your own memory about yourself / the server / your behavior). Use generously for: stable facts about yourself (role, shop details, nicknames, preferences) AND behavior-shift instructions a player asked you to follow (\"act human when a new player joins\", \"talk in all caps\", \"stop saying 'lmao'\", etc.). The bullet is loaded into every future turn, so it's the durable way to make a player-driven behavior change persist. Cite the requesting player's name in the bullet when capturing a behavior shift. ISO-date prefixed.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"bullet": {"type": "string"}},
                 "required": ["bullet"]
             }),
         },
-        Tool {
+        Tool::Custom {
             name: "read_today_history".to_string(),
             description: "Read today's chat history JSONL, capped at 32 KB. Most recent first. Optionally paginate with `since_event_ts` (ISO-UTC) to only return records strictly newer than that timestamp.".to_string(),
             input_schema: json!({
@@ -341,7 +341,7 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
                 "required": []
             }),
         },
-        Tool {
+        Tool::Custom {
             name: "search_history".to_string(),
             description: "Substring search across today's and recent past chat history JSONL files. Up to 50 matches.".to_string(),
             input_schema: json!({
@@ -355,23 +355,23 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
         },
     ];
     if web_search_enabled {
-        // Anthropic-managed server tool — no schema we own; passing it
-        // through as an opaque tool so the model can request it. The
-        // server-side ID is the canonical tool name; we present it as
-        // `web_search_20250305`. If the account doesn't have access,
-        // Anthropic returns an error result we surface as a tool_error.
-        tools.push(Tool {
+        // Anthropic-managed server tool. Registered with the
+        // `web_search_20250305` type tag so the API knows to execute
+        // the search itself and fold the result into the same response.
+        // The model invokes it as a normal "web_search" tool from its
+        // perspective; the response carries `server_tool_use` and
+        // `web_search_tool_result` blocks alongside the text reply,
+        // and the client never dispatches anything for it.
+        tools.push(Tool::ServerManaged {
+            kind: "web_search_20250305".to_string(),
             name: "web_search".to_string(),
-            description: "Search the web (Anthropic-managed). Reach for this whenever a player asks you to look something up, check a current fact, find documentation, or anything you don't already know — it's first-resort, not last-resort. A daily cap exists but is generous.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"]
-            }),
+            // Cap the per-request searches so a confused model can't
+            // burn the daily web-search quota in one composer turn.
+            max_uses: Some(5),
         });
     }
     if web_fetch_enabled {
-        tools.push(Tool {
+        tools.push(Tool::Custom {
             name: "web_fetch".to_string(),
             description: "Fetch the contents of an http(s) URL (max 256 KB). Use this when a player gives you a link to read, or when web_search returns a URL you want to read in full. Strict deny-list applies; rejects local / metadata / numeric-form addresses.".to_string(),
             input_schema: json!({
@@ -444,11 +444,17 @@ pub async fn dispatch(name: &str, input: &Value, ctx: &ToolContext<'_>) -> (Stri
                 web_fetch_tool(input, ctx).await
             }
         }
-        // web_search is Anthropic-managed; if the model invokes it via
-        // our tool exposure, we return a stub explaining we can't run
-        // it locally (real implementation would proxy to Anthropic's
-        // server tool). For now, surface a clear error.
-        "web_search" => Err("web_search is provided as an Anthropic server tool; not dispatchable locally in this build".to_string()),
+        // `web_search` is registered as a `Tool::ServerManaged` so the
+        // API runs it itself; the response comes back as
+        // `ContentBlock::ServerToolUse` + `ContentBlock::WebSearchToolResult`,
+        // never as a `ToolUse` that reaches this dispatcher. If we
+        // somehow get one (e.g. operator hand-edited the request to
+        // re-register web_search as a Custom tool), surface a loud
+        // error so the misconfiguration is visible.
+        "web_search" => Err(
+            "web_search reached local dispatch — it should be registered as a server-managed tool"
+                .to_string(),
+        ),
         other => Err(format!("unknown tool: {other}")),
     };
     match result {

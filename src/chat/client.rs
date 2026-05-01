@@ -38,16 +38,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-/// True if the named tool is dispatched by the Anthropic API (server-side)
-/// rather than by our local dispatcher. The composer's tool-use loop must
-/// skip emitting a local `tool_result` for these — the API folds the real
-/// result into the next assistant message itself. Currently only
-/// `web_search_*` is server-side; if Anthropic adds more, extend the
-/// match below.
-pub fn is_server_side_tool(name: &str) -> bool {
-    name.starts_with("web_search")
-}
-
 /// Runtime flag controlling whether the 1-hour ephemeral cache TTL beta is
 /// available. Defaults to `true`; flipped to `false` the first time the
 /// API returns a 4xx that mentions the beta header. Once flipped, all
@@ -205,6 +195,9 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// Client-dispatched tool. Composer matches on this variant only;
+    /// server-side tools come back as [`ContentBlock::ServerToolUse`]
+    /// instead and never enter the dispatch loop.
     ToolUse {
         id: String,
         name: String,
@@ -215,6 +208,26 @@ pub enum ContentBlock {
         content: String,
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+    },
+    /// Anthropic-managed server tool invocation (e.g. web_search). The
+    /// API runs the tool itself; the client must NOT emit a
+    /// `tool_result` for it. We deserialize the block so it can
+    /// round-trip through the assistant message on multi-turn flows
+    /// and so the loop's terminal-turn check classifies it correctly
+    /// (server tools alongside text = terminal).
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Result of an Anthropic-managed server tool, emitted in the same
+    /// response as the corresponding `server_tool_use`. Content is left
+    /// opaque (`serde_json::Value`) — we don't inspect it; the model
+    /// already read it server-side. Echoed back verbatim if the
+    /// conversation continues.
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
     },
 }
 
@@ -237,11 +250,41 @@ impl CacheControl {
     }
 }
 
+/// A tool exposed to the composer. Two shapes:
+///
+/// - [`Tool::Custom`] — a regular client-side tool. The model emits a
+///   plain `tool_use` block; we dispatch via [`crate::chat::tools::dispatch`]
+///   and reply with a `tool_result` block.
+/// - [`Tool::ServerManaged`] — an Anthropic-managed server tool (e.g.
+///   `web_search_20250305`). The API runs the tool itself in the same
+///   request and returns `server_tool_use` + a result block alongside
+///   text. The client does NOT dispatch and does NOT need to send a
+///   tool_result back.
+///
+/// Serialized untagged so each variant produces its own object shape.
+/// `Custom` produces `{"name", "description", "input_schema"}`;
+/// `ServerManaged` produces `{"type", "name", "max_uses?"}`.
 #[derive(Debug, Clone, Serialize)]
-pub struct Tool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
+#[serde(untagged)]
+pub enum Tool {
+    Custom {
+        name: String,
+        description: String,
+        input_schema: serde_json::Value,
+    },
+    ServerManaged {
+        /// Anthropic tool type identifier (e.g. `"web_search_20250305"`).
+        #[serde(rename = "type")]
+        kind: String,
+        /// The name the model uses to invoke the tool. For
+        /// `web_search_20250305` Anthropic expects exactly `"web_search"`.
+        name: String,
+        /// Optional cap on how many times the model can invoke the
+        /// server tool within one request. Anthropic's default applies
+        /// when `None`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+    },
 }
 
 // ---- Response types -----------------------------------------------------
@@ -615,6 +658,19 @@ fn demote_request_to_5min(req: &CreateMessageRequest) -> CreateMessageRequest {
                             tool_use_id: tool_use_id.clone(),
                             content: content.clone(),
                             is_error: *is_error,
+                        }
+                    }
+                    ContentBlock::ServerToolUse { id, name, input } => {
+                        ContentBlock::ServerToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        }
+                    }
+                    ContentBlock::WebSearchToolResult { tool_use_id, content } => {
+                        ContentBlock::WebSearchToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: content.clone(),
                         }
                     }
                 })
@@ -1563,19 +1619,123 @@ mod tests {
         assert!(s.contains("claude-opus"));
     }
 
-    // ---- Server-side tool sentinel -------------------------------------
+    // ---- Tool serialization shapes -------------------------------------
 
     #[test]
-    fn web_search_recognized_as_server_side() {
-        assert!(is_server_side_tool("web_search"));
-        assert!(is_server_side_tool("web_search_20250305"));
+    fn custom_tool_serializes_as_name_description_schema() {
+        let t = Tool::Custom {
+            name: "read_my_memory".to_string(),
+            description: "read it".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let v: serde_json::Value = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["name"], "read_my_memory");
+        assert_eq!(v["description"], "read it");
+        assert!(v.get("input_schema").is_some());
+        // ServerManaged-only fields must be absent.
+        assert!(v.get("type").is_none());
+        assert!(v.get("max_uses").is_none());
     }
 
     #[test]
-    fn local_tool_names_not_server_side() {
-        assert!(!is_server_side_tool("read_my_memory"));
-        assert!(!is_server_side_tool("web_fetch"));
-        assert!(!is_server_side_tool("websearch")); // missing underscore
+    fn server_managed_tool_serializes_with_type_and_name() {
+        let t = Tool::ServerManaged {
+            kind: "web_search_20250305".to_string(),
+            name: "web_search".to_string(),
+            max_uses: Some(5),
+        };
+        let v: serde_json::Value = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["type"], "web_search_20250305");
+        assert_eq!(v["name"], "web_search");
+        assert_eq!(v["max_uses"], 5);
+        // Custom-only fields must be absent.
+        assert!(v.get("description").is_none());
+        assert!(v.get("input_schema").is_none());
+    }
+
+    #[test]
+    fn server_managed_tool_omits_max_uses_when_none() {
+        let t = Tool::ServerManaged {
+            kind: "web_search_20250305".to_string(),
+            name: "web_search".to_string(),
+            max_uses: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&t).unwrap();
+        assert!(v.get("max_uses").is_none());
+    }
+
+    // ---- Server-tool ContentBlock parsing ------------------------------
+
+    #[test]
+    fn server_tool_use_deserializes() {
+        let raw = serde_json::json!({
+            "type": "server_tool_use",
+            "id": "srvtoolu_abc",
+            "name": "web_search",
+            "input": {"query": "wti crude oil price"}
+        });
+        let cb: ContentBlock = serde_json::from_value(raw).unwrap();
+        match cb {
+            ContentBlock::ServerToolUse { id, name, input } => {
+                assert_eq!(id, "srvtoolu_abc");
+                assert_eq!(name, "web_search");
+                assert_eq!(input["query"], "wti crude oil price");
+            }
+            _ => panic!("expected ServerToolUse"),
+        }
+    }
+
+    #[test]
+    fn web_search_tool_result_deserializes() {
+        let raw = serde_json::json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_abc",
+            "content": [
+                {"type": "web_search_result", "url": "https://example.com",
+                 "title": "WTI Crude Price", "encrypted_content": "xx"}
+            ]
+        });
+        let cb: ContentBlock = serde_json::from_value(raw).unwrap();
+        match cb {
+            ContentBlock::WebSearchToolResult { tool_use_id, content } => {
+                assert_eq!(tool_use_id, "srvtoolu_abc");
+                // Content is opaque (Value); we just verify it round-trips.
+                assert!(content.is_array());
+            }
+            _ => panic!("expected WebSearchToolResult"),
+        }
+    }
+
+    #[test]
+    fn full_response_with_server_tool_blocks_parses() {
+        // The realistic shape: server_tool_use → web_search_tool_result
+        // → text, all in one response. Composer's terminal-turn check
+        // returns true (no client `ToolUse` blocks), and the loop
+        // exits with the text reply.
+        let raw = serde_json::json!({
+            "id": "msg_abc",
+            "model": "claude-sonnet-4-6",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search",
+                 "input": {"query": "wti"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srv_1",
+                 "content": [{"type": "web_search_result", "url": "https://example.com",
+                              "title": "x", "encrypted_content": "y"}]},
+                {"type": "text", "text": "wti is around $73 today"}
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 30,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+        });
+        let resp: CreateMessageResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(resp.content.len(), 3);
+        // None of the blocks match `ToolUse` — terminal turn.
+        let has_client_tool_use = resp
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        assert!(!has_client_tool_use);
     }
 
     // ---- Model-404 helpers ---------------------------------------------

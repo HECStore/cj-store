@@ -12,6 +12,7 @@ pub mod composer;
 pub mod conversation;
 pub mod decisions;
 pub mod history;
+pub(crate) mod jsonl;
 pub mod memory;
 pub mod pacing;
 pub mod persona;
@@ -84,6 +85,7 @@ pub async fn chat_task(
     in_critical_section: Arc<AtomicBool>,
     bot_username: Arc<RwLock<Option<String>>>,
     config: ChatConfig,
+    history_tx: mpsc::Sender<history::HistoryItem>,
 ) {
     if !config.enabled {
         info!("[Chat] disabled (config.chat.enabled=false), task exiting");
@@ -448,9 +450,11 @@ pub async fn chat_task(
                     Some(ChatCommand::ShowDecisionLog { last_n, respond_to }) => {
                         // Read today's decisions JSONL and return the trailing
                         // `last_n` lines.
-                        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                        let path = std::path::Path::new(decisions::DECISIONS_DIR)
-                            .join(format!("{today}.jsonl"));
+                        let today = chrono::Utc::now().date_naive();
+                        let path = jsonl::day_file_for_date(
+                            std::path::Path::new(decisions::DECISIONS_DIR),
+                            today,
+                        );
                         let result = match std::fs::read_to_string(&path) {
                             Ok(body) => {
                                 let lines: Vec<String> = body.lines().map(str::to_string).collect();
@@ -615,7 +619,7 @@ pub async fn chat_task(
                                 } else {
                                     Ok(())
                                 };
-                                let scrub_outcome = scrub_history_for_player(&uuid, &username);
+                                let scrub_outcome = scrub_history_for_player(&uuid, &username, &history_tx).await;
                                 let outcome = match (player_outcome, scrub_outcome) {
                                     (Ok(()), Ok(stats)) => {
                                         info!(
@@ -624,9 +628,13 @@ pub async fn chat_task(
                                             history_lines_removed = stats.history_lines,
                                             decisions_lines_removed = stats.decisions_lines,
                                             uuid_overlay_entries_removed = stats.overlay_entries,
+                                            malformed_lines_dropped = stats.malformed_dropped,
                                             "[Chat] forget_player completed"
                                         );
                                         write_operator_audit("forget_player", &username, &uuid, "");
+                                        if let Err(e) = runtime_state.save() {
+                                            warn!(error = %e, "[Chat] state save failed after forget_player");
+                                        }
                                         Ok(())
                                     }
                                     (Err(e), _) | (_, Err(e)) => Err(e),
@@ -1850,7 +1858,7 @@ async fn process_event(
                 &decisions::DecisionRecord::new("pacing_drop")
                     .with_sender(&event.sender)
                     .with_event_ts(event.recv_at)
-                    .with_reason(format!("{other:?}")),
+                    .with_reason(other.reason_code()),
             );
             return Ok(());
         }
@@ -1921,6 +1929,7 @@ struct ForgetScrubStats {
     history_lines: u64,
     decisions_lines: u64,
     overlay_entries: u64,
+    malformed_dropped: u64,
 }
 
 /// Walk every JSONL under `data/chat/history/` and `data/chat/decisions/`,
@@ -1929,10 +1938,47 @@ struct ForgetScrubStats {
 /// entries keyed on the same UUID. Each affected file is rewritten via
 /// [`crate::fsutil::write_atomic`] so a crash mid-scrub leaves either
 /// the original or the scrubbed file, never a torn one.
-fn scrub_history_for_player(uuid: &str, username: &str) -> Result<ForgetScrubStats, String> {
+///
+/// **Live-writer coordination.** Before reading the history dir and
+/// after each successful `write_atomic` of a history file, sends a
+/// [`history::HistoryItem::DropCacheAndAck`] to the writer task and
+/// awaits the ack. The first call commits any line currently buffered
+/// in the writer to the OLD inode so our reads see it; the second
+/// makes the writer drop its cached `LineWriter<File>` (now pointing
+/// at an orphaned inode after the `write_atomic` rename) so the next
+/// event lazily re-opens by path against the new inode rather than
+/// silently writing into the orphan until midnight rotation.
+async fn scrub_history_for_player(
+    uuid: &str,
+    username: &str,
+    history_tx: &mpsc::Sender<history::HistoryItem>,
+) -> Result<ForgetScrubStats, String> {
     let mut stats = ForgetScrubStats::default();
     let username_lc = username.to_lowercase();
     let uuid_lc = uuid.to_lowercase();
+    // Best-effort handshake with the live history writer task. Any
+    // per-recv channel issue is logged but does not abort the scrub —
+    // we still want the GDPR rewrite to complete; the worst case is
+    // that whatever line was buffered in the writer at the moment of
+    // the rewrite ends up appended to the new file post-rename, which
+    // is correct behavior (it just won't have been visible to the
+    // pre-rewrite read).
+    async fn drop_cache_and_ack(history_tx: &mpsc::Sender<history::HistoryItem>) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if history_tx
+            .send(history::HistoryItem::DropCacheAndAck { ack: ack_tx })
+            .await
+            .is_err()
+        {
+            warn!(
+                "[Chat] scrub: history channel closed; cannot coordinate drop-cache-and-ack"
+            );
+            return;
+        }
+        if ack_rx.await.is_err() {
+            warn!("[Chat] scrub: writer dropped ack before sending");
+        }
+    }
     for (dir, kind) in [
         (history::HISTORY_DIR, "history"),
         (decisions::DECISIONS_DIR, "decisions"),
@@ -1940,6 +1986,13 @@ fn scrub_history_for_player(uuid: &str, username: &str) -> Result<ForgetScrubSta
         let path = std::path::Path::new(dir);
         if !path.exists() {
             continue;
+        }
+        // Before reading the history dir, flush+drop the live writer's
+        // cached `LineWriter<File>` so any line currently buffered is
+        // committed to the OLD inode and our reads see it. Decisions
+        // writer is a separate fixer's concern — leave it untouched.
+        if kind == "history" {
+            drop_cache_and_ack(history_tx).await;
         }
         let entries = std::fs::read_dir(path)
             .map_err(|e| format!("read_dir({dir}): {e}"))?;
@@ -1951,57 +2004,122 @@ fn scrub_history_for_player(uuid: &str, username: &str) -> Result<ForgetScrubSta
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.ends_with(".uuids.json") {
                 // Sidecar overlay — load JSON object, drop keys/values
-                // matching the UUID.
-                if let Ok(body) = std::fs::read_to_string(&p)
-                    && let Ok(mut v) =
-                        serde_json::from_str::<serde_json::Value>(&body)
-                    && let Some(obj) = v.as_object_mut()
-                {
-                    let before = obj.len();
-                    obj.retain(|_, val| {
-                        val.as_str().is_none_or(|s| !s.eq_ignore_ascii_case(&uuid_lc))
-                    });
-                    let removed = before.saturating_sub(obj.len()) as u64;
-                    if removed > 0 {
-                        let new = serde_json::to_string_pretty(&v)
-                            .map_err(|e| format!("overlay re-serialize: {e}"))?;
-                        crate::fsutil::write_atomic(&p, &new)
-                            .map_err(|e| format!("overlay rewrite: {e}"))?;
-                        stats.overlay_entries =
-                            stats.overlay_entries.saturating_add(removed);
-                    }
+                // matching the UUID. Heavy I/O (read + serialize +
+                // atomic rewrite) is offloaded to a blocking thread so
+                // the chat task isn't stalled while we walk a long
+                // history of overlay sidecars.
+                let p_blk = p.clone();
+                let uuid_lc_blk = uuid_lc.clone();
+                let removed = tokio::task::spawn_blocking(
+                    move || -> Result<u64, String> {
+                        let Ok(body) = std::fs::read_to_string(&p_blk) else {
+                            return Ok(0);
+                        };
+                        let Ok(mut v) =
+                            serde_json::from_str::<serde_json::Value>(&body)
+                        else {
+                            return Ok(0);
+                        };
+                        let Some(obj) = v.as_object_mut() else {
+                            return Ok(0);
+                        };
+                        let before = obj.len();
+                        obj.retain(|_, val| {
+                            val.as_str()
+                                .is_none_or(|s| !s.eq_ignore_ascii_case(&uuid_lc_blk))
+                        });
+                        let removed = before.saturating_sub(obj.len()) as u64;
+                        if removed > 0 {
+                            let new = serde_json::to_string_pretty(&v)
+                                .map_err(|e| format!("overlay re-serialize: {e}"))?;
+                            crate::fsutil::write_atomic(&p_blk, &new)
+                                .map_err(|e| format!("overlay rewrite: {e}"))?;
+                        }
+                        Ok(removed)
+                    },
+                )
+                .await
+                .expect("scrub overlay blocking task panicked")?;
+                if removed > 0 {
+                    stats.overlay_entries =
+                        stats.overlay_entries.saturating_add(removed);
                 }
                 continue;
             }
             if !name.ends_with(".jsonl") {
                 continue;
             }
-            let body = match std::fs::read_to_string(&p) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let mut kept = String::with_capacity(body.len());
-            let mut removed = 0u64;
-            for line in body.lines() {
-                let drop_it = match serde_json::from_str::<serde_json::Value>(line) {
-                    Ok(v) => record_matches_player(&v, &uuid_lc, &username_lc),
-                    Err(_) => false,
-                };
-                if drop_it {
-                    removed = removed.saturating_add(1);
-                    continue;
-                }
-                kept.push_str(line);
-                kept.push('\n');
-            }
+            // Offload the per-file read + line filter + atomic rewrite
+            // to a blocking thread. The closure returns the removed +
+            // malformed counts so the outer async body can update stats
+            // and run the per-file `DropCacheAndAck` /
+            // `invalidate_cache_for` hooks.
+            let p_blk = p.clone();
+            let uuid_lc_blk = uuid_lc.clone();
+            let username_lc_blk = username_lc.clone();
+            let kind_blk = kind;
+            let (removed, malformed) = tokio::task::spawn_blocking(
+                move || -> Result<(u64, u64), String> {
+                    let body = match std::fs::read_to_string(&p_blk) {
+                        Ok(b) => b,
+                        Err(_) => return Ok((0, 0)),
+                    };
+                    let mut kept = String::with_capacity(body.len());
+                    let mut removed = 0u64;
+                    let mut malformed = 0u64;
+                    for line in body.lines() {
+                        let drop_it =
+                            match serde_json::from_str::<serde_json::Value>(line) {
+                                Ok(v) => record_matches_player(
+                                    &v,
+                                    &uuid_lc_blk,
+                                    &username_lc_blk,
+                                ),
+                                Err(_) => {
+                                    // Torn / malformed JSONL: drop rather than
+                                    // keep. Keeping a line that fails parse but
+                                    // textually contains the forgotten player's
+                                    // name is a privacy/compliance hole.
+                                    malformed = malformed.saturating_add(1);
+                                    true
+                                }
+                            };
+                        if drop_it {
+                            removed = removed.saturating_add(1);
+                            continue;
+                        }
+                        kept.push_str(line);
+                        kept.push('\n');
+                    }
+                    if removed > 0 {
+                        crate::fsutil::write_atomic(&p_blk, &kept).map_err(|e| {
+                            format!("rewrite {kind_blk} {}: {e}", p_blk.display())
+                        })?;
+                    }
+                    Ok((removed, malformed))
+                },
+            )
+            .await
+            .expect("scrub jsonl blocking task panicked")?;
+            stats.malformed_dropped = stats.malformed_dropped.saturating_add(malformed);
             if removed > 0 {
-                crate::fsutil::write_atomic(&p, &kept)
-                    .map_err(|e| format!("rewrite {kind} {}: {e}", p.display()))?;
                 if kind == "history" {
                     stats.history_lines = stats.history_lines.saturating_add(removed);
+                    // After the rename, the writer's cached handle (if
+                    // any) is now pointing at an orphaned inode. Tell
+                    // it to drop the cache so the next event re-opens
+                    // by path against the new inode.
+                    drop_cache_and_ack(history_tx).await;
                 } else {
                     stats.decisions_lines =
                         stats.decisions_lines.saturating_add(removed);
+                    // Same orphan-handle hazard as history above: the
+                    // decisions writer caches a `File` clone keyed by
+                    // path, which survives the `write_atomic` rename
+                    // on both Linux and Windows. Drop the entry so the
+                    // next `decisions::write` re-opens the freshly
+                    // renamed file instead of writing into the orphan.
+                    decisions::invalidate_cache_for(&p);
                 }
             }
         }
@@ -2032,11 +2150,11 @@ async fn build_replay_prompt(
     let event_ts_owned = event_ts.to_string();
     let found_line = tokio::task::spawn_blocking(move || -> Option<String> {
         for d in 0..7i64 {
-            let day = (chrono::Utc::now() - chrono::Duration::days(d))
-                .format("%Y-%m-%d")
-                .to_string();
-            let path = std::path::Path::new(history::HISTORY_DIR)
-                .join(format!("{day}.jsonl"));
+            let day = (chrono::Utc::now() - chrono::Duration::days(d)).date_naive();
+            let path = jsonl::day_file_for_date(
+                std::path::Path::new(history::HISTORY_DIR),
+                day,
+            );
             let body = match std::fs::read_to_string(&path) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -2131,6 +2249,8 @@ fn write_operator_audit(action: &str, username: &str, uuid: &str, reason: &str) 
         Ok(mut f) => {
             if let Err(e) = writeln!(f, "{line}") {
                 warn!(error = %e, path = %path.display(), "[Chat] operator_audit append failed");
+            } else if let Err(e) = f.sync_all() {
+                warn!(error = %e, path = %path.display(), "[Chat] operator_audit fsync failed");
             }
         }
         Err(e) => warn!(error = %e, path = %path.display(), "[Chat] operator_audit open failed"),
@@ -2245,10 +2365,12 @@ pub(super) fn extract_first_json_object<'a>(
 /// Read the trailing `n` lines of today's history JSONL. Returns
 /// empty on missing file.
 async fn recent_history_slice_blocking(n: usize) -> String {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Utc::now().date_naive();
     tokio::task::spawn_blocking(move || {
-        let p = std::path::Path::new(history::HISTORY_DIR)
-            .join(format!("{today}.jsonl"));
+        let p = jsonl::day_file_for_date(
+            std::path::Path::new(history::HISTORY_DIR),
+            today,
+        );
         let body = std::fs::read_to_string(&p).unwrap_or_default();
         let mut lines: Vec<&str> = body.lines().collect();
         if lines.len() > n {

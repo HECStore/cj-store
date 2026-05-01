@@ -310,7 +310,7 @@ pub fn count_interactions_for_uuid(
     let today = chrono::Utc::now().date_naive();
     for d in 0..days_back as i64 {
         let date = today - chrono::Duration::days(d);
-        let path = history_dir.join(format!("{}.jsonl", date.format("%Y-%m-%d")));
+        let path = crate::chat::jsonl::day_file_for_date(history_dir, date);
         let body = match fs::read_to_string(&path) {
             Ok(b) => b,
             Err(_) => continue,
@@ -605,7 +605,7 @@ mod tests {
         let target_uuid = "11111111-2222-3333-4444-555555555555";
 
         // Today's file: 2 matching bot_out + 1 non-matching kind.
-        let today_path = history.join(format!("{}.jsonl", today.format("%Y-%m-%d")));
+        let today_path = crate::chat::jsonl::day_file_for_date(&history, today);
         let today_body = format!(
             "{}\n{}\n{}\n",
             // Match by target_uuid.
@@ -630,8 +630,7 @@ mod tests {
         fs::write(&today_path, today_body).unwrap();
 
         // Yesterday's file: 1 matching record.
-        let yest_path =
-            history.join(format!("{}.jsonl", yesterday.format("%Y-%m-%d")));
+        let yest_path = crate::chat::jsonl::day_file_for_date(&history, yesterday);
         let yest_body = format!(
             "{}\n",
             serde_json::json!({
@@ -658,7 +657,7 @@ mod tests {
         fs::create_dir_all(&history).unwrap();
         let today = chrono::Utc::now().date_naive();
         let target_uuid = "11111111-2222-3333-4444-555555555555";
-        let path = history.join(format!("{}.jsonl", today.format("%Y-%m-%d")));
+        let path = crate::chat::jsonl::day_file_for_date(&history, today);
         let body = format!(
             "{}\n{}\n{}\n{}\n",
             serde_json::json!({

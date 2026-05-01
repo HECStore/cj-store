@@ -377,6 +377,12 @@ pub fn capture_today_utc() -> String {
 }
 
 /// Pretty-print an absolute UTC instant for state.json fields.
+///
+/// Intentionally distinct from `chat::jsonl::iso_utc_millis`: this takes
+/// `DateTime<Utc>` and emits second-precision (`SecondsFormat::Secs`) for
+/// state.json, whereas the JSONL helper takes `SystemTime` and emits
+/// millisecond precision. Do not unify without auditing every state.json
+/// reader.
 pub fn iso_utc(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }

@@ -321,6 +321,12 @@ fn is_denied_ipv6(ip: Ipv6Addr) -> bool {
     if (segs[0] & 0xffc0) == 0xfe80 {
         return true;
     }
+    // Deprecated site-local fec0::/10 (RFC 3879). Reserved and not
+    // routable on the public Internet — treat like other non-global
+    // scopes to avoid SSRF surprises.
+    if (segs[0] & 0xffc0) == 0xfec0 {
+        return true;
+    }
     // 64:ff9b::/96 — IPv4/IPv6 well-known prefix; treat conservatively.
     if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0 {
         return true;
@@ -357,6 +363,21 @@ fn is_denied_ipv6(ip: Ipv6Addr) -> bool {
             (segs[1] & 0xff) as u8,
             (segs[2] >> 8) as u8,
             (segs[2] & 0xff) as u8,
+        );
+        if is_denied_ipv4(v4) {
+            return true;
+        }
+    }
+    // 2001::/32 — Teredo (RFC 4380). The last 32 bits hold the client's
+    // IPv4 address, obfuscated by bitwise-NOT. Decode and run through
+    // the v4 deny-list so attackers can't smuggle loopback / metadata
+    // IPs via a Teredo wrapper.
+    if segs[0] == 0x2001 && segs[1] == 0x0000 {
+        let v4 = Ipv4Addr::new(
+            !((segs[6] >> 8) as u8),
+            !((segs[6] & 0xff) as u8),
+            !((segs[7] >> 8) as u8),
+            !((segs[7] & 0xff) as u8),
         );
         if is_denied_ipv4(v4) {
             return true;
@@ -427,8 +448,18 @@ const MAX_REDIRECTS: u8 = 3;
 /// Returns the response body as plain text (stripped of HTML tags) or
 /// an error string suitable for the model's tool_result.
 pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
+    use std::time::{Duration, Instant};
+    // Single overall wall-clock budget for the entire fetch, including all
+    // redirect hops and the per-hop DNS lookup. Without this, DNS could
+    // burn FETCH_TIMEOUT_SECS and each of up to MAX_REDIRECTS+1 hops could
+    // burn another FETCH_TIMEOUT_SECS, blocking the chat task for ~40s.
+    let deadline = Instant::now() + Duration::from_secs(FETCH_TIMEOUT_SECS);
+    let remaining = || deadline.saturating_duration_since(Instant::now());
     let mut current = url.to_string();
     for hop in 0..=MAX_REDIRECTS {
+        if remaining().is_zero() {
+            return Err("fetch deadline exceeded".to_string());
+        }
         let safe = validate_url(&current).map_err(|e| format!("url rejected: {e:?}"))?;
         let host_for_check = match &safe.host {
             Host::Name(n) => n.clone(),
@@ -455,7 +486,7 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
                 // block the chat task for the OS default (often 15 s+ on
                 // Windows) before the reqwest timeout takes over.
                 let addrs: Vec<SocketAddr> = match tokio::time::timeout(
-                    std::time::Duration::from_secs(FETCH_TIMEOUT_SECS),
+                    remaining().min(Duration::from_secs(FETCH_TIMEOUT_SECS)),
                     tokio::net::lookup_host(lookup),
                 )
                 .await
@@ -486,7 +517,7 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         // Build a fresh reqwest client per call: we pin the resolver
         // to the validated IPs, which is a per-host config.
         let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .timeout(remaining().min(Duration::from_secs(FETCH_TIMEOUT_SECS)))
             .redirect(reqwest::redirect::Policy::none())
             .https_only(false); // operator may explicitly fetch http URLs
         for addr in &resolved_addrs {
@@ -686,8 +717,7 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
     } else {
         // Path-relative — resolve against last `/` of the base path.
         let base_path = &after[path_start..];
-        let last_slash = base_path.rfind('/').unwrap_or(0);
-        let prefix = &base_path[..=last_slash];
+        let prefix = if let Some(idx) = base_path.rfind('/') { &base_path[..=idx] } else { "/" };
         Ok(format!("{scheme}{authority}{prefix}{location}"))
     }
 }
@@ -1168,6 +1198,24 @@ mod tests {
     }
 
     #[test]
+    fn teredo_v6_consults_v4_denylist() {
+        // 2001:0:102:304:0:0:f5ff:fffe — Teredo with embedded client v4
+        // ~0xf5fffffe = 10.0.0.1 (private RFC 1918).
+        assert!(is_denied_ip("2001:0:102:304:0:0:f5ff:fffe".parse().unwrap()));
+        // 2001:0:102:304:0:0:f7f7:f7f7 — Teredo with embedded client v4
+        // ~0xf7f7f7f7 = 8.8.8.8, public, allowed (no false positive on
+        // every 2001::/32 address).
+        assert!(!is_denied_ip("2001:0:102:304:0:0:f7f7:f7f7".parse().unwrap()));
+    }
+
+    #[test]
+    fn site_local_v6_denied() {
+        // fec0::/10 is deprecated (RFC 3879) but must still be rejected
+        // since it's non-global scope.
+        assert!(is_denied_ip("fec0::1".parse().unwrap()));
+    }
+
+    #[test]
     fn public_v4_allowed() {
         // Public DNS resolvers — known good test addresses.
         assert!(!is_denied_ip("8.8.8.8".parse().unwrap()));
@@ -1329,6 +1377,22 @@ mod tests {
     fn resolve_relative_relative_path() {
         let r = resolve_relative("https://a.com/path/here", "next").unwrap();
         assert_eq!(r, "https://a.com/path/next");
+    }
+
+    #[test]
+    fn resolve_relative_path_relative_against_pathless_base() {
+        // Regression: a 3xx response with `Location: foo` from a path-less
+        // base URL used to panic — `base_path = ""`, `rfind('/').unwrap_or(0)`
+        // gave 0, then `&base_path[..=0]` sliced `0..1` on an empty string.
+        assert_eq!(
+            resolve_relative("http://example.com", "foo").unwrap(),
+            "http://example.com/foo"
+        );
+        // Same regression class with a query-only relative target.
+        assert_eq!(
+            resolve_relative("http://example.com", "?q=1").unwrap(),
+            "http://example.com/?q=1"
+        );
     }
 
     #[test]

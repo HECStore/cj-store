@@ -176,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chat_in_critical = in_critical_section.clone();
             let chat_bot_username = bot_username.clone();
             let chat_config_for_task = (*chat_config).clone();
+            let chat_history_tx = history_tx.clone();
             let chat_handle = tokio::spawn(async move {
                 let result = tokio::spawn(crate::chat::chat_task(
                     chat_events_rx_for_chat,
@@ -184,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chat_in_critical,
                     chat_bot_username,
                     chat_config_for_task,
+                    chat_history_tx,
                 ))
                 .await;
                 if let Err(e) = result {

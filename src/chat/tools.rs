@@ -806,9 +806,10 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         .get("since_event_ts")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let today = chrono::Utc::now().format("%Y-%m-%d");
-    let path = std::path::Path::new(crate::chat::history::HISTORY_DIR)
-        .join(format!("{today}.jsonl"));
+    let path = crate::chat::jsonl::day_file(
+        std::path::Path::new(crate::chat::history::HISTORY_DIR),
+        std::time::SystemTime::now(),
+    );
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),

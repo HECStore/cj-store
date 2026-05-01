@@ -24,6 +24,20 @@ pub enum SendDecision {
     DeferredCriticalSection,
 }
 
+impl SendDecision {
+    /// Stable snake_case identifier for the audit log. Exhaustive on
+    /// purpose — adding a variant must be a compile error here so the
+    /// reason code stays in sync with the enum.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            SendDecision::Send => "send",
+            SendDecision::DropRateLimited => "drop_rate_limited",
+            SendDecision::DropMinSilence => "drop_min_silence",
+            SendDecision::DeferredCriticalSection => "deferred_critical_section",
+        }
+    }
+}
+
 /// Compute the typing delay for a reply, in milliseconds. The Gaussian
 /// jitter is approximated by Box-Muller from a single uniform sample
 /// supplied by the caller — letting tests inject a deterministic value.
@@ -525,6 +539,25 @@ mod tests {
         // enough since last send" for the min-silence gate.
         let v = recheck_after_sleep(false, false, true, 0, 4, None, 6);
         assert_eq!(v, SendDecision::Send);
+    }
+
+    #[test]
+    fn send_decision_reason_code_maps_each_variant() {
+        // Pinned snake_case audit codes — changing one is a breaking
+        // log-format change and must be intentional.
+        assert_eq!(SendDecision::Send.reason_code(), "send");
+        assert_eq!(
+            SendDecision::DropRateLimited.reason_code(),
+            "drop_rate_limited"
+        );
+        assert_eq!(
+            SendDecision::DropMinSilence.reason_code(),
+            "drop_min_silence"
+        );
+        assert_eq!(
+            SendDecision::DeferredCriticalSection.reason_code(),
+            "deferred_critical_section"
+        );
     }
 
     // ---- strip_ai_tells -------------------------------------------------

@@ -124,10 +124,14 @@ Channels:
   but it never starves durable history.
 - `mpsc::Sender<HistoryItem>` (capacity 4096) — Bot → history-writer task,
   parallel to the broadcast. `HistoryItem` is the private wrapper enum
-  in `chat::history` with two variants: `Inbound(ChatEvent)` for observed
-  chat lines and `BotOut { … }` for lines the bot itself emitted (chat
-  or whisper). **Publishers use `try_send`, never `await`** — a hostile
-  flooder must not be able to block `bot_task` by filling this channel.
+  in `chat::history` with three variants: `Inbound(ChatEvent)` for
+  observed chat lines, `BotOut { … }` for lines the bot itself emitted
+  (chat or whisper), and `DropCacheAndAck { ack }` — a control message
+  used by `scrub_history_for_player` to drop the writer's cached
+  `LineWriter<File>` (so the next event re-opens by path) and ack back,
+  fencing GDPR rewrites against the live writer cache. **Publishers use
+  `try_send`, never `await`** — a hostile flooder must not be able to
+  block `bot_task` by filling this channel.
   Inbound publishers and the bot-out publisher (`enqueue_bot_output`)
   share the same drop discipline: on `try_send` failure the publisher
   increments `state.history_drops_today` and logs at most once per

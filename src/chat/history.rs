@@ -32,6 +32,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::messages::{ChatEvent, ChatEventKind};
@@ -65,6 +66,17 @@ pub enum HistoryItem {
         recv_at: DateTime<Utc>,
         /// True for whisper lines.
         is_whisper: bool,
+    },
+    /// Control message: drop the cached `LineWriter<File>` (its Drop will
+    /// flush any buffered line into the currently-open inode), then ack
+    /// on `ack`. The next event will lazily re-open the per-day file by
+    /// path, picking up any rename that happened in the meantime — used
+    /// by [`crate::chat::scrub_history_for_player`] to coordinate the
+    /// GDPR rewrite-via-`write_atomic` against the live writer cache so
+    /// no event lands in an orphaned inode after the rename. This arm
+    /// must NOT exit the loop.
+    DropCacheAndAck {
+        ack: oneshot::Sender<()>,
     },
 }
 
@@ -123,17 +135,16 @@ struct DroppedRecord<'a> {
 }
 
 /// Format a `SystemTime` as a UTC ISO-8601 string. Centralized so the
-/// `ts` field shape is guaranteed identical across record kinds.
+/// `ts` field shape is guaranteed identical across record kinds. Thin
+/// wrapper over [`crate::chat::jsonl::iso_utc_millis`] so the many call
+/// sites in this module stay terse.
 fn iso_utc(t: SystemTime) -> String {
-    let dt: DateTime<Utc> = t.into();
-    dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    crate::chat::jsonl::iso_utc_millis(t)
 }
 
 /// Compute the per-day filename for `t`.
 fn file_for(t: SystemTime) -> PathBuf {
-    let dt: DateTime<Utc> = t.into();
-    let date = dt.format("%Y-%m-%d");
-    PathBuf::from(HISTORY_DIR).join(format!("{date}.jsonl"))
+    crate::chat::jsonl::day_file(Path::new(HISTORY_DIR), t)
 }
 
 /// Truncate a UTF-8 string to at most `max_bytes`, on a char boundary.
@@ -267,7 +278,7 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// directly against a `NaiveDate` so the writer task can compare/format
 /// without round-tripping through `SystemTime`.
 fn file_for_date(date: NaiveDate) -> PathBuf {
-    PathBuf::from(HISTORY_DIR).join(format!("{}.jsonl", date.format("%Y-%m-%d")))
+    crate::chat::jsonl::day_file_for_date(Path::new(HISTORY_DIR), date)
 }
 
 /// History writer task: drains [`ChatEvent`]s from the publisher-side mpsc
@@ -310,6 +321,17 @@ pub async fn writer_task(mut history_rx: mpsc::Receiver<HistoryItem>, chat_enabl
         // For both variants we go through `encode_with_kind` so the
         // on-disk shape and truncation discipline match exactly.
         let (line, today, kind_dbg, sender_dbg) = match item {
+            HistoryItem::DropCacheAndAck { ack } => {
+                // Drop the cached `LineWriter<File>` — its Drop runs
+                // flush()+close, committing any line currently buffered
+                // in the writer to the OLD inode so a concurrent
+                // `write_atomic` rewrite of the same path sees it. The
+                // next event lazily re-opens the per-day file by path,
+                // picking up the rename. Ack so the requester can proceed.
+                cache = None;
+                let _ = ack.send(());
+                continue;
+            }
             HistoryItem::Inbound(event) => {
                 let line = encode_event(&event, /* is_bot */ false);
                 let today: NaiveDate = DateTime::<Utc>::from(event.recv_at).date_naive();

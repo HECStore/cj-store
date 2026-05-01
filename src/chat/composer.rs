@@ -345,6 +345,44 @@ pub fn is_terminal_turn(content: &[ContentBlock]) -> bool {
 
 use crate::chat::client::{ApiKey, CreateMessageResponse};
 
+/// Heuristic byte-cost charged for each `ToolUse` / `ServerToolUse`
+/// content block when estimating per-request input tokens for the rate
+/// limiter. The actual JSON serialization varies, but a fixed nominal
+/// per-block charge is good enough for the limiter's accounting.
+const TOOL_USE_BYTE_ESTIMATE: u64 = 64;
+
+/// Estimate input-token cost for a request by summing the byte sizes of
+/// system blocks and message content blocks and dividing by ~4
+/// chars-per-token. More precise than a hardcoded constant; less precise
+/// than a real tokenizer. Used to pre-charge the rate limiter before a
+/// composer call.
+fn estimate_request_tokens(req: &CreateMessageRequest) -> u32 {
+    use crate::chat::client::{ContentBlock, SystemBlock};
+    let est_input: u64 = req
+        .system
+        .iter()
+        .map(|b| match b {
+            SystemBlock::Text { text, .. } => text.len() as u64,
+        })
+        .sum::<u64>()
+        + req
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .map(|cb| match cb {
+                ContentBlock::Text { text, .. } => text.len() as u64,
+                ContentBlock::ToolResult { content, .. } => content.len() as u64,
+                ContentBlock::WebSearchToolResult { content, .. } => {
+                    content.to_string().len() as u64
+                }
+                ContentBlock::ToolUse { .. } | ContentBlock::ServerToolUse { .. } => {
+                    TOOL_USE_BYTE_ESTIMATE
+                }
+            })
+            .sum::<u64>();
+    (est_input / 4).max(1) as u32
+}
+
 /// Outcome of [`run_loop`]: either a final text reply (possibly empty,
 /// in which case the bot stays silent), or an error.
 #[derive(Debug)]
@@ -404,33 +442,7 @@ pub async fn run_loop(
         if let Some(limiter) = rate_limiter {
             // Estimate weight as the cumulative system+user byte size /
             // ~4 chars-per-token; more precise than a hardcoded 4_000.
-            let est_input: u64 = req
-                .system
-                .iter()
-                .map(|b| match b {
-                    crate::chat::client::SystemBlock::Text { text, .. } => text.len() as u64,
-                })
-                .sum::<u64>()
-                + req
-                    .messages
-                    .iter()
-                    .flat_map(|m| m.content.iter())
-                    .map(|cb| match cb {
-                        crate::chat::client::ContentBlock::Text { text, .. } => {
-                            text.len() as u64
-                        }
-                        crate::chat::client::ContentBlock::ToolResult { content, .. } => {
-                            content.len() as u64
-                        }
-                        crate::chat::client::ContentBlock::WebSearchToolResult {
-                            content,
-                            ..
-                        } => content.to_string().len() as u64,
-                        crate::chat::client::ContentBlock::ToolUse { .. }
-                        | crate::chat::client::ContentBlock::ServerToolUse { .. } => 64,
-                    })
-                    .sum::<u64>();
-            let est_tokens = (est_input / 4).max(1) as u32;
+            let est_tokens = estimate_request_tokens(&req);
             limiter
                 .acquire(est_tokens)
                 .await
@@ -519,6 +531,14 @@ pub async fn run_loop(
                     );
                     let wrapped = wrap_untrusted("tool_result", nonce, &msg)
                         .unwrap_or_else(|_| "[content withheld]".to_string());
+                    crate::chat::decisions::write(
+                        &crate::chat::decisions::DecisionRecord::new("tool_cap_tripped")
+                            .with_reason("daily_cap_reached_in_run")
+                            .extra("tool", serde_json::Value::from(name.as_str()))
+                            .extra("count", serde_json::Value::from(cap_now))
+                            .extra("max", serde_json::Value::from(cap_max))
+                            .extra("iterations", serde_json::Value::from(iterations)),
+                    );
                     tool_results.push(crate::chat::client::ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
                         content: wrapped,
@@ -571,10 +591,11 @@ pub async fn run_loop(
                     .extra("output_tokens", serde_json::Value::from(output_tokens)),
             );
             let reply = extract_text_reply(&resp.content);
+            // Reuse `hit_cap` semantically: this dead exit is a failure to make forward progress, so route through the orchestrator's cap-handling path rather than masquerading as a clean success.
             return Ok(ComposerRun {
                 reply,
                 iterations,
-                hit_cap: false,
+                hit_cap: true,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
@@ -967,5 +988,47 @@ mod tests {
             },
         ];
         assert!(!is_terminal_turn(&blocks));
+    }
+
+    // ---- estimate_request_tokens ---------------------------------------
+
+    #[test]
+    fn estimate_request_tokens_grows_when_text_appended() {
+        // Build a minimal request with one ~100-char system block and a
+        // single user `Text` block. Token estimate must be non-zero, and
+        // appending another `Text` block must strictly increase it.
+        // We deliberately do NOT exercise `WebSearchToolResult`
+        // re-serialization here — that path is non-stable.
+        let system = vec![SystemBlock::Text {
+            text: "x".repeat(100),
+            cache_control: None,
+        }];
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hello there".to_string(),
+                cache_control: None,
+            }],
+        }];
+        let mut req = CreateMessageRequest {
+            model: "model".to_string(),
+            max_tokens: 128,
+            system,
+            messages,
+            temperature: None,
+            tools: vec![],
+        };
+        let before = estimate_request_tokens(&req);
+        assert!(before > 0, "estimate must be non-zero for non-empty req");
+
+        req.messages[0].content.push(ContentBlock::Text {
+            text: "another chunk of user text".to_string(),
+            cache_control: None,
+        });
+        let after = estimate_request_tokens(&req);
+        assert!(
+            after > before,
+            "appending a Text block must grow the estimate (before={before}, after={after})"
+        );
     }
 }

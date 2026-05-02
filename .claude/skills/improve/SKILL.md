@@ -1,7 +1,7 @@
 ---
 name: improve
 description: |
-  Probabilistic / sampled improvement sweep of the current codebase, project, or app. Begins by asking the user two upfront scoping questions — a minimum severity floor and the areas of focus — both defaulting to "no filter" so accepting defaults reproduces the skill's prior behavior. Then spawns N parallel spotter subagents (default 16) that each sample one random aspect (a function, struct, pattern, doc section, project META, etc.) and propose 1+ concrete improvements with rationale — one big change, several smaller ones, or a mix, depending on what they actually find in the sampled area. Each spotter report is then adversarially challenged by K more subagents (default 2) that read the same target and produce their own adjusted lists — confirming, refining, replacing, or rejecting each proposal, and adding any the spotter missed. Finally synthesizes one deduplicated, prioritized improvement list and EXECUTES every accepted improvement: small in-file edits (up to ~25 edited lines, one or two tightly-coupled files, no caller fan-out) are applied **directly by the main agent inline**, while changes that ripple across files or change observable function behavior are dispatched to **fixer subagents** — running them in parallel when their file sets are provably disjoint, serially otherwise. Improvements may target any file (code, docs, configs, schemas, CI, etc.); after execution a drift-reconciliation sweep fixes anything on either side that no longer matches (code ↔ docs, code ↔ configs, etc.).
+  Probabilistic / sampled improvement sweep of the current codebase, project, or app. Begins by asking the user two upfront scoping questions — a minimum severity floor and the areas of focus — both defaulting to "no filter" so accepting defaults reproduces the skill's prior behavior. Then spawns N parallel spotter subagents (default 16) that each sample one random small cluster (a function plus its closest collaborators, a struct plus its impls, 2-4 related source files, a doc section plus the code it references, a recurring pattern, project META, etc.) and propose 1+ concrete improvements with rationale — one big change, several smaller ones, or a mix, depending on what they actually find. Each spotter report is then adversarially challenged by K more subagents (default 2) that read the same target and produce their own adjusted lists — confirming, refining, replacing, or rejecting each proposal, and adding any the spotter missed. Finally synthesizes one deduplicated, prioritized improvement list and EXECUTES every accepted improvement: small in-file edits (up to ~25 edited lines, one or two tightly-coupled files, no caller fan-out) are applied **directly by the main agent inline**, while changes that ripple across files or change observable function behavior are dispatched to **fixer subagents** — running them in parallel when their file sets are provably disjoint, serially otherwise. Improvements may target any file (code, docs, configs, schemas, CI, etc.); after execution a drift-reconciliation sweep fixes anything on either side that no longer matches (code ↔ docs, code ↔ configs, etc.).
 
   Optional args: `/improve` uses defaults; `/improve N` overrides spotter count (e.g. `/improve 8`); `/improve N K` overrides both spotter count and adversaries-per-spotter (e.g. `/improve 32 4`). Add the literal token `dry` anywhere in the args (e.g. `/improve dry`, `/improve 8 dry`, `/improve 32 4 dry`) to stop after synthesis — produce the prioritized plan but do NOT execute any fixer subagents.
 
@@ -69,14 +69,14 @@ One message, N Agent calls, `subagent_type: general-purpose`, `run_in_background
 **Build the available pool** by filtering the list below using the user's `areas` answer (`all` → full pool; subset → keep entries whose meaning overlaps; always retain the wildcard fallback). If N ≤ pool size, sample N distinct hints; else use each once and fill the rest with the wildcard.
 
 Pool:
-- a specific function or method
-- a specific struct / class / type / enum
-- a specific module or single source file
+- a function or method plus its closest collaborators (1-3 callers, helpers it calls, or its tests)
+- a struct / class / type / enum and the impls / methods / constructors that operate on it
+- a small group of 2-4 related source files (a module with its sub-files, a file plus its tests, sibling files in the same subsystem)
 - a recurring pattern (error handling, logging, validation, retries, ID generation, …)
 - a style/formatting choice (naming, comments, line length, import ordering)
 - a structural decision (folder layout, module boundaries, dependency graph)
 - an architectural approach (concurrency model, state management, data flow)
-- a section of a doc file (README, CLAUDE.md, design doc, ADR)
+- a section of a doc file (README, CLAUDE.md, design doc, ADR) plus the code or configs it references
 - project META: `.gitignore`, CI config, Dockerfile, build scripts, release process
 - dependency choices (what's pulled in, version pinning, alternatives)
 - test coverage / quality for some specific area
@@ -94,9 +94,9 @@ Every subagent in the run (spotter, adversary, fixer, drift) must receive a *uni
 >
 > You are a spotter in a probabilistic project improvement sweep. The repo is at the working directory.
 >
-> **Your category:** `<CATEGORY HINT>`. Find one concrete target area in this category. Pick something specific — not "the codebase" but e.g. "the `reconcile_index` function in src/store/index.rs", or "the README section describing storage layout".
+> **Your category:** `<CATEGORY HINT>`. Find one concrete target area in this category. Aim for a **small focused cluster** you can read carefully in one pass — not "the codebase" and not just one isolated function/struct, but a coherent slice with enough context to spot real issues. Examples: "the `reconcile_index` function plus the 1-2 helpers it calls in src/store/index.rs"; "the `CartItem` struct and the `Cart` impls that operate on it"; "the README's storage-layout section plus the `src/store/mod.rs` it points to"; "the 3 files that make up the pricing subsystem". Roughly 1-3 functions, 1 struct + its impls, or 2-4 related files is the right size — broad enough to surface multiple distinct improvements, narrow enough to read end-to-end.
 >
-> Read the actual code/file. Propose **1 to ~5 concrete, actionable improvements** for this target — one large change, several smaller ones, or a mix, sized to whatever you find. **Quality over quantity.** Don't pad. List proposals in the order you'd want them applied; each must be robust to its siblings succeeding, failing, being deemed obsolete, or running concurrently.
+> Read the actual code/files. Propose **1 to ~5 concrete, actionable improvements** for this cluster — one large change, several smaller ones, or a mix, sized to whatever you find. **Quality over quantity.** Don't pad. Proposals can target different items within the cluster (e.g. one fix in function A, two in struct B, one in the doc that references both). List proposals in the order you'd want them applied; each must be robust to its siblings succeeding, failing, being deemed obsolete, or running concurrently.
 >
 > Return EXACTLY this format and nothing else:
 >

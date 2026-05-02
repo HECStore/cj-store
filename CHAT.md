@@ -35,19 +35,39 @@ everything else can. See [§ Behavioral floor vs. overridable defaults](#behavio
 ## Hard architectural invariants
 
 > [!CAUTION]
-> The chat module **never has a handle into Store state**. It cannot read
-> balances, pending orders, trade history, or pair reserves. The
-> `chat_task` signature carries only `bot_tx`, channels, an
+> The chat module **never has an in-process handle into Store state**.
+> The `chat_task` signature carries only `bot_tx`, channels, an
 > `Arc<AtomicBool>` "busy" flag, and the bot's username — nothing more.
-> A chat reply that mentions a balance or an order is a privacy leak —
-> the bot has no business confirming, in public chat or even in DMs,
-> what another player owns or has traded. Preserve this gap when
-> extending.
+> When `tools_store_enabled = true`, chat can READ
+> `data/trades`, `data/pairs`, and `data/users` via the read-only
+> [`store_view`](src/chat/store_view/) module — independent file scans,
+> no shared state, no callbacks into Store — to answer economy questions
+> ("what's the price of iron?", "did Bob just buy?"). Cross-player
+> balance lookups are doubly gated: `tools_store_enabled` AND
+> `tools_store_cross_player_balance_lookups` (the latter mirrors
+> `cross_player_reads`; balance is more sensitive than memory bullets,
+> so it gets its own switch). Operator status is **never** exposed
+> through chat — `UserView` deliberately does not deserialize that
+> field.
 
 Companion invariants:
 
 - **The chat AI never queues orders.** All trade actions go through
   whisper commands handled by Store.
+- **Chat does not import `crate::types::*`.** The `types` module pulls
+  in `reqwest` (Mojang HTTP), atomic-write helpers, and orphan-deletion
+  semantics in `save_*`. The chat-side [`store_view`](src/chat/store_view/)
+  defines its own minimal `*View` deserializers and CWD-relative path
+  constants so chat reads the same JSON shapes the trade bot writes
+  without inheriting any of those deps. A `#[cfg(test)]` cross-check
+  test serializes a real `Trade` / `Pair` / `User` through the chat
+  views to catch schema drift.
+- **Chat reuses Store's pricing math, not its own.** `get_pair` calls
+  [`store::pricing::indicative_spot_*`](src/store/pricing.rs) so the
+  bot cannot quote a price that contradicts what the store actually
+  charges. Indicative prices are spot prices for tiny orders; real
+  order quotes scale with slippage, and the persona prompt
+  instructs the model to caveat large-order answers.
 - **Whispers are routed once, at the bot layer** ([§ Whisper
   routing](#whisper-routing)) — so a freeform DM never reaches Store and
   gets `"Unknown command"` back while also being answered by chat.
@@ -75,6 +95,8 @@ src/chat/
   decisions.rs      Daily decision-log JSONL writer
   retention.rs      Daily sweep: prune old history/decisions/archives
   pricing.rs        Per-model price table (loaded from data/chat/pricing.json)
+  store_view/       Read-only views over data/trades, data/pairs, data/users
+                    (chat-side deserializers; never imports crate::types::*)
   web.rs            web_fetch SSRF defenses + streaming size enforcement
 ```
 
@@ -844,6 +866,9 @@ model sees agree with the system prompt; the daily caps
 | `search_history`       | `query`, `days_back`                    | Substring search **scoped strictly to `data/chat/history/*.jsonl`**. Returns up to 50 matches, each capped at 1 KB. Streaming line scan via `tokio::task::spawn_blocking`.                     |
 | `web_search`           | (server-managed)                        | Anthropic-managed server tool `web_search_20250305`. Registered as a `Tool::ServerManaged` with `max_uses: 5` per request; the API runs the search itself and returns `server_tool_use` + `web_search_tool_result` blocks alongside the text reply in the SAME response. The composer never dispatches it locally. |
 | `web_fetch`            | `url`                                   | Single GET, max `chat.web_fetch_max_bytes` (default 256 KB), 5 s timeout, plain-text. SSRF + size hardening — see [§ web_fetch hardening](#web_fetch-hardening). Disabled by default.          |
+| `query_trades`         | `limit?`, `item?`, `user_uuid?`, `trade_type?`, `since?` | **Store data, opt-in (`tools_store_enabled`).** Reads `data/trades/*.json` via [`store_view::trade::scan_filtered`](src/chat/store_view/trade.rs). Filename-level prune by `since` BEFORE deserialization (each trade is its own file). Returns newest-first, capped at `tools_store_trade_query_max_results` (default 50). Combined per-turn budget for store tools is `tools_store_max_calls_per_turn` (default 4). |
+| `get_pair`             | `item`                                  | **Store data, opt-in.** Reads `data/pairs/*.json` and returns reserves + indicative spot prices from the same constant-product AMM the trade bot quotes (`store::pricing::indicative_spot_*`). `price_available=false` when reserves are below `MIN_RESERVE_FOR_PRICE`. Path-traversal item names rejected at the chat boundary; lookup is by in-memory map, never via constructed file paths. |
+| `get_user_balance`     | `uuid` XOR `username`                   | **Store data, opt-in.** Reads `data/users/<uuid>.json` via [`store_view::user::UserView`](src/chat/store_view/user.rs) — the `operator` field is **deliberately not deserialized** (so the chat surface cannot leak operator status). `username` resolves through the local index first, then Mojang. Cross-player lookups gated by `tools_store_cross_player_balance_lookups` (default false; mirrors `cross_player_reads`). Balance may be up to `autosave_interval_secs` stale. |
 
 > [!NOTE]
 > **Two `Tool` shapes.** [`Tool::Custom`](src/chat/client.rs) is a

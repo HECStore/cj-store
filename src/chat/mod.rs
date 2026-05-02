@@ -20,6 +20,7 @@ pub mod pricing;
 pub mod reflection;
 pub mod retention;
 pub mod state;
+pub mod store_view;
 pub mod tools;
 pub mod web;
 
@@ -1767,7 +1768,11 @@ async fn process_event(
         config.composer_temperature,
         &snapshot,
         user_content,
-        tools::tool_definitions(config.web_search_enabled, config.web_fetch_enabled),
+        tools::tool_definitions(
+            config.web_search_enabled,
+            config.web_fetch_enabled,
+            config.tools_store_enabled,
+        ),
         cache_ttl,
     );
 
@@ -1795,6 +1800,10 @@ async fn process_event(
         memory_max_inferred_bullets: config.memory_max_inferred_bullets,
         web_fetches_today: runtime_state.web_fetches_today,
         web_fetch_daily_max: config.web_fetch_daily_max,
+        store_tools_enabled: config.tools_store_enabled,
+        store_tool_calls_max_per_turn: config.tools_store_max_calls_per_turn,
+        store_tool_trade_query_max_results: config.tools_store_trade_query_max_results,
+        cross_player_balance_lookups: config.tools_store_cross_player_balance_lookups,
     };
 
     // CHAT.md cancellation contract: between iterations only. We cannot

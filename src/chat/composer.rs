@@ -496,6 +496,10 @@ pub async fn run_loop(
     let mut iterations = 0u32;
     let mut update_self_memory_calls = 0u32;
     let mut web_fetch_calls = 0u32;
+    // Combined per-turn budget for the three store-read tools. The
+    // model is nudged to use them eagerly; without an in-run cap, a
+    // confused turn could fan out into N back-to-back queries.
+    let mut store_tool_calls_this_turn = 0u32;
 
     loop {
         iterations += 1;
@@ -583,11 +587,15 @@ pub async fn run_loop(
                             .saturating_add(web_fetch_calls),
                         tool_ctx.web_fetch_daily_max,
                     ),
+                    "query_trades" | "get_pair" | "get_user_balance" => (
+                        store_tool_calls_this_turn,
+                        tool_ctx.store_tool_calls_max_per_turn,
+                    ),
                     _ => (0, u32::MAX),
                 };
                 if cap_now >= cap_max {
                     let msg = format!(
-                        "{name} daily cap reached ({cap_now}/{cap_max}); will be available tomorrow"
+                        "{name} cap reached ({cap_now}/{cap_max}); will be available later"
                     );
                     let wrapped = wrap_untrusted("tool_result", nonce, &msg)
                         .unwrap_or_else(|_| "[content withheld]".to_string());
@@ -608,10 +616,13 @@ pub async fn run_loop(
                 }
                 let (text, is_err) = crate::chat::tools::dispatch(name, input, tool_ctx).await;
                 if !is_err {
-                    if name == "update_self_memory" {
-                        update_self_memory_calls += 1;
-                    } else if name == "web_fetch" {
-                        web_fetch_calls += 1;
+                    match name.as_str() {
+                        "update_self_memory" => update_self_memory_calls += 1,
+                        "web_fetch" => web_fetch_calls += 1,
+                        "query_trades" | "get_pair" | "get_user_balance" => {
+                            store_tool_calls_this_turn += 1
+                        }
+                        _ => {}
                     }
                 }
                 // Wrap tool result content in `<untrusted_tool_result_*>`

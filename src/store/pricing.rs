@@ -76,6 +76,30 @@ pub fn buy_cost_pure(item_stock: i32, currency_stock: f64, amount: i32, fee: f64
     if cost.is_finite() && cost > 0.0 { Some(cost) } else { None }
 }
 
+/// Indicative spot buy price (currency per 1 item) for chat lookups.
+///
+/// This is the marginal AMM cost of buying a single item. It is the same
+/// value [`buy_cost_pure`] would return at `amount = 1` — share the
+/// underlying math so the chat tool cannot drift from the trade bot's
+/// quoting.
+///
+/// Returns `None` when reserves are below [`MIN_RESERVE_FOR_PRICE`] or any
+/// other condition that would block a real buy quote — chat surfaces this
+/// as `price_available = false` instead of inventing a number.
+///
+/// Caveat: this is a **spot** price. Real order quotes scale with
+/// slippage; chat must label the answer as indicative and refuse to use
+/// it for large-order math.
+pub fn indicative_spot_buy_price(item_stock: i32, currency_stock: f64, fee: f64) -> Option<f64> {
+    buy_cost_pure(item_stock, currency_stock, 1, fee)
+}
+
+/// Indicative spot sell price (currency per 1 item) for chat lookups.
+/// See [`indicative_spot_buy_price`] for the rationale.
+pub fn indicative_spot_sell_price(item_stock: i32, currency_stock: f64, fee: f64) -> Option<f64> {
+    sell_payout_pure(item_stock, currency_stock, 1, fee)
+}
+
 /// Payout in currency for selling `amount` items into `item`'s pair.
 ///
 /// Returns `None` if the item is unknown, reserves are insufficient, fee

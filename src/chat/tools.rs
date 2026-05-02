@@ -283,9 +283,14 @@ use crate::chat::client::Tool;
 use serde_json::{Value, json};
 
 /// Build the full `Tool` list to expose to the composer.
-/// `web_search_enabled` and `web_fetch_enabled` come from `ChatConfig`;
-/// the composer only sees web tools when the operator opts in.
-pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Vec<Tool> {
+/// `web_search_enabled`, `web_fetch_enabled`, and `store_tools_enabled`
+/// come from `ChatConfig`; the composer only sees these tools when the
+/// operator opts in.
+pub fn tool_definitions(
+    web_search_enabled: bool,
+    web_fetch_enabled: bool,
+    store_tools_enabled: bool,
+) -> Vec<Tool> {
     let mut tools = vec![
         Tool::Custom {
             name: "read_my_memory".to_string(),
@@ -381,6 +386,85 @@ pub fn tool_definitions(web_search_enabled: bool, web_fetch_enabled: bool) -> Ve
             }),
         });
     }
+    if store_tools_enabled {
+        tools.push(Tool::Custom {
+            name: "query_trades".to_string(),
+            description: "Search the live trade log. Returns trades newest-first. \
+                          All filters optional; combine to narrow the result. \
+                          Note: balances and pair stocks may be up to ~30s stale due to \
+                          autosave, but `query_trades` is always live (each trade is its \
+                          own file written immediately). Use sparingly; one call per \
+                          economy question is the norm.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "default": 10,
+                        "maximum": 50,
+                        "description": "Max trades to return (1..=50)."
+                    },
+                    "item": {
+                        "type": "string",
+                        "description": "Item id, e.g. 'iron_ingot'. Either form works ('minecraft:iron_ingot' too)."
+                    },
+                    "user_uuid": {
+                        "type": "string",
+                        "description": "Filter to one player's trades (canonical hyphenated UUID)."
+                    },
+                    "trade_type": {
+                        "type": "string",
+                        "description": "Pascal-case: Buy, Sell, AddStock, RemoveStock, DepositBalance, WithdrawBalance, AddCurrency, RemoveCurrency."
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "ISO-UTC timestamp. Only trades strictly newer than this are returned."
+                    }
+                },
+                "required": []
+            }),
+        });
+        tools.push(Tool::Custom {
+            name: "get_pair".to_string(),
+            description: "Look up reserves and indicative spot price for a single \
+                          item. `price_available=false` means reserves are below the \
+                          pricing threshold and the store is not currently quoting. \
+                          Indicative prices are SPOT — real order quotes scale with \
+                          slippage, so do not multiply for large-order math without \
+                          caveating.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "item": {
+                        "type": "string",
+                        "description": "Item id, e.g. 'iron_ingot' or 'minecraft:iron_ingot'."
+                    }
+                },
+                "required": ["item"]
+            }),
+        });
+        tools.push(Tool::Custom {
+            name: "get_user_balance".to_string(),
+            description: "Look up a player's diamond balance. Provide either \
+                          `uuid` or `username` (not both). Cross-player lookups are \
+                          gated; a non-sender lookup returns 'access denied' unless the \
+                          operator opted in. Balance may be up to ~30s stale.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "uuid": {
+                        "type": "string",
+                        "description": "Canonical hyphenated UUID."
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Mojang username; resolved against the local index first, then Mojang."
+                    }
+                },
+                "required": []
+            }),
+        });
+    }
     tools
 }
 
@@ -423,6 +507,30 @@ pub struct ToolContext<'a> {
     pub web_fetches_today: u32,
     /// CHAT.md — `web_fetch` daily budget cap.
     pub web_fetch_daily_max: u32,
+    /// Whether the operator enabled `query_trades` / `get_pair` /
+    /// `get_user_balance`. These tools are off by default — the
+    /// dispatcher refuses to run them when this is false.
+    pub store_tools_enabled: bool,
+    /// Per-turn budget for store-read tools (combined). Prevents the
+    /// model from preflighting store data on every greeting. The
+    /// composer's `run_loop` increments the in-run counter; the
+    /// dispatcher gets a snapshot via this field and short-circuits
+    /// when crossed.
+    pub store_tool_calls_max_per_turn: u32,
+    /// Cap on `query_trades.limit` (the schema also caps at 50; this
+    /// enforces the same bound at the tool boundary as defense-in-depth).
+    pub store_tool_trade_query_max_results: u32,
+    /// Operator opt-in: cross-player balance lookups via
+    /// `get_user_balance`. Mirrors `cross_player_reads`; balance is
+    /// strictly more sensitive (financial state vs. memory bullets), so
+    /// it gets its own switch and defaults to false.
+    pub cross_player_balance_lookups: bool,
+    // Path to `data/` is intentionally NOT threaded through here.
+    // The chat task and the trade bot share a process and a CWD; the
+    // store_view module uses the same CWD-relative constants the
+    // trade bot does (`data/trades`, `data/pairs`, `data/users`).
+    // Adding a parameter would be theatre — there is no second root
+    // to point at and no isolation it could enforce.
 }
 
 /// Dispatch one tool_use block from the model. Returns the textual
@@ -442,6 +550,27 @@ pub async fn dispatch(name: &str, input: &Value, ctx: &ToolContext<'_>) -> (Stri
                 Err("web_fetch is not enabled in config".to_string())
             } else {
                 web_fetch_tool(input, ctx).await
+            }
+        }
+        "query_trades" => {
+            if !ctx.store_tools_enabled {
+                Err("store tools are not enabled in config".to_string())
+            } else {
+                query_trades_tool(input, ctx).await
+            }
+        }
+        "get_pair" => {
+            if !ctx.store_tools_enabled {
+                Err("store tools are not enabled in config".to_string())
+            } else {
+                get_pair_tool(input, ctx).await
+            }
+        }
+        "get_user_balance" => {
+            if !ctx.store_tools_enabled {
+                Err("store tools are not enabled in config".to_string())
+            } else {
+                get_user_balance_tool(input, ctx).await
             }
         }
         // `web_search` is registered as a `Tool::ServerManaged` so the
@@ -961,6 +1090,261 @@ async fn web_fetch_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, 
     crate::chat::web::fetch(url, ctx.web_fetch_max_bytes).await
 }
 
+// ===== Store-read tools ====================================================
+
+/// Validate the shape of a Minecraft item id at the chat boundary.
+///
+/// Mirrors the contract of `crate::types::ItemId::new` without
+/// importing it: ASCII alphanumerics and `_` only, optional leading
+/// `minecraft:` prefix, non-empty after prefix-strip. The point is to
+/// reject path-traversal and shell-meta inputs (`../`, `;`, spaces)
+/// before they reach any filesystem code — `store_view::pair::get`
+/// already refuses to construct a path from input, but the validation
+/// gives the model a clear error message instead of a silent miss.
+fn validate_item_id(item: &str) -> Result<String, &'static str> {
+    let normalized = item.strip_prefix("minecraft:").unwrap_or(item);
+    if normalized.is_empty() {
+        return Err("item id is empty");
+    }
+    if normalized.len() > 64 {
+        return Err("item id exceeds 64 chars");
+    }
+    if !normalized
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err("item id may only contain ASCII alphanumerics and underscore");
+    }
+    Ok(normalized.to_string())
+}
+
+async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let raw_limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10);
+    // Clamp the operator-configured cap into the schema's [1, 50]
+    // hard range, then clamp the model-supplied value into that.
+    let upper = (ctx.store_tool_trade_query_max_results as u64).clamp(1, 50);
+    let limit = raw_limit.clamp(1, upper) as usize;
+
+    let item = input
+        .get("item")
+        .and_then(|v| v.as_str())
+        .map(validate_item_id)
+        .transpose()
+        .map_err(str::to_string)?;
+
+    let user_uuid = match input.get("user_uuid").and_then(|v| v.as_str()) {
+        Some(u) => {
+            validate_uuid(u).map_err(str::to_string)?;
+            Some(u.to_string())
+        }
+        None => None,
+    };
+
+    let trade_type = match input.get("trade_type").and_then(|v| v.as_str()) {
+        Some(t) => {
+            // Whitelist Pascal-case variant names; reject anything else
+            // so the model can't push an arbitrary string into our scan
+            // and silently get zero matches forever.
+            const ALLOWED: &[&str] = &[
+                "Buy",
+                "Sell",
+                "AddStock",
+                "RemoveStock",
+                "DepositBalance",
+                "WithdrawBalance",
+                "AddCurrency",
+                "RemoveCurrency",
+            ];
+            if !ALLOWED.contains(&t) {
+                return Err(format!(
+                    "trade_type must be one of {ALLOWED:?} (got '{t}')",
+                ));
+            }
+            Some(t.to_string())
+        }
+        None => None,
+    };
+
+    let since = match input.get("since").and_then(|v| v.as_str()) {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("since must be RFC3339: {e}"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+
+    let filter = crate::chat::store_view::trade::TradeFilter {
+        since,
+        item,
+        user_uuid,
+        trade_type,
+    };
+
+    let trades = crate::chat::store_view::trade::scan_filtered(filter, limit)
+        .await
+        .map_err(|e| format!("scan_filtered: {e}"))?;
+
+    // Compact JSON keeps the byte cap honest. Cap output at
+    // `history_max_bytes` (the same cap `read_today_history` uses) so
+    // a query that matches every trade in a 50K-trade history can't
+    // blow the model's context.
+    let mut serialized: Vec<serde_json::Value> = Vec::with_capacity(trades.len());
+    for t in &trades {
+        serialized.push(serde_json::json!({
+            "trade_type": t.trade_type,
+            "item": t.item,
+            "amount": t.amount,
+            "amount_currency": t.amount_currency,
+            "user_uuid": t.user_uuid,
+            "timestamp": t.timestamp.to_rfc3339(),
+        }));
+    }
+    let mut body = serde_json::to_string(&serialized)
+        .map_err(|e| format!("serialize trades: {e}"))?;
+    if body.len() > ctx.history_max_bytes {
+        // Truncate by re-serializing the first N entries that fit.
+        let mut acc: Vec<serde_json::Value> = Vec::new();
+        for entry in &serialized {
+            let candidate = serde_json::to_string(&acc).unwrap_or_default();
+            if candidate.len() > ctx.history_max_bytes {
+                break;
+            }
+            acc.push(entry.clone());
+        }
+        if acc.len() > 1 {
+            acc.pop();
+        }
+        body = serde_json::to_string(&serde_json::json!({
+            "truncated": true,
+            "max_bytes": ctx.history_max_bytes,
+            "returned": acc.len(),
+            "trades": acc,
+        }))
+        .unwrap_or_else(|_| "[truncated]".to_string());
+    }
+    Ok(body)
+}
+
+async fn get_pair_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
+    let _ = ctx; // currently unused — kept on the signature for symmetry
+    let item_raw = input
+        .get("item")
+        .and_then(|v| v.as_str())
+        .ok_or("item is required")?;
+    let item = validate_item_id(item_raw).map_err(str::to_string)?;
+
+    let pair = crate::chat::store_view::pair::get(&item).await;
+    let Some(p) = pair else {
+        return Ok(serde_json::json!({
+            "found": false,
+            "item": item,
+        })
+        .to_string());
+    };
+
+    // Pricing math from the same module the trade bot quotes from —
+    // hard requirement 3 (no flat-ratio price). The chat tool treats
+    // `None` as "below MIN_RESERVE_FOR_PRICE; not currently quoting"
+    // rather than inventing a number.
+    let fee = read_store_fee_or_default();
+    let buy_price =
+        crate::store::pricing::indicative_spot_buy_price(p.item_stock, p.currency_stock, fee);
+    let sell_price =
+        crate::store::pricing::indicative_spot_sell_price(p.item_stock, p.currency_stock, fee);
+    let price_available = buy_price.is_some() && sell_price.is_some();
+
+    Ok(serde_json::json!({
+        "found": true,
+        "item": p.item,
+        "stack_size": p.stack_size,
+        "item_stock": p.item_stock,
+        "currency_stock": p.currency_stock,
+        "price_available": price_available,
+        "indicative_buy_price": buy_price,
+        "indicative_sell_price": sell_price,
+        "fee": fee,
+        "note": "indicative prices are spot; real order quotes scale with slippage",
+    })
+    .to_string())
+}
+
+/// Best-effort load of the store fee from `data/config.json`. We
+/// re-read on every call (chat is the cold path, the trade bot
+/// reloads on its own), and fall back to the canonical default if
+/// anything fails so a missing config doesn't break the price quote.
+fn read_store_fee_or_default() -> f64 {
+    let body = std::fs::read_to_string("data/config.json").unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    v.get("fee")
+        .and_then(|x| x.as_f64())
+        .filter(|f| f.is_finite() && (0.0..=1.0).contains(f))
+        .unwrap_or(0.125)
+}
+
+async fn get_user_balance_tool(
+    input: &Value,
+    ctx: &ToolContext<'_>,
+) -> Result<String, String> {
+    let uuid_arg = input.get("uuid").and_then(|v| v.as_str());
+    let username_arg = input.get("username").and_then(|v| v.as_str());
+    if uuid_arg.is_some() == username_arg.is_some() {
+        return Err("require exactly one of uuid or username".to_string());
+    }
+
+    let target_uuid = if let Some(u) = uuid_arg {
+        validate_uuid(u).map_err(str::to_string)?;
+        u.to_string()
+    } else if let Some(name) = username_arg {
+        validate_username_shape(name).map_err(str::to_string)?;
+        // Try the local index first — it is keyed by lowercased
+        // username and avoids a Mojang round-trip for known players.
+        let local_hit = crate::chat::memory::load_or_rebuild_index().ok().and_then(|idx| {
+            idx.by_lower_username
+                .get(&name.to_lowercase())
+                .cloned()
+        });
+        match local_hit {
+            Some(u) => u,
+            None => crate::mojang::resolve_user_uuid(name)
+                .await
+                .map_err(|e| format!("resolve {name}: {e}"))?,
+        }
+    } else {
+        unreachable!("exactly-one-of guard above");
+    };
+
+    // Cross-player gate: balance is strictly more sensitive than the
+    // memory bullets `cross_player_reads` covers. Default-deny.
+    if !target_uuid.eq_ignore_ascii_case(ctx.sender_uuid) && !ctx.cross_player_balance_lookups {
+        return Err("access denied (cross-player balance lookups disabled)".to_string());
+    }
+
+    let user = crate::chat::store_view::user::get_by_uuid(&target_uuid).await;
+    let Some(u) = user else {
+        return Ok(serde_json::json!({
+            "found": false,
+            "uuid": target_uuid,
+        })
+        .to_string());
+    };
+
+    // The `UserView` struct does not deserialize `operator`, so even
+    // serializing the whole thing would not leak it. Build the
+    // response by hand anyway — the explicit shape documents the
+    // contract and survives a future `serde(flatten)` mistake.
+    Ok(serde_json::json!({
+        "found": true,
+        "uuid": u.uuid,
+        "username": u.username,
+        "balance": u.balance,
+    })
+    .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,6 +1620,10 @@ mod tests {
             memory_max_inferred_bullets: 30,
             web_fetches_today: 0,
             web_fetch_daily_max: 50,
+            store_tools_enabled: false,
+            store_tool_calls_max_per_turn: 4,
+            store_tool_trade_query_max_results: 50,
+            cross_player_balance_lookups: false,
         }
     }
 
@@ -1474,5 +1862,140 @@ mod tests {
                 .unwrap_or("")
                 .contains("web_fetch daily budget exhausted")
         );
+    }
+
+    // ---- store-tool gates ----------------------------------------------
+
+    #[test]
+    fn validate_item_id_rejects_traversal_and_meta() {
+        // Any input that would let the path layer escape `data/pairs/`
+        // must be rejected at the chat boundary. `store_view::pair::get`
+        // never constructs a path from input either, so this is
+        // belt-and-braces.
+        for bad in [
+            "../../etc/passwd",
+            "diamond/bad",
+            "diamond\\bad",
+            "diamond bad",
+            "",
+            "minecraft:",
+            "diamond;rm -rf /",
+            "../diamond",
+        ] {
+            assert!(
+                validate_item_id(bad).is_err(),
+                "should reject: {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_item_id_accepts_canonical_forms() {
+        for ok in [
+            "diamond",
+            "iron_ingot",
+            "minecraft:diamond",
+            "minecraft:iron_ingot",
+            "log_2",
+            "ENCHANTED_GOLDEN_APPLE",
+        ] {
+            assert!(
+                validate_item_id(ok).is_ok(),
+                "should accept: {ok:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn store_tools_disabled_returns_explicit_error() {
+        // Default ctx has store_tools_enabled=false; dispatch must
+        // refuse without ever reaching the store_view layer.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ctx = test_ctx("11111111-2222-3333-4444-555555555555");
+        let input = json!({});
+        let (out, is_err) = rt.block_on(dispatch("query_trades", &input, &ctx));
+        assert!(is_err);
+        assert!(
+            out.contains("not enabled"),
+            "expected 'not enabled' error, got: {out}",
+        );
+    }
+
+    #[test]
+    fn get_user_balance_rejects_cross_player_when_gate_off() {
+        // Sender is A, target is B, gate is off → "access denied".
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut ctx = test_ctx("11111111-2222-3333-4444-aaaaaaaaaaaa");
+        ctx.store_tools_enabled = true;
+        ctx.cross_player_balance_lookups = false;
+        let input = json!({"uuid": "22222222-3333-4444-5555-bbbbbbbbbbbb"});
+        let res = rt.block_on(get_user_balance_tool(&input, &ctx));
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().contains("access denied"),
+            "wrong error",
+        );
+    }
+
+    #[test]
+    fn get_user_balance_requires_exactly_one_of_uuid_or_username() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut ctx = test_ctx("11111111-2222-3333-4444-aaaaaaaaaaaa");
+        ctx.store_tools_enabled = true;
+        // Both supplied → error.
+        let input = json!({
+            "uuid": "11111111-2222-3333-4444-aaaaaaaaaaaa",
+            "username": "alice"
+        });
+        let res = rt.block_on(get_user_balance_tool(&input, &ctx));
+        assert!(res.is_err());
+        // Neither supplied → error.
+        let input = json!({});
+        let res = rt.block_on(get_user_balance_tool(&input, &ctx));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn query_trades_rejects_unknown_trade_type() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut ctx = test_ctx("11111111-2222-3333-4444-aaaaaaaaaaaa");
+        ctx.store_tools_enabled = true;
+        let input = json!({"trade_type": "nonsense"});
+        let res = rt.block_on(query_trades_tool(&input, &ctx));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("trade_type"));
+    }
+
+    #[test]
+    fn query_trades_rejects_invalid_since() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut ctx = test_ctx("11111111-2222-3333-4444-aaaaaaaaaaaa");
+        ctx.store_tools_enabled = true;
+        let input = json!({"since": "not a timestamp"});
+        let res = rt.block_on(query_trades_tool(&input, &ctx));
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("RFC3339"));
+    }
+
+    #[test]
+    fn get_pair_rejects_invalid_item() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut ctx = test_ctx("11111111-2222-3333-4444-aaaaaaaaaaaa");
+        ctx.store_tools_enabled = true;
+        let input = json!({"item": "../../etc/passwd"});
+        let res = rt.block_on(get_pair_tool(&input, &ctx));
+        assert!(res.is_err(), "expected error, got: {res:?}");
     }
 }

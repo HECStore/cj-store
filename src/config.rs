@@ -180,6 +180,19 @@ pub struct ChatConfig {
     #[serde(default)]
     pub cross_player_reads: bool,
 
+    // Store-read tools (query_trades / get_pair / get_user_balance).
+    // Disabled by default — operators opt in. Cross-player balance
+    // lookups get their own switch because balance is more sensitive
+    // than the per-player memory bullets `cross_player_reads` covers.
+    #[serde(default)]
+    pub tools_store_enabled: bool,
+    #[serde(default = "default_chat_tools_store_max_calls_per_turn")]
+    pub tools_store_max_calls_per_turn: u32,
+    #[serde(default = "default_chat_tools_store_trade_query_max_results")]
+    pub tools_store_trade_query_max_results: u32,
+    #[serde(default)]
+    pub tools_store_cross_player_balance_lookups: bool,
+
     // Reflection
     #[serde(default = "default_chat_reflection_max_pending")]
     pub reflection_max_pending: u32,
@@ -330,6 +343,11 @@ impl Default for ChatConfig {
             web_fetch_enabled: false,
             web_search_enabled: default_chat_web_search_enabled(),
             cross_player_reads: false,
+            tools_store_enabled: false,
+            tools_store_max_calls_per_turn: default_chat_tools_store_max_calls_per_turn(),
+            tools_store_trade_query_max_results:
+                default_chat_tools_store_trade_query_max_results(),
+            tools_store_cross_player_balance_lookups: false,
             reflection_max_pending: default_chat_reflection_max_pending(),
             reflection_idle_trigger_secs: default_chat_reflection_idle_trigger_secs(),
             reflection_min_interval_secs: default_chat_reflection_min_interval_secs(),
@@ -430,6 +448,8 @@ fn default_chat_proactive_min_secs_since_bot() -> u32 { 30 }
 fn default_chat_proactive_min_secs_since_partner() -> u32 { 15 }
 fn default_chat_proactive_max_secs_since_partner() -> u32 { 300 }
 fn default_chat_proactive_probability_pct() -> u32 { 20 }
+fn default_chat_tools_store_max_calls_per_turn() -> u32 { 4 }
+fn default_chat_tools_store_trade_query_max_results() -> u32 { 50 }
 
 impl ChatConfig {
     /// Validate the chat-config invariants. Returns a single human-readable
@@ -531,6 +551,25 @@ impl ChatConfig {
             errors.push(format!(
                 "active_hours_utc components must be in [0, 24) (got {start}, {end})"
             ));
+        }
+
+        // Store-read tools. When the operator opts in, both the
+        // per-turn budget and the trade-query result cap MUST be
+        // positive — a 0 silently disables every call and the model
+        // gets a confusing "cap reached (0/0)" on every attempt.
+        if self.tools_store_enabled {
+            if self.tools_store_max_calls_per_turn == 0 {
+                errors.push("tools_store_max_calls_per_turn must be > 0 when tools_store_enabled".to_string());
+            }
+            if self.tools_store_trade_query_max_results == 0 {
+                errors.push("tools_store_trade_query_max_results must be > 0 when tools_store_enabled".to_string());
+            }
+            if self.tools_store_trade_query_max_results > 50 {
+                errors.push(format!(
+                    "tools_store_trade_query_max_results must be <= 50 (the schema cap; got {})",
+                    self.tools_store_trade_query_max_results,
+                ));
+            }
         }
 
         // Proactive thread continuation. Most fields are bounded by

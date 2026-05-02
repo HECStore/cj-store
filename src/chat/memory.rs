@@ -29,6 +29,8 @@ use tracing::{debug, info, warn};
 
 use crate::fsutil::write_atomic;
 
+const LOG_TARGET: &str = "cj_store::chat::memory";
+
 pub const CHAT_DIR: &str = "data/chat";
 pub const PLAYERS_DIR: &str = "data/chat/players";
 pub const GLOBAL_MEMORY: &str = "data/chat/memory.md";
@@ -98,10 +100,10 @@ pub fn ensure_player_file(uuid: &str, username: &str) -> io::Result<()> {
     if let Ok(mut idx) = load_or_rebuild_index() {
         idx.insert(username, uuid);
         if let Err(e) = save_index(&idx) {
-            warn!(error = %e, "failed to persist _index.json after ensure_player_file");
+            warn!(target: LOG_TARGET, error = %e, "failed to persist _index.json after ensure_player_file");
         }
     }
-    debug!(uuid = uuid, username = username, "created new per-player file");
+    debug!(target: LOG_TARGET, uuid = uuid, username = username, "created new per-player file");
     Ok(())
 }
 
@@ -200,7 +202,7 @@ pub fn rebuild_index() -> io::Result<PlayerIndex> {
             Ok(b) => b,
             Err(e) => {
                 skipped += 1;
-                warn!(path = %path.display(), error = %e, "skipping unreadable player file");
+                warn!(target: LOG_TARGET, path = %path.display(), error = %e, "skipping unreadable player file");
                 continue;
             }
         };
@@ -208,12 +210,13 @@ pub fn rebuild_index() -> io::Result<PlayerIndex> {
         let username = first_line.strip_prefix("# ").unwrap_or("").trim();
         if username.is_empty() {
             skipped += 1;
-            warn!(path = %path.display(), "skipping player file with no `# <username>` header");
+            warn!(target: LOG_TARGET, path = %path.display(), "skipping player file with no `# <username>` header");
             continue;
         }
         idx.insert(username, stem);
     }
     info!(
+        target: LOG_TARGET,
         loaded = idx.by_lower_username.len(),
         skipped = skipped,
         "rebuilt player index"
@@ -382,17 +385,17 @@ pub fn load_or_rebuild_index() -> io::Result<PlayerIndex> {
         Ok(s) => match serde_json::from_str::<PlayerIndex>(&s) {
             Ok(idx) if idx.version == INDEX_VERSION => Ok(idx),
             Ok(_) | Err(_) => {
-                warn!(path = %path.display(), "player index unparsable or wrong version, rebuilding");
+                warn!(target: LOG_TARGET, path = %path.display(), "player index unparsable or wrong version, rebuilding");
                 let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
                 let bad = path.with_extension(format!("json.corrupt-{stamp}"));
                 if let Err(e) = fs::rename(path, &bad) {
-                    warn!(error = %e, "failed to set aside corrupt _index.json before rebuild");
+                    warn!(target: LOG_TARGET, error = %e, "failed to set aside corrupt _index.json before rebuild");
                 }
                 rebuild_index()
             }
         },
         Err(e) => {
-            warn!(error = %e, "failed to read _index.json, rebuilding");
+            warn!(target: LOG_TARGET, error = %e, "failed to read _index.json, rebuilding");
             rebuild_index()
         }
     }

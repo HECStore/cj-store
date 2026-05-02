@@ -18,6 +18,8 @@ use std::path::Path;
 
 use tracing::{debug, info};
 
+const LOG_TARGET: &str = "cj_store::chat::persona";
+
 pub const PERSONA_FILE: &str = "data/chat/persona.md";
 /// Persona seed lives in its own file, separate from `persona.md`, so it
 /// cannot ride into the trusted prompt block. Only a
@@ -94,11 +96,11 @@ pub fn validate_seed(seed: &str) -> Result<(), String> {
 pub fn load() -> io::Result<Option<String>> {
     let p = Path::new(PERSONA_FILE);
     if !p.exists() {
-        debug!(path = %p.display(), "persona file missing");
+        debug!(target: LOG_TARGET, path = %p.display(), "persona file missing");
         return Ok(None);
     }
     let body = fs::read_to_string(p)?;
-    info!(path = %p.display(), bytes = body.len(), "persona loaded");
+    info!(target: LOG_TARGET, path = %p.display(), bytes = body.len(), "persona loaded");
     Ok(Some(body))
 }
 
@@ -350,7 +352,7 @@ pub async fn generate(
         .map_err(|e| format!("write persona.md: {e}"))?;
     crate::fsutil::write_atomic(PERSONA_SEED_FILE, seed)
         .map_err(|e| format!("write persona.seed: {e}"))?;
-    info!(bytes = composed.len(), "persona generated and persisted");
+    info!(target: LOG_TARGET, bytes = composed.len(), "persona generated and persisted");
     Ok(composed)
 }
 

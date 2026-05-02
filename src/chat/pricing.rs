@@ -18,6 +18,8 @@ use tracing::{info, warn};
 
 use crate::fsutil::write_atomic;
 
+const LOG_TARGET: &str = "cj_store::chat::pricing";
+
 pub const PRICING_FILE: &str = "data/chat/pricing.json";
 
 /// Tracks model names that `usd_for_call` has already warned about, so the
@@ -101,7 +103,7 @@ impl PricingTable {
             let table = Self::default_table();
             let json = serde_json::to_string_pretty(&table)?;
             write_atomic(path, &json)?;
-            info!(path = %path.display(), "created default pricing.json");
+            info!(target: LOG_TARGET, path = %path.display(), "created default pricing.json");
             return Ok(table);
         }
         let s = fs::read_to_string(path)?;
@@ -120,6 +122,7 @@ impl PricingTable {
                         || cr < 0.0
                     {
                         warn!(
+                            target: LOG_TARGET,
                             path = %path.display(),
                             model = %name,
                             "pricing.json has invalid rates (non-finite or negative); using built-in defaults (file unchanged)"
@@ -131,6 +134,7 @@ impl PricingTable {
             }
             Ok(t) if t.version > VERSION => {
                 warn!(
+                    target: LOG_TARGET,
                     path = %path.display(),
                     found = t.version,
                     expected = VERSION,
@@ -140,6 +144,7 @@ impl PricingTable {
             }
             Ok(t) => {
                 warn!(
+                    target: LOG_TARGET,
                     path = %path.display(),
                     found = t.version,
                     expected = VERSION,
@@ -149,6 +154,7 @@ impl PricingTable {
             }
             Err(e) => {
                 warn!(
+                    target: LOG_TARGET,
                     path = %path.display(),
                     error = %e,
                     "pricing.json parse error; using built-in defaults (file unchanged)"
@@ -207,6 +213,7 @@ impl PricingTable {
                 && set.insert(model.to_string())
             {
                 warn!(
+                    target: LOG_TARGET,
                     model = %model,
                     "pricing: unknown model, billing as $0.00 — add it to data/chat/pricing.json to enforce the daily USD cap"
                 );

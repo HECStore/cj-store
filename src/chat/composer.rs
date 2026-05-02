@@ -512,7 +512,7 @@ pub async fn run_loop(
                 .await
                 .map_err(|e| format!("composer rate limited: {e}"))?;
         }
-        let resp: CreateMessageResponse =
+        let mut resp: CreateMessageResponse =
             crate::chat::client::call_with_retry(api_key, &req, use_extended_cache)
                 .await
                 .map_err(|e| format!("composer call failed: {e}"))?;
@@ -541,6 +541,21 @@ pub async fn run_loop(
         if iterations >= max_iterations {
             // Best-effort recovery — take any text alongside tool calls.
             let reply = extract_text_reply(&resp.content);
+            let had_tool_blocks = resp
+                .content
+                .iter()
+                .any(|b| matches!(b, crate::chat::client::ContentBlock::ToolUse { .. }));
+            // Structured signal for operators. The orchestrator's
+            // `composer` decision record (see chat/mod.rs at the run_loop
+            // call site) already persists `hit_cap` to disk, so this is
+            // an in-process tracing emission only — no duplicate
+            // decisions::write.
+            tracing::info!(
+                iterations,
+                output_tokens,
+                had_tool_blocks,
+                "composer hit max_iterations cap"
+            );
             return Ok(ComposerRun {
                 reply,
                 iterations,
@@ -574,45 +589,47 @@ pub async fn run_loop(
                 // exceeded by up to `max_iterations`. Combine the
                 // snapshot with the in-run tally and short-circuit
                 // before dispatch when the live total would breach.
-                let (cap_now, cap_max) = match name.as_str() {
-                    "update_self_memory" => (
+                let cap = match name.as_str() {
+                    "update_self_memory" => Some((
                         tool_ctx
                             .update_self_memory_today
                             .saturating_add(update_self_memory_calls),
                         tool_ctx.update_self_memory_max_per_day,
-                    ),
-                    "web_fetch" => (
+                    )),
+                    "web_fetch" => Some((
                         tool_ctx
                             .web_fetches_today
                             .saturating_add(web_fetch_calls),
                         tool_ctx.web_fetch_daily_max,
-                    ),
-                    "query_trades" | "get_pair" | "get_user_balance" => (
+                    )),
+                    "query_trades" | "get_pair" | "get_user_balance" => Some((
                         store_tool_calls_this_turn,
                         tool_ctx.store_tool_calls_max_per_turn,
-                    ),
-                    _ => (0, u32::MAX),
+                    )),
+                    _ => None,
                 };
-                if cap_now >= cap_max {
-                    let msg = format!(
-                        "{name} cap reached ({cap_now}/{cap_max}); will be available later"
-                    );
-                    let wrapped = wrap_untrusted("tool_result", nonce, &msg)
-                        .unwrap_or_else(|_| "[content withheld]".to_string());
-                    crate::chat::decisions::write(
-                        &crate::chat::decisions::DecisionRecord::new("tool_cap_tripped")
-                            .with_reason("daily_cap_reached_in_run")
-                            .extra("tool", serde_json::Value::from(name.as_str()))
-                            .extra("count", serde_json::Value::from(cap_now))
-                            .extra("max", serde_json::Value::from(cap_max))
-                            .extra("iterations", serde_json::Value::from(iterations)),
-                    );
-                    tool_results.push(crate::chat::client::ContentBlock::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: wrapped,
-                        is_error: true,
-                    });
-                    continue;
+                if let Some((cap_now, cap_max)) = cap {
+                    if cap_now >= cap_max {
+                        let msg = format!(
+                            "{name} cap reached ({cap_now}/{cap_max}); will be available later"
+                        );
+                        let wrapped = wrap_untrusted("tool_result", nonce, &msg)
+                            .unwrap_or_else(|_| "[content withheld]".to_string());
+                        crate::chat::decisions::write(
+                            &crate::chat::decisions::DecisionRecord::new("tool_cap_tripped")
+                                .with_reason("daily_cap_reached_in_run")
+                                .extra("tool", serde_json::Value::from(name.as_str()))
+                                .extra("count", serde_json::Value::from(cap_now))
+                                .extra("max", serde_json::Value::from(cap_max))
+                                .extra("iterations", serde_json::Value::from(iterations)),
+                        );
+                        tool_results.push(crate::chat::client::ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: wrapped,
+                            is_error: true,
+                        });
+                        continue;
+                    }
                 }
                 let (text, is_err) = crate::chat::tools::dispatch(name, input, tool_ctx).await;
                 if !is_err {
@@ -644,45 +661,25 @@ pub async fn run_loop(
                 });
             }
         }
-        if tool_results.is_empty() {
-            // Defensive: `is_terminal_turn` returned false (there's at
-            // least one client `ToolUse` in `resp.content`) but no
-            // dispatch fired. This shouldn't happen — every `ToolUse`
-            // either dispatches or is rejected by the daily-cap branch
-            // (which still pushes a `ToolResult`). Most likely a future
-            // change adds a third skip path; surface it loudly via a
-            // `composer_drop` decision so the silent-exit can't hide.
-            tracing::warn!(
-                iterations,
-                output_tokens,
-                "composer non-terminal turn produced no tool_results — exiting with whatever text we have"
-            );
-            crate::chat::decisions::write(
-                &crate::chat::decisions::DecisionRecord::new("composer_drop")
-                    .with_reason("tool_results_empty_on_non_terminal")
-                    .extra("iterations", serde_json::Value::from(iterations))
-                    .extra("output_tokens", serde_json::Value::from(output_tokens)),
-            );
-            let reply = extract_text_reply(&resp.content);
-            // Reuse `hit_cap` semantically: this dead exit is a failure to make forward progress, so route through the orchestrator's cap-handling path rather than masquerading as a clean success.
-            return Ok(ComposerRun {
-                reply,
-                iterations,
-                hit_cap: true,
-                input_tokens,
-                output_tokens,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-                update_self_memory_calls,
-                web_fetch_calls,
-            });
-        }
+        // `is_terminal_turn` returned false, so at least one
+        // `ContentBlock::ToolUse` is present. Both branches inside the
+        // for-loop above (cap-trip and dispatch) push a `ToolResult`, so
+        // `tool_results` cannot be empty here. A `debug_assert` surfaces
+        // any future regression (e.g. someone adds a third skip path) in
+        // tests rather than silently routing through `hit_cap=true`.
+        debug_assert!(
+            !tool_results.is_empty(),
+            "non-terminal turn must produce at least one tool_result"
+        );
 
         // Append the assistant turn AND the tool-result user turn so
-        // the next call has full context.
+        // the next call has full context. `resp` is local and
+        // `resp.content` isn't read after this point, so move the vec
+        // out instead of cloning — saves tens of KB per iteration on
+        // long tool loops carrying web-fetch payloads.
         req.messages.push(crate::chat::client::Message {
             role: crate::chat::client::Role::Assistant,
-            content: resp.content.clone(),
+            content: std::mem::take(&mut resp.content),
         });
         req.messages.push(crate::chat::client::Message {
             role: crate::chat::client::Role::User,

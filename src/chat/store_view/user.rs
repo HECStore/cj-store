@@ -45,14 +45,26 @@ pub async fn get_by_uuid(uuid: &str) -> Option<UserView> {
 
 /// Inner sync helper for [`get_by_uuid`] — exposed so tests can target
 /// a temp dir.
+///
+/// Retries once on either I/O or parse failure to absorb the
+/// atomic-rename window: `write_atomic` saves user files via
+/// tmp-file + rename, so a chat-side read can land mid-rename and see
+/// either a transient `NotFound` or (rarely) a half-written body. The
+/// retry is sleepless — by the second attempt the rename has settled.
 pub fn get_by_uuid_in_dir(dir: &std::path::Path, uuid: &str) -> Option<UserView> {
     let path = dir.join(format!("{uuid}.json"));
-    // One retry to absorb the write_atomic rename window.
-    let mut body = std::fs::read_to_string(&path).ok()?;
-    if serde_json::from_str::<UserView>(&body).is_err() {
-        body = std::fs::read_to_string(&path).ok()?;
+    for attempt in 0..2 {
+        match std::fs::read_to_string(&path) {
+            Ok(body) => match serde_json::from_str::<UserView>(&body) {
+                Ok(u) => return Some(u),
+                Err(_) if attempt == 0 => continue,
+                Err(_) => return None,
+            },
+            Err(_) if attempt == 0 => continue,
+            Err(_) => return None,
+        }
     }
-    serde_json::from_str(&body).ok()
+    None
 }
 
 #[cfg(test)]

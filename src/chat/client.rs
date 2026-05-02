@@ -33,6 +33,7 @@
 //! (composer in Phase 4, classifier-call in Phase 4) are where
 //! integration coverage will land.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -470,7 +471,7 @@ pub async fn send_one(
         401 => {
             tracing::error!(
                 status = %status,
-                body = %safe,
+                body = %truncate_log_body(&safe, 1024),
                 "[Chat] anthropic auth failed (401)"
             );
             Err(ClientError::Auth)
@@ -479,7 +480,7 @@ pub async fn send_one(
             tracing::error!(
                 status = %status,
                 model = %request_to_send.model,
-                body = %safe,
+                body = %truncate_log_body(&safe, 1024),
                 "[Chat] anthropic model 404 (deprecated?)"
             );
             Err(ClientError::ModelNotFound {
@@ -489,7 +490,7 @@ pub async fn send_one(
         429 | 500 | 502 | 503 | 504 => {
             tracing::warn!(
                 status = %status,
-                body = %safe,
+                body = %truncate_log_body(&safe, 1024),
                 retry_after_ms = ?retry_after_hint_ms,
                 "[Chat] anthropic throttled / 5xx"
             );
@@ -516,7 +517,7 @@ pub async fn send_one(
             }
             tracing::error!(
                 status = %status,
-                body = %safe,
+                body = %truncate_log_body(&safe, 1024),
                 "[Chat] anthropic bad request"
             );
             Err(ClientError::BadRequest {
@@ -1058,6 +1059,33 @@ fn humanize_count(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Bound the length of an already-sanitized log payload so a pathological
+/// upstream response (multi-MB HTML error page, runaway text body) cannot
+/// fill the disk via the tracing layer. `sanitize_for_log` only redacts
+/// long alphanumeric runs; it does not truncate the surrounding text.
+///
+/// Returns `s` unchanged when within budget; otherwise a borrowed-then-
+/// owned `Cow` carrying the prefix (sliced on a UTF-8 char boundary,
+/// never inside a multi-byte codepoint) and a `... [truncated N bytes]`
+/// suffix recording how much was elided.
+pub fn truncate_log_body(s: &str, max: usize) -> Cow<'_, str> {
+    if s.len() <= max {
+        return Cow::Borrowed(s);
+    }
+    // Largest char-boundary index <= max. `char_indices()` yields the
+    // start byte of each code point; if no code point starts within
+    // `0..=max`, fall back to 0 (truncates to empty prefix rather than
+    // splitting a multi-byte char).
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i <= max)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let elided = s.len() - cut;
+    Cow::Owned(format!("{}... [truncated {} bytes]", &s[..cut], elided))
 }
 
 /// Sanitize a raw API response body for logging. The Anthropic 401 body

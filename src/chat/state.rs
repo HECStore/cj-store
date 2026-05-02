@@ -28,6 +28,8 @@ use tracing::{info, warn};
 
 use crate::fsutil::write_atomic;
 
+const LOG_TARGET: &str = "cj_store::chat::state";
+
 pub const STATE_FILE: &str = "data/chat/state.json";
 
 const STATE_VERSION: u32 = 1;
@@ -188,6 +190,7 @@ impl ChatState {
                 match fs::rename(p, &sidecar) {
                     Ok(()) => {
                         warn!(
+                            target: LOG_TARGET,
                             on_disk_version = other.version,
                             expected = STATE_VERSION,
                             sidecar = %sidecar,
@@ -196,6 +199,7 @@ impl ChatState {
                     }
                     Err(e) => {
                         warn!(
+                            target: LOG_TARGET,
                             on_disk_version = other.version,
                             expected = STATE_VERSION,
                             error = %e,
@@ -208,6 +212,7 @@ impl ChatState {
             }
             Ok(other) => {
                 warn!(
+                    target: LOG_TARGET,
                     on_disk_version = other.version,
                     expected = STATE_VERSION,
                     "state.json version mismatch; ignoring on-disk state and starting fresh"
@@ -215,7 +220,7 @@ impl ChatState {
                 Ok(Self::default())
             }
             Err(e) => {
-                warn!(error = %e, "state.json unparseable; ignoring");
+                warn!(target: LOG_TARGET, error = %e, "state.json unparseable; ignoring");
                 Ok(Self::default())
             }
         }
@@ -256,6 +261,7 @@ impl ChatState {
     pub(crate) fn roll_to_day(&mut self, today: &str) {
         if today > self.last_meter_day_utc.as_str() {
             info!(
+                target: LOG_TARGET,
                 from = %self.last_meter_day_utc,
                 to = today,
                 tokens_input = self.tokens_today.composer_input + self.tokens_today.classifier_input,

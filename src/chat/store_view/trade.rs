@@ -91,6 +91,25 @@ pub fn scan_filtered_in_dir(
     // strings directly: `filename > since_str` ⇒ `trade.timestamp >
     // since` (modulo the trailing `.json` and any sub-second component
     // that is also lex-monotonic).
+    //
+    // LOAD-BEARING BYTE-ORDERING INVARIANT: chrono's `to_rfc3339()`
+    // (no `_opts`) emits the UTC suffix as `+00:00` (not `Z`). After
+    // the `:`→`-` swap the suffix becomes `+00-00`. The sub-second
+    // separator is `.`. Relevant byte values:
+    //   `+` = 0x2B  <  `.` = 0x2E  <  `'0'..='9'` = 0x30..=0x39
+    // This means a stem with NO fractional part (`…T10:00:00+00:00`)
+    // sorts BEFORE a stem with one (`…T10:00:00.5+00:00`) sorts BEFORE
+    // a stem at the next whole second (`…T10:00:01+00:00`), which is
+    // chronological order. Sub-second precision can be mixed freely
+    // between filenames and lex-order still matches time-order.
+    //
+    // WARNING: do NOT switch to `to_rfc3339_opts(SecondsFormat::Secs,
+    // true)` — that emits `Z` (0x5A), which is GREATER than every
+    // digit, so a `Z`-suffixed whole-second stem sorts AFTER a stem
+    // for the next whole second under sub-second precision (or after
+    // a fractional stem in the same second), silently breaking the
+    // prune at the second boundary. The mixed-precision tests in this
+    // file are pinned to fail if that swap is ever introduced.
     let since_filename_prefix = filter
         .since
         .as_ref()
@@ -173,7 +192,7 @@ pub fn scan_filtered_in_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
 
     fn write_trade(dir: &std::path::Path, ts: DateTime<Utc>, json: &str) {
         let stem = ts.to_rfc3339().replace(':', "-");
@@ -231,6 +250,115 @@ mod tests {
         let out = scan_filtered_in_dir(&dir, f, 10).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|t| t.timestamp > t1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_keeps_subsecond_trade_when_since_lacks_subsecond() {
+        // Regression: the lex-prune fast path must keep a sub-second
+        // trade when `since` is on the same whole second but has no
+        // fractional component. After the `:`→`-` swap the stems are:
+        //   trade:  2026-01-01T10-00-00.123456789+00-00
+        //   since:  2026-01-01T10-00-00+00-00
+        // Byte comparison at the first differing position is `.` (0x2E)
+        // vs `+` (0x2B) — the trade stem is greater, so it survives.
+        let dir = fixture_dir("subsec-keep");
+        let ts = Utc
+            .with_ymd_and_hms(2026, 1, 1, 10, 0, 0)
+            .unwrap()
+            .with_nanosecond(123_456_789)
+            .unwrap();
+        write_trade(&dir, ts, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.123456789Z"}"#);
+        let since = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        let f = TradeFilter {
+            since: Some(since),
+            ..Default::default()
+        };
+        let out = scan_filtered_in_dir(&dir, f, 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, ts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_distinguishes_two_subsecond_trades_in_same_second() {
+        // Two trades in the same whole second, distinguishable only
+        // by their fractional part. `since` = the earlier one, so
+        // strict-greater excludes it and keeps the later one.
+        let dir = fixture_dir("subsec-pair");
+        let early = Utc
+            .with_ymd_and_hms(2026, 1, 1, 10, 0, 0)
+            .unwrap()
+            .with_nanosecond(1_000)
+            .unwrap();
+        let late = Utc
+            .with_ymd_and_hms(2026, 1, 1, 10, 0, 0)
+            .unwrap()
+            .with_nanosecond(999_999_000)
+            .unwrap();
+        write_trade(&dir, early, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.000001Z"}"#);
+        write_trade(&dir, late, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.999999Z"}"#);
+        let f = TradeFilter {
+            since: Some(early),
+            ..Default::default()
+        };
+        let out = scan_filtered_in_dir(&dir, f, 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, late);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_orders_mixed_precision_newest_first() {
+        // Three trades, mixed precision, all within ~1s. The lex sort
+        // on filenames must produce chronological newest-first order:
+        //   T10:00:01           (whole second)
+        //   T10:00:00.500…      (fractional, same second as #3)
+        //   T10:00:00           (whole second, oldest)
+        // This pins the `+` < `.` < digit byte ordering invariant.
+        let dir = fixture_dir("mixed-prec-order");
+        let t_whole_early = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 0).unwrap();
+        let t_frac = Utc
+            .with_ymd_and_hms(2026, 1, 2, 10, 0, 0)
+            .unwrap()
+            .with_nanosecond(500_000_000)
+            .unwrap();
+        let t_whole_late = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 1).unwrap();
+        write_trade(&dir, t_whole_early, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#);
+        write_trade(&dir, t_frac, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00.500000000Z"}"#);
+        write_trade(&dir, t_whole_late, r#"{"trade_type":"Buy","item":"iron_ingot","amount":3,"amount_currency":6.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:01Z"}"#);
+        let out = scan_filtered_in_dir(&dir, TradeFilter::default(), 10).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].timestamp, t_whole_late);
+        assert_eq!(out[1].timestamp, t_frac);
+        assert_eq!(out[2].timestamp, t_whole_early);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_with_subsecond_since_returns_strict_greater_only() {
+        // Same fixture as `scan_orders_mixed_precision_newest_first`,
+        // but with `since` set to the fractional middle trade. Strict-
+        // greater excludes both the `.500` itself and the older whole-
+        // second trade; only the later whole-second trade survives.
+        let dir = fixture_dir("subsec-since");
+        let t_whole_early = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 0).unwrap();
+        let t_frac = Utc
+            .with_ymd_and_hms(2026, 1, 2, 10, 0, 0)
+            .unwrap()
+            .with_nanosecond(500_000_000)
+            .unwrap();
+        let t_whole_late = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 1).unwrap();
+        write_trade(&dir, t_whole_early, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#);
+        write_trade(&dir, t_frac, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00.500000000Z"}"#);
+        write_trade(&dir, t_whole_late, r#"{"trade_type":"Buy","item":"iron_ingot","amount":3,"amount_currency":6.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:01Z"}"#);
+        let f = TradeFilter {
+            since: Some(t_frac),
+            ..Default::default()
+        };
+        let out = scan_filtered_in_dir(&dir, f, 10).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].timestamp, t_whole_late);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

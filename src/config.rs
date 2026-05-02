@@ -176,14 +176,24 @@ pub struct ChatConfig {
     #[serde(default = "default_chat_web_search_enabled")]
     pub web_search_enabled: bool,
 
-    // Cross-player firewall
+    // Cross-player firewall. Off by default. Covers BOTH
+    // `read_player_memory` (memory bullets about another player) AND
+    // the history tools `read_today_history` / `search_history`, which
+    // would otherwise surface whisper records targeting other players.
+    // Financial state has its own switch
+    // (`tools_store_cross_player_balance_lookups`) below — a strictly
+    // more sensitive class than memory bullets or chat history.
     #[serde(default)]
     pub cross_player_reads: bool,
 
     // Store-read tools (query_trades / get_pair / get_user_balance).
-    // Disabled by default — operators opt in. Cross-player balance
-    // lookups get their own switch because balance is more sensitive
-    // than the per-player memory bullets `cross_player_reads` covers.
+    // Disabled by default — operators opt in. Cross-player reads of
+    // financial data (balance lookups AND `query_trades` against
+    // another player's UUID) get their own switch because financial
+    // state is more sensitive than the per-player memory bullets and
+    // chat-history whisper records `cross_player_reads` covers.
+    // `query_trades` defaults to self-scope when `user_uuid` is omitted
+    // regardless of this flag.
     #[serde(default)]
     pub tools_store_enabled: bool,
     #[serde(default = "default_chat_tools_store_max_calls_per_turn")]

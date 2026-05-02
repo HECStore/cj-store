@@ -333,7 +333,7 @@ pub fn tool_definitions(
         },
         Tool::Custom {
             name: "read_today_history".to_string(),
-            description: "Read today's chat history JSONL, capped at 32 KB. Most recent first. Optionally paginate with `since_event_ts` (ISO-UTC) to only return records strictly newer than that timestamp.".to_string(),
+            description: "Read today's chat history JSONL, capped at 32 KB. Most recent first. By default scoped to records where the caller is sender or target, plus the bot's own output (`bot_*` kinds); whisper records targeting other players are filtered out unless the operator opted into `cross_player_reads`. Optionally paginate with `since_event_ts` (ISO-UTC) to only return records strictly newer than that timestamp.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -348,7 +348,7 @@ pub fn tool_definitions(
         },
         Tool::Custom {
             name: "search_history".to_string(),
-            description: "Substring search across today's and recent past chat history JSONL files. Up to 50 matches.".to_string(),
+            description: "Substring search across today's and recent past chat history JSONL files. Up to 50 matches. By default scoped to records where the caller is sender or target, plus the bot's own output (`bot_*` kinds); whisper records targeting other players are filtered out unless the operator opted into `cross_player_reads`.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -391,6 +391,10 @@ pub fn tool_definitions(
             name: "query_trades".to_string(),
             description: "Search the live trade log. Returns trades newest-first. \
                           All filters optional; combine to narrow the result. \
+                          By default returns only the caller's own trades; \
+                          querying another player's trades requires the operator \
+                          opt-in `cross_player_balance_lookups` (trades are \
+                          financial data of the same sensitivity class as balance). \
                           Note: balances and pair stocks may be up to ~30s stale due to \
                           autosave, but `query_trades` is always live (each trade is its \
                           own file written immediately). Use sparingly; one call per \
@@ -410,7 +414,7 @@ pub fn tool_definitions(
                     },
                     "user_uuid": {
                         "type": "string",
-                        "description": "Filter to one player's trades (canonical hyphenated UUID)."
+                        "description": "Optional. Filter to one player's trades (canonical hyphenated UUID). Defaults to the caller's own UUID; specifying a different UUID requires the operator opt-in `cross_player_balance_lookups`."
                     },
                     "trade_type": {
                         "type": "string",
@@ -617,12 +621,39 @@ async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
     let username_arg = input.get("username").and_then(|v| v.as_str());
     let target_uuid = if let Some(u) = uuid_arg {
         validate_uuid(u).map_err(str::to_string)?;
+        // Auth check fires BEFORE any subsequent index/Mojang work, so a
+        // forged UUID can't be used to probe other internals on a denied
+        // path.
+        if !u.eq_ignore_ascii_case(ctx.sender_uuid) && !ctx.cross_player_reads {
+            return Err("access denied (cross-player reads disabled)".to_string());
+        }
         u.to_string()
     } else if let Some(name) = username_arg {
         validate_username_shape(name).map_err(str::to_string)?;
-        crate::mojang::resolve_user_uuid(name)
-            .await
-            .map_err(|e| format!("resolve {name}: {e}"))?
+        // Username-only path: consult the local player index FIRST so
+        // we never burn a Mojang round-trip on a request that will be
+        // denied. If the lower-cased name resolves to the sender's own
+        // UUID, allow. Otherwise require the cross-player flag before
+        // falling through to Mojang — denying here keeps the username-
+        // existence oracle sealed.
+        let local_hit = crate::chat::memory::load_or_rebuild_index()
+            .ok()
+            .and_then(|idx| idx.by_lower_username.get(&name.to_lowercase()).cloned());
+        if let Some(hit) = local_hit.as_deref()
+            && hit.eq_ignore_ascii_case(ctx.sender_uuid)
+        {
+            // Self lookup by name; no auth bypass needed.
+            local_hit.unwrap()
+        } else if !ctx.cross_player_reads {
+            return Err("access denied (cross-player reads disabled)".to_string());
+        } else if let Some(hit) = local_hit {
+            hit
+        } else {
+            crate::mojang::resolve_user_uuid(name).await.map_err(|e| {
+                tracing::warn!(name = %name, error = %e, "resolve_user_uuid failed");
+                "resolve username failed".to_string()
+            })?
+        }
     } else {
         return Err("require either uuid or username".to_string());
     };
@@ -922,6 +953,57 @@ fn update_self_memory_at_paths(
     Ok("committed to memory.md ## Inferred".to_string())
 }
 
+/// Inverse-lookup: find the username whose entry in `by_lower_username`
+/// resolves to `uuid`. Used by [`read_today_history_tool`] /
+/// [`search_history_tool`] to filter history records to ones the sender
+/// is sender-or-target on.
+///
+/// Returns the lower-cased username from the index (history records'
+/// `sender` field is the player's display username; we compare
+/// case-insensitively at the call site).
+fn sender_username_from_index(sender_uuid: &str) -> Option<String> {
+    crate::chat::memory::load_or_rebuild_index().ok().and_then(|idx| {
+        idx.by_lower_username
+            .iter()
+            .find(|(_, v)| v.eq_ignore_ascii_case(sender_uuid))
+            .map(|(k, _)| k.clone())
+    })
+}
+
+/// Predicate: is this history record visible to the sender under the
+/// default (cross_player_reads=false) scope? See
+/// [`read_today_history_tool`] / [`search_history_tool`] callers for the
+/// full rationale.
+fn history_record_visible_to_sender(
+    record: &serde_json::Value,
+    sender_username_lower: Option<&str>,
+    sender_uuid: &str,
+) -> bool {
+    // Bot's own output is always surfaced — `bot_chat` / `bot_whisper`.
+    if let Some(kind) = record.get("kind").and_then(|x| x.as_str())
+        && kind.starts_with("bot_")
+    {
+        return true;
+    }
+    // Sender-name match (case-insensitive). The username in the index
+    // is already lower-cased; we lower-case the record's sender to
+    // match.
+    if let Some(uname) = sender_username_lower
+        && let Some(s) = record.get("sender").and_then(|x| x.as_str())
+        && s.to_lowercase() == uname
+    {
+        return true;
+    }
+    // Target UUID match (only present on bot_out records, but checked
+    // generically for forward-compat).
+    if let Some(t) = record.get("target_uuid").and_then(|x| x.as_str())
+        && t.eq_ignore_ascii_case(sender_uuid)
+    {
+        return true;
+    }
+    false
+}
+
 async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
     let limit_lines = input
         .get("limit_lines")
@@ -944,13 +1026,35 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(format!("read today's history: {e}")),
     };
+    // Cross-player gate: history records can include whispers targeting
+    // other players. When `cross_player_reads` is OFF, restrict matched
+    // lines to records where (a) `sender` (username) equals the
+    // sender's resolved username, OR (b) `target_uuid` equals the
+    // sender's UUID, OR (c) `kind` starts with `bot_` (bot's own output
+    // is harmless to surface).
+    let sender_username = if ctx.cross_player_reads {
+        None
+    } else {
+        sender_username_from_index(ctx.sender_uuid)
+    };
+    let allow_record = |line: &str| -> bool {
+        if ctx.cross_player_reads {
+            return true;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            // Unparseable lines aren't surfaced under the restricted
+            // scope — they could be anything.
+            return false;
+        };
+        history_record_visible_to_sender(&v, sender_username.as_deref(), ctx.sender_uuid)
+    };
     // Filter by `since_event_ts` first (oldest-first scan is fine — we
     // re-reverse below), then take the most-recent `limit_lines`. The
     // 32 KB byte cap from `ctx.history_max_bytes` continues to apply.
-    let filtered: Vec<&str> = if let Some(since) = since_event_ts.as_deref() {
-        contents
-            .lines()
-            .filter(|line| {
+    let filtered: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            if let Some(since) = since_event_ts.as_deref() {
                 // Parse just enough JSON to find the timestamp field.
                 let v: serde_json::Value = match serde_json::from_str(line) {
                     Ok(v) => v,
@@ -962,12 +1066,13 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
                     .or_else(|| v.get("event_ts"))
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
-                ts > since
-            })
-            .collect()
-    } else {
-        contents.lines().collect()
-    };
+                if ts <= since {
+                    return false;
+                }
+            }
+            allow_record(line)
+        })
+        .collect();
     let mut lines: Vec<&str> = filtered.into_iter().rev().take(limit_lines).collect();
     let mut out = String::new();
     let mut bytes = 0usize;
@@ -1007,6 +1112,17 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
     let max_excerpt = 1024usize;
     let q = query.clone();
     let dir_clone = history_dir.clone();
+    // Cross-player gate: same shape as `read_today_history_tool`. When
+    // OFF, lines are filtered to ones the sender is sender-or-target
+    // on, plus `bot_*` kinds. The inverse-username lookup happens here
+    // (off the blocking task) so the closure only borrows owned data.
+    let cross_player_reads = ctx.cross_player_reads;
+    let sender_uuid = ctx.sender_uuid.to_string();
+    let sender_username = if cross_player_reads {
+        None
+    } else {
+        sender_username_from_index(&sender_uuid)
+    };
     let result: Result<String, String> = tokio::task::spawn_blocking(move || {
         let q_lc = q.to_lowercase();
         let mut matches: Vec<String> = Vec::new();
@@ -1044,6 +1160,24 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
             };
             for line in body.lines().rev() {
                 if line.to_lowercase().contains(&q_lc) {
+                    // Cross-player gate. Parsing each candidate line as
+                    // JSON is paid only when the substring already
+                    // matched, so pathological cases (every line
+                    // matches) still bound the parse cost at
+                    // max_matches before short-circuit.
+                    if !cross_player_reads {
+                        let v: serde_json::Value = match serde_json::from_str(line) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if !history_record_visible_to_sender(
+                            &v,
+                            sender_username.as_deref(),
+                            &sender_uuid,
+                        ) {
+                            continue;
+                        }
+                    }
                     let mut excerpt = line.to_string();
                     if excerpt.len() > max_excerpt {
                         // Round down to a char boundary; `String::truncate`
@@ -1135,12 +1269,19 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
         .transpose()
         .map_err(str::to_string)?;
 
+    // Cross-player gate (symmetric to `get_user_balance_tool`): trades
+    // are financial data of the same sensitivity class as balance.
+    // If the model omits `user_uuid`, force self-scope. If it supplies
+    // a different UUID, require `cross_player_balance_lookups`.
     let user_uuid = match input.get("user_uuid").and_then(|v| v.as_str()) {
         Some(u) => {
             validate_uuid(u).map_err(str::to_string)?;
+            if !u.eq_ignore_ascii_case(ctx.sender_uuid) && !ctx.cross_player_balance_lookups {
+                return Err("access denied (cross-player balance lookups disabled)".to_string());
+            }
             Some(u.to_string())
         }
-        None => None,
+        None => Some(ctx.sender_uuid.to_string()),
     };
 
     let trade_type = match input.get("trade_type").and_then(|v| v.as_str()) {
@@ -1194,37 +1335,89 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
     // blow the model's context.
     let mut serialized: Vec<serde_json::Value> = Vec::with_capacity(trades.len());
     for t in &trades {
-        serialized.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "trade_type": t.trade_type,
             "item": t.item,
             "amount": t.amount,
             "amount_currency": t.amount_currency,
-            "user_uuid": t.user_uuid,
             "timestamp": t.timestamp.to_rfc3339(),
-        }));
+        });
+        // Only expose per-trade `user_uuid` when cross-player reads are
+        // enabled. Self-scoped requests don't need it (caller already
+        // knows their own UUID), and dropping it keeps us symmetric
+        // with the cross-player gate above.
+        if ctx.cross_player_balance_lookups {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert(
+                    "user_uuid".to_string(),
+                    serde_json::Value::String(t.user_uuid.clone()),
+                );
+            }
+        }
+        serialized.push(entry);
     }
     let mut body = serde_json::to_string(&serialized)
         .map_err(|e| format!("serialize trades: {e}"))?;
     if body.len() > ctx.history_max_bytes {
-        // Truncate by re-serializing the first N entries that fit.
+        // Account for the envelope wrapper bytes, otherwise the inner
+        // array fits the cap but the wrapped response blows past it.
+        let wrapper_overhead = serde_json::to_string(&serde_json::json!({
+            "truncated": true,
+            "max_bytes": ctx.history_max_bytes,
+            "returned": 0,
+            "trades": [],
+        }))
+        .map(|s| s.len())
+        .unwrap_or(96);
+        // Small safety margin for the `returned` digit count growing
+        // (e.g. 0 → 47).
+        let budget = ctx
+            .history_max_bytes
+            .saturating_sub(wrapper_overhead)
+            .saturating_sub(8);
+
+        // O(N) admit loop: track the running serialized length of the
+        // inner JSON array (`[a,b,c]` shape) without re-serializing the
+        // accumulator on every iteration.
         let mut acc: Vec<serde_json::Value> = Vec::new();
+        // Start at 2 for the surrounding `[]`.
+        let mut cur_len: usize = 2;
+        let mut oversized_first_trade = false;
         for entry in &serialized {
-            let candidate = serde_json::to_string(&acc).unwrap_or_default();
-            if candidate.len() > ctx.history_max_bytes {
+            let entry_str = entry.to_string();
+            // First admit: just the entry, no comma. Subsequent: + 1 for the comma.
+            let added = if acc.is_empty() {
+                entry_str.len()
+            } else {
+                entry_str.len() + 1
+            };
+            if cur_len + added > budget {
+                if acc.is_empty() {
+                    // Even one trade exceeds the cap by itself; surface
+                    // that so the model knows the shape is real but
+                    // empty rather than thinking the filter matched
+                    // nothing.
+                    oversized_first_trade = true;
+                }
                 break;
             }
+            cur_len += added;
             acc.push(entry.clone());
         }
-        if acc.len() > 1 {
-            acc.pop();
-        }
-        body = serde_json::to_string(&serde_json::json!({
+
+        let mut envelope = serde_json::json!({
             "truncated": true,
             "max_bytes": ctx.history_max_bytes,
             "returned": acc.len(),
             "trades": acc,
-        }))
-        .unwrap_or_else(|_| "[truncated]".to_string());
+        });
+        if oversized_first_trade
+            && let Some(obj) = envelope.as_object_mut()
+        {
+            obj.insert("oversized_first_trade".to_string(), serde_json::Value::Bool(true));
+        }
+        body = serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| "[truncated]".to_string());
     }
     Ok(body)
 }
@@ -1297,28 +1490,45 @@ async fn get_user_balance_tool(
 
     let target_uuid = if let Some(u) = uuid_arg {
         validate_uuid(u).map_err(str::to_string)?;
+        // Auth check fires BEFORE any subsequent index/Mojang work so a
+        // forged UUID can't probe other internals on a denied path.
+        if !u.eq_ignore_ascii_case(ctx.sender_uuid) && !ctx.cross_player_balance_lookups {
+            return Err("access denied (cross-player balance lookups disabled)".to_string());
+        }
         u.to_string()
     } else if let Some(name) = username_arg {
         validate_username_shape(name).map_err(str::to_string)?;
-        // Try the local index first — it is keyed by lowercased
-        // username and avoids a Mojang round-trip for known players.
-        let local_hit = crate::chat::memory::load_or_rebuild_index().ok().and_then(|idx| {
-            idx.by_lower_username
-                .get(&name.to_lowercase())
-                .cloned()
-        });
-        match local_hit {
-            Some(u) => u,
-            None => crate::mojang::resolve_user_uuid(name)
-                .await
-                .map_err(|e| format!("resolve {name}: {e}"))?,
+        // Username-only path: consult the local index FIRST. If the
+        // name resolves to the sender's own UUID, allow. Otherwise
+        // require `cross_player_balance_lookups` BEFORE falling through
+        // to Mojang — denying here seals the username-existence oracle
+        // and stops burning Mojang rate budget on doomed requests.
+        let local_hit = crate::chat::memory::load_or_rebuild_index()
+            .ok()
+            .and_then(|idx| idx.by_lower_username.get(&name.to_lowercase()).cloned());
+        if let Some(hit) = local_hit.as_deref()
+            && hit.eq_ignore_ascii_case(ctx.sender_uuid)
+        {
+            local_hit.unwrap()
+        } else if !ctx.cross_player_balance_lookups {
+            return Err("access denied (cross-player balance lookups disabled)".to_string());
+        } else if let Some(hit) = local_hit {
+            hit
+        } else {
+            crate::mojang::resolve_user_uuid(name).await.map_err(|e| {
+                tracing::warn!(name = %name, error = %e, "resolve_user_uuid failed");
+                "resolve username failed".to_string()
+            })?
         }
     } else {
         unreachable!("exactly-one-of guard above");
     };
 
-    // Cross-player gate: balance is strictly more sensitive than the
-    // memory bullets `cross_player_reads` covers. Default-deny.
+    // Defense-in-depth: balance is strictly more sensitive than the
+    // memory bullets `cross_player_reads` covers. The auth check above
+    // already gated by-username and by-uuid paths, but this re-check
+    // catches any future code path that constructs `target_uuid`
+    // differently.
     if !target_uuid.eq_ignore_ascii_case(ctx.sender_uuid) && !ctx.cross_player_balance_lookups {
         return Err("access denied (cross-player balance lookups disabled)".to_string());
     }

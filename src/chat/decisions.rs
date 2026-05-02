@@ -15,6 +15,8 @@ use std::time::SystemTime;
 use serde::Serialize;
 use tracing::{debug, error};
 
+const LOG_TARGET: &str = "cj_store::chat::decisions";
+
 pub const DECISIONS_DIR: &str = "data/chat/decisions";
 
 /// Whole-line ceiling. Above this, the record is replaced by a sentinel —
@@ -224,7 +226,7 @@ pub fn write(record: &DecisionRecord) {
     let line = match serde_json::to_string(record) {
         Ok(s) => s,
         Err(e) => {
-            error!(error = %e, kind = record.kind, "decision serialize failed");
+            error!(target: LOG_TARGET, error = %e, kind = record.kind, "decision serialize failed");
             return;
         }
     };
@@ -257,10 +259,10 @@ fn append_line(path: &Path, line: &str, kind: Option<&'static str>) {
     match open_or_reuse(path, line.as_bytes()) {
         Ok(()) => {
             if let Some(kind) = kind {
-                debug!(kind = kind, "decision logged");
+                debug!(target: LOG_TARGET, kind = kind, "decision logged");
             }
         }
-        Err(e) => error!(path = %path.display(), error = %e, "decision append failed"),
+        Err(e) => error!(target: LOG_TARGET, path = %path.display(), error = %e, "decision append failed"),
     }
 }
 

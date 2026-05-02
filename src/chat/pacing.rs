@@ -392,14 +392,26 @@ pub fn strip_ai_tells(reply: &str) -> String {
     out
 }
 
+/// Hard ceiling on chat-message length (Unicode scalar values).
+/// Vanilla Minecraft refuses chat lines longer than 256 characters;
+/// anything we ship past that gets rejected or truncated by the server.
+/// This is a wire-protocol limit, not a policy — it must never be
+/// crossed regardless of how `composer_max_chars` is configured.
+pub const MINECRAFT_CHAT_LIMIT: usize = 256;
+
 /// Truncate a reply to the Minecraft chat limit.
-/// `max_chars` defaults to 240 (256 server cap with margin for the
-/// username prefix).
+/// `max_chars` is the configured soft cap (defaults to 240 — 256 with
+/// margin for the username prefix the server prepends). The function
+/// also enforces [`MINECRAFT_CHAT_LIMIT`] as a hard ceiling: even if a
+/// caller passes a larger `max_chars`, the result is clamped to 256
+/// chars so the chat module physically cannot ship a line the server
+/// would reject.
 pub fn truncate_to_chat_limit(reply: &str, max_chars: usize) -> String {
-    if reply.chars().count() <= max_chars {
+    let cap = max_chars.min(MINECRAFT_CHAT_LIMIT);
+    if reply.chars().count() <= cap {
         return reply.to_string();
     }
-    reply.chars().take(max_chars).collect()
+    reply.chars().take(cap).collect()
 }
 
 /// Apply persona-driven lowercase-first-character rule (CHAT.md
@@ -774,6 +786,32 @@ mod tests {
         assert_eq!(s.chars().count(), 100);
         // Each '日' is 3 bytes in UTF-8 — the byte count is a multiple
         // of 3, never a torn codepoint.
+        assert_eq!(s.len() % 3, 0);
+    }
+
+    #[test]
+    fn truncate_enforces_hard_minecraft_ceiling_even_when_caller_asks_for_more() {
+        // Defense-in-depth: regardless of the configured max_chars,
+        // the function must never emit more than MINECRAFT_CHAT_LIMIT
+        // chars. The server would reject a longer line.
+        let big = "a".repeat(1000);
+        for cap in [300_usize, 512, 10_000, usize::MAX] {
+            let s = truncate_to_chat_limit(&big, cap);
+            assert!(
+                s.chars().count() <= MINECRAFT_CHAT_LIMIT,
+                "cap={cap} produced {} chars, exceeds Minecraft limit",
+                s.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_hard_ceiling_holds_for_multibyte_chars() {
+        // 1000 '日' characters with a permissive cap must still clamp
+        // to 256 chars without splitting a codepoint.
+        let big: String = std::iter::repeat_n('日', 1000).collect();
+        let s = truncate_to_chat_limit(&big, usize::MAX);
+        assert_eq!(s.chars().count(), MINECRAFT_CHAT_LIMIT);
         assert_eq!(s.len() % 3, 0);
     }
 

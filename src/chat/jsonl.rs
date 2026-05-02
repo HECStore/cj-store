@@ -24,6 +24,14 @@ pub(crate) fn iso_utc_millis(t: SystemTime) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Same canonical millisecond-precision UTC ISO-8601 string, but for an
+/// already-derived `DateTime<Utc>`. Use when the caller already holds a
+/// `chrono::Utc::now()` value and would otherwise have to round-trip
+/// through `SystemTime`.
+pub(crate) fn iso_utc_millis_dt(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Per-day JSONL file path: `<dir>/<UTC-date>.jsonl` for `t`.
 pub(crate) fn day_file(dir: &Path, t: SystemTime) -> PathBuf {
     let dt: DateTime<Utc> = t.into();

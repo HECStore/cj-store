@@ -507,12 +507,14 @@ of only reacting.
 
 Gate stack (every gate must pass before the composer fires):
 
-1. **Pause / critical-section / model-404 / composer-throttle** — same
-   global short-circuits as the per-event pipeline. Skip with the
-   same decision-log reasons.
+1. **Pause / critical-section / model-404 / composer-throttle /
+   outside-active-hours / bot-username-unresolved** — same global
+   short-circuits as the per-event pipeline (active-hours and
+   bot-username-unresolved apply to proactive ticks too). Skip with
+   the same decision-log reasons.
 2. **`evaluate_proactive_tick`**
    ([conversation.rs](src/chat/conversation.rs)) — pure function with
-   four sub-gates:
+   the following gates:
    - `secs_since_last_bot_send ≥ proactive_min_secs_since_bot`
      (default 30) — bot has been silent long enough that another line
      wouldn't be flooding.
@@ -528,11 +530,24 @@ Gate stack (every gate must pass before the composer fires):
      silent; the roll prevents the bot from feeling clockwork.
 3. **Decision log.** Both Skip and Fire write to
    `data/chat/decisions/<day>.jsonl` with `kind: "proactive_skip"` or
-   `kind: "proactive_fire_pending"`. Skip records carry `reason` —
-   one of `bot_never_spoke`, `bot_too_recent`, `no_partner_in_window`,
-   `partner_too_recent`, `partner_too_stale`, `probability_roll` —
-   so operators can audit how often gates would fire and tune
-   thresholds before any tokens are spent.
+   `kind: "proactive_fire_pending"`. Skip records carry `reason`, drawn
+   from the full set below, so operators can audit how often gates
+   would fire and tune thresholds before any tokens are spent.
+   - Global short-circuits (emitted by the proactive arm before the
+     gate evaluator runs):
+     - `paused`
+     - `in_critical_section`
+     - `model_404_backoff`
+     - `composer_throttle_backoff`
+     - `outside_active_hours`
+     - `bot_username_unresolved`
+   - Gate evaluator (emitted by `evaluate_proactive_tick`):
+     - `bot_never_spoke`
+     - `bot_too_recent`
+     - `no_partner_in_window`
+     - `partner_too_recent`
+     - `partner_too_stale`
+     - `probability_roll`
 
 Status today: gate evaluation, decision logging, and tick wiring are
 in place. The composer-side dispatch (loading the partner's per-player
@@ -542,10 +557,25 @@ and currently logs `proactive_fire_pending` instead of calling
 Anthropic. With `proactive_threading_enabled = false` (the default),
 the entire arm resolves to `pending()` and adds zero overhead.
 
+**Scaffold-only flag.** Setting `proactive_threading_enabled = true`
+in the current build does **not** cause the bot to send proactive
+replies — the Fire arm only emits `proactive_fire_pending` gate-evaluation
+decision-log entries. `chat_task` warns at startup when the flag is on,
+and `Chat: status` surfaces both `proactive_threading_enabled` (the
+config value the task observed) and `proactive_dispatch_wired` (a
+hardcoded `false` until composer dispatch lands), so operators can
+confirm the half-finished state at a glance. When dispatch is wired,
+it MUST gate on the daily caps (USD/tokens), `recent_bot_send_times`
+(max-replies-per-min), `spam_guard.is_suppressed`,
+`spam_guard.is_blocklisted`, and `dry_run`; the synthetic event fed
+to the composer MUST NOT be inserted into `window` (it would re-trigger
+itself on the next tick); and `last_bot_send_at` MUST advance only
+on a successful real send.
+
 | Knob                                | Default | What it does                                                                 |
 | ----------------------------------- | ------- | ---------------------------------------------------------------------------- |
 | `proactive_threading_enabled`       | `false` | Master switch.                                                                |
-| `proactive_tick_secs`               | 30      | Seconds between gate-evaluation checks.                                       |
+| `proactive_tick_secs`               | 30      | Seconds between gate-evaluation checks. Clamped to `.max(1)` at startup, so a configured 0 silently becomes 1s. |
 | `proactive_min_secs_since_bot`      | 30      | Bot must have been silent for at least this long.                             |
 | `proactive_min_secs_since_partner`  | 15      | Partner's last message must be at least this old (let real replies land).     |
 | `proactive_max_secs_since_partner`  | 300     | Above this, the convo is dead — don't try to revive.                          |
@@ -982,8 +1012,20 @@ after login, so it lives in
   divergence triggers a warning and the new value wins.
 - **In-flight composer cancellation** — `chat_task` holds a
   `tokio_util::sync::CancellationToken` for the live composer call.
-  On `ChatCommand::BotDisconnected` the token fires; tokens billed up
-  to abort still count against the daily cap.
+  Both `ChatCommand::BotDisconnected` and `ChatCommand::Shutdown` fire
+  the same token: BotDisconnected mints a fresh token afterwards so
+  subsequent dispatches aren't born already-cancelled, while Shutdown
+  fires the token *before* the existing drain + state save + ack so the
+  CLI doesn't block up to ~60s on a slow Anthropic round-trip.
+  Cancellation only takes effect *between iterations* of the composer
+  loop and around the typing-delay sleep — never mid-tool-dispatch, so
+  an in-flight `update_self_memory` write or `web_fetch` can't be torn.
+  Each cancel originator writes a `composer_cancelled` decision-log
+  entry with `reason = "bot_disconnected"` or `reason = "shutdown"` so
+  cost auditing has a signal even though `record_composer` is skipped
+  on the cancel path (the upstream provider may have charged for a
+  partial call, but the local meter doesn't double-count). Tokens
+  billed up to abort still count against the daily cap.
 - **`is_bot` history tag** — every line written by the bot's own
   `SendChat`/`Whisper` is tagged `"is_bot": true`, independent of
   sender comparison. Events from the pre-username-known window are
@@ -1195,7 +1237,7 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 | `Chat: dump player memory <username>`            | Prints `players/<uuid>.md` to stdout.                                                                                                  |
 | `Chat: regenerate persona`                       | One-shot; requires confirmation + 24 h cooldown. Archives prior persona to `persona.md.<UTC>`.                                         |
 | `Chat: run reflection now`                       | Consumes `pending_adjustments.jsonl` immediately. Permissive validator (operator decides).                                             |
-| `Chat: forget player <username>`                 | GDPR: purges per-player file + history JSONL records + decisions JSONL records + overlay sidecars. Confirmation prompt; logged to operator audit. |
+| `Chat: forget player <username>`                 | GDPR: purges per-player file + history JSONL records + decisions JSONL records + overlay sidecars + `pending_adjustments.jsonl` (live + rotated archives) + rotated `pending_self_memory` archives + `_index.json` entries. Confirmation prompt; logged to operator audit. |
 | `Chat: resume after moderation backoff`          | Clears `state.moderation_backoff_until`.                                                                                               |
 | `Chat: pause` / `Chat: resume`                   | Toggles `state.paused`, observed at the top of the chat decision pipeline.                                                              |
 
@@ -1219,7 +1261,7 @@ injection defense, SSRF defense) are real safety/cost guards.
 | Talking through trades          | `in_critical_section` flag suppresses public chat and defers whispers up to 30 s.                                                                                          |
 | Being muted but still talking   | Moderation-event parser → 24-h backoff (`chat.moderation_backoff_secs`).                                                                                                   |
 | Echo loop                       | Self-echo guard on bot username; spam guard on the same external username flipping ≥ 4 messages in 10 s.                                                                   |
-| Prompt injection in chat        | Nonce-tagged `<untrusted_chat_…>` wrappers; defensive rejection of events containing `<untrusted` (any case) before wrapping.                                              |
+| Prompt injection in chat        | Nonce-tagged `<untrusted_chat_…>` wrappers; any literal `<untrusted` substring inside the wrapped content (any case) is neutralized to `<_untrusted` before wrapping.       |
 | Prompt injection via tools      | `<untrusted_tool_result_…>` and `<untrusted_web_…>` markers; the static rules block instructs the model to ignore instructions inside any `<untrusted_…>` tag.            |
 | Prompt injection in adjustments | Reflection pass paraphrase requirement + multi-axis validator (substring overlap, distinct triggers, distinct senders, sender Trust ≥ 1).                                  |
 | Off-tone phrases                | `pacing::strip_ai_tells` removes em-dashes, smart quotes, "As an AI", "I'm Claude", "language model", etc. — these are tonally wrong for Minecraft chat regardless of identity. |

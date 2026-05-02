@@ -348,6 +348,28 @@ pub fn should_summarize_player_file(current_file_bytes: usize, cap_bytes: usize)
     current_file_bytes * 100 > cap_bytes * 125
 }
 
+/// Drop every `{username_lc: <uuid>}` entry whose value matches the
+/// given `uuid` and persist the result to disk via [`save_index`].
+///
+/// Used by `forget_player` (CHAT.md GDPR scrub) so a forgotten player's
+/// username + UUID don't survive in cleartext inside `_index.json` until
+/// the next full rebuild. Returns the count of entries removed.
+///
+/// Loads the index via [`load_or_rebuild_index`] so a not-yet-initialized
+/// index is materialized first — skipping removal because the in-memory
+/// state was lazy would defeat the scrub.
+pub(crate) fn forget_index_entry(uuid: &str) -> io::Result<u64> {
+    let mut idx = load_or_rebuild_index()?;
+    let before = idx.by_lower_username.len();
+    idx.by_lower_username
+        .retain(|_, v| !v.eq_ignore_ascii_case(uuid));
+    let removed = before.saturating_sub(idx.by_lower_username.len()) as u64;
+    if removed > 0 {
+        save_index(&idx)?;
+    }
+    Ok(removed)
+}
+
 /// Load the index from disk. On corruption or version mismatch the file
 /// is renamed `<orig>.corrupt-<UTC>` and a fresh rebuild is run; the
 /// original bytes are retained for forensic inspection.

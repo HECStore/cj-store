@@ -142,7 +142,10 @@ fn iso_utc(t: SystemTime) -> String {
     crate::chat::jsonl::iso_utc_millis(t)
 }
 
-/// Compute the per-day filename for `t`.
+/// Compute the per-day filename for `t`. Test-only — production paths go
+/// through `file_for_date` so the writer task can compare/format without
+/// round-tripping through `SystemTime`.
+#[cfg(test)]
 fn file_for(t: SystemTime) -> PathBuf {
     crate::chat::jsonl::day_file(Path::new(HISTORY_DIR), t)
 }
@@ -262,6 +265,9 @@ pub fn enqueue_bot_output(
 /// Append one line to the per-day JSONL file. Creates the directory and
 /// file on demand. Errors are returned to the caller; the writer task logs
 /// them and continues so a transient disk hiccup doesn't kill the task.
+/// Test-only — the production writer task uses a cached `LineWriter` and
+/// does not reopen the file per line.
+#[cfg(test)]
 fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

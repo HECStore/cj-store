@@ -254,6 +254,10 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
                 "classifier active senders: {}",
                 s.classifier_active_senders
             );
+            println!(
+                "proactive threading: enabled={} dispatch_wired={}",
+                s.proactive_threading_enabled, s.proactive_dispatch_wired
+            );
             println!("====================\n");
         }
         Err(_) => println!("Chat task did not respond."),

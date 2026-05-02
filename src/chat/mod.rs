@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ChatConfig;
@@ -63,6 +64,17 @@ pub struct ChatStatusReport {
     /// Number of senders currently tracked in the classifier per-sender
     /// counter — operator-visible measure of the active classifier load.
     pub classifier_active_senders: usize,
+    /// Effective state of the `chat.proactive_threading_enabled` config
+    /// flag. Mirrored into status so operators can confirm what the
+    /// running task actually saw.
+    pub proactive_threading_enabled: bool,
+    /// Whether the proactive Fire arm currently dispatches a composer
+    /// call. Hardcoded `false` until composer dispatch lands — pairs
+    /// with `proactive_threading_enabled` to make the scaffold-only
+    /// state visible: operators with the flag on but this `false` know
+    /// ticks emit `proactive_fire_pending` entries only and send no
+    /// replies. See CHAT.md "Scaffold-only flag." callout.
+    pub proactive_dispatch_wired: bool,
 }
 
 /// Run the chat task.
@@ -98,6 +110,16 @@ pub async fn chat_task(
         "[Chat] enabled (dry_run={}); fully wired — pre-filter -> classifier -> composer -> pacing",
         config.dry_run
     );
+
+    // Scaffold-only warning: the proactive Fire arm logs a
+    // `proactive_fire_pending` decision-log entry but does not yet
+    // dispatch a composer call. Surface this loudly at startup so
+    // operators tuning thresholds don't believe replies are being sent.
+    if config.proactive_threading_enabled {
+        warn!(
+            "[Chat] proactive_threading_enabled = true but composer dispatch is not yet wired; ticks will only emit proactive_fire_pending decision-log entries (no replies will be sent)"
+        );
+    }
 
     // Load persistent supporting state.
     let pricing = match pricing::PricingTable::load_or_create() {
@@ -177,6 +199,14 @@ pub async fn chat_task(
             state::ChatState::default()
         }
     };
+
+    // CHAT.md in-flight composer cancellation. The token is fired by both
+    // `ChatCommand::BotDisconnected` (so a composer call against a stale
+    // identity can bail) and `ChatCommand::Shutdown` (so the CLI doesn't
+    // block up to ~60s on a slow Anthropic round-trip). A fresh token is
+    // minted after each cancel so subsequent process_event calls aren't
+    // born already-cancelled.
+    let mut composer_cancel = CancellationToken::new();
 
     // CHAT.md: seed `bot_username` from the cached `last_known_bot_username`
     // so events arriving in the pre-Init window (join broadcasts, early
@@ -266,6 +296,28 @@ pub async fn chat_task(
                 match cmd {
                     Some(ChatCommand::Shutdown { ack }) => {
                         info!("[Chat] shutdown command received, draining and exiting");
+                        // CHAT.md cancellation contract: fire the token
+                        // BEFORE drain + save + ack so any in-flight composer
+                        // turn aborts at the next iteration boundary, rather
+                        // than blocking the CLI on a slow Anthropic round-trip.
+                        // Tools already dispatched in the current turn complete
+                        // first (see `process_event`'s select wrap of run_loop).
+                        if !composer_cancel.is_cancelled() {
+                            composer_cancel.cancel();
+                            decisions::write(
+                                &decisions::DecisionRecord::new("composer_cancelled")
+                                    .with_reason("shutdown"),
+                            );
+                        }
+                        // Drain any commands queued behind Shutdown (or that
+                        // landed in the brief window after the cancel token
+                        // fired). Each variant's `respond_to` oneshot gets an
+                        // explicit shutdown-error reply so the operator's
+                        // `blocking_recv` unblocks immediately with a clear
+                        // message instead of waiting for channel close.
+                        while let Ok(queued) = chat_cmd_rx.try_recv() {
+                            reply_shutdown_error(queued);
+                        }
                         // Best-effort drain of the broadcast so any in-flight
                         // events are observed before we leave.
                         while let Ok(ev) = chat_events_rx.try_recv() {
@@ -287,7 +339,7 @@ pub async fn chat_task(
                         runtime_state.roll_to_today();
                         // Count pending_adjustments.jsonl lines for status display.
                         let pending_count = std::fs::read_to_string(
-                            std::path::Path::new(memory::CHAT_DIR).join("pending_adjustments.jsonl"),
+                            std::path::Path::new(reflection::PENDING_FILE),
                         )
                         .map(|s| s.lines().count() as u32)
                         .unwrap_or(0);
@@ -325,6 +377,12 @@ pub async fn chat_task(
                                 .unwrap_or(0.0),
                             web_fetches_today: runtime_state.web_fetches_today,
                             classifier_active_senders: classifier_counter.active_senders(),
+                            proactive_threading_enabled: config.proactive_threading_enabled,
+                            // Scaffold-only: the proactive Fire arm only
+                            // logs `proactive_fire_pending` today. Flip
+                            // this literal to `true` once composer
+                            // dispatch is wired.
+                            proactive_dispatch_wired: false,
                         };
                         let _ = respond_to.send(report);
                     }
@@ -438,14 +496,23 @@ pub async fn chat_task(
                         let _ = respond_to.send(result);
                     }
                     Some(ChatCommand::BotDisconnected) => {
-                        // CHAT.md in-flight cancellation. Today the
-                        // composer call is sequential and short; just log
-                        // the signal — the actual CancellationToken plumbing
-                        // arrives in a follow-up. The signal remains useful
-                        // because the chat task's bot_username read becomes
-                        // None once Event::Disconnect fires, so subsequent
-                        // events skip with "bot_username_unknown".
-                        info!("[Chat] bot disconnected; in-flight composer (if any) will resolve on its own");
+                        // CHAT.md in-flight cancellation: fire the live
+                        // composer's CancellationToken so any composer turn
+                        // wrapping this dispatch bails between iterations
+                        // (or before the typing-delay sleep finishes), then
+                        // mint a fresh token for subsequent dispatches so
+                        // they aren't born already-cancelled. The decision
+                        // log preserves the cost-audit signal even though
+                        // `record_composer` is skipped on the cancel path.
+                        info!("[Chat] bot disconnected; cancelling any in-flight composer");
+                        if !composer_cancel.is_cancelled() {
+                            composer_cancel.cancel();
+                            decisions::write(
+                                &decisions::DecisionRecord::new("composer_cancelled")
+                                    .with_reason("bot_disconnected"),
+                            );
+                        }
+                        composer_cancel = CancellationToken::new();
                     }
                     Some(ChatCommand::ShowDecisionLog { last_n, respond_to }) => {
                         // Read today's decisions JSONL and return the trailing
@@ -629,9 +696,22 @@ pub async fn chat_task(
                                             decisions_lines_removed = stats.decisions_lines,
                                             uuid_overlay_entries_removed = stats.overlay_entries,
                                             malformed_lines_dropped = stats.malformed_dropped,
+                                            pending_adjustments_lines_removed = stats.pending_adjustments_lines,
+                                            pending_self_memory_archive_lines_removed = stats.pending_self_memory_archive_lines,
+                                            index_entries_removed = stats.index_entries,
                                             "[Chat] forget_player completed"
                                         );
-                                        write_operator_audit("forget_player", &username, &uuid, "");
+                                        let audit_reason = format!(
+                                            "history_lines={} decisions_lines={} overlay_entries={} malformed_dropped={} pending_adjustments_lines={} pending_self_memory_archive_lines={} index_entries={}",
+                                            stats.history_lines,
+                                            stats.decisions_lines,
+                                            stats.overlay_entries,
+                                            stats.malformed_dropped,
+                                            stats.pending_adjustments_lines,
+                                            stats.pending_self_memory_archive_lines,
+                                            stats.index_entries,
+                                        );
+                                        write_operator_audit("forget_player", &username, &uuid, &audit_reason);
                                         if let Err(e) = runtime_state.save() {
                                             warn!(error = %e, "[Chat] state save failed after forget_player");
                                         }
@@ -823,34 +903,61 @@ pub async fn chat_task(
                         // accumulated during composer execution (CHAT.md
                         // concurrent-message policy). Priority order in the
                         // drain: most-recent direct-address > most-recent.
-                        let process_result = process_event(
-                            &event,
-                            &api_key,
-                            &config,
-                            &pricing,
-                            &mut runtime_state,
-                            &bot_username,
-                            &persona_body,
-                            &persona_nicknames,
-                            persona_lowercase_default,
-                            &common_words,
-                            &blocklist,
-                            &system_senders_re,
-                            &system_senders_exact,
-                            &moderation_patterns,
-                            &mut window,
-                            &mut classifier_counter,
-                            &mut spam_guard,
-                            &mut recent_speakers,
-                            &mut recent_bot_send_times,
-                            &mut last_bot_send_at,
-                            &in_critical_section,
-                            &bot_tx,
-                            &composer_limiter,
-                            &classifier_limiter,
-                        ).await;
-                        if let Err(e) = process_result {
-                            warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
+                        //
+                        // CHAT.md cancellation contract: race the dispatch
+                        // against `composer_cancel.cancelled()` so a
+                        // BotDisconnected or Shutdown signal aborts the
+                        // in-flight composer at the next iteration boundary.
+                        // The cancel arm does NOT save state here — the
+                        // Shutdown branch owns the save+ack flow — and does
+                        // NOT log the decision (the cancel originator does
+                        // that with the proper reason).
+                        let cancelled = composer_cancel.clone();
+                        let mut cancelled_during_live = false;
+                        tokio::select! {
+                            biased;
+                            _ = cancelled.cancelled() => {
+                                cancelled_during_live = true;
+                            }
+                            process_result = process_event(
+                                &event,
+                                &api_key,
+                                &config,
+                                &pricing,
+                                &mut runtime_state,
+                                &bot_username,
+                                &persona_body,
+                                &persona_nicknames,
+                                persona_lowercase_default,
+                                &common_words,
+                                &blocklist,
+                                &system_senders_re,
+                                &system_senders_exact,
+                                &moderation_patterns,
+                                &mut window,
+                                &mut classifier_counter,
+                                &mut spam_guard,
+                                &mut recent_speakers,
+                                &mut recent_bot_send_times,
+                                &mut last_bot_send_at,
+                                &in_critical_section,
+                                &bot_tx,
+                                &composer_limiter,
+                                &classifier_limiter,
+                                composer_cancel.clone(),
+                            ) => {
+                                if let Err(e) = process_result {
+                                    warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
+                                }
+                            }
+                        }
+                        if cancelled_during_live {
+                            // Skip the backlog drain — Shutdown is exiting,
+                            // and BotDisconnected wants events from the
+                            // post-disconnect window to be re-evaluated by
+                            // the per-event filters once a new identity is
+                            // known, not opportunistically replayed here.
+                            continue;
                         }
 
                         // Drain any backlog accumulated during the (slow)
@@ -890,35 +997,47 @@ pub async fn chat_task(
                                 }
                                 window.push_back(backlog_ev.clone());
                             }
-                            let backlog_result = process_event(
-                                &backlog_ev,
-                                &api_key,
-                                &config,
-                                &pricing,
-                                &mut runtime_state,
-                                &bot_username,
-                                &persona_body,
-                                &persona_nicknames,
-                                persona_lowercase_default,
-                                &common_words,
-                                &blocklist,
-                                &system_senders_re,
-                                &system_senders_exact,
-                                &moderation_patterns,
-                                &mut window,
-                                &mut classifier_counter,
-                                &mut spam_guard,
-                                &mut recent_speakers,
-                                &mut recent_bot_send_times,
-                                &mut last_bot_send_at,
-                                &in_critical_section,
-                                &bot_tx,
-                                &composer_limiter,
-                                &classifier_limiter,
-                            )
-                            .await;
-                            if let Err(e) = backlog_result {
-                                warn!(sender = %backlog_ev.sender, error = %e, "[Chat] backlog event processing error");
+                            let cancelled = composer_cancel.clone();
+                            let mut cancelled_during_backlog = false;
+                            tokio::select! {
+                                biased;
+                                _ = cancelled.cancelled() => {
+                                    cancelled_during_backlog = true;
+                                }
+                                backlog_result = process_event(
+                                    &backlog_ev,
+                                    &api_key,
+                                    &config,
+                                    &pricing,
+                                    &mut runtime_state,
+                                    &bot_username,
+                                    &persona_body,
+                                    &persona_nicknames,
+                                    persona_lowercase_default,
+                                    &common_words,
+                                    &blocklist,
+                                    &system_senders_re,
+                                    &system_senders_exact,
+                                    &moderation_patterns,
+                                    &mut window,
+                                    &mut classifier_counter,
+                                    &mut spam_guard,
+                                    &mut recent_speakers,
+                                    &mut recent_bot_send_times,
+                                    &mut last_bot_send_at,
+                                    &in_critical_section,
+                                    &bot_tx,
+                                    &composer_limiter,
+                                    &classifier_limiter,
+                                    composer_cancel.clone(),
+                                ) => {
+                                    if let Err(e) = backlog_result {
+                                        warn!(sender = %backlog_ev.sender, error = %e, "[Chat] backlog event processing error");
+                                    }
+                                }
+                            }
+                            if cancelled_during_backlog {
+                                break;
                             }
                         }
 
@@ -1173,6 +1292,7 @@ async fn process_event(
     bot_tx: &mpsc::Sender<BotInstruction>,
     composer_limiter: &client::RateLimiter,
     classifier_limiter: &client::RateLimiter,
+    composer_cancel: CancellationToken,
 ) -> Result<(), String> {
     let now = Instant::now();
 
@@ -1677,6 +1797,16 @@ async fn process_event(
         web_fetch_daily_max: config.web_fetch_daily_max,
     };
 
+    // CHAT.md cancellation contract: between iterations only. We cannot
+    // cancel mid-tool-dispatch (would tear an in-flight `update_self_memory`
+    // write), so the per-iteration wrap belongs inside `composer::run_loop`.
+    // Until that plumbing lands, the safe checkpoints we own here are
+    // BEFORE the run_loop call (no work yet) and AFTER it returns
+    // (every tool dispatched in that run has completed) — both honor
+    // the no-torn-write rule.
+    if composer_cancel.is_cancelled() {
+        return Ok(());
+    }
     let run = match composer::run_loop(
         api_key,
         req,
@@ -1824,7 +1954,34 @@ async fn process_event(
         config.typing_delay_floor_ms,
         config.typing_delay_max_ms,
     );
-    tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+    // CHAT.md cancellation contract: race the typing-delay sleep against
+    // the cancel token so a BotDisconnected/Shutdown signal during the
+    // pacing wait aborts the send rather than dripping a stale reply
+    // after the bot already left the server.
+    tokio::select! {
+        _ = composer_cancel.cancelled() => {
+            return Ok(());
+        }
+        _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
+    }
+
+    // Post-sleep bot_username re-check: a soft network blip can drop the
+    // live username to None without raising BotDisconnected (and thus
+    // without firing `composer_cancel`), and a disconnect-then-reconnect
+    // race can flip it to a different identity. Either way, sending the
+    // staged reply against a stale username is wasteful — convert the
+    // would-be `send_error` into a `pacing_drop` signal. Composer tokens
+    // were already burned upstream; skip `record_composer` to match the
+    // cancellation-path convention.
+    if bot_username.read().await.is_none() {
+        decisions::write(
+            &decisions::DecisionRecord::new("pacing_drop")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason("bot_disconnected_during_pacing"),
+        );
+        return Ok(());
+    }
 
     // Recompute window-bound counters using a fresh `Instant::now()` —
     // the `now` captured at the top of `process_event` is stale by the
@@ -1930,6 +2087,9 @@ struct ForgetScrubStats {
     decisions_lines: u64,
     overlay_entries: u64,
     malformed_dropped: u64,
+    pending_adjustments_lines: u64,
+    pending_self_memory_archive_lines: u64,
+    index_entries: u64,
 }
 
 /// Walk every JSONL under `data/chat/history/` and `data/chat/decisions/`,
@@ -2124,6 +2284,169 @@ async fn scrub_history_for_player(
             }
         }
     }
+
+    // Pending-adjustments live file + rotated archives for both
+    // pending_adjustments and pending_self_memory. These streams are
+    // written WITHOUT a process-wide cached LineWriter (the classifier
+    // reopens per write; rotated archives are read-only after rotation),
+    // so no cache-invalidation handshake is needed here. If a future
+    // writer cache is introduced for either stream, this scrub branch
+    // must grow an analogous DropCacheAndAck / invalidate_cache_for
+    // hook so the rewrite isn't silently overwritten.
+    let chat_dir = std::path::Path::new(memory::CHAT_DIR);
+    // (1) Live single-file `pending_adjustments.jsonl`.
+    let live_pending = std::path::Path::new(reflection::PENDING_FILE).to_path_buf();
+    if live_pending.exists() {
+        let p_blk = live_pending.clone();
+        let uuid_lc_blk = uuid_lc.clone();
+        let username_lc_blk = username_lc.clone();
+        let (removed, malformed) = tokio::task::spawn_blocking(
+            move || -> Result<(u64, u64), String> {
+                let body = match std::fs::read_to_string(&p_blk) {
+                    Ok(b) => b,
+                    Err(_) => return Ok((0, 0)),
+                };
+                let mut kept = String::with_capacity(body.len());
+                let mut removed = 0u64;
+                let mut malformed = 0u64;
+                for line in body.lines() {
+                    let drop_it =
+                        match serde_json::from_str::<serde_json::Value>(line) {
+                            Ok(v) => record_matches_player(
+                                &v,
+                                &uuid_lc_blk,
+                                &username_lc_blk,
+                            ),
+                            Err(_) => {
+                                malformed = malformed.saturating_add(1);
+                                true
+                            }
+                        };
+                    if drop_it {
+                        removed = removed.saturating_add(1);
+                        continue;
+                    }
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+                if removed > 0 {
+                    crate::fsutil::write_atomic(&p_blk, &kept).map_err(|e| {
+                        format!("rewrite pending_adjustments {}: {e}", p_blk.display())
+                    })?;
+                }
+                Ok((removed, malformed))
+            },
+        )
+        .await
+        .expect("scrub pending live blocking task panicked")?;
+        stats.malformed_dropped = stats.malformed_dropped.saturating_add(malformed);
+        stats.pending_adjustments_lines =
+            stats.pending_adjustments_lines.saturating_add(removed);
+    }
+
+    // (2) Rotated archives in `data/chat/`:
+    //     `pending_adjustments.<UTC>.jsonl`
+    //     `pending_self_memory.<UTC>.jsonl`
+    if chat_dir.exists() {
+        let entries = std::fs::read_dir(chat_dir)
+            .map_err(|e| format!("read_dir({}): {e}", chat_dir.display()))?;
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let bucket = if name.starts_with("pending_adjustments.")
+                && name.ends_with(".jsonl")
+                && name != "pending_adjustments.jsonl"
+            {
+                Some("pending_adjustments")
+            } else if name.starts_with("pending_self_memory.")
+                && name.ends_with(".jsonl")
+            {
+                Some("pending_self_memory")
+            } else {
+                None
+            };
+            let Some(bucket) = bucket else {
+                continue;
+            };
+            let p_blk = p.clone();
+            let uuid_lc_blk = uuid_lc.clone();
+            let username_lc_blk = username_lc.clone();
+            let bucket_blk = bucket;
+            let (removed, malformed) = tokio::task::spawn_blocking(
+                move || -> Result<(u64, u64), String> {
+                    let body = match std::fs::read_to_string(&p_blk) {
+                        Ok(b) => b,
+                        Err(_) => return Ok((0, 0)),
+                    };
+                    let mut kept = String::with_capacity(body.len());
+                    let mut removed = 0u64;
+                    let mut malformed = 0u64;
+                    for line in body.lines() {
+                        let drop_it =
+                            match serde_json::from_str::<serde_json::Value>(line) {
+                                Ok(v) => record_matches_player(
+                                    &v,
+                                    &uuid_lc_blk,
+                                    &username_lc_blk,
+                                ),
+                                Err(_) => {
+                                    malformed = malformed.saturating_add(1);
+                                    true
+                                }
+                            };
+                        if drop_it {
+                            removed = removed.saturating_add(1);
+                            continue;
+                        }
+                        kept.push_str(line);
+                        kept.push('\n');
+                    }
+                    if removed > 0 {
+                        crate::fsutil::write_atomic(&p_blk, &kept).map_err(|e| {
+                            format!("rewrite {bucket_blk} {}: {e}", p_blk.display())
+                        })?;
+                    }
+                    Ok((removed, malformed))
+                },
+            )
+            .await
+            .expect("scrub pending archive blocking task panicked")?;
+            stats.malformed_dropped =
+                stats.malformed_dropped.saturating_add(malformed);
+            if removed > 0 {
+                match bucket {
+                    "pending_adjustments" => {
+                        stats.pending_adjustments_lines = stats
+                            .pending_adjustments_lines
+                            .saturating_add(removed);
+                    }
+                    "pending_self_memory" => {
+                        stats.pending_self_memory_archive_lines = stats
+                            .pending_self_memory_archive_lines
+                            .saturating_add(removed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Drop any `{username_lc: <uuid>}` entry from `_index.json` that
+    // points at the forgotten UUID. Without this, the player's username
+    // + UUID survive in cleartext in the index until the next full
+    // rebuild — same compliance gap as the JSONL pending-streams scrub.
+    let uuid_owned = uuid.to_string();
+    let index_entries = tokio::task::spawn_blocking(move || {
+        memory::forget_index_entry(&uuid_owned)
+    })
+    .await
+    .expect("scrub index blocking task panicked")
+    .map_err(|e| format!("forget_index_entry: {e}"))?;
+    stats.index_entries = stats.index_entries.saturating_add(index_entries);
+
     Ok(stats)
 }
 
@@ -2224,7 +2547,7 @@ async fn build_replay_prompt(
 fn write_operator_audit(action: &str, username: &str, uuid: &str, reason: &str) {
     use std::io::Write;
     let entry = serde_json::json!({
-        "ts": state::iso_utc(chrono::Utc::now()),
+        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "action": action,
         "username": username,
         "uuid": uuid,
@@ -2281,6 +2604,73 @@ async fn resolve_username_via_index_or_mojang(username: &str) -> Result<String, 
         format!("resolved uuid for {username:?} failed shape check: {e}")
     })?;
     Ok(uuid)
+}
+
+/// Drain helper for `ChatCommand`s queued behind `Shutdown`. Each variant
+/// that carries a `respond_to` oneshot gets an explicit shutdown-error
+/// reply so the operator's `blocking_recv` unblocks with a clear message
+/// instead of silently observing a `RecvError` once the channel finally
+/// closes. Variants without a `respond_to` (`BotDisconnected`) and the
+/// terminal `Shutdown` ack itself are simply discarded — at this point we
+/// are already on the shutdown path, so a second ack is meaningless.
+fn reply_shutdown_error(cmd: ChatCommand) {
+    const MSG: &str = "chat task shutting down";
+    match cmd {
+        // Already on the shutdown path — extra acks are noise.
+        ChatCommand::Shutdown { ack } => {
+            let _ = ack.send(());
+        }
+        // No respond_to channel — just drop.
+        ChatCommand::BotDisconnected => {}
+        // Infallible response shapes — best we can do is drop the sender,
+        // since the `Result` doesn't include a shutdown signal. Logging
+        // here so the operator at least sees why their query went silent.
+        ChatCommand::Status { respond_to } => {
+            warn!("[Chat] dropping Status command queued during shutdown");
+            drop(respond_to);
+        }
+        ChatCommand::SetPaused { respond_to, .. } => {
+            warn!("[Chat] dropping SetPaused command queued during shutdown");
+            drop(respond_to);
+        }
+        ChatCommand::SetDryRun { respond_to, .. } => {
+            warn!("[Chat] dropping SetDryRun command queued during shutdown");
+            drop(respond_to);
+        }
+        ChatCommand::ClearModerationBackoff { respond_to } => {
+            warn!("[Chat] dropping ClearModerationBackoff command queued during shutdown");
+            drop(respond_to);
+        }
+        ChatCommand::RunRetentionSweep { respond_to } => {
+            warn!("[Chat] dropping RunRetentionSweep command queued during shutdown");
+            drop(respond_to);
+        }
+        // Result-shaped responses can carry the shutdown reason explicitly.
+        ChatCommand::RunReflection { respond_to } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::ShowDecisionLog { respond_to, .. } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::ReplayEvent { respond_to, .. } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::ResetPlayerMemory { respond_to, .. } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::DumpPlayerMemory { respond_to, .. } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::SetOperatorTrust { respond_to, .. } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::RegeneratePersona { respond_to } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+        ChatCommand::ForgetPlayer { respond_to, .. } => {
+            let _ = respond_to.send(Err(MSG.to_string()));
+        }
+    }
 }
 
 /// Cheap deterministic-process-RNG returning a value in [0.0, 1.0).

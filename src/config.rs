@@ -514,8 +514,8 @@ impl ChatConfig {
         if self.rate_limit_wait_max_secs == 0 {
             errors.push("rate_limit_wait_max_secs must be > 0".to_string());
         }
-        if self.composer_max_tool_iterations == 0 {
-            errors.push("composer_max_tool_iterations must be > 0".to_string());
+        if self.composer_max_tool_iterations < 2 {
+            errors.push("composer_max_tool_iterations must be >= 2 (1 disables tool dispatch)".to_string());
         }
         if self.daily_input_token_cap == 0 {
             errors.push("daily_input_token_cap must be > 0".to_string());

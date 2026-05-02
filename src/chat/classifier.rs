@@ -426,7 +426,7 @@ pub fn parse_verdict(text: &str) -> Result<Verdict, String> {
 }
 
 /// Append a pending-adjustment entry to `data/chat/pending_adjustments.jsonl`.
-/// CHAT.mdrrors are logged but never raised — pending writes are
+/// Errors are logged but never raised — pending writes are
 /// best-effort and recoverable from history.
 pub fn write_pending_adjustment(
     trigger: &str,
@@ -439,7 +439,7 @@ pub fn write_pending_adjustment(
     // across a midnight-UTC tick.
     let now = chrono::Utc::now();
     let entry = crate::chat::reflection::PendingEntry {
-        ts: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ts: crate::chat::jsonl::iso_utc_millis_dt(now),
         trigger: trigger.to_string(),
         sender: sender.to_string(),
         sender_uuid: sender_uuid.map(str::to_string),
@@ -452,7 +452,7 @@ pub fn write_pending_adjustment(
             return;
         }
     };
-    let path = std::path::Path::new("data/chat/pending_adjustments.jsonl");
+    let path = std::path::Path::new(crate::chat::reflection::PENDING_FILE);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

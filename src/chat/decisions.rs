@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tracing::{debug, error};
 
@@ -278,6 +277,7 @@ pub(crate) fn dir() -> &'static Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
 
     #[test]
     fn record_serializes_required_fields() {

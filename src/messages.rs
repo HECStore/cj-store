@@ -121,8 +121,12 @@ pub enum ChatCommand {
         respond_to: oneshot::Sender<Result<(), String>>,
     },
     /// "Right to be forgotten": purge a player's UUID from per-player
-    /// file, history JSONL records, decisions JSONL records, and UUID
-    /// overlay sidecars; logs the action to `operator_audit.jsonl`.
+    /// file, history JSONL records, decisions JSONL records, UUID
+    /// overlay sidecars, `pending_adjustments.jsonl` (live + rotated
+    /// `pending_adjustments.<UTC>.jsonl` archives), rotated
+    /// `pending_self_memory.<UTC>.jsonl` archives, and matching entries
+    /// in `data/chat/players/_index.json`; logs the action to
+    /// `operator_audit.jsonl`.
     ForgetPlayer {
         username: String,
         respond_to: oneshot::Sender<Result<(), String>>,

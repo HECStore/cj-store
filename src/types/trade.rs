@@ -142,7 +142,7 @@ impl Trade {
             &json_paths[..]
         };
 
-        let mut skipped = 0usize;
+        let mut quarantined = 0usize;
         for path in paths_to_load {
             match fs::read_to_string(path) {
                 Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
@@ -150,13 +150,13 @@ impl Trade {
                         trades.push(trade);
                     }
                     Err(e) => {
-                        skipped += 1;
-                        tracing::warn!("[Trade] skipping malformed {}: {e}", path.display());
+                        quarantine_trade_file(path, &format!("malformed: {e}"))?;
+                        quarantined += 1;
                     }
                 },
                 Err(e) => {
-                    skipped += 1;
-                    tracing::warn!("[Trade] skipping unreadable {}: {e}", path.display());
+                    quarantine_trade_file(path, &format!("unreadable: {e}"))?;
+                    quarantined += 1;
                 }
             }
         }
@@ -166,11 +166,11 @@ impl Trade {
         trades.sort_by_key(|a| a.timestamp);
 
         tracing::info!(
-            "[Trade] loaded {} of {} trades (limit {}, skipped {})",
+            "[Trade] loaded {} of {} trades (limit {}, quarantined {})",
             trades.len(),
             file_count,
             max_trades,
-            skipped,
+            quarantined,
         );
 
         Ok(trades)
@@ -228,6 +228,25 @@ impl Trade {
         );
         Ok(())
     }
+}
+
+/// Rename a malformed/unreadable trade file to `*.json.corrupt.<millis>` so
+/// the next `save_all` orphan-cleanup cannot delete it (extension is no
+/// longer `.json`) and subsequent `load_all_with_limit` calls do not retry
+/// deserializing it. Mirrors `quarantine_pair_file` in `types::pair`.
+fn quarantine_trade_file(path: &Path, reason: &str) -> io::Result<()> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let target = path.with_extension(format!("json.corrupt.{ts}"));
+    tracing::warn!(
+        "[Trade] quarantining {} ({}): renaming to {}",
+        path.display(),
+        reason,
+        target.display(),
+    );
+    fs::rename(path, target)
 }
 
 #[cfg(test)]

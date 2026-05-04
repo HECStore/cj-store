@@ -194,25 +194,45 @@ pub async fn handle_deposit_balance_queued(
         "[Deposit]",
     )
     .await;
+    // Credit only what the bot physically deposited into storage. Crediting
+    // the planned `diamonds_actually_received` when some remained on the bot
+    // would mint currency unbacked by physical reserves.
+    let credited_diamonds = rb.items_returned;
     if rb.has_failures() {
         warn!(
             player = player_name,
             uuid = %user_uuid,
             failed_steps = rb.operations_failed,
             items_unplanned = rb.items_unplanned,
-            diamonds = diamonds_actually_received,
+            diamonds_received = diamonds_actually_received,
+            credited = credited_diamonds,
             "Deposit storage write partially failed; some diamonds may remain in bot inventory"
         );
     } else {
         info!(
             uuid = %user_uuid,
             item = "diamond",
-            amount = diamonds_actually_received,
+            amount = credited_diamonds,
             "Deposit storage credited"
         );
     }
 
-    let actual_amount = diamonds_actually_received as f64;
+    if credited_diamonds <= 0 {
+        let detail = rb
+            .partial_message()
+            .unwrap_or_else(|| "no diamonds reached storage".to_string());
+        return utils::send_message_to_player(
+            store,
+            player_name,
+            &format!(
+                "Deposit failed: none of your {} diamonds could be deposited ({}); contact an operator.",
+                diamonds_actually_received, detail
+            ),
+        )
+        .await;
+    }
+
+    let actual_amount = credited_diamonds as f64;
     let new_balance = {
         let user = store.expect_user_mut(&user_uuid, "deposit-balance/credit")?;
         user.balance += actual_amount;
@@ -233,7 +253,7 @@ pub async fn handle_deposit_balance_queued(
     store.orders.push_back(crate::types::Order {
         order_type: crate::types::order::OrderType::DepositBalance,
         item: ItemId::from_normalized("diamond".to_string()),
-        amount: diamonds_actually_received,
+        amount: credited_diamonds,
         currency_amount: 0.0,
         user_uuid: user_uuid.clone(),
     });
@@ -241,13 +261,13 @@ pub async fn handle_deposit_balance_queued(
     store.trades.push(crate::types::Trade::new(
         crate::types::TradeType::DepositBalance,
         ItemId::from_normalized("diamond".to_string()),
-        diamonds_actually_received,
+        credited_diamonds,
         actual_amount,
         user_uuid.clone(),
     ));
 
     store.advance_trade(|s| {
-        s.commit("diamond".to_string(), diamonds_actually_received, actual_amount)
+        s.commit("diamond".to_string(), credited_diamonds, actual_amount)
     });
 
     info!(
@@ -267,12 +287,20 @@ pub async fn handle_deposit_balance_queued(
         let _ = state::save(store);
     }
 
+    let shortfall_suffix = if credited_diamonds < diamonds_actually_received {
+        format!(
+            " ({} of {} diamonds reached storage)",
+            credited_diamonds, diamonds_actually_received
+        )
+    } else {
+        String::new()
+    };
     utils::send_message_to_player(
         store,
         player_name,
         &format!(
-            "Deposited {:.2} diamonds to your balance. New balance: {:.2}",
-            actual_amount, new_balance
+            "Deposited {:.2} diamonds to your balance. New balance: {:.2}{}",
+            actual_amount, new_balance, shortfall_suffix
         ),
     )
     .await

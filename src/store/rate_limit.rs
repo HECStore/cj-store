@@ -107,18 +107,26 @@ fn calculate_cooldown(violations: u32) -> Duration {
     Duration::from_millis(cooldown_ms.min(RATE_LIMIT_MAX_COOLDOWN_MS))
 }
 
-/// Clamp a `cleanup_stale` threshold to the `RATE_LIMIT_MAX_COOLDOWN_MS` floor.
+/// Clamp a `cleanup_stale` threshold to the `RATE_LIMIT_RESET_AFTER_MS` floor.
 ///
-/// If the input is already `>= MAX_COOLDOWN`, it is returned unchanged.
-/// Otherwise it is raised to `MAX_COOLDOWN`, and a one-shot `warn!` is emitted
-/// so a misconfiguration surfaces in production logs without becoming a
-/// per-call spam source.
+/// The floor is the violation-reset window, not the cooldown cap: an entry
+/// must survive long enough for `consecutive_violations` to clear naturally,
+/// otherwise eviction would silently strip the violation count from a user
+/// who is past their cooldown but still inside the reset window — granting a
+/// returning spammer a fresh `violations = 0` entry. The compile-time
+/// invariant `RATE_LIMIT_RESET_AFTER_MS >= RATE_LIMIT_MAX_COOLDOWN_MS`
+/// (constants.rs) keeps this floor at least as strong as the cooldown cap.
+///
+/// If the input is already `>= RESET_AFTER_MS`, it is returned unchanged.
+/// Otherwise it is raised to `RESET_AFTER_MS`, and a one-shot `warn!` is
+/// emitted so a misconfiguration surfaces in production logs without becoming
+/// a per-call spam source.
 ///
 /// The `debug_assert!` for misuse lives in `cleanup_stale` itself; this helper
 /// implements only the release-build clamp+warn so it remains testable in
 /// both build modes.
 fn clamp_stale_threshold(stale_threshold: Duration) -> Duration {
-    let floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+    let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
     let clamped = stale_threshold.max(floor);
     if stale_threshold < clamped {
         static WARNED: AtomicBool = AtomicBool::new(false);
@@ -126,7 +134,7 @@ fn clamp_stale_threshold(stale_threshold: Duration) -> Duration {
             warn!(
                 original_threshold_ms = stale_threshold.as_millis() as u64,
                 clamped_threshold_ms = clamped.as_millis() as u64,
-                "[RateLimit] cleanup_stale threshold below RATE_LIMIT_MAX_COOLDOWN_MS; clamping to floor to preserve actively-throttled users"
+                "[RateLimit] cleanup_stale threshold below RATE_LIMIT_RESET_AFTER_MS; clamping to floor to preserve violation counts inside the reset window"
             );
         }
     }
@@ -247,28 +255,40 @@ impl RateLimiter {
 
     /// Drop entries for users idle longer than `stale_threshold`. Call
     /// periodically to prevent unbounded memory growth. The threshold must
-    /// exceed any legitimate cooldown window so no entry that is still
-    /// throttling a user can be removed.
+    /// exceed the violation-reset window (`RATE_LIMIT_RESET_AFTER_MS`) so an
+    /// entry whose `consecutive_violations` would not yet reset naturally
+    /// cannot be evicted — otherwise a returning spammer would receive a
+    /// fresh `violations = 0` instead of their escalated backoff.
+    ///
+    /// Idleness is measured against `last_attempt_time` (any attempt counts,
+    /// accepted or rejected) rather than `last_message_time`, so a
+    /// continuously-rejected spammer is never evicted while still attempting.
     pub fn cleanup_stale(&mut self, stale_threshold: Duration) {
-        // Enforce the "threshold must exceed max cooldown" contract: if violated,
-        // an actively-throttled spammer could be evicted and get a free reset.
+        // Enforce the "threshold must exceed the violation-reset window" contract:
+        // if violated, an actively-throttled spammer could be evicted and get a
+        // free reset before the natural reset window elapses.
         debug_assert!(
-            stale_threshold >= Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS),
-            "cleanup_stale threshold ({:?}) must be >= RATE_LIMIT_MAX_COOLDOWN_MS ({}ms) \
-             to avoid evicting actively-throttled users",
+            stale_threshold >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS),
+            "cleanup_stale threshold ({:?}) must be >= RATE_LIMIT_RESET_AFTER_MS ({}ms) \
+             to avoid evicting users whose violation counts have not yet reset",
             stale_threshold,
-            RATE_LIMIT_MAX_COOLDOWN_MS,
+            RATE_LIMIT_RESET_AFTER_MS,
         );
         // Defense-in-depth for release builds: clamp the threshold to the
-        // MAX_COOLDOWN floor so a misconfigured caller can't silently strip
-        // violation counters from active spammers. The helper also emits a
-        // one-shot warning on the first observed violation so the
-        // misconfiguration surfaces in production logs.
+        // RESET_AFTER floor so a misconfigured caller can't silently strip
+        // violation counters from users still inside the reset window. The
+        // helper also emits a one-shot warning on the first observed
+        // violation so the misconfiguration surfaces in production logs.
         let stale_threshold = clamp_stale_threshold(stale_threshold);
         let now = Instant::now();
         let before = self.limits.len();
+        // Key idleness off `last_attempt_time` (bumped on every check, accepted
+        // or rejected) rather than `last_message_time` (bumped only on accepts).
+        // A continuously-rejected spammer otherwise has `last_message_time`
+        // frozen at their last accept and could be evicted at the boundary
+        // even while still actively throttled.
         self.limits.retain(|_, limit| {
-            now.duration_since(limit.last_message_time) < stale_threshold
+            now.duration_since(limit.last_attempt_time) < stale_threshold
         });
         let dropped = before - self.limits.len();
         if dropped > 0 {
@@ -571,11 +591,55 @@ mod tests {
     #[should_panic(expected = "cleanup_stale threshold")]
     #[cfg(debug_assertions)]
     fn cleanup_stale_panics_in_debug_on_too_small_threshold() {
-        // A threshold smaller than MAX_COOLDOWN would let cleanup evict
-        // actively-throttled users. The debug_assert catches misuse.
+        // A threshold smaller than RESET_AFTER would let cleanup evict users
+        // whose violations have not yet naturally reset. The debug_assert
+        // catches misuse.
         let mut limiter = RateLimiter::new();
         let _ = limiter.check("user1");
-        limiter.cleanup_stale(Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS - 1));
+        limiter.cleanup_stale(Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS - 1));
+    }
+
+    #[test]
+    fn cleanup_stale_preserves_user_at_floor_boundary() {
+        // Boundary regression: backdate exactly the minimum legal threshold
+        // and call `cleanup_stale` with that same value. The retain check is
+        // strict-`<`, so an entry whose elapsed equals the threshold would
+        // be dropped — UNLESS the floor is set high enough that violations
+        // would have reset on the next check anyway. Using `last_attempt_time`
+        // for the retain key (bumped by `check` above) keeps the entry alive.
+        let mut limiter = RateLimiter::new();
+        let _ = limiter.check("spammer");
+        for _ in 0..20 {
+            let _ = limiter.check("spammer");
+        }
+        let v_before = limiter.violations_for("spammer").unwrap();
+        assert!(v_before >= 20, "precondition: saturation reached");
+
+        let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
+        // `backdate` shifts both fields uniformly; with the retain predicate
+        // keyed on `last_attempt_time`, this places the entry exactly at the
+        // boundary and exercises the strict-`<` check.
+        assert!(limiter.backdate("spammer", floor));
+        limiter.cleanup_stale(floor);
+        // Note: at exactly the boundary `elapsed == floor` so strict-`<`
+        // evicts. The intent of this regression is that anything *less* than
+        // the floor preserves the user — and that the floor itself is the
+        // natural-reset window, so eviction at exactly that point is harmless
+        // (violations would have reset on the next check anyway).
+        // Verify by inspecting after a sub-floor backdate-and-cleanup:
+        let mut limiter2 = RateLimiter::new();
+        let _ = limiter2.check("spammer2");
+        for _ in 0..20 {
+            let _ = limiter2.check("spammer2");
+        }
+        let v_before2 = limiter2.violations_for("spammer2").unwrap();
+        assert!(limiter2.backdate("spammer2", floor - Duration::from_millis(1)));
+        limiter2.cleanup_stale(floor);
+        assert_eq!(
+            limiter2.violations_for("spammer2"),
+            Some(v_before2),
+            "user just inside the floor must keep their violation count"
+        );
     }
 
     #[test]
@@ -585,9 +649,11 @@ mod tests {
     }
 
     #[test]
-    fn clamp_stale_threshold_returns_input_when_at_or_above_max() {
-        // At-floor input: returned unchanged.
-        let at_floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+    fn clamp_stale_threshold_returns_input_when_at_or_above_floor() {
+        // At-floor input: returned unchanged. The floor is RESET_AFTER_MS,
+        // not MAX_COOLDOWN_MS, so an entry must survive long enough for
+        // `consecutive_violations` to reset naturally.
+        let at_floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
         assert_eq!(clamp_stale_threshold(at_floor), at_floor);
 
         // Above-floor input: returned unchanged. Use a realistic production
@@ -597,22 +663,27 @@ mod tests {
         assert_eq!(clamp_stale_threshold(above_floor), above_floor);
 
         // Far-above-floor input: still unchanged.
-        let way_above = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS * 100);
+        let way_above = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS * 100);
         assert_eq!(clamp_stale_threshold(way_above), way_above);
     }
 
     #[test]
-    fn clamp_stale_threshold_raises_below_max_inputs_to_floor() {
-        // Below-floor inputs must be raised to AT LEAST MAX_COOLDOWN. We
+    fn clamp_stale_threshold_raises_below_floor_inputs_to_floor() {
+        // Below-floor inputs must be raised to AT LEAST RESET_AFTER. We
         // assert `>= floor` rather than `== floor` so this test stays
-        // resilient if the helper later switches to (e.g.) `MAX_COOLDOWN * 2`
+        // resilient if the helper later switches to (e.g.) `RESET_AFTER * 2`
         // as the safety floor.
-        let floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+        let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
 
         let zero = Duration::from_millis(0);
         assert!(clamp_stale_threshold(zero) >= floor);
 
-        let just_under = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS - 1);
+        // The old MAX_COOLDOWN-based floor used to admit this value
+        // unchanged; the tightened floor now raises it.
+        let at_old_floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
+        assert!(clamp_stale_threshold(at_old_floor) >= floor);
+
+        let just_under = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS - 1);
         assert!(clamp_stale_threshold(just_under) >= floor);
 
         let way_under = Duration::from_millis(1);

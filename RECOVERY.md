@@ -73,18 +73,30 @@ Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
 
 **Symptoms**
 
-- Bot fails to start with a JSON parse error mentioning the file.
-- A specific pair disappears from the `pairs` CLI menu (the Store logs
-  `Skipping pair with empty item name …` or `Skipping pair with invalid
-  item name …` on load).
+- A specific pair disappears from the `pairs` CLI menu and the Store log
+  contains one of:
+  - `[Pair] quarantining <path> (malformed: …)` /  `(unreadable: …)` /
+    `(duplicate key '…' already loaded)` — `Pair::load_all` could not
+    deserialize the file (or saw two files mapping to the same item),
+    and renamed the bad file to `data/pairs/<item>.json.corrupt.<millis>`
+    so the next `save_all` orphan-cleanup pass cannot delete it and so
+    subsequent `load_all` calls skip it.
+  - `Skipping pair with empty item name …` / `Skipping pair with invalid
+    item name '…' (normalized to empty)` — the file deserialized, but
+    `Store::new`'s post-load normalization rejected its `item` field; the
+    pair is dropped from the in-memory map and the file is then deleted
+    by the next `save_all` orphan-cleanup pass.
+
+  Startup completes — neither path blocks the bot.
 - AMM prices are suddenly absurd for one pair (see
   `MIN_RESERVE_FOR_PRICE` in [src/constants.rs](src/constants.rs)).
 
 **Fix**
 
 1. Stop the bot.
-2. Open the offending `data/pairs/<item>.json`. Expected shape (see
-   [DATA_SCHEMA.md](DATA_SCHEMA.md#datapairsitemjson)):
+2. Locate the quarantined sidecar `data/pairs/<item>.json.corrupt.<millis>`
+   (the rename the Store performed at load time). Open it. Expected shape
+   (see [DATA_SCHEMA.md](DATA_SCHEMA.md#datapairsitemjson)):
    ```json
    {
      "item": "cobblestone",
@@ -101,12 +113,16 @@ Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
    - `currency_stock` is not derivable from elsewhere — consult the last
      known good value (from a `data.bak.*` snapshot or `data/logs/store.log`
      around the last price quote).
-4. If the file is unfixable, delete it. The pair will be gone on next
-   startup; operators can recreate it via CLI menu option 8 "Add pair",
-   which sets both stocks to zero. A pair with zero `item_stock` will
-   refuse buys, and a pair with zero `currency_stock` will refuse sells:
-   the AMM price formula has no defined value when the relevant reserve
-   is empty, so the order is rejected up front with the message
+4. If the sidecar is repairable, edit it and rename it back to
+   `data/pairs/<item>.json`. If two `*.json.corrupt.<millis>` files exist
+   for the same item (the duplicate-key path), reconcile them into one
+   correct `<item>.json` first. If the sidecar is unfixable, leave or
+   delete it — the pair will be gone on next startup; operators can
+   recreate it via CLI menu option 8 "Add pair", which sets both stocks
+   to zero. A pair with zero `item_stock` will refuse buys, and a pair
+   with zero `currency_stock` will refuse sells: the AMM price formula
+   has no defined value when the relevant reserve is empty, so the order
+   is rejected up front with the message
    `Item 'X' is not available for trading (no stock or reserves).` (this
    exact wording is sent for both buys and sells; see
    [src/store/orders.rs](src/store/orders.rs) `validate_and_plan_buy` /
@@ -117,13 +133,14 @@ Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
    non-zero reserves — that is *not* the zero-stock path. Either way,
    expect to use `additem` / `addcurrency` operator whispers to seed
    stock before players can trade.
-5. Restart the bot. Watch the log for `Loaded N pairs`.
+5. Restart the bot. Watch the log for `[Pair] loaded N pairs (quarantined K)`.
 6. In the CLI, run `audit-state` to cross-check that pair stocks match the
    chest totals.
 
 **Why this can happen**: hand-edit typo, disk full during an atomic write
-(rare — the rename step is atomic on both NTFS and POSIX), or a half-synced
-backup restore.
+(rare — the rename step is atomic on both NTFS and POSIX), a half-synced
+backup restore, or two pair files on disk both deserializing to the same
+`pair.item` (duplicate key — the second-loaded file is quarantined).
 
 ---
 

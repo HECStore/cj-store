@@ -121,7 +121,10 @@ One file per trading pair. Filename is the canonical item id (no
 
 - `stack_size` ∈ {1, 16, 64}. Set at pair creation via CLI option 8 and
   not intended to change afterwards — the AMM and the deposit planner
-  both assume it's constant for the lifetime of the pair.
+  both assume it's constant for the lifetime of the pair. `Pair::save`
+  rejects any other value (including the `Default` of 0) so a hand-edit
+  to e.g. 32 fails the next save instead of silently breaking shulker
+  capacity math.
 - `item_stock` must match the sum of all in-world inventory for this
   item across every chest whose `item == "<item>"`. Drift is flagged by
   CLI option 12 "Audit state".
@@ -130,6 +133,14 @@ One file per trading pair. Filename is the canonical item id (no
   invariant `k = item_stock × currency_stock` grows only by the fee on
   each trade. Changing either stock directly (without the other) re-prices
   the pair instantly; don't hand-edit unless you know what you're doing.
+- On corrupt-JSON or unreadable pair files, `Pair::load_all` renames the
+  bad file to `data/pairs/<item>.json.corrupt.<millis>` (the millisecond
+  suffix avoids collisions if quarantine fires repeatedly) and continues
+  loading the rest. Two on-disk files that deserialize to the same
+  `pair.item` are also a quarantine case: the first wins, the second is
+  renamed. `Pair::save_all` refuses to run with an empty in-memory
+  `pairs` map (returns `InvalidInput`) so the orphan-cleanup pass cannot
+  wipe the pairs directory.
 
 ## `data/users/<uuid>.json`
 
@@ -151,6 +162,12 @@ One file per known player. Filename is the hyphenated Mojang UUID. See
   withdraw/pay handlers reject when the result would go below zero.
 - `operator: true` unlocks `additem` / `removeitem` / `addcurrency` /
   `removecurrency` in whispers.
+- `User::save` validates the embedded `uuid` shape (canonical hyphenated
+  lowercase hex, or bare 32-char lowercase hex) before building the file
+  path; out-of-shape uuids fail with `InvalidInput`. `User::load_all`
+  additionally requires that the embedded `uuid` field equals the
+  filename stem and skips files where it doesn't, so a hand-renamed or
+  tampered user file can't smuggle a mismatched identity into the store.
 
 ## `data/storage/<node_id>.json`
 

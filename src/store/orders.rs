@@ -502,7 +502,9 @@ pub async fn handle_buy_order(
         .await;
         // The player effectively prepaid an under-quota deposit. Move the
         // diamonds they did hand over into storage and credit their balance
-        // with the same amount so the partial payment is not silently lost.
+        // by the amount actually deposited (`rb.items_returned`). Crediting
+        // the planned `diamonds_received` when storage rejected some would
+        // mint currency the bot still physically holds.
         let credited_suffix = if diamonds_received > 0 {
             let rb = rollback::rollback_amount_to_storage(
                 store,
@@ -512,21 +514,39 @@ pub async fn handle_buy_order(
                 "[Buy] insufficient-payment",
             )
             .await;
+            let credited = rb.items_returned;
             if rb.has_failures() {
                 warn!(
                     phase = "buy.payment_check",
                     player = %player_name,
                     diamonds_received,
+                    credited,
                     operations_failed = rb.operations_failed,
                     items_unplanned = rb.items_unplanned,
                     "Failed to deposit some received diamonds into storage after insufficient payment"
                 );
             }
-            if let Some(u) = store.users.get_mut(&plan.user_uuid) {
-                u.balance += diamonds_received as f64;
+            if credited > 0 {
+                if let Some(u) = store.users.get_mut(&plan.user_uuid) {
+                    u.balance += credited as f64;
+                }
+                store.dirty_users.insert(plan.user_uuid.clone());
             }
-            store.dirty_users.insert(plan.user_uuid.clone());
-            format!(" Your {} diamonds have been credited to your balance.", diamonds_received)
+            match (credited, rb.partial_message()) {
+                (c, Some(detail)) if c > 0 => format!(
+                    " Your {} diamonds have been credited to your balance ({}).",
+                    c, detail
+                ),
+                (c, None) if c > 0 => format!(
+                    " Your {} diamonds have been credited to your balance.",
+                    c
+                ),
+                (_, Some(detail)) => format!(
+                    " None of your {} diamonds could be deposited ({}); contact an operator.",
+                    diamonds_received, detail
+                ),
+                _ => String::new(),
+            }
         } else {
             String::new()
         };
@@ -541,8 +561,12 @@ pub async fn handle_buy_order(
         .await;
     }
 
-    // Deposit received diamonds into storage.
-    if diamonds_received > 0 {
+    // Deposit received diamonds into storage. The physical-diamonds figure
+    // (`rb.items_returned`) — not the planned `diamonds_received` — is what
+    // backs all downstream currency_stock and balance math: crediting
+    // `currency_stock` for diamonds the bot still holds would inflate
+    // reserves and let the next sell trade pay out from thin air.
+    let physical_diamonds: i32 = if diamonds_received > 0 {
         let rb = rollback::rollback_amount_to_storage(
             store,
             "diamond",
@@ -552,15 +576,20 @@ pub async fn handle_buy_order(
         )
         .await;
         if rb.has_failures() {
-            warn!(
+            error!(
                 phase = "buy.diamond_deposit",
                 player = %player_name,
+                diamonds_received,
+                items_returned = rb.items_returned,
                 operations_failed = rb.operations_failed,
                 items_unplanned = rb.items_unplanned,
-                "Failed to deposit some diamonds into storage"
+                "Diamond deposit partially failed; commit will use physical figure to keep reserves backed. Operator must reconcile stranded diamonds."
             );
         }
-    }
+        rb.items_returned
+    } else {
+        0
+    };
 
     // Commit ledgers.
     let current_stock = store.storage.total_item_amount(item);
@@ -577,6 +606,13 @@ pub async fn handle_buy_order(
         );
     }
 
+    // Player's balance debit is computed from what they TENDERED in trade
+    // (`diamonds_received`) — they shouldn't be charged extra balance to
+    // cover diamonds the bot's storage failed to accept. Surplus credit, on
+    // the other hand, is conservative: only credit balance for diamonds
+    // actually deposited, otherwise we'd hand the player virtual diamonds
+    // backed only by stranded inventory on the bot.
+    let physical_diamonds_f64 = physical_diamonds as f64;
     let diamonds_received_f64 = diamonds_received as f64;
     let balance_needed = plan.total_cost - diamonds_received_f64;
     let (balance_deduction, surplus) = if balance_needed > 0.0 {
@@ -584,9 +620,11 @@ pub async fn handle_buy_order(
         store.expect_user_mut(&plan.user_uuid, "buy/commit-deduct")?.balance -= deduction;
         (deduction, 0.0)
     } else {
-        let surplus_amount = -balance_needed;
-        store.expect_user_mut(&plan.user_uuid, "buy/commit-surplus")?.balance += surplus_amount;
-        (0.0, surplus_amount)
+        let backed_surplus = (physical_diamonds_f64 - plan.total_cost).max(0.0);
+        if backed_surplus > 0.0 {
+            store.expect_user_mut(&plan.user_uuid, "buy/commit-surplus")?.balance += backed_surplus;
+        }
+        (0.0, backed_surplus)
     };
     store.expect_user_mut(&plan.user_uuid, "buy/commit-username")?.username = player_name.to_owned();
     store.dirty = true;
@@ -595,7 +633,11 @@ pub async fn handle_buy_order(
     let new_item_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "buy/commit-pair")?;
     pair.item_stock = new_item_stock;
-    pair.currency_stock += plan.total_cost;
+    // Grow reserves by what's actually backed: physical diamonds in storage
+    // plus the virtual balance the player paid from. Crediting `total_cost`
+    // would over-state reserves whenever the deposit-rollback partially
+    // failed (`physical_diamonds < diamonds_received`).
+    pair.currency_stock += physical_diamonds_f64 + balance_deduction;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after buy");
     debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
         "currency_stock invalid after buy: {}", pair.currency_stock);

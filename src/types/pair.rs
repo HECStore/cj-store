@@ -86,15 +86,32 @@ impl Pair {
 
     /// Saves this single `Pair` instance to `data/pairs/{self.item}.json`.
     /// Creates the 'data/pairs' directory if it doesn't exist.
-    /// Returns an error if the item name is empty or invalid (e.g., "minecraft:").
+    /// Returns an error if the item name is empty/sentinel or `stack_size` is
+    /// not one of Minecraft's three legal values (1, 16, 64).
     pub fn save(&self) -> io::Result<()> {
-        // Guard against writing a pair with an unusable identifier: an empty name
-        // would produce ".json", and a bare "minecraft:" prefix would sanitize to
-        // an empty name, both of which would silently collide or corrupt storage.
-        if self.item.trim().is_empty() || self.item == "minecraft:" {
+        // Guard against writing a pair with an unusable identifier: the
+        // EMPTY sentinel sanitizes to ".json" and would silently collide or
+        // corrupt storage. `ItemId::new` strips the "minecraft:" prefix and
+        // rejects any colon, so a non-EMPTY ItemId-validated value cannot
+        // smuggle in a bare "minecraft:" — the EMPTY check is the only
+        // remaining failure mode.
+        if self.item.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Cannot save pair with invalid item name: '{}'", self.item),
+                "Cannot save pair with empty/sentinel item name",
+            ));
+        }
+        // Minecraft only has three legal stack sizes (1, 16, 64). A pair
+        // persisted with any other value (e.g. the `Default` of 0, or a
+        // hand-edited 32) silently breaks `shulker_capacity_for_stack_size`
+        // and downstream chest planning even though the file looks valid.
+        if !matches!(self.stack_size, 1 | 16 | 64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Cannot save pair '{}' with invalid stack_size {} (must be 1, 16, or 64)",
+                    self.item, self.stack_size
+                ),
             ));
         }
 
@@ -116,7 +133,9 @@ impl Pair {
 
     /// Loads all `Pair`s by reading every JSON file in the `data/pairs/` directory.
     /// It uses the internal deserialization logic for each file.
-    /// Files that cannot be deserialized are skipped with a warning.
+    /// Files that cannot be deserialized are quarantined by renaming them to
+    /// `*.json.corrupt` so the next `save_all` orphan-cleanup pass cannot
+    /// silently delete them, and so subsequent `load_all` calls won't retry.
     /// If the directory does not exist, it returns an empty `HashMap<String, Pair>`.
     pub fn load_all() -> io::Result<HashMap<String, Self>> {
         let dir_path = Path::new(Self::PAIRS_DIR);
@@ -127,7 +146,7 @@ impl Pair {
             return Ok(HashMap::new());
         }
 
-        let mut skipped = 0usize;
+        let mut quarantined = 0usize;
         for entry in fs::read_dir(dir_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -137,21 +156,34 @@ impl Pair {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(pair) => {
                             let item_name = pair.item.to_string();
-                            pairs.insert(item_name, pair);
+                            // Two on-disk files mapping to the same `pair.item`
+                            // would silently overwrite each other in memory and
+                            // then `save_all`'s orphan-cleanup would delete the
+                            // loser as a stale `.json`. Quarantine the second
+                            // file (`*.json.dup`) so an operator can reconcile.
+                            if pairs.contains_key(&item_name) {
+                                quarantine_pair_file(
+                                    &path,
+                                    &format!("duplicate key '{item_name}' already loaded"),
+                                )?;
+                                quarantined += 1;
+                            } else {
+                                pairs.insert(item_name, pair);
+                            }
                         }
                         Err(e) => {
-                            skipped += 1;
-                            warn!("[Pair] skipping malformed {}: {e}", path.display());
+                            quarantine_pair_file(&path, &format!("malformed: {e}"))?;
+                            quarantined += 1;
                         }
                     },
                     Err(e) => {
-                        skipped += 1;
-                        warn!("[Pair] skipping unreadable {}: {e}", path.display());
+                        quarantine_pair_file(&path, &format!("unreadable: {e}"))?;
+                        quarantined += 1;
                     }
                 }
             }
         }
-        info!("[Pair] loaded {} pairs (skipped {})", pairs.len(), skipped);
+        info!("[Pair] loaded {} pairs (quarantined {})", pairs.len(), quarantined);
         Ok(pairs)
     }
 
@@ -159,6 +191,16 @@ impl Pair {
     /// in the `data/pairs/` directory using the `pair.save()` method.
     /// This method overwrites existing files and then removes any orphaned files.
     pub fn save_all(pairs: &HashMap<String, Self>) -> io::Result<()> {
+        // Refuse to proceed with an empty map — the orphan-cleanup loop below
+        // would otherwise wipe every pair file. The base-currency `diamond`
+        // pair is invariantly retained, so an empty `pairs` is never legitimate.
+        if pairs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "save_all called with an empty pairs map; refusing to wipe the pairs directory",
+            ));
+        }
+
         let dir_path = Path::new(Self::PAIRS_DIR);
 
         if !dir_path.exists() {
@@ -193,6 +235,26 @@ impl Pair {
         info!("[Pair] save_all: wrote {} pairs, cleaned {} orphan files", pairs.len(), removed);
         Ok(())
     }
+}
+
+/// Rename a malformed/unreadable pair file to `*.json.corrupt.<millis>` so the
+/// next `save_all` orphan-cleanup cannot delete it (extension is no longer
+/// `.json`) and subsequent `load_all` calls do not retry deserializing it.
+/// The millisecond timestamp suffix avoids collisions if quarantine fires
+/// repeatedly for the same path.
+fn quarantine_pair_file(path: &Path, reason: &str) -> io::Result<()> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let target = path.with_extension(format!("json.corrupt.{ts}"));
+    warn!(
+        "[Pair] quarantining {} ({}): renaming to {}",
+        path.display(),
+        reason,
+        target.display(),
+    );
+    fs::rename(path, target)
 }
 
 #[cfg(test)]
@@ -244,5 +306,12 @@ mod tests {
         let mut p = Pair::default();
         p.item = ItemId::EMPTY;
         assert_eq!(p.save().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn save_all_refuses_empty_map_to_prevent_accidental_wipe() {
+        let err = Pair::save_all(&HashMap::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("empty pairs map"));
     }
 }

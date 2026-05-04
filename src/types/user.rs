@@ -87,6 +87,46 @@ struct MojangResponse {
     id: String,
 }
 
+/// Mojang-shape username validator (3-16 chars, ASCII alphanumeric + `_`).
+/// Mirrors `crate::chat::tools::validate_username_shape`; intentionally
+/// duplicated here so this module has no dependency on `chat::*`. The two
+/// must stay in sync — both enforce the in-game protocol's username rules.
+fn is_valid_username_shape(username: &str) -> bool {
+    (3..=16).contains(&username.len())
+        && username
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// UUID-shape validator: canonical 36-char hyphenated lowercase hex
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, OR bare 32-char lowercase hex.
+/// Rejects uppercase, missing hyphens, wrong length, and any path-separator
+/// or `..` content. Mirrors `crate::chat::tools::validate_uuid`'s acceptance
+/// set; intentionally duplicated to keep `types::user` chat-independent.
+fn is_valid_uuid_shape(uuid: &str) -> bool {
+    let bytes = uuid.as_bytes();
+    match bytes.len() {
+        32 => bytes
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        36 => {
+            let hyphen_positions = [8usize, 13, 18, 23];
+            for (i, &b) in bytes.iter().enumerate() {
+                let expect_hyphen = hyphen_positions.contains(&i);
+                if expect_hyphen {
+                    if b != b'-' {
+                        return false;
+                    }
+                } else if !(b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 impl User {
     // Directory where all individual user files will be stored
     const USERS_DIR: &str = "data/users";
@@ -94,8 +134,17 @@ impl User {
     /// Resolves a Minecraft username to a hyphenated Mojang UUID via
     /// `https://api.mojang.com/users/profiles/minecraft/{username}`.
     /// HTTP 204 → player not found; other non-2xx or network errors → `Err`.
+    /// Rejects out-of-shape usernames before constructing the URL so a
+    /// malformed name (slash, query, fragment, control char) cannot escape
+    /// the path component into an attacker-chosen Mojang endpoint.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn get_uuid_async(username: &str) -> Result<String, String> {
+        if !is_valid_username_shape(username) {
+            warn!("[Mojang] rejecting out-of-shape username '{username}' before URL build");
+            return Err(format!(
+                "Invalid Minecraft username '{username}' (must be 3-16 chars, ASCII alphanumeric or _)"
+            ));
+        }
         let url = format!("https://api.mojang.com/users/profiles/minecraft/{username}");
 
         let client = get_http_client();
@@ -129,12 +178,19 @@ impl User {
         })?;
 
         // Mojang returns a bare-hex UUID; hyphenate to the canonical
-        // xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. The length guard prevents
-        // the slicing below from panicking on malformed responses.
+        // xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. Both guards are needed:
+        // length alone counts BYTES, not chars, so a 32-byte response with
+        // any non-ASCII multi-byte char would slice on a non-char-boundary
+        // and panic. Requiring every byte to be ASCII hex makes the slice
+        // offsets land on valid char boundaries AND prevents non-hex content
+        // (which would later become a filename component) from propagating.
         let id = &mojang_response.id;
-        if id.len() != 32 {
-            warn!("[Mojang] invalid UUID length for '{username}': got {} chars", id.len());
-            return Err(format!("Invalid UUID length from Mojang API: {id}"));
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            warn!(
+                "[Mojang] invalid UUID shape for '{username}': got {:?}",
+                id
+            );
+            return Err(format!("Invalid UUID from Mojang API: {id}"));
         }
         let formatted = format!(
             "{}-{}-{}-{}-{}",
@@ -149,15 +205,27 @@ impl User {
         Ok(formatted)
     }
 
-    fn get_user_file_path(uuid: &str) -> PathBuf {
-        PathBuf::from(Self::USERS_DIR).join(format!("{uuid}.json"))
+    /// Build the on-disk path for a user file. Validates `uuid` shape so a
+    /// tampered or legacy `User.uuid` (e.g. `"../foo"`) cannot turn the next
+    /// `save_dirty` cycle into a write-anywhere primitive — `save_dirty`
+    /// builds expected filenames from `user.uuid` verbatim and orphan-deletes
+    /// any unmatched `.json` in the users directory, so a malformed value
+    /// would both write outside the directory AND wipe legitimate files.
+    fn get_user_file_path(uuid: &str) -> io::Result<PathBuf> {
+        if !is_valid_uuid_shape(uuid) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid user UUID shape: {uuid:?}"),
+            ));
+        }
+        Ok(PathBuf::from(Self::USERS_DIR).join(format!("{uuid}.json")))
     }
 
     /// Saves this single `User` to `data/users/{self.uuid}.json`, creating
     /// the directory if needed. Uses `write_atomic` so a crash mid-write
     /// cannot leave a partially written user file.
     pub fn save(&self) -> io::Result<()> {
-        let path = Self::get_user_file_path(&self.uuid);
+        let path = Self::get_user_file_path(&self.uuid)?;
 
         if let Some(parent_dir) = path.parent()
             && !parent_dir.exists() {
@@ -190,6 +258,35 @@ impl User {
                 match fs::read_to_string(&path) {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(user) => {
+                            // Defense-in-depth at the load boundary: require
+                            // the embedded `uuid` matches a hex-UUID shape
+                            // AND equals the file stem. Without this, a
+                            // tampered file `foo.json` could carry
+                            // `"uuid": "../bar"` and on the next save_dirty
+                            // cycle (a) write to an attacker-chosen path and
+                            // (b) sweep away every legitimate user file as
+                            // an "orphan" (their canonical filenames don't
+                            // match the malformed `expected_files` set).
+                            if !is_valid_uuid_shape(&user.uuid) {
+                                skipped += 1;
+                                warn!(
+                                    "[User] skipping {}: embedded uuid {:?} fails shape check",
+                                    path.display(), user.uuid
+                                );
+                                continue;
+                            }
+                            let stem = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("");
+                            if stem != user.uuid {
+                                skipped += 1;
+                                warn!(
+                                    "[User] skipping {}: filename stem {:?} does not match embedded uuid {:?}",
+                                    path.display(), stem, user.uuid
+                                );
+                                continue;
+                            }
                             let uuid = user.uuid.clone();
                             users.insert(uuid, user);
                         }
@@ -243,11 +340,23 @@ impl User {
 
         // Filenames are keyed on `user.uuid` (not the HashMap key) so on-disk
         // files always match the canonical identity inside the User struct,
-        // even if the two ever diverge.
+        // even if the two ever diverge. Skip any user whose `uuid` fails the
+        // shape check — including their malformed filename in `expected_files`
+        // would also exempt that path from the orphan sweep, defeating the
+        // sweep's "directory mirrors map" contract.
         let mut expected_files = HashSet::with_capacity(users.len());
         let mut written = 0usize;
+        let mut skipped_invalid = 0usize;
 
         for (key, user) in users.iter() {
+            if !is_valid_uuid_shape(&user.uuid) {
+                warn!(
+                    "[User] skipping save for {:?} (key {:?}): uuid fails shape check",
+                    user.uuid, key
+                );
+                skipped_invalid += 1;
+                continue;
+            }
             let filename = format!("{}.json", user.uuid);
             expected_files.insert(filename);
             if dirty.contains(key) {
@@ -271,8 +380,8 @@ impl User {
         }
 
         info!(
-            "[User] save_dirty: wrote {} of {} users, cleaned {} orphan files",
-            written, users.len(), removed
+            "[User] save_dirty: wrote {} of {} users, cleaned {} orphan files (skipped {} with invalid uuid shape)",
+            written, users.len(), removed, skipped_invalid
         );
         Ok(())
     }
@@ -284,8 +393,32 @@ mod tests {
 
     #[test]
     fn user_file_path_uses_uuid_with_json_extension() {
-        let p = User::get_user_file_path("550e8400-e29b-41d4-a716-446655440000");
+        let p = User::get_user_file_path("550e8400-e29b-41d4-a716-446655440000").unwrap();
         assert!(p.ends_with("550e8400-e29b-41d4-a716-446655440000.json"));
+    }
+
+    #[test]
+    fn user_file_path_rejects_path_traversal_and_separators() {
+        for bad in [
+            "../etc/passwd",
+            "..\\windows\\system32",
+            "/abs/path",
+            "550e8400/../escape",
+            "UPPER-CASE-IS-NOT-CANONICAL-LOWERCASE",
+            "",
+            "tooshort",
+        ] {
+            let err = User::get_user_file_path(bad).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "uuid {bad:?}");
+        }
+    }
+
+    #[test]
+    fn user_file_path_accepts_canonical_and_bare_hex_uuids() {
+        // Canonical hyphenated, lowercase.
+        assert!(User::get_user_file_path("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        // Bare 32-char lowercase hex.
+        assert!(User::get_user_file_path("550e8400e29b41d4a716446655440000").is_ok());
     }
 
     #[test]

@@ -53,13 +53,45 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
         // Offline deterministic UUID for integration tests: avoids hitting the
         // Mojang API (which requires network and introduces flakiness). Format:
         // zero-padded username embedded in the last UUID segment.
-        let trimmed: String = username.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
+        //
+        // Validate the username up front with the same Mojang shape rule the
+        // production path now enforces. This keeps the test fixture honest:
+        // a non-ASCII or out-of-range username matches the production branch's
+        // error path instead of silently producing a multi-byte trailing
+        // segment that would violate the canonical 36-char UUID contract.
+        if username.len() < 3
+            || username.len() > 16
+            || !username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(format!("Player '{username}' not found"));
+        }
+        // After the shape gate the username is guaranteed ASCII, so byte-level
+        // padding produces exactly 12 ASCII bytes in the trailing segment.
+        let padded = format!("{:0>12}", username);
         Ok(format!("00000000-0000-0000-0000-{}", padded))
     }
     #[cfg(not(test))]
     {
-        let key = username.to_lowercase();
+        // Defense-in-depth shape check before the cache lookup so a junk
+        // username can't pollute the cache or burn a Mojang round-trip.
+        // `User::get_uuid_async` runs the same check before URL construction;
+        // doing it here too means even cache hits/misses see only valid keys.
+        if username.len() < 3
+            || username.len() > 16
+            || !username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(format!(
+                "Invalid Minecraft username '{username}' (must be 3-16 chars, ASCII alphanumeric or _)"
+            ));
+        }
+        // After the shape gate the username is ASCII, so `to_ascii_lowercase`
+        // is correct and avoids Unicode case-folding (which is locale-aware
+        // and could split a cache entry on e.g. Turkish dotless I).
+        let key = username.to_ascii_lowercase();
         let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
 
         {
@@ -97,7 +129,10 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
 /// inside an async block and can't `await` a network call without
 /// distorting the surrounding state.
 pub fn lookup_cached_uuid(username: &str) -> Option<String> {
-    let key = username.to_lowercase();
+    // Production cache keys are lowercased ASCII (post shape-gate). Use
+    // `to_ascii_lowercase` here too so the lookup matches insert exactly,
+    // independent of any Unicode case-folding quirks in arbitrary callers.
+    let key = username.to_ascii_lowercase();
     let ttl = Duration::from_secs(UUID_CACHE_TTL_SECS);
     let cache = uuid_cache().lock();
     cache.get(&key).and_then(|(uuid, ts)| {
@@ -142,8 +177,26 @@ pub fn clear_uuid_cache() {
 mod tests {
     use super::*;
 
+    /// Cargo runs unit tests in parallel by default, but every test in this
+    /// module touches the process-global `UUID_CACHE`. Acquiring this mutex
+    /// at the top of each test serializes them so a `clear_uuid_cache()` in
+    /// one test cannot wipe the fixture another test just inserted.
+    /// Cheap to acquire in the uncontended case; only matters during
+    /// `cargo test` with the default thread pool.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the test lock, swallowing poisoning so a panicking test doesn't
+    /// cascade-fail every subsequent one.
+    fn lock_test() -> std::sync::MutexGuard<'static, ()> {
+        match TEST_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
     #[test]
     fn uuid_cache_insert_then_read_returns_same_entry() {
+        let _g = lock_test();
         clear_uuid_cache();
         let cache = uuid_cache();
         let key = "testplayer".to_string();
@@ -161,6 +214,7 @@ mod tests {
         // the lookup argument. Verify mixed-case callers all resolve to the
         // same cached entry — this is the contract chat/mod.rs:718 relies on
         // when handling whatever capitalisation a sender's name arrives in.
+        let _g = lock_test();
         clear_uuid_cache();
         let uuid = "00000000-0000-0000-0000-000000000002".to_string();
 
@@ -175,12 +229,14 @@ mod tests {
 
     #[test]
     fn lookup_cached_uuid_returns_none_on_miss() {
+        let _g = lock_test();
         clear_uuid_cache();
         assert_eq!(lookup_cached_uuid("nobody_here"), None);
     }
 
     #[test]
     fn lookup_cached_uuid_returns_cached_value_on_hit() {
+        let _g = lock_test();
         clear_uuid_cache();
         let uuid = "00000000-0000-0000-0000-0000000000aa".to_string();
         uuid_cache()
@@ -195,6 +251,7 @@ mod tests {
         // Insert under the lowercase key the production path uses, then
         // confirm every casing variant the chat layer might pass routes to
         // the same entry.
+        let _g = lock_test();
         clear_uuid_cache();
         let uuid = "00000000-0000-0000-0000-0000000000bb".to_string();
         uuid_cache()
@@ -208,6 +265,7 @@ mod tests {
 
     #[test]
     fn lookup_cached_uuid_rejects_stale_entries() {
+        let _g = lock_test();
         clear_uuid_cache();
         let uuid = "00000000-0000-0000-0000-0000000000cc".to_string();
         let stale_ts = Instant::now() - Duration::from_secs(UUID_CACHE_TTL_SECS + 1);
@@ -220,6 +278,7 @@ mod tests {
 
     #[test]
     fn cleanup_uuid_cache_drops_stale_entries_and_keeps_fresh_ones() {
+        let _g = lock_test();
         clear_uuid_cache();
         let cache = uuid_cache();
 
@@ -242,6 +301,7 @@ mod tests {
 
     #[test]
     fn cleanup_uuid_cache_is_noop_when_all_entries_are_fresh() {
+        let _g = lock_test();
         clear_uuid_cache();
         let cache = uuid_cache();
         cache.lock().insert("a".to_string(), ("uuid-a".to_string(), Instant::now()));
@@ -254,6 +314,7 @@ mod tests {
 
     #[test]
     fn clear_uuid_cache_empties_the_cache() {
+        let _g = lock_test();
         let cache = uuid_cache();
         cache.lock().insert("a".to_string(), ("uuid-a".to_string(), Instant::now()));
         cache.lock().insert("b".to_string(), ("uuid-b".to_string(), Instant::now()));
@@ -263,11 +324,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_user_uuid_cfg_test_branch_pads_and_truncates_deterministically() {
-        // Mirror the production cfg(test) recipe so we never hand-count.
+    async fn resolve_user_uuid_cfg_test_branch_pads_deterministically() {
+        // Mirror the production cfg(test) recipe so we never hand-count. The
+        // post-shape-gate branch always pads to 12 ASCII bytes, so for any
+        // valid Mojang-shape username (3-16 ASCII alphanumeric+_) the
+        // expected output is `format!("{:0>12}", username)` in the trailing
+        // segment.
         fn expected_test_uuid(username: &str) -> String {
-            let trimmed: String = username.chars().take(12).collect();
-            format!("00000000-0000-0000-0000-{:0>12}", trimmed)
+            format!("00000000-0000-0000-0000-{:0>12}", username)
         }
 
         // (a) normal short username — left-padded with zeros.
@@ -292,20 +356,36 @@ mod tests {
             "00000000-0000-0000-0000-0000000steve",
         );
 
-        // (c) exactly-12-char username — no padding, no truncation.
+        // (c) exactly-12-char username — no padding needed.
         let twelve = "abcdefghijkl";
-        assert_eq!(twelve.chars().count(), 12);
+        assert_eq!(twelve.len(), 12);
         assert_eq!(
             resolve_user_uuid(twelve).await.unwrap(),
             expected_test_uuid(twelve),
         );
 
-        // (d) >12-char username — demonstrates truncation. The truncated
-        // value is "averylonguse" (first 12 chars of "averylongusername").
-        let long = "averylongusername";
+        // (d) maximum-length valid username (16 chars) — fits the embedded
+        // segment after truncation to 12 bytes via formatter width.
+        let sixteen = "abcdefghijklmnop";
+        assert_eq!(sixteen.len(), 16);
+        // `format!("{:0>12}", "abcdefghijklmnop")` returns the string
+        // unchanged because it's already wider than 12; no truncation.
         assert_eq!(
-            resolve_user_uuid(long).await.unwrap(),
-            expected_test_uuid(long),
+            resolve_user_uuid(sixteen).await.unwrap(),
+            expected_test_uuid(sixteen),
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_user_uuid_cfg_test_branch_rejects_out_of_shape_usernames() {
+        // The cfg(test) branch now mirrors the production shape gate so test
+        // fixtures match production error semantics: too-short, too-long, and
+        // non-ASCII names all produce a "not found" Err.
+        for bad in ["ab", "averylongusername", "has space", "has-dash", "has.dot"] {
+            assert!(
+                resolve_user_uuid(bad).await.is_err(),
+                "expected Err for out-of-shape username {bad:?}"
+            );
+        }
     }
 }

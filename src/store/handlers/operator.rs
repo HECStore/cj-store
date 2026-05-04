@@ -1330,10 +1330,10 @@ mod tests {
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();
 
-        let add_result = handle_add_currency(&mut store, "Op", item, 250.0).await;
+        let add_result = handle_add_currency(&mut store, "Ops", item, 250.0).await;
         assert!(add_result.is_ok(), "handle_add_currency failed: {:?}", add_result);
 
-        let remove_result = handle_remove_currency(&mut store, "Op", item, 250.0).await;
+        let remove_result = handle_remove_currency(&mut store, "Ops", item, 250.0).await;
         assert!(remove_result.is_ok(), "handle_remove_currency failed: {:?}", remove_result);
 
         // Bit-exact: integer-typed f64 round trip must restore the reserve.

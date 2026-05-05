@@ -747,6 +747,17 @@ async fn transfer_withdraw_from_shulker(
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
 
+            // Verify how many items actually landed in the destination inventory slot
+            // BEFORE the put-back left-click, so a partial success isn't masked by it.
+            // The target slot was confirmed empty above (pre = 0), so the post-click count
+            // IS the number actually moved. Source-shulker slot is empty (full stack on
+            // cursor), so reading it here would be misleading.
+            let slots_after = shulker_container
+                .slots()
+                .ok_or_else(|| "Shulker closed".to_string())?;
+            let placed_count = slots_after.get(target).map(|s| s.count()).unwrap_or(0);
+            let actual_moved = placed_count.clamp(0, remaining);
+
             // Put remaining items back in original slot
             debug!(
                 "transfer_items_with_shulker: Returning remaining items to slot {}",
@@ -757,8 +768,24 @@ async fn transfer_withdraw_from_shulker(
             });
             tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
 
-            total_moved += remaining;
-            remaining = 0;
+            if actual_moved == 0 {
+                consecutive_failures += 1;
+                warn!(
+                    "transfer_items_with_shulker: Partial withdraw from shulker slot {} moved 0 items for {} (failure {}/3, moved {} of {} so far)",
+                    slot, target_id, consecutive_failures, total_moved, amount
+                );
+                if consecutive_failures >= 3 {
+                    error!(
+                        "transfer_items_with_shulker: Partial withdraw from shulker slot {} failed 3 times in a row for {} (moved {} of {} so far), stopping extraction",
+                        slot, target_id, total_moved, amount
+                    );
+                    break;
+                }
+            } else {
+                consecutive_failures = 0;
+                total_moved += actual_moved;
+                remaining -= actual_moved;
+            }
         }
     }
 
@@ -928,6 +955,15 @@ async fn transfer_deposit_into_shulker(
                 break;
             }
 
+            // Snapshot pre-click counts for every target slot we're about to click,
+            // so we can compute authoritative per-slot deltas after the right-clicks settle.
+            let original_remaining = remaining;
+            let mut pre_counts: Vec<(usize, i32)> = Vec::with_capacity(target_slots.len());
+            for (target_slot, _space) in &target_slots {
+                let pre = all_slots.get(*target_slot).map(|s| s.count()).unwrap_or(0);
+                pre_counts.push((*target_slot, pre));
+            }
+
             // Deposit items into available slots, filling each before moving to next
             let mut items_to_place = remaining;
             for (target_slot, space) in &target_slots {
@@ -946,24 +982,56 @@ async fn transfer_deposit_into_shulker(
                     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_SHORT_MS)).await;
                 }
                 items_to_place -= place_count;
-                total_moved += place_count;
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
 
-            // Calculate how many were actually placed
-            let placed = remaining - items_to_place;
-            remaining = items_to_place;
+            // Re-read the container and sum positive per-slot deltas across the
+            // exact target slots we clicked. Destination IS the shulker contents,
+            // so per-slot deltas on those slots are the authoritative measure.
+            let slots_after = shulker_container
+                .slots()
+                .ok_or_else(|| "Shulker closed".to_string())?;
+            let mut sum_delta: i32 = 0;
+            for (target_slot, pre) in &pre_counts {
+                let post = slots_after.get(*target_slot).map(|s| s.count()).unwrap_or(0);
+                let delta = post - pre;
+                if delta > 0 {
+                    sum_delta += delta;
+                }
+            }
+            let actual_moved = sum_delta.clamp(0, original_remaining);
 
             // Put remaining items back in original slot (if any left on cursor)
             debug!(
                 "transfer_items_with_shulker: Returning remaining items ({}) to slot {}",
-                stack_count - placed,
+                original_remaining - actual_moved,
                 slot
             );
             shulker_container.click(PickupClick::Left {
                 slot: Some(slot as u16),
             });
             tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
+
+            if actual_moved == 0 {
+                consecutive_failures += 1;
+                warn!(
+                    "transfer_items_with_shulker: Partial deposit of {} from inventory slot {} moved 0 items (failure {}/3, moved {} of {} so far)",
+                    target_id, slot, consecutive_failures, total_moved, amount
+                );
+                if consecutive_failures >= 3 {
+                    error!(
+                        "transfer_items_with_shulker: Partial deposit of {} from inventory slot {} failed 3 times in a row (moved {} of {} so far), stopping deposit",
+                        target_id, slot, total_moved, amount
+                    );
+                    break;
+                }
+                // Retry on next outer iteration; don't fall through to the
+                // "remaining > 0 -> shulker full" break below.
+                continue;
+            }
+            consecutive_failures = 0;
+            total_moved += actual_moved;
+            remaining = original_remaining - actual_moved;
 
             // If we couldn't place everything, shulker is now full - break to let caller try next shulker
             if remaining > 0 {
@@ -1192,10 +1260,19 @@ async fn place_shulker_on_station(
     container.click(PickupClick::LeftOutside);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
 
-    // Journal: record intent before touching the shulker.
+    // Journal: record intent before touching the shulker. This is the only
+    // pre-physical-action persistence point — if it fails, abort BEFORE
+    // picking up the shulker so a subsequent crash cannot leave a stranded
+    // shulker with no on-disk record. (Later `advance`/`complete` failures
+    // are post-physical and stay log-and-continue, since aborting after the
+    // shulker has moved makes the world state strictly worse.)
     {
         if let Err(e) = bot.journal.lock().begin(journal_op, chest_id, slot_idx) {
-            warn!("[Journal] begin failed: {}", e);
+            error!(
+                "[Journal] begin failed before shulker pickup at chest {} slot {}: {}",
+                chest_id, slot_idx, e
+            );
+            return Err(format!("Journal begin failed: {}", e));
         }
     }
 

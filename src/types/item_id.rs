@@ -17,10 +17,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// A normalized, non-empty item identifier.
 ///
-/// Constructed via [`ItemId::new`] which strips any `minecraft:` prefix and
-/// rejects empty strings. The inner value is prefix-free (e.g. `"cobblestone"`,
-/// not `"minecraft:cobblestone"`). Case is preserved as given — Minecraft item
-/// IDs are lowercase by convention but this type does not enforce casing.
+/// Constructed via [`ItemId::new`] which strips any `minecraft:` prefix,
+/// rejects empty strings, and canonicalizes the inner value to ASCII
+/// lowercase. The inner value is prefix-free and case-canonical (e.g.
+/// `"cobblestone"`, never `"Cobblestone"` or `"minecraft:cobblestone"`).
 ///
 /// Implements `Deref<Target = str>` so it can be passed to any function
 /// expecting `&str` via deref coercion, and `Borrow<str>` so it works as a
@@ -53,19 +53,21 @@ impl ItemId {
         if !normalized.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
             return Err("item id contains forbidden character");
         }
-        Ok(Self(normalized.to_string()))
+        Ok(Self(normalized.to_ascii_lowercase()))
     }
 
     /// Build an `ItemId` from a string that is already known to be
     /// normalized (no `minecraft:` prefix). No prefix stripping is performed.
     ///
-    /// # Panics (debug builds only)
+    /// # Panics
     ///
     /// Panics if `s` is empty, because an empty `ItemId` is never valid outside
     /// the [`EMPTY`](Self::EMPTY) sentinel. Use [`new`](Self::new) for
-    /// user/external input.
+    /// user/external input. The check fires in release builds as well as debug
+    /// — folding empty into [`EMPTY`](Self::EMPTY) silently would mask real
+    /// bugs in callers that produce values they think are non-empty.
     pub fn from_normalized(s: String) -> Self {
-        debug_assert!(!s.is_empty(), "ItemId::from_normalized called with empty string");
+        assert!(!s.is_empty(), "ItemId::from_normalized called with empty string");
         Self(s)
     }
 
@@ -177,6 +179,14 @@ mod tests {
     fn no_prefix_passthrough() {
         let id = ItemId::new("cobblestone").unwrap();
         assert_eq!(id.as_str(), "cobblestone");
+    }
+
+    #[test]
+    fn canonicalizes_case_to_lowercase() {
+        assert_eq!(ItemId::new("Diamond").unwrap().as_str(), "diamond");
+        assert_eq!(ItemId::new("DIAMOND").unwrap().as_str(), "diamond");
+        assert_eq!(ItemId::new("minecraft:Diamond").unwrap().as_str(), "diamond");
+        assert_eq!(ItemId::new("a").unwrap(), ItemId::new("A").unwrap());
     }
 
     #[test]

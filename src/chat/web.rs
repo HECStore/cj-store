@@ -518,6 +518,7 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         // to the validated IPs, which is a per-host config.
         let mut builder = reqwest::Client::builder()
             .timeout(remaining().min(Duration::from_secs(FETCH_TIMEOUT_SECS)))
+            .connect_timeout(remaining().min(Duration::from_secs(2)))
             .redirect(reqwest::redirect::Policy::none())
             .https_only(false); // operator may explicitly fetch http URLs
         for addr in &resolved_addrs {

@@ -53,7 +53,7 @@ Eager adversary spawning is mandatory whenever K ≥ 1 and the spotter returned 
 
 Before any subagents, ask via a single `AskUserQuestion`:
 
-1. **Minimum severity floor**: `nit` (default, no filter), `low`, `medium`, `high`, `critical`. Inclusive — `medium` keeps medium/high/critical, drops low/nit. Below-floor candidates show in the per-proposal overview as `→ Skip (below floor)` but never execute.
+1. **Minimum severity floor**: `nit` (default, no filter), `low`, `medium`, `high`, `critical`. Inclusive — `medium` keeps medium/high/critical, drops low/nit. Spotters receive the floor and pre-filter their own proposals, so most below-floor candidates never enter the pipeline. Anything that still slips through (e.g. an adversary downgrades a spotter proposal below the floor, or surfaces a below-floor addition) shows in the per-proposal overview as `→ Skip (below floor)` and never executes.
 2. **Areas to focus on**: `all` (default, full pool) or free-text mapped loosely to entries in the Step 1 category-hint pool (e.g. `security, performance, tests`, or `the storage subsystem and its tests`). Always retain the wildcard entry as fallback.
 
 If non-interactive (no user attached), fall back to defaults silently. After answers, echo one line: `_Scope: severity ≥ medium, areas = [security, tests, performance]; sweeping now…_`.
@@ -64,7 +64,7 @@ Run Step 0 even when `dry` is on — the questions scope what gets synthesized, 
 
 ## Step 1 — Launch N spotters in parallel
 
-One message, N Agent calls, `subagent_type: general-purpose`, `run_in_background: true`. Each spotter gets a different **category hint**.
+One message, N Agent calls, `subagent_type: general-purpose`, `run_in_background: true`. Each spotter gets a different **category hint** and the **severity floor** chosen in Step 0 (every spotter gets the same floor).
 
 **Build the available pool** by filtering the list below using the user's `areas` answer (`all` → full pool; subset → keep entries whose meaning overlaps; always retain the wildcard fallback). If N ≤ pool size, sample N distinct hints; else use each once and fill the rest with the wildcard.
 
@@ -96,7 +96,11 @@ Every subagent in the run (spotter, adversary, fixer, drift) must receive a *uni
 >
 > **Your category:** `<CATEGORY HINT>`. Find one concrete target area in this category. Aim for a **small focused cluster** you can read carefully in one pass — not "the codebase" and not just one isolated function/struct, but a coherent slice with enough context to spot real issues. Examples: "the `reconcile_index` function plus the 1-2 helpers it calls in src/store/index.rs"; "the `CartItem` struct and the `Cart` impls that operate on it"; "the README's storage-layout section plus the `src/store/mod.rs` it points to"; "the 3 files that make up the pricing subsystem". Roughly 1-3 functions, 1 struct + its impls, or 2-4 related files is the right size — broad enough to surface multiple distinct improvements, narrow enough to read end-to-end.
 >
-> Read the actual code/files. Propose **1 to ~5 concrete, actionable improvements** for this cluster — one large change, several smaller ones, or a mix, sized to whatever you find. **Quality over quantity.** Don't pad. Proposals can target different items within the cluster (e.g. one fix in function A, two in struct B, one in the doc that references both). List proposals in the order you'd want them applied; each must be robust to its siblings succeeding, failing, being deemed obsolete, or running concurrently.
+> **Severity floor: `<SEVERITY FLOOR>`.** Only propose improvements at this severity or higher (severity order: `nit < low < medium < high < critical`). **Silently drop anything below the floor** — don't list it, don't mention it, don't surface near-misses or "you might also consider…" items. Below-floor noise wastes downstream budget. Keep searching at-or-above the floor; don't reach below it to fill space.
+>
+> **If your assigned cluster is dry, pivot — don't return empty.** After reading carefully, if you find nothing at-or-above the floor worth changing in the initial cluster, either (a) **expand outward** — its callers, its dependencies, neighboring files in the same module/subsystem — while staying within the spirit of your category, or (b) **walk to a different cluster** that still fits your category. Reflect the pivot in `TARGET_AREA` (e.g. "expanded from `reconcile_index` to surrounding `src/store/index.rs` after the original cluster was clean at the medium floor"). One pivot is the norm; two is the cap. `PROPOSALS: none` is only allowed after an honest pivot still turns up nothing.
+>
+> Read the actual code/files. Propose **1 to ~5 concrete, actionable improvements** for whatever cluster you ultimately settled on — one large change, several smaller ones, or a mix, sized to whatever you find. **Quality over quantity.** Don't pad. Proposals can target different items within the cluster (e.g. one fix in function A, two in struct B, one in the doc that references both). List proposals in the order you'd want them applied; each must be robust to its siblings succeeding, failing, being deemed obsolete, or running concurrently.
 >
 > Return EXACTLY this format and nothing else:
 >
@@ -123,7 +127,7 @@ Every subagent in the run (spotter, adversary, fixer, drift) must receive a *uni
 > - **low** — minor nit, readability, small cleanup
 > - **nit** — cosmetic / taste-level
 >
-> If you genuinely find nothing worth changing, return `TARGET_AREA: <what you looked at>` followed by `PROPOSALS: none` and nothing else. Do not invent improvements to fill a quota.
+> If you genuinely find nothing worth changing **after pivoting at least once**, return `TARGET_AREA: <what you ultimately looked at, including any pivots>` followed by `PROPOSALS: none` and nothing else. Do not invent improvements to fill a quota, and do not surface below-floor items just to have something to say.
 
 ## Step 2 — Spawn adversaries eagerly
 
@@ -465,6 +469,7 @@ Aggregate every non-empty fixer `FOLLOWUPS` the drift sweep didn't already resol
 - **SEED on every subagent prompt** — 8 unique random English words; don't reuse across subagents in a run; don't explain to subagent.
 - **Spotters and adversaries never edit files** — only propose. Editing happens in Step 4.
 - **Spotters return 1+ proposals**, each one a stand-alone unit (a fixer is spawned per accepted proposal — inline or subagent). Quality over quantity; don't pad to a number.
+- **Spotters pre-filter at the severity floor** — they receive the floor and silently drop below-floor candidates rather than reporting them. If their initially-assigned cluster turns up nothing at-or-above the floor, they pivot (expand outward to callers/dependencies/neighboring files in the same module, or walk to a different cluster in the same category) before falling back to `PROPOSALS: none`. One pivot is the norm; two is the cap.
 - **Adversaries review every spotter proposal** — one ADJUSTED block per proposal in numeric order (`ORIGINAL_REF: <N>`), no skipping, plus optional `ORIGINAL_REF: new` additions.
 - **Adversaries read the target themselves** — they don't argue from the spotter's text alone.
 - **Dry mode** suppresses everything past Step 3: no inline edits, no fixer subagents, no drift sweep, no Step 6 execution table.

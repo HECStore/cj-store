@@ -387,56 +387,26 @@ pub async fn handle_removeitem_order(
         &format!("Removeitem {} {}: Withdrawing from storage, then trading to you.", quantity, item),
     ).await?;
 
-    for t in &preview_withdraw_plan {
-        let node_position = store.get_node_position(t.chest_id);
-        let chest = crate::types::Chest {
-            id: t.chest_id,
-            node_id: t.chest_id / CHESTS_PER_NODE as i32,
-            index: t.chest_id % CHESTS_PER_NODE as i32,
-            position: t.position,
-            item: t.item.clone(),
-            amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-        };
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        store.bot_tx
-            .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                target_chest: chest,
-                node_position,
-                action: crate::messages::ChestAction::Withdraw {
-                    item: item.to_string(),
-                    amount: t.amount,
-                    to_player: None,
-                    stack_size: store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64),
-                },
-                respond_to: tx,
-            })
-            .await
-            .map_err(|e| StoreError::BotSendFailed(e.to_string()))?;
-
-        let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
-            .await
-            .map_err(|_| StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) })?
-            .map_err(|e| StoreError::BotResponseDropped(e.to_string()))?;
-
-        match bot_result {
-            Err(err) => {
-                error!("[Removeitem] chest withdraw step failed: operator={} item={} chest_id={} chunk_amount={} err={}",
-                    player_name, item, t.chest_id, t.amount, err);
-                return utils::send_message_to_player(
-                    store,
-                    player_name,
-                    &format!("Removeitem aborted: bot failed chest withdrawal step: {}", err),
-                )
-                .await;
-            }
-            Ok(report) => {
-                if let Err(e) = store.apply_chest_sync(report) {
-                    warn!("[Removeitem] chest sync failed after withdraw: item={} chest_id={} err={}",
-                        item, t.chest_id, e);
-                }
-            }
-        }
+    let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
+    if let Err(e) = super::super::orders::execute_chest_transfers(
+        store,
+        &preview_withdraw_plan,
+        item,
+        stack_size,
+        super::super::orders::ChestDirection::Withdraw,
+        "[Removeitem]",
+    )
+    .await
+    {
+        error!("[Removeitem] chest withdraw failed: operator={} item={} err={}",
+            player_name, item, e);
+        utils::send_message_to_player(
+            store,
+            player_name,
+            &format!("Removeitem aborted: bot failed chest withdrawal step: {}", e),
+        )
+        .await?;
+        return Err(e);
     }
 
     // Operator offers nothing, so exact-amount enforcement is meaningless.

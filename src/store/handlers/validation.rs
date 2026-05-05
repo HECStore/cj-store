@@ -9,9 +9,11 @@ use crate::types::ItemId;
 /// Validate that `item` is a syntactically valid Minecraft item name.
 ///
 /// Accepts ASCII alphanumerics plus `_` and `:` (the `:` allows the optional
-/// `minecraft:` namespace prefix that `ItemId::new` strips). On error,
-/// returns a user-facing message suitable for direct chat reply.
-pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
+/// `minecraft:` namespace prefix that `ItemId::new` strips). On success,
+/// returns the canonicalized [`ItemId`] so callers don't need to re-run
+/// `ItemId::new`. On error, returns a user-facing message suitable for
+/// direct chat reply.
+pub(crate) fn validate_item_name(item: &str) -> Result<ItemId, String> {
     if item.is_empty() {
         return Err("Item name cannot be empty. Example: buy cobblestone 64".to_string());
     }
@@ -29,11 +31,9 @@ pub(crate) fn validate_item_name(item: &str) -> Result<(), String> {
         }
     }
 
-    if ItemId::new(item).is_err() {
-        return Err("Invalid item name. Example items: cobblestone, iron_ingot, diamond".to_string());
-    }
-
-    Ok(())
+    ItemId::new(item).map_err(|_| {
+        "Invalid item name. Example items: cobblestone, iron_ingot, diamond".to_string()
+    })
 }
 
 /// Parse `quantity_str` and enforce `1 <= quantity <= MAX_TRANSACTION_QUANTITY`.

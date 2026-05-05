@@ -1,8 +1,11 @@
 //! Utility functions for the Store
 
+use std::time::Duration;
+
 use tokio::sync::oneshot;
 use tracing::debug;
 
+use crate::constants::WHISPER_ACK_TIMEOUT_SECS;
 use crate::messages::BotInstruction;
 use crate::types::User;
 use super::Store;
@@ -84,9 +87,12 @@ pub async fn send_message_to_player(
         .await
         .map_err(|_| crate::error::StoreError::BotDisconnected)?;
 
-    rx.await
-        .map_err(|_| crate::error::StoreError::BotDisconnected)?
-        .map_err(crate::error::StoreError::BotReportedError)
+    match tokio::time::timeout(Duration::from_secs(WHISPER_ACK_TIMEOUT_SECS), rx).await {
+        Err(_elapsed) => Err(crate::error::StoreError::BotAckTimeout("whisper ack".into())),
+        Ok(Err(_recv_err)) => Err(crate::error::StoreError::BotDisconnected),
+        Ok(Ok(Err(e))) => Err(crate::error::StoreError::BotReportedError(e)),
+        Ok(Ok(Ok(()))) => Ok(()),
+    }
 }
 
 /// Helper to format transfer summaries (excludes coordinates for security).

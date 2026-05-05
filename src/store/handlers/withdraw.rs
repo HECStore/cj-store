@@ -3,7 +3,7 @@
 use tracing::{debug, error, info, warn};
 
 use super::super::{Store, state, utils};
-use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE, MAX_TRADE_DIAMONDS};
+use crate::constants::MAX_TRADE_DIAMONDS;
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
 use crate::types::ItemId;
@@ -55,6 +55,7 @@ pub(super) async fn handle_enqueue(
 pub async fn handle_withdraw_balance_queued(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     amount: Option<f64>,
 ) -> Result<(), StoreError> {
     info!(
@@ -64,10 +65,8 @@ pub async fn handle_withdraw_balance_queued(
     );
     state::assert_invariants(store, "pre-withdraw-balance", false)?;
 
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
-    utils::ensure_user_exists(store, player_name, &user_uuid);
+    utils::ensure_user_exists(store, player_name, user_uuid);
+    let user_uuid = user_uuid.to_string();
 
     let user_balance = store.expect_user(&user_uuid, "withdraw-balance/pre-check")?.balance;
 
@@ -77,7 +76,29 @@ pub async fn handle_withdraw_balance_queued(
                 return utils::send_message_to_player(store, player_name, "Amount must be positive")
                     .await;
             }
-            amt
+            // Snap to whole diamonds up front so the ledger debit equals
+            // the physical delivery. Without this, `/withdraw 5.7` would
+            // debit 5.7 from balance while only 5 diamonds are delivered,
+            // silently vaporizing the fractional remainder. Surface the
+            // round-down to the player so they aren't surprised.
+            let snapped = amt.floor();
+            if snapped < 1.0 {
+                return utils::send_message_to_player(
+                    store,
+                    player_name,
+                    &format!("Withdraw amount must be at least 1 whole diamond (got {amt:.2})."),
+                )
+                .await;
+            }
+            if snapped != amt {
+                utils::send_message_to_player(
+                    store,
+                    player_name,
+                    &format!("Fractional remainder ignored: withdrawing {snapped} whole diamonds."),
+                )
+                .await?;
+            }
+            snapped
         }
         None => {
             let whole_balance = user_balance.floor();
@@ -182,96 +203,29 @@ pub async fn handle_withdraw_balance_queued(
             "Withdraw: decrementing storage"
         );
 
-        for t in &withdraw_plan {
-            let node_position = store.get_node_position(t.chest_id);
-            let chest = crate::types::Chest {
-                id: t.chest_id,
-                node_id: t.chest_id / CHESTS_PER_NODE as i32,
-                index: t.chest_id % CHESTS_PER_NODE as i32,
-                position: t.position,
-                item: t.item.clone(),
-                amounts: vec![0; crate::types::Storage::SLOTS_PER_CHEST],
-            };
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let send_result = store.bot_tx
-                .send(crate::messages::BotInstruction::InteractWithChestAndSync {
-                    target_chest: chest,
-                    node_position,
-                    action: crate::messages::ChestAction::Withdraw {
-                        item: "diamond".to_string(),
-                        amount: t.amount,
-                        to_player: None,
-                        stack_size: 64,
-                    },
-                    respond_to: tx,
-                })
-                .await;
-
-            if let Err(e) = send_result {
-                error!(
-                    uuid = %user_uuid,
-                    player = player_name,
-                    chest_id = t.chest_id,
-                    "Withdraw: failed to send chest instruction: {}", e
-                );
-                return Err(StoreError::BotSendFailed(e.to_string()));
-            }
-
-            let bot_result = match tokio::time::timeout(
-                tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS),
-                rx,
+        if let Err(e) = super::super::orders::execute_chest_transfers(
+            store,
+            &withdraw_plan,
+            "diamond",
+            64,
+            super::super::orders::ChestDirection::Withdraw,
+            "[Withdraw]",
+        )
+        .await
+        {
+            error!(
+                uuid = %user_uuid,
+                player = player_name,
+                "Withdraw: chest pull failed: {}", e
+            );
+            store.advance_trade(|s| s.rollback("withdraw/chest-pull-failed".to_string()));
+            utils::send_message_to_player(
+                store,
+                player_name,
+                &format!("Withdraw aborted: failed to get diamonds from storage: {}", e),
             )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(e)) => {
-                    error!(
-                        uuid = %user_uuid,
-                        player = player_name,
-                        chest_id = t.chest_id,
-                        "Withdraw: chest response channel dropped: {}", e
-                    );
-                    return Err(StoreError::BotResponseDropped(e.to_string()));
-                }
-                Err(_) => {
-                    error!(
-                        uuid = %user_uuid,
-                        player = player_name,
-                        chest_id = t.chest_id,
-                        timeout_secs = CHEST_OP_TIMEOUT_SECS,
-                        "Withdraw: timed out waiting for bot chest operation"
-                    );
-                    return Err(StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
-                }
-            };
-
-            match bot_result {
-                Err(err) => {
-                    error!(
-                        uuid = %user_uuid,
-                        player = player_name,
-                        chest_id = t.chest_id,
-                        "Withdraw: bot failed to withdraw diamonds from chest: {}", err
-                    );
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        &format!("Withdraw aborted: failed to get diamonds from storage: {}", err),
-                    )
-                    .await;
-                }
-                Ok(report) => {
-                    if let Err(e) = store.apply_chest_sync(report) {
-                        warn!(
-                            uuid = %user_uuid,
-                            player = player_name,
-                            chest_id = t.chest_id,
-                            "Withdraw: chest sync failed after diamond withdrawal: {}", e
-                        );
-                    }
-                }
-            }
+            .await?;
+            return Err(e);
         }
     }
 
@@ -323,6 +277,7 @@ pub async fn handle_withdraw_balance_queued(
                 "Withdraw: rollback after trade-send failure was partial — items may remain on bot"
             );
         }
+        store.advance_trade(|s| s.rollback("withdraw/trade-send-failed".to_string()));
         return Err(StoreError::BotSendFailed(e.to_string()));
     }
 
@@ -352,6 +307,7 @@ pub async fn handle_withdraw_balance_queued(
                 Some(detail) => format!(" Rollback partial: {}.", detail),
                 None => String::new(),
             };
+            store.advance_trade(|s| s.rollback("withdraw/channel-dropped".to_string()));
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -385,6 +341,7 @@ pub async fn handle_withdraw_balance_queued(
                         .to_string()
                 }
             };
+            store.advance_trade(|s| s.rollback("withdraw/trade-timeout".to_string()));
             return utils::send_message_to_player(store, player_name, &msg).await;
         }
     };
@@ -414,6 +371,7 @@ pub async fn handle_withdraw_balance_queued(
                 err
             ),
         };
+        store.advance_trade(|s| s.rollback("withdraw/trade-rejected".to_string()));
         return utils::send_message_to_player(store, player_name, &msg).await;
     }
 

@@ -34,7 +34,7 @@
 
 use std::{
     fs, io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -124,7 +124,42 @@ impl Journal {
                 None,
             ));
         }
-        let json = fs::read_to_string(path)?;
+        // Distinguish "file present but unreadable" from "missing": a transient
+        // IO error (Windows AV scanner hold, lost handle, permission flap) on a
+        // journal containing an in-flight entry is exactly the case where
+        // preserving the record matters. If we returned the error here the
+        // caller would fall back to `Journal::default()` pointing at the same
+        // path, and the next `begin()` would silently overwrite the unreadable
+        // file. Move it aside first so the path is clear for a fresh journal
+        // while the artifact is preserved for operator review.
+        let json = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(read_err) => {
+                tracing::warn!(
+                    "[Journal] failed to read journal file {:?}: {read_err} - attempting to quarantine before falling back to empty journal",
+                    path
+                );
+                match Self::quarantine_unreadable(path) {
+                    Ok(archived) => {
+                        tracing::error!(
+                            "[Journal] quarantined unreadable journal to {:?} - preserve for operator review",
+                            archived
+                        );
+                        return Ok((
+                            Self { entry: None, path: path.to_path_buf() },
+                            None,
+                        ));
+                    }
+                    Err(rename_err) => {
+                        tracing::error!(
+                            "[Journal] could not quarantine unreadable journal {:?}: {rename_err} - returning original read error so caller is aware",
+                            path
+                        );
+                        return Err(read_err);
+                    }
+                }
+            }
+        };
         // Corrupt JSON → empty journal. We keep the swallow-and-continue
         // behaviour (the journal is a diagnostic aid, not a hard dependency),
         // but surface a warning so operators don't silently lose in-flight
@@ -165,6 +200,63 @@ impl Journal {
             ),
         }
         res
+    }
+
+    /// Quarantine the on-disk journal by renaming it to a timestamped sibling.
+    ///
+    /// Preferred over [`clear_leftover`](Self::clear_leftover) at startup: a
+    /// leftover entry is forensic evidence of a stranded shulker, and silently
+    /// zeroing the file means a second crash before an operator notices wipes
+    /// that evidence. Renaming preserves the artifact while still freeing the
+    /// active path so the bot can boot.
+    ///
+    /// Falls back to copy+remove if the file lives on a different device than
+    /// the destination (rare on a single-disk deploy, but rename on Windows
+    /// can also fail if another process holds a handle).
+    pub fn archive_leftover(&self) -> io::Result<std::path::PathBuf> {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let archived = match self.path.parent() {
+            Some(parent) => parent.join(format!("journal.leftover-{unix_ms}.json")),
+            None => std::path::PathBuf::from(format!("journal.leftover-{unix_ms}.json")),
+        };
+        match fs::rename(&self.path, &archived) {
+            Ok(()) => Ok(archived),
+            Err(_) => {
+                fs::copy(&self.path, &archived)?;
+                fs::remove_file(&self.path)?;
+                Ok(archived)
+            }
+        }
+    }
+
+    /// Move an unreadable journal file aside to a timestamped sibling so the
+    /// active path is free for a fresh journal without clobbering the original.
+    ///
+    /// Used by [`load_from`](Self::load_from) when `read_to_string` fails on an
+    /// existing file (transient IO: AV scanner hold, lost handle, permission
+    /// flap). Mirrors [`archive_leftover`](Self::archive_leftover)'s rename →
+    /// copy+remove fallback for cross-device or held-handle cases. Returns the
+    /// archived path on success so callers can log it.
+    fn quarantine_unreadable(path: &Path) -> io::Result<PathBuf> {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let archived = match path.parent() {
+            Some(parent) => parent.join(format!("journal.unreadable-{unix_ms}.json")),
+            None => PathBuf::from(format!("journal.unreadable-{unix_ms}.json")),
+        };
+        match fs::rename(path, &archived) {
+            Ok(()) => Ok(archived),
+            Err(_) => {
+                fs::copy(path, &archived)?;
+                fs::remove_file(path)?;
+                Ok(archived)
+            }
+        }
     }
 
     /// Start tracking a new shulker operation.

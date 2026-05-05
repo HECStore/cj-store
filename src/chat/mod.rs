@@ -1931,6 +1931,13 @@ async fn process_event(
     } else {
         reply
     };
+    // Strip ASCII control characters (including `\r` / `\n`) before the
+    // length cap so the configured `composer_max_chars` budgets only real
+    // content — not control-char debris that would be sanitized away
+    // anyway. This also closes a chat-command-injection vector: an
+    // LLM-emitted `\n/op foo` would otherwise reach the server as a raw
+    // command line via `/msg <target> <message>`.
+    let reply = pacing::sanitize_outbound_chat(&reply);
     let reply = pacing::truncate_to_chat_limit(&reply, config.composer_max_chars as usize);
     if reply.trim().is_empty() {
         return Ok(());
@@ -2683,7 +2690,11 @@ fn reply_shutdown_error(cmd: ChatCommand) {
 }
 
 /// Cheap deterministic-process-RNG returning a value in [0.0, 1.0).
-/// Mixes the same monotonic counter and time used by `composer::fresh_nonce`.
+/// Mixes a process-local atomic counter with `SystemTime::now()` nanos.
+/// Not cryptographic — purely for sample-rate rolls and similar
+/// non-security knobs. (Distinct from `composer::fresh_nonce`, which
+/// draws from the OS CSPRNG via `getrandom` because the prompt-injection
+/// defense relies on the nonce being unguessable.)
 fn rand_unit_f32() -> f32 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

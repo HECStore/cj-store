@@ -597,25 +597,62 @@ impl Store {
     /// Advance the in-flight trade through the state machine.
     ///
     /// Takes a closure that receives the current `TradeState` by value and
-    /// returns the next state.  If no trade is active the call is a no-op
-    /// (logged at debug level).
-    pub(crate) fn advance_trade(&mut self, transition: impl FnOnce(trade_state::TradeState) -> trade_state::TradeState) {
+    /// returns either the next state or a `TransitionError`. If no trade is
+    /// active the call is a no-op (logged at debug level).
+    ///
+    /// On `Err` the prior state is restored, an `error!` is logged, and the
+    /// unchanged state is persisted with `dirty = true`. `processing_order`
+    /// is intentionally left untouched so the existing `ClearStuckOrder`
+    /// operator path can drain a wedged trade — the actor stays alive,
+    /// turning what used to be a `try_join!`-fatal panic into a recoverable
+    /// alert.
+    pub(crate) fn advance_trade(
+        &mut self,
+        transition: impl FnOnce(trade_state::TradeState) -> Result<trade_state::TradeState, trade_state::TransitionError>,
+    ) {
         if let Some(state) = self.current_trade.take() {
-            let next = transition(state);
-            let order = next.order();
-            info!(
-                order_id = order.id,
-                player = %order.username,
-                phase = next.phase(),
-                "trade state advanced"
-            );
-            // Mirror the new phase to disk so a crash between here and the
-            // next transition leaves enough information on disk for the
-            // operator to detect and investigate on restart.
-            if let Err(e) = trade_state::persist(&next) {
-                warn!("[Store] Failed to persist trade state: {}", e);
+            // Clone before calling the closure so we can restore on Err
+            // without panicking the actor task (see method docs).
+            let prev = state.clone();
+            match transition(state) {
+                Ok(next) => {
+                    let order = next.order();
+                    info!(
+                        order_id = order.id,
+                        player = %order.username,
+                        phase = next.phase(),
+                        "trade state advanced"
+                    );
+                    // Mirror the new phase to disk so a crash between here
+                    // and the next transition leaves enough information on
+                    // disk for the operator to detect and investigate on
+                    // restart.
+                    if let Err(e) = trade_state::persist(&next) {
+                        warn!("[Store] Failed to persist trade state: {}", e);
+                    }
+                    self.current_trade = Some(next);
+                    self.dirty = true;
+                }
+                Err(e) => {
+                    let order = prev.order();
+                    error!(
+                        order_id = order.id,
+                        player = %order.username,
+                        from = e.from,
+                        to = e.to,
+                        "Invalid trade-state transition; leaving in-flight trade for operator recovery"
+                    );
+                    // Persist the unchanged state so a crash-restart still
+                    // sees the wedged trade, and so RECOVERY.md procedures
+                    // apply. processing_order stays high so ClearStuckOrder
+                    // can drain it.
+                    if let Err(persist_err) = trade_state::persist(&prev) {
+                        warn!("[Store] Failed to persist trade state after invalid transition: {}", persist_err);
+                    }
+                    self.current_trade = Some(prev);
+                    self.dirty = true;
+                }
             }
-            self.current_trade = Some(next);
         } else {
             debug!("[Store] advance_trade called with no active trade (no-op)");
         }

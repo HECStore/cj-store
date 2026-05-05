@@ -252,8 +252,13 @@ code path. See [src/store/journal.rs](src/store/journal.rs).
 ```
 
 Every state change atomically rewrites `data/journal.json`. On startup the
-Store reads any leftover entry, logs it as a diagnostic, and clears the
-file. Automatic replay of partial shulker ops is
+Store reads any leftover entry, logs it at error level as a diagnostic,
+and renames the file to `data/journal.leftover-<unix-millis>.json` so
+the in-flight evidence is preserved for operator review (rather than
+silently overwritten). If the file is unreadable on load, it is similarly
+quarantined to `data/journal.unreadable-<unix-millis>.json` and the bot
+continues with a fresh empty journal. Automatic replay of partial
+shulker ops is
 [planned](#planned-automatic-crash-resume) but not yet implemented; today
 the operator works through [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-entry).
 
@@ -573,6 +578,7 @@ cannot be traded — only loose items.
 | `/trade` lifecycle       | `trade_timeout_ms` (45 s)     | One bound covers request → accept → exchange; trade cancelled, rollback attempted |
 | Pathfinding              | `pathfinding_timeout_ms` (60 s) | Navigation aborted, current action fails      |
 | Chest operation          | `CHEST_OP_TIMEOUT_SECS` (90 s) | Navigation / shulker I/O aborted, operation fails |
+| Whisper bot-ack          | `WHISPER_ACK_TIMEOUT_SECS` (120 s) | `send_message_to_player` returns `StoreError::BotAckTimeout` instead of hanging the actor on a dropped oneshot. Set above `CHEST_OP_TIMEOUT_SECS` so a normal in-flight chest op never trips it. |
 | Whole order (outer watchdog) | `ORDER_HARD_TIMEOUT_SECS` (15 min) | `process_next_order` future dropped; `current_trade` is persisted and left in place so the operator sees the order as stuck and can recover via **Clear stuck order** (CLI option 15). Inner per-phase timeouts above should fire first; this is a last-resort guard against lost channel responses or future-deadlocks. |
 
 ### Trade GUI layout (9×6, 54 slots)

@@ -40,29 +40,42 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             is_operator,
             respond_to,
         } => {
-            // Hyphen presence distinguishes a raw UUID from a Minecraft
-            // username (usernames cannot contain hyphens). Usernames require
-            // an async Mojang lookup; UUIDs are used as-is.
-            let uuid = if username_or_uuid.contains('-') {
-                username_or_uuid.clone()
+            // Shape-gate the input BEFORE any state mutation. The previous
+            // hyphen heuristic accepted arbitrary strings like "steve-the-op"
+            // as literal UUIDs; ensure_user_exists then inserted a phantom
+            // operator=true record that the persistence layer silently
+            // quarantines on next save while emitting a misleading success
+            // log. Loud rejection at the input boundary fixes this.
+            let trimmed = username_or_uuid.trim();
+            let uuid = if crate::types::user::is_valid_uuid_shape(trimmed) {
+                // Accepts both 36-char canonical hyphenated and 32-char bare
+                // hex, matching what the persistence layer accepts.
+                trimmed.to_string()
+            } else if let Err(e) = crate::store::handlers::validation::validate_username(trimmed) {
+                warn!("[CLI-Store] SetOperator: rejecting input {:?}: {}", username_or_uuid, e);
+                let _ = respond_to.send(Err(
+                    "input is neither a valid Minecraft username nor a canonical/bare-hex UUID".into()
+                ));
+                return Ok(());
             } else {
-                crate::mojang::resolve_user_uuid(&username_or_uuid)
+                // Username shape OK; resolve via Mojang.
+                crate::mojang::resolve_user_uuid(trimmed)
                     .await
                     .map_err(StoreError::ValidationError)?
             };
             // Auto-create the user record so operators can be granted to
             // players who have never interacted with the store.
-            utils::ensure_user_exists(store, &username_or_uuid, &uuid);
+            utils::ensure_user_exists(store, trimmed, &uuid);
             if let Some(user) = store.users.get_mut(&uuid) {
                 user.operator = is_operator;
                 store.dirty = true;
                 store.dirty_users.insert(uuid.clone());
-                info!("[CLI-Store] Set operator={} for user {} ({})", is_operator, username_or_uuid, uuid);
+                info!("[CLI-Store] Set operator={} for user {} ({})", is_operator, trimmed, uuid);
                 let _ = respond_to.send(Ok(()));
             } else {
                 // Guard against a failed insert rather than panicking;
                 // should not happen after ensure_user_exists.
-                error!("[CLI-Store] SetOperator: user {} ({}) missing after ensure_user_exists", username_or_uuid, uuid);
+                error!("[CLI-Store] SetOperator: user {} ({}) missing after ensure_user_exists", trimmed, uuid);
                 let _ = respond_to.send(Err("User not found".to_string()));
             }
             Ok(())

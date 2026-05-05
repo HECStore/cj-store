@@ -148,13 +148,51 @@ impl Pair {
 
         let mut quarantined = 0usize;
         for entry in fs::read_dir(dir_path)? {
-            let entry = entry?;
+            // Per-entry IO errors (transient lock, deleted-during-iter, EACCES
+            // on a single file) skip the entry rather than aborting the whole
+            // load. The whole-directory `read_dir` failure above remains fatal.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    quarantined += 1;
+                    warn!("[Pair] skipping unreadable directory entry: {e}");
+                    continue;
+                }
+            };
             let path = entry.path();
 
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
                 match fs::read_to_string(&path) {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(pair) => {
+                            // Defense-in-depth at the load boundary: require
+                            // the embedded `item` to map back to the file
+                            // stem. Without this, `diamond.json` could carry
+                            // `"item": "cobblestone"` and win the duplicate-key
+                            // race against the legitimate `cobblestone.json`,
+                            // causing the legitimate file to be quarantined
+                            // while the misnamed/tampered file wins.
+                            let expected_stem = Self::sanitize_item_name_for_filename(&pair.item);
+                            let stem = path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            if stem != expected_stem {
+                                if let Err(e) = quarantine_pair_file(
+                                    &path,
+                                    &format!(
+                                        "stem mismatch: file stem {stem:?} vs expected {expected_stem:?} from item {:?}",
+                                        pair.item.as_str()
+                                    ),
+                                ) {
+                                    warn!(
+                                        "[Pair] quarantine rename failed for {} (stem mismatch): {e}; skipping insert",
+                                        path.display()
+                                    );
+                                }
+                                quarantined += 1;
+                                continue;
+                            }
                             let item_name = pair.item.to_string();
                             // Two on-disk files mapping to the same `pair.item`
                             // would silently overwrite each other in memory and
@@ -162,22 +200,37 @@ impl Pair {
                             // loser as a stale `.json`. Quarantine the second
                             // file (`*.json.dup`) so an operator can reconcile.
                             if pairs.contains_key(&item_name) {
-                                quarantine_pair_file(
+                                if let Err(e) = quarantine_pair_file(
                                     &path,
                                     &format!("duplicate key '{item_name}' already loaded"),
-                                )?;
+                                ) {
+                                    warn!(
+                                        "[Pair] quarantine rename failed for {} (duplicate key): {e}; skipping insert",
+                                        path.display()
+                                    );
+                                }
                                 quarantined += 1;
                             } else {
                                 pairs.insert(item_name, pair);
                             }
                         }
                         Err(e) => {
-                            quarantine_pair_file(&path, &format!("malformed: {e}"))?;
+                            if let Err(qe) = quarantine_pair_file(&path, &format!("malformed: {e}")) {
+                                warn!(
+                                    "[Pair] quarantine rename failed for {} (malformed): {qe}",
+                                    path.display()
+                                );
+                            }
                             quarantined += 1;
                         }
                     },
                     Err(e) => {
-                        quarantine_pair_file(&path, &format!("unreadable: {e}"))?;
+                        if let Err(qe) = quarantine_pair_file(&path, &format!("unreadable: {e}")) {
+                            warn!(
+                                "[Pair] quarantine rename failed for {} (unreadable): {qe}",
+                                path.display()
+                            );
+                        }
                         quarantined += 1;
                     }
                 }
@@ -210,30 +263,77 @@ impl Pair {
         // Track which filenames are still "live" so we can garbage-collect
         // files for pairs removed from the in-memory map below.
         let mut expected_files = HashSet::new();
+        let mut written = 0usize;
+        let mut first_save_err: Option<io::Error> = None;
 
         for pair in pairs.values() {
-            pair.save()?;
             let sanitized_name = Self::sanitize_item_name_for_filename(&pair.item);
             let filename = format!("{sanitized_name}.json");
+            // Populate `expected_files` regardless of save outcome so the
+            // orphan sweep below still runs against the full intended map —
+            // a transient write failure must not turn legitimate files into
+            // sweep targets.
             expected_files.insert(filename);
-        }
-
-        let mut removed = 0usize;
-        if dir_path.exists() {
-            for entry in fs::read_dir(dir_path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    && let Some(filename) = path.file_name().and_then(|n| n.to_str())
-                        && !expected_files.contains(filename) {
-                            fs::remove_file(&path)?;
-                            removed += 1;
-                        }
+            // Attempt every pair even after a previous failure: each
+            // `write_atomic` is independent, so one transient hiccup must
+            // not silently drop later pairs' updates. Capture only the
+            // first error to surface to the caller.
+            if let Err(e) = pair.save() {
+                warn!("[Pair] save failed for {}: {e}", pair.item.as_str());
+                first_save_err.get_or_insert(e);
+            } else {
+                written += 1;
             }
         }
 
-        info!("[Pair] save_all: wrote {} pairs, cleaned {} orphan files", pairs.len(), removed);
-        Ok(())
+        // Orphan sweep: warn-and-continue on per-entry IO errors so a single
+        // locked/transient failure doesn't abort the whole sweep, and so a
+        // captured `first_save_err` always wins over a sweep-only error
+        // (stale orphans self-heal next cycle; a swallowed save error makes
+        // callers think state was persisted when it wasn't).
+        let mut removed = 0usize;
+        let mut first_sweep_err: Option<io::Error> = None;
+        if dir_path.exists() {
+            match fs::read_dir(dir_path) {
+                Ok(read_dir) => {
+                    for entry in read_dir {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                warn!("[Pair] orphan sweep: unreadable entry: {e}");
+                                first_sweep_err.get_or_insert(e);
+                                continue;
+                            }
+                        };
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                            && let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                            && !expected_files.contains(filename)
+                        {
+                            if let Err(e) = fs::remove_file(&path) {
+                                warn!("[Pair] orphan sweep: remove_file({}) failed: {e}", path.display());
+                                first_sweep_err.get_or_insert(e);
+                            } else {
+                                removed += 1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[Pair] orphan sweep: read_dir({}) failed: {e}", dir_path.display());
+                    first_sweep_err = Some(e);
+                }
+            }
+        }
+
+        info!(
+            "[Pair] save_all: wrote {} of {} pairs (failed {}), cleaned {} orphan files",
+            written, pairs.len(), pairs.len() - written, removed
+        );
+        match first_save_err.or(first_sweep_err) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 

@@ -95,8 +95,10 @@ What's shipped is described across the other docs. Things that are **not yet
 implemented** and that someone reading the code might expect:
 
 - Automatic crash-resume. Today the bot *detects* an interrupted trade or
-  chest op on startup, logs it, and clears the journal; reconciling the
-  world and ledger is an operator task (see [RECOVERY.md](RECOVERY.md)).
+  chest op on startup, logs it, and (for an interrupted chest op) renames
+  the leftover journal aside to a timestamped
+  `data/journal.leftover-*.json` archive for operator review; reconciling
+  the world and ledger is an operator task (see [RECOVERY.md](RECOVERY.md)).
   Planned behavior: [ARCHITECTURE.md § Planned: automatic crash-resume](ARCHITECTURE.md#planned-automatic-crash-resume).
 - Order books / limit orders, multi-item trades, statistics.
 

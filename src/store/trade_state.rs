@@ -24,6 +24,23 @@ use crate::messages::TradeItem;
 use crate::store::queue::QueuedOrder;
 use crate::types::storage::ChestTransfer;
 
+/// Error returned when a `TradeState` transition is requested from a state
+/// that does not permit it. Carrying the source/destination phase names lets
+/// callers log a structured operator alert instead of the actor task panicking.
+#[derive(Debug, Clone)]
+pub struct TransitionError {
+    pub from: &'static str,
+    pub to:   &'static str,
+}
+
+impl fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TradeState::{} called from invalid state: {}", self.to, self.from)
+    }
+}
+
+impl std::error::Error for TransitionError {}
+
 /// Items the bot actually received from the player during the GUI exchange.
 ///
 /// Retained past the `Depositing` phase purely for diagnostics (Debug output
@@ -91,10 +108,12 @@ impl TradeState {
 
     /// Queued -> Withdrawing.
     ///
-    /// Panics if called from any other state — the state machine is
-    /// intentionally total so a misrouted call fails loudly rather than
-    /// silently corrupting an in-flight trade.
-    pub fn begin_withdrawal(self, plan: Vec<ChestTransfer>) -> Self {
+    /// Returns `Err(TransitionError)` if called from any other state. The
+    /// state machine is intentionally total so a misrouted call surfaces as
+    /// a recoverable operator alert rather than panicking the actor task
+    /// (the Store is awaited via `try_join!`, so a panic would take pending
+    /// orders down with the whole process).
+    pub fn begin_withdrawal(self, plan: Vec<ChestTransfer>) -> Result<TradeState, TransitionError> {
         match self {
             TradeState::Queued(order) => {
                 tracing::debug!(
@@ -103,17 +122,17 @@ impl TradeState {
                     phase = "withdrawing",
                     "TradeState transition"
                 );
-                TradeState::Withdrawing { order, plan }
+                Ok(TradeState::Withdrawing { order, plan })
             }
-            other => panic!(
-                "TradeState::begin_withdrawal called from invalid state: {}",
-                other.phase()
-            ),
+            other => Err(TransitionError {
+                from: other.phase(),
+                to: "begin_withdrawal",
+            }),
         }
     }
 
     /// Withdrawing -> Trading.
-    pub fn begin_trading(self) -> Self {
+    pub fn begin_trading(self) -> Result<TradeState, TransitionError> {
         match self {
             TradeState::Withdrawing { order, plan } => {
                 tracing::debug!(
@@ -122,20 +141,20 @@ impl TradeState {
                     phase = "trading",
                     "TradeState transition"
                 );
-                TradeState::Trading {
+                Ok(TradeState::Trading {
                     order,
                     withdrawn: plan,
-                }
+                })
             }
-            other => panic!(
-                "TradeState::begin_trading called from invalid state: {}",
-                other.phase()
-            ),
+            other => Err(TransitionError {
+                from: other.phase(),
+                to: "begin_trading",
+            }),
         }
     }
 
     /// Trading -> Depositing.
-    pub fn begin_depositing(self, trade_result: TradeResult, deposit_plan: Vec<ChestTransfer>) -> Self {
+    pub fn begin_depositing(self, trade_result: TradeResult, deposit_plan: Vec<ChestTransfer>) -> Result<TradeState, TransitionError> {
         match self {
             TradeState::Trading { order, .. } => {
                 tracing::debug!(
@@ -144,16 +163,16 @@ impl TradeState {
                     phase = "depositing",
                     "TradeState transition"
                 );
-                TradeState::Depositing {
+                Ok(TradeState::Depositing {
                     order,
                     trade_result,
                     deposit_plan,
-                }
+                })
             }
-            other => panic!(
-                "TradeState::begin_depositing called from invalid state: {}",
-                other.phase()
-            ),
+            other => Err(TransitionError {
+                from: other.phase(),
+                to: "begin_depositing",
+            }),
         }
     }
 
@@ -161,7 +180,7 @@ impl TradeState {
     ///
     /// Accepts `Trading` directly (payout-to-balance trades have no deposit
     /// phase) and `Depositing` (normal case).
-    pub fn commit(self, item: String, quantity: i32, currency_amount: f64) -> Self {
+    pub fn commit(self, item: String, quantity: i32, currency_amount: f64) -> Result<TradeState, TransitionError> {
         match self {
             TradeState::Trading { order, .. }
             | TradeState::Depositing { order, .. } => {
@@ -174,34 +193,45 @@ impl TradeState {
                     currency = format_args!("{:.2}", currency_amount),
                     "TradeState transition"
                 );
-                TradeState::Committed(CompletedTrade {
+                Ok(TradeState::Committed(CompletedTrade {
                     order,
                     item,
                     quantity,
                     currency_amount,
-                })
+                }))
             }
-            other => panic!(
-                "TradeState::commit called from invalid state: {}",
-                other.phase()
-            ),
+            other => Err(TransitionError {
+                from: other.phase(),
+                to: "commit",
+            }),
         }
     }
 
     /// Any non-terminal state -> RolledBack.
     ///
-    /// Panics on a committed or already-rolled-back trade: the caller is
-    /// trying to retreat from a terminal state, which indicates a handler
-    /// bug, not a recoverable condition.
+    /// Returns `Err(TransitionError)` on a committed or already-rolled-back
+    /// trade: the caller is trying to retreat from a terminal state, which
+    /// indicates a handler bug. A typed error keeps the actor alive instead
+    /// of panicking the entire Store task.
     #[allow(dead_code)] // API surface; used in tests
-    pub fn rollback(self, reason: String) -> Self {
+    pub fn rollback(self, reason: String) -> Result<TradeState, TransitionError> {
         let order = match self {
             TradeState::Queued(order)
             | TradeState::Withdrawing { order, .. }
             | TradeState::Trading { order, .. }
             | TradeState::Depositing { order, .. } => order,
-            TradeState::Committed(_) => panic!("Cannot rollback a committed trade"),
-            TradeState::RolledBack { .. } => panic!("Trade already rolled back"),
+            TradeState::Committed(_) => {
+                return Err(TransitionError {
+                    from: "committed",
+                    to: "rollback",
+                });
+            }
+            TradeState::RolledBack { .. } => {
+                return Err(TransitionError {
+                    from: "rolled_back",
+                    to: "rollback",
+                });
+            }
         };
         tracing::info!(
             order_id = order.id,
@@ -210,7 +240,7 @@ impl TradeState {
             reason = %reason,
             "TradeState rolled back"
         );
-        TradeState::RolledBack { order, reason }
+        Ok(TradeState::RolledBack { order, reason })
     }
 
     /// Short label for the current phase, stable across serialization and
@@ -365,15 +395,15 @@ mod tests {
         assert_eq!(state.phase(), "queued");
         assert!(!state.is_terminal());
 
-        let state = state.begin_withdrawal(sample_transfers());
+        let state = state.begin_withdrawal(sample_transfers()).unwrap();
         assert_eq!(state.phase(), "withdrawing");
         assert!(!state.is_terminal());
 
-        let state = state.begin_trading();
+        let state = state.begin_trading().unwrap();
         assert_eq!(state.phase(), "trading");
         assert!(!state.is_terminal());
 
-        let state = state.commit("cobblestone".to_string(), 64, 12.5);
+        let state = state.commit("cobblestone".to_string(), 64, 12.5).unwrap();
         assert_eq!(state.phase(), "committed");
         assert!(state.is_terminal());
 
@@ -391,20 +421,20 @@ mod tests {
     fn depositing_commits_after_post_trade_chest_work() {
         // Queued -> Withdrawing -> Trading -> Depositing -> Committed.
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading()
-            .begin_depositing(sample_trade_result(), sample_transfers());
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap()
+            .begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
         assert_eq!(state.phase(), "depositing");
         assert!(!state.is_terminal());
 
-        let state = state.commit("cobblestone".to_string(), 64, 8.0);
+        let state = state.commit("cobblestone".to_string(), 64, 8.0).unwrap();
         assert_eq!(state.phase(), "committed");
         assert!(state.is_terminal());
     }
 
     #[test]
     fn withdrawing_preserves_order_and_plan() {
-        let state = TradeState::new(sample_order()).begin_withdrawal(sample_transfers());
+        let state = TradeState::new(sample_order()).begin_withdrawal(sample_transfers()).unwrap();
         if let TradeState::Withdrawing { order, plan } = &state {
             assert_eq!(order.id, 1);
             assert_eq!(order.username, "TestPlayer");
@@ -418,8 +448,8 @@ mod tests {
     #[test]
     fn trading_carries_withdrawn_plan_for_rollback() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading();
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap();
         if let TradeState::Trading { withdrawn, .. } = &state {
             assert_eq!(withdrawn.len(), 1, "withdrawn plan must survive into Trading so rollback can reverse it");
         } else {
@@ -431,7 +461,7 @@ mod tests {
 
     #[test]
     fn rollback_from_queued_captures_reason() {
-        let state = TradeState::new(sample_order()).rollback("cancelled before withdraw".to_string());
+        let state = TradeState::new(sample_order()).rollback("cancelled before withdraw".to_string()).unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert!(state.is_terminal());
         if let TradeState::RolledBack { reason, order } = &state {
@@ -445,8 +475,8 @@ mod tests {
     #[test]
     fn rollback_from_withdrawing_preserves_order() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .rollback("chest timeout".to_string());
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .rollback("chest timeout".to_string()).unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert_eq!(state.order().id, 1);
         if let TradeState::RolledBack { reason, .. } = &state {
@@ -457,9 +487,9 @@ mod tests {
     #[test]
     fn rollback_from_trading_preserves_order() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading()
-            .rollback("trade rejected by player".to_string());
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap()
+            .rollback("trade rejected by player".to_string()).unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert_eq!(state.order().id, 1);
     }
@@ -467,10 +497,10 @@ mod tests {
     #[test]
     fn rollback_from_depositing_preserves_order() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading()
-            .begin_depositing(sample_trade_result(), sample_transfers())
-            .rollback("deposit failed".to_string());
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap()
+            .begin_depositing(sample_trade_result(), sample_transfers()).unwrap()
+            .rollback("deposit failed".to_string()).unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert_eq!(state.order().id, 1);
     }
@@ -478,63 +508,93 @@ mod tests {
     // --- invalid-transition guards ---------------------------------------
 
     #[test]
-    #[should_panic(expected = "begin_trading called from invalid state: queued")]
     fn cannot_skip_withdrawing() {
-        let _ = TradeState::new(sample_order()).begin_trading();
+        let err = TradeState::new(sample_order()).begin_trading().unwrap_err();
+        assert_eq!(err.from, "queued");
+        assert_eq!(err.to, "begin_trading");
     }
 
     #[test]
-    #[should_panic(expected = "begin_depositing called from invalid state: queued")]
     fn cannot_deposit_from_queued() {
-        let _ = TradeState::new(sample_order())
-            .begin_depositing(sample_trade_result(), sample_transfers());
+        let err = TradeState::new(sample_order())
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap_err();
+        assert_eq!(err.from, "queued");
+        assert_eq!(err.to, "begin_depositing");
     }
 
     #[test]
-    #[should_panic(expected = "begin_depositing called from invalid state: withdrawing")]
     fn cannot_deposit_from_withdrawing() {
-        let _ = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_depositing(sample_trade_result(), sample_transfers());
+        let err = TradeState::new(sample_order())
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap_err();
+        assert_eq!(err.from, "withdrawing");
+        assert_eq!(err.to, "begin_depositing");
     }
 
     #[test]
-    #[should_panic(expected = "commit called from invalid state: queued")]
     fn cannot_commit_from_queued() {
-        let _ = TradeState::new(sample_order()).commit("x".to_string(), 1, 1.0);
+        let err = TradeState::new(sample_order())
+            .commit("x".to_string(), 1, 1.0)
+            .unwrap_err();
+        assert_eq!(err.from, "queued");
+        assert_eq!(err.to, "commit");
     }
 
     #[test]
-    #[should_panic(expected = "commit called from invalid state: withdrawing")]
     fn cannot_commit_from_withdrawing() {
-        let _ = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .commit("x".to_string(), 1, 1.0);
+        let err = TradeState::new(sample_order())
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .commit("x".to_string(), 1, 1.0)
+            .unwrap_err();
+        assert_eq!(err.from, "withdrawing");
+        assert_eq!(err.to, "commit");
     }
 
     #[test]
-    #[should_panic(expected = "begin_withdrawal called from invalid state: withdrawing")]
     fn cannot_re_enter_withdrawing() {
-        let _ = TradeState::new(sample_order())
+        let err = TradeState::new(sample_order())
+            .begin_withdrawal(sample_transfers()).unwrap()
             .begin_withdrawal(sample_transfers())
-            .begin_withdrawal(sample_transfers());
+            .unwrap_err();
+        assert_eq!(err.from, "withdrawing");
+        assert_eq!(err.to, "begin_withdrawal");
     }
 
     #[test]
-    #[should_panic(expected = "Cannot rollback a committed trade")]
     fn cannot_rollback_committed() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading()
-            .commit("cobblestone".to_string(), 64, 10.0);
-        let _ = state.rollback("oops".to_string());
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap()
+            .commit("cobblestone".to_string(), 64, 10.0).unwrap();
+        let err = state.rollback("oops".to_string()).unwrap_err();
+        assert_eq!(err.from, "committed");
+        assert_eq!(err.to, "rollback");
     }
 
     #[test]
-    #[should_panic(expected = "Trade already rolled back")]
     fn cannot_double_rollback() {
-        let state = TradeState::new(sample_order()).rollback("first".to_string());
-        let _ = state.rollback("second".to_string());
+        let state = TradeState::new(sample_order()).rollback("first".to_string()).unwrap();
+        let err = state.rollback("second".to_string()).unwrap_err();
+        assert_eq!(err.from, "rolled_back");
+        assert_eq!(err.to, "rollback");
+    }
+
+    #[test]
+    fn commit_with_invalid_state_returns_err() {
+        // From rolled_back: cannot commit.
+        let state = TradeState::new(sample_order()).rollback("cancelled".to_string()).unwrap();
+        let err = state.commit("x".to_string(), 1, 1.0).unwrap_err();
+        assert_eq!(err.from, "rolled_back");
+        assert_eq!(err.to, "commit");
+
+        // Display formatting roundtrips the message contract callers used to
+        // see in panic messages, so log scrapers still match.
+        assert_eq!(
+            err.to_string(),
+            "TradeState::commit called from invalid state: rolled_back"
+        );
     }
 
     // --- introspection ----------------------------------------------------
@@ -544,19 +604,19 @@ mod tests {
         let order = sample_order();
         assert_eq!(TradeState::Queued(order.clone()).phase(), "queued");
         assert_eq!(
-            TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).phase(),
+            TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).unwrap().phase(),
             "withdrawing"
         );
         let trading = TradeState::new(order.clone())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading();
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap();
         assert_eq!(trading.phase(), "trading");
-        let depositing = trading.begin_depositing(sample_trade_result(), sample_transfers());
+        let depositing = trading.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
         assert_eq!(depositing.phase(), "depositing");
-        let committed = depositing.commit("cobblestone".to_string(), 64, 1.0);
+        let committed = depositing.commit("cobblestone".to_string(), 64, 1.0).unwrap();
         assert_eq!(committed.phase(), "committed");
         assert_eq!(
-            TradeState::new(order).rollback("r".to_string()).phase(),
+            TradeState::new(order).rollback("r".to_string()).unwrap().phase(),
             "rolled_back"
         );
     }
@@ -565,14 +625,14 @@ mod tests {
     fn is_terminal_only_for_committed_and_rolled_back() {
         let order = sample_order();
         assert!(!TradeState::Queued(order.clone()).is_terminal());
-        let w = TradeState::new(order.clone()).begin_withdrawal(sample_transfers());
+        let w = TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).unwrap();
         assert!(!w.is_terminal());
-        let t = w.begin_trading();
+        let t = w.begin_trading().unwrap();
         assert!(!t.is_terminal());
-        let d = t.begin_depositing(sample_trade_result(), sample_transfers());
+        let d = t.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
         assert!(!d.is_terminal());
-        assert!(d.commit("cobblestone".to_string(), 64, 1.0).is_terminal());
-        assert!(TradeState::new(order).rollback("r".to_string()).is_terminal());
+        assert!(d.commit("cobblestone".to_string(), 64, 1.0).unwrap().is_terminal());
+        assert!(TradeState::new(order).rollback("r".to_string()).unwrap().is_terminal());
     }
 
     #[test]
@@ -581,22 +641,22 @@ mod tests {
         assert_eq!(state.order().id, 1);
         assert_eq!(state.order().username, "TestPlayer");
 
-        let state = state.begin_withdrawal(sample_transfers());
+        let state = state.begin_withdrawal(sample_transfers()).unwrap();
         assert_eq!(state.order().id, 1);
 
-        let state = state.begin_trading();
+        let state = state.begin_trading().unwrap();
         assert_eq!(state.order().username, "TestPlayer");
 
-        let state = state.begin_depositing(sample_trade_result(), sample_transfers());
+        let state = state.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
         assert_eq!(state.order().id, 1);
 
-        let state = state.commit("cobblestone".to_string(), 64, 10.0);
+        let state = state.commit("cobblestone".to_string(), 64, 10.0).unwrap();
         assert_eq!(state.order().id, 1);
     }
 
     #[test]
     fn order_accessor_returns_order_from_rolled_back() {
-        let state = TradeState::new(sample_order()).rollback("x".to_string());
+        let state = TradeState::new(sample_order()).rollback("x".to_string()).unwrap();
         assert_eq!(state.order().id, 1);
         assert_eq!(state.order().username, "TestPlayer");
     }
@@ -610,18 +670,18 @@ mod tests {
         assert!(rendered.starts_with("Queued:"), "got {rendered}");
         assert!(rendered.contains("buy cobblestone 64"));
 
-        let state = state.begin_withdrawal(sample_transfers());
+        let state = state.begin_withdrawal(sample_transfers()).unwrap();
         let rendered = state.to_string();
         assert!(rendered.starts_with("Withdrawing for:"), "got {rendered}");
 
-        let state = state.begin_trading();
+        let state = state.begin_trading().unwrap();
         let rendered = state.to_string();
         assert!(rendered.starts_with("Trading with player:"), "got {rendered}");
 
-        let state = state.begin_depositing(sample_trade_result(), sample_transfers());
+        let state = state.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
         assert!(state.to_string().starts_with("Depositing after:"));
 
-        let state = state.commit("cobblestone".to_string(), 64, 12.5);
+        let state = state.commit("cobblestone".to_string(), 64, 12.5).unwrap();
         let rendered = state.to_string();
         assert!(rendered.contains("64x cobblestone"));
         assert!(rendered.contains("12.50 diamonds"));
@@ -630,7 +690,7 @@ mod tests {
     #[test]
     fn display_rolled_back_includes_reason() {
         let rendered = TradeState::new(sample_order())
-            .rollback("timeout".to_string())
+            .rollback("timeout".to_string()).unwrap()
             .to_string();
         assert!(rendered.starts_with("Rolled back"), "got {rendered}");
         assert!(rendered.contains("timeout"));
@@ -643,19 +703,19 @@ mod tests {
         let order = sample_order();
         let states = vec![
             TradeState::new(order.clone()),
-            TradeState::new(order.clone()).begin_withdrawal(sample_transfers()),
+            TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).unwrap(),
             TradeState::new(order.clone())
-                .begin_withdrawal(sample_transfers())
-                .begin_trading(),
+                .begin_withdrawal(sample_transfers()).unwrap()
+                .begin_trading().unwrap(),
             TradeState::new(order.clone())
-                .begin_withdrawal(sample_transfers())
-                .begin_trading()
-                .begin_depositing(sample_trade_result(), sample_transfers()),
+                .begin_withdrawal(sample_transfers()).unwrap()
+                .begin_trading().unwrap()
+                .begin_depositing(sample_trade_result(), sample_transfers()).unwrap(),
             TradeState::new(order.clone())
-                .begin_withdrawal(sample_transfers())
-                .begin_trading()
-                .commit("cobblestone".to_string(), 64, 5.0),
-            TradeState::new(order).rollback("boom".to_string()),
+                .begin_withdrawal(sample_transfers()).unwrap()
+                .begin_trading().unwrap()
+                .commit("cobblestone".to_string(), 64, 5.0).unwrap(),
+            TradeState::new(order).rollback("boom".to_string()).unwrap(),
         ];
         for state in &states {
             let json = serde_json::to_string(state).expect("serialize");
@@ -705,8 +765,8 @@ mod tests {
         let path = dir.path("current_trade.json");
 
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers())
-            .begin_trading();
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap();
 
         persist_to(&path, &state).expect("persist must succeed");
 

@@ -63,6 +63,57 @@ impl Drop for CriticalGuard<'_> {
     }
 }
 
+/// Return the byte index of the first ASCII control character (0x00-0x1F or
+/// 0x7F) in `s`, or `None` if there are none.
+///
+/// Defense-in-depth helper used by [`Bot::send_whisper`] and
+/// [`Bot::send_chat_message`] to refuse payloads that would inject newlines or
+/// other control bytes into the raw chat packet.
+fn first_control_char(s: &str) -> Option<usize> {
+    s.bytes()
+        .position(|b| b < 0x20 || b == 0x7F)
+}
+
+/// Returns true when the first non-whitespace byte of `target` is `/`.
+///
+/// Used by [`Bot::send_whisper`] only (NOT [`Bot::send_chat_message`], which
+/// intentionally accepts slash-prefixed commands like `/trade {username}`)
+/// to reject hostile targets that would turn `/msg {target} {msg}` into a
+/// nested server-side command parse.
+fn target_has_leading_slash(target: &str) -> bool {
+    target
+        .bytes()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_some_and(|b| b == b'/')
+}
+
+/// Validate a chat payload pair the way [`Bot::send_whisper`] does — used by
+/// unit tests to exercise the validation rules without constructing a real
+/// `Bot` (which depends on a Microsoft auth round-trip).
+#[cfg(test)]
+fn validate_whisper_payload(target: &str, msg: &str) -> Result<(), &'static str> {
+    if first_control_char(target).is_some() {
+        return Err("control character in chat payload");
+    }
+    if first_control_char(msg).is_some() {
+        return Err("control character in chat payload");
+    }
+    if target_has_leading_slash(target) {
+        return Err("control character in chat payload");
+    }
+    Ok(())
+}
+
+/// Validate a chat-message payload the way [`Bot::send_chat_message`] does
+/// (controls only — leading-slash is allowed, used for `/trade {user}`).
+#[cfg(test)]
+fn validate_chat_message_payload(content: &str) -> Result<(), &'static str> {
+    if first_control_char(content).is_some() {
+        return Err("control character in chat payload");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Component)]
 pub struct BotState {
     pub connected: bool,
@@ -255,6 +306,22 @@ impl Bot {
     }
 
     pub async fn send_chat_message(&self, message: &str) -> Result<(), String> {
+        // Defense-in-depth at the actual `client.chat()` call site. Even if
+        // upstream sanitization (the chat composer's `sanitize_outbound_chat`)
+        // is bypassed by a future caller or store error formatter, controls
+        // cannot smuggle a second command line into the raw chat packet.
+        // NOTE: no leading-slash guard here — `send_chat_message` is
+        // intentionally used to send slash-prefixed commands like
+        // `/trade {username}`.
+        if first_control_char(message).is_some() {
+            let preview: Vec<u8> = message.bytes().take(16).collect();
+            tracing::warn!(
+                "[bot] rejected send_chat_message: control char in content (preview: {:02x?})",
+                &preview
+            );
+            return Err("control character in chat payload".to_string());
+        }
+
         if let Some(client) = self.client.read().await.as_ref() {
             client.chat(message);
             debug!("Sent chat message: {}", message);
@@ -269,6 +336,38 @@ impl Bot {
     }
 
     pub async fn send_whisper(&self, target: &str, message: &str) -> Result<(), String> {
+        // Defense-in-depth at the actual `client.chat()` call site (see
+        // `send_chat_message` for the full rationale). Additionally rejects
+        // a leading-slash `target` so a hostile `target = "/op typicalhog"`
+        // cannot turn `/msg /op typicalhog ...` into a server-side
+        // privileged parse. The leading-slash guard is NOT applied to
+        // `message` — whisper bodies can legitimately contain `/`-prefixed
+        // text (URLs, paths, quoted commands).
+        if first_control_char(target).is_some() {
+            let preview: Vec<u8> = target.bytes().take(16).collect();
+            tracing::warn!(
+                "[bot] rejected send_whisper: control char in target (preview: {:02x?})",
+                &preview
+            );
+            return Err("control character in chat payload".to_string());
+        }
+        if first_control_char(message).is_some() {
+            let preview: Vec<u8> = message.bytes().take(16).collect();
+            tracing::warn!(
+                "[bot] rejected send_whisper: control char in message (preview: {:02x?})",
+                &preview
+            );
+            return Err("control character in chat payload".to_string());
+        }
+        if target_has_leading_slash(target) {
+            let preview: Vec<u8> = target.bytes().take(16).collect();
+            tracing::warn!(
+                "[bot] rejected send_whisper: leading-slash in target (preview: {:02x?})",
+                &preview
+            );
+            return Err("control character in chat payload".to_string());
+        }
+
         if let Some(client) = self.client.read().await.as_ref() {
             client.chat(format!("/msg {} {}", target, message));
             debug!("Sent whisper to {}: {}", target, message);
@@ -324,6 +423,7 @@ pub async fn bot_task(
     // bot can proceed with fresh operations.
     let journal = match crate::store::journal::Journal::load() {
         Ok((journal, leftover)) => {
+            let had_leftover = leftover.is_some();
             if let Some(entry) = leftover {
                 error!(
                     "[Bot] Crash recovery: previous run left an in-flight shulker op: op_id={} type={:?} chest_id={} slot={} state={:?} — manual reconciliation recommended",
@@ -335,14 +435,29 @@ pub async fn bot_task(
                 );
             }
             let shared = std::sync::Arc::new(parking_lot::Mutex::new(journal));
-            if let Err(e) = shared.lock().clear_leftover() {
-                warn!("[Bot] Failed to clear journal after startup warning: {}", e);
+            if had_leftover {
+                match shared.lock().archive_leftover() {
+                    Ok(path) => error!(
+                        "[Bot] Quarantined leftover journal to {:?} — preserve for operator review",
+                        path
+                    ),
+                    Err(e) => warn!(
+                        "[Bot] Failed to archive leftover journal: {} — entry remains on disk",
+                        e
+                    ),
+                }
             }
             shared
         }
         Err(e) => {
-            warn!(
-                "[Bot] Failed to load operation journal: {} — starting with empty journal",
+            // After the load_from quarantine refactor, this arm only fires
+            // when the journal was both unreadable AND could not be moved
+            // aside — the bot is about to fall back to a default journal
+            // that points at the same path, so the next `begin()` will
+            // overwrite the original. Log at error so the operator sees
+            // that in-flight evidence may be lost on the next persist.
+            error!(
+                "[Bot] Failed to load operation journal AND failed to quarantine it: {} — starting with empty journal; original file may be overwritten on next persist",
                 e
             );
             std::sync::Arc::new(parking_lot::Mutex::new(
@@ -1373,6 +1488,92 @@ mod tests {
     fn parse_join_broadcast_returns_none_when_only_stop_words_present() {
         // "joined the game" with no name must not invent one.
         assert!(parse_join_broadcast("joined the game").is_none());
+    }
+
+    #[test]
+    fn validate_whisper_payload_rejects_newline_in_target() {
+        assert!(validate_whisper_payload("foo\nbar", "hi").is_err());
+    }
+
+    #[test]
+    fn validate_whisper_payload_rejects_carriage_return_in_message() {
+        assert!(validate_whisper_payload("foo", "hi\rthere").is_err());
+    }
+
+    #[test]
+    fn validate_whisper_payload_rejects_nul_in_target() {
+        assert!(validate_whisper_payload("foo\0bar", "hi").is_err());
+    }
+
+    #[test]
+    fn validate_whisper_payload_rejects_nul_in_message() {
+        assert!(validate_whisper_payload("foo", "hi\0there").is_err());
+    }
+
+    #[test]
+    fn validate_whisper_payload_rejects_leading_slash_target() {
+        // /msg /op typicalhog ... must not be allowed to ride through as a
+        // server-side privileged parse.
+        assert!(validate_whisper_payload("/op typicalhog", "hi").is_err());
+    }
+
+    #[test]
+    fn validate_whisper_payload_rejects_leading_slash_after_whitespace() {
+        // Leading whitespace must not mask the slash check.
+        assert!(validate_whisper_payload("   /op", "hi").is_err());
+        assert!(validate_whisper_payload("\t/op", "hi").is_err());
+    }
+
+    #[test]
+    fn validate_whisper_payload_accepts_clean_inputs() {
+        assert!(validate_whisper_payload("typicalhog", "hello there").is_ok());
+    }
+
+    #[test]
+    fn validate_whisper_payload_accepts_slash_inside_message() {
+        // The leading-slash guard is target-only; whisper bodies may
+        // legitimately contain `/`-prefixed text (URLs, paths, quoted commands).
+        assert!(validate_whisper_payload("typicalhog", "see /home").is_ok());
+    }
+
+    #[test]
+    fn validate_chat_message_payload_rejects_newline() {
+        assert!(validate_chat_message_payload("hi\nthere").is_err());
+    }
+
+    #[test]
+    fn validate_chat_message_payload_rejects_carriage_return() {
+        assert!(validate_chat_message_payload("hi\rthere").is_err());
+    }
+
+    #[test]
+    fn validate_chat_message_payload_rejects_nul() {
+        assert!(validate_chat_message_payload("hi\0there").is_err());
+    }
+
+    #[test]
+    fn validate_chat_message_payload_accepts_leading_slash() {
+        // send_chat_message intentionally accepts slash-prefixed commands
+        // like `/trade {username}` — the guard must not reject these.
+        assert!(validate_chat_message_payload("/trade typicalhog").is_ok());
+    }
+
+    #[test]
+    fn validate_chat_message_payload_accepts_clean_inputs() {
+        assert!(validate_chat_message_payload("hello world").is_ok());
+    }
+
+    #[test]
+    fn first_control_char_detects_del_byte() {
+        // 0x7F (DEL) is in scope per the rule.
+        assert!(first_control_char("foo\x7Fbar").is_some());
+    }
+
+    #[test]
+    fn first_control_char_skips_high_ascii_and_utf8() {
+        // High-bit / multi-byte UTF-8 must NOT be flagged — only 0x00-0x1F and 0x7F.
+        assert!(first_control_char("café").is_none());
+        assert!(first_control_char("naïve").is_none());
     }
 
     #[test]

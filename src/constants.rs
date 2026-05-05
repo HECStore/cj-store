@@ -26,6 +26,18 @@ pub const TRADE_TIMEOUT_MS: u64 = 45_000;
 /// 90 seconds should handle even complex multi-shulker operations.
 pub const CHEST_OP_TIMEOUT_SECS: u64 = 90;
 
+/// Outer timeout (seconds) on the oneshot ack returned by `BotInstruction::Whisper`.
+///
+/// Whisper handling is serialized with chest operations on the bot's `bot_rx`
+/// loop, so the ack can legitimately be delayed behind a long-running chest op.
+/// This must therefore be **comfortably larger** than `CHEST_OP_TIMEOUT_SECS`
+/// (currently 90s) so the whisper ack only ever fires when the bot is truly
+/// wedged — not merely busy. Without this outer timeout, a dropped/forgotten
+/// `respond_to.send` on the bot side would hang the entire store loop
+/// indefinitely (the non-order `dispatch_message` path has no
+/// `ORDER_HARD_TIMEOUT_SECS` watchdog around it).
+pub const WHISPER_ACK_TIMEOUT_SECS: u64 = 120;
+
 pub const PATHFINDING_TIMEOUT_MS: u64 = 60_000;
 
 // Delays are intentionally generous to handle server lag. Do not reduce

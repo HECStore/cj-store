@@ -16,9 +16,11 @@
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
-    path::{Path, PathBuf},
+    path::Path,
     sync::OnceLock,
 };
+#[cfg(test)]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +48,7 @@ fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(MOJANG_TIMEOUT_SECS))
+            .connect_timeout(std::time::Duration::from_secs(3))
             .build()
             .expect("Failed to create HTTP client")
     })
@@ -101,9 +104,13 @@ fn is_valid_username_shape(username: &str) -> bool {
 /// UUID-shape validator: canonical 36-char hyphenated lowercase hex
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, OR bare 32-char lowercase hex.
 /// Rejects uppercase, missing hyphens, wrong length, and any path-separator
-/// or `..` content. Mirrors `crate::chat::tools::validate_uuid`'s acceptance
-/// set; intentionally duplicated to keep `types::user` chat-independent.
-fn is_valid_uuid_shape(uuid: &str) -> bool {
+/// or `..` content. Strictly broader than the chat-tool boundary
+/// validator at `crate::chat::tools::validate_uuid`, which now accepts
+/// canonical-hyphenated only — the storage layer keeps the bare-hex
+/// arm because Mojang's API returns the bare form and existing on-disk
+/// user files were historically written with it. Intentionally
+/// duplicated to keep `types::user` chat-independent.
+pub(crate) fn is_valid_uuid_shape(uuid: &str) -> bool {
     let bytes = uuid.as_bytes();
     match bytes.len() {
         32 => bytes
@@ -184,7 +191,12 @@ impl User {
         // and panic. Requiring every byte to be ASCII hex makes the slice
         // offsets land on valid char boundaries AND prevents non-hex content
         // (which would later become a filename component) from propagating.
-        let id = &mojang_response.id;
+        // The persistence layer's `is_valid_uuid_shape` is lowercase-only,
+        // so canonicalize here — Mojang doesn't contractually guarantee a
+        // case, and an uppercase response would otherwise survive this guard
+        // (`is_ascii_hexdigit` accepts A-F) and then be silently rejected by
+        // `save_in_dir`/`load_all_in_dir`, dropping the user on next start.
+        let id = mojang_response.id.to_ascii_lowercase();
         if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             warn!(
                 "[Mojang] invalid UUID shape for '{username}': got {:?}",
@@ -211,6 +223,12 @@ impl User {
     /// builds expected filenames from `user.uuid` verbatim and orphan-deletes
     /// any unmatched `.json` in the users directory, so a malformed value
     /// would both write outside the directory AND wipe legitimate files.
+    ///
+    /// Production code now goes through `save_in_dir`, which inlines the
+    /// same shape gate; this helper is retained for the shape-gate tests
+    /// and is therefore `#[cfg(test)]`-gated to keep the production binary
+    /// free of dead code.
+    #[cfg(test)]
     fn get_user_file_path(uuid: &str) -> io::Result<PathBuf> {
         if !is_valid_uuid_shape(uuid) {
             return Err(io::Error::new(
@@ -224,13 +242,36 @@ impl User {
     /// Saves this single `User` to `data/users/{self.uuid}.json`, creating
     /// the directory if needed. Uses `write_atomic` so a crash mid-write
     /// cannot leave a partially written user file.
+    ///
+    /// Retained as a one-liner over `save_in_dir` for symmetry with the
+    /// other `Type::save` methods on the storage types (and as a future
+    /// callsite if a single-user write path is needed). Production code
+    /// reaches the same logic through
+    /// `save_dirty` → `save_dirty_in_dir` → `save_in_dir`, so this wrapper
+    /// has no live callers — `#[allow(dead_code)]` keeps it available
+    /// without a warning.
+    #[allow(dead_code)]
     pub fn save(&self) -> io::Result<()> {
-        let path = Self::get_user_file_path(&self.uuid)?;
+        self.save_in_dir(Path::new(Self::USERS_DIR))
+    }
 
-        if let Some(parent_dir) = path.parent()
-            && !parent_dir.exists() {
-                fs::create_dir_all(parent_dir)?;
-            }
+    /// Directory-parameterized form of `save`. Validates the embedded uuid
+    /// shape before joining it to `dir` so a tampered `self.uuid` cannot
+    /// escape the supplied directory. Tests target this directly with a
+    /// `tempfile::tempdir()` to exercise the persistence path without
+    /// touching `data/users/`.
+    fn save_in_dir(&self, dir: &Path) -> io::Result<()> {
+        if !is_valid_uuid_shape(&self.uuid) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid user UUID shape: {:?}", self.uuid),
+            ));
+        }
+        let path = dir.join(format!("{}.json", self.uuid));
+
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
+        }
 
         let json_str = serde_json::to_string_pretty(self)?;
         write_atomic(&path, &json_str)?;
@@ -241,7 +282,13 @@ impl User {
     /// Loads every `{uuid}.json` from the users directory. Malformed or
     /// unreadable files are skipped with a `warn!` log that includes the path.
     pub fn load_all() -> io::Result<HashMap<String, Self>> {
-        let dir_path = Path::new(Self::USERS_DIR);
+        Self::load_all_in_dir(Path::new(Self::USERS_DIR))
+    }
+
+    /// Directory-parameterized form of `load_all`. Same skip-and-quarantine
+    /// rules; tests target this directly with a `tempfile::tempdir()` to
+    /// pin the malformed-entry guards without touching `data/users/`.
+    fn load_all_in_dir(dir_path: &Path) -> io::Result<HashMap<String, Self>> {
         let mut users = HashMap::new();
 
         if !dir_path.exists() {
@@ -251,7 +298,17 @@ impl User {
 
         let mut skipped = 0usize;
         for entry in fs::read_dir(dir_path)? {
-            let entry = entry?;
+            // Per-entry IO errors (transient lock, deleted-during-iter, EACCES
+            // on a single file) skip the entry rather than aborting the whole
+            // load. The whole-directory `read_dir` failure above remains fatal.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    skipped += 1;
+                    warn!("[User] skipping unreadable directory entry: {e}");
+                    continue;
+                }
+            };
             let path = entry.path();
 
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
@@ -307,7 +364,8 @@ impl User {
     }
 
     /// Saves a HashMap of `User`s, where each `User` is saved to its own file
-    /// in the `data/users/` directory using the `user.save()` method.
+    /// in the `data/users/` directory through the shared `save_dirty` →
+    /// `save_dirty_in_dir` → `save_in_dir` chain.
     /// This method overwrites existing files and then removes any orphaned files.
     ///
     /// The orphan cleanup pass makes the on-disk directory a faithful mirror
@@ -331,8 +389,37 @@ impl User {
     ///
     /// Skips persisting users that are in `dirty` but no longer present in
     /// `users` — they'll be removed by the orphan sweep below.
+    ///
+    /// Refuses to operate on an empty `users` map, mirroring `Pair::save_all`
+    /// and `Trade::save_all`. An empty map would produce an empty
+    /// `expected_files` set and the orphan sweep would then wipe every
+    /// persisted user. A bug that empties the in-memory map should fail loud
+    /// rather than silently zap balances and operator flags.
+    ///
+    /// On a write failure, still completes population of `expected_files` for
+    /// the remaining shape-valid users and runs the orphan sweep before
+    /// returning the captured error — this preserves the "directory mirrors
+    /// map" invariant and prevents stale on-disk files for users dropped from
+    /// the map from accumulating across save attempts.
     pub fn save_dirty(users: &HashMap<String, Self>, dirty: &HashSet<String>) -> io::Result<()> {
-        let dir_path = Path::new(Self::USERS_DIR);
+        Self::save_dirty_in_dir(users, dirty, Path::new(Self::USERS_DIR))
+    }
+
+    /// Directory-parameterized form of `save_dirty`. The empty-map guard
+    /// lives here (not just in the public wrapper) so tests can exercise
+    /// the wipe-refusal invariant directly against a temp dir; the public
+    /// `save_dirty` is a thin one-liner over this helper.
+    fn save_dirty_in_dir(
+        users: &HashMap<String, Self>,
+        dirty: &HashSet<String>,
+        dir_path: &Path,
+    ) -> io::Result<()> {
+        if users.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "save_dirty called with an empty users map; refusing to wipe the users directory",
+            ));
+        }
 
         if !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
@@ -347,7 +434,9 @@ impl User {
         let mut expected_files = HashSet::with_capacity(users.len());
         let mut written = 0usize;
         let mut skipped_invalid = 0usize;
+        let mut first_save_err: Option<io::Error> = None;
 
+        let mut attempted = 0usize;
         for (key, user) in users.iter() {
             if !is_valid_uuid_shape(&user.uuid) {
                 warn!(
@@ -360,30 +449,84 @@ impl User {
             let filename = format!("{}.json", user.uuid);
             expected_files.insert(filename);
             if dirty.contains(key) {
-                user.save()?;
-                written += 1;
+                attempted += 1;
+                // Attempt every dirty user even after a previous failure: each
+                // `write_atomic` is independent, so one transient hiccup must
+                // not silently drop later users' balance/operator updates.
+                // Capture only the first error to surface to the caller.
+                if let Err(e) = user.save_in_dir(dir_path) {
+                    warn!("[User] save failed for {}: {e}", user.uuid);
+                    if first_save_err.is_none() {
+                        first_save_err = Some(e);
+                    }
+                } else {
+                    written += 1;
+                }
             }
         }
 
+        // Wipe-refusal: if every user in the map failed the shape gate,
+        // `expected_files` is empty and the orphan sweep below would delete
+        // every legitimate `.json`. Match the explicit empty-map guard above.
+        if expected_files.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "save_dirty: no shape-valid users to mirror; refusing to wipe the users directory",
+            ));
+        }
+
+        // Orphan sweep: warn-and-continue on per-entry IO errors so a single
+        // locked/transient failure doesn't abort the whole sweep, and so a
+        // captured `first_save_err` always wins over a sweep-only error
+        // (stale orphans self-heal next cycle; a swallowed save error makes
+        // callers think state was persisted when it wasn't).
         let mut removed = 0usize;
+        let mut first_sweep_err: Option<io::Error> = None;
         if dir_path.exists() {
-            for entry in fs::read_dir(dir_path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    && let Some(filename) = path.file_name().and_then(|n| n.to_str())
-                        && !expected_files.contains(filename) {
-                            fs::remove_file(&path)?;
-                            removed += 1;
+            match fs::read_dir(dir_path) {
+                Ok(read_dir) => {
+                    for entry in read_dir {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                warn!("[User] orphan sweep: unreadable entry: {e}");
+                                if first_sweep_err.is_none() {
+                                    first_sweep_err = Some(e);
+                                }
+                                continue;
+                            }
+                        };
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                            && let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                            && !expected_files.contains(filename)
+                        {
+                            if let Err(e) = fs::remove_file(&path) {
+                                warn!("[User] orphan sweep: remove_file({}) failed: {e}", path.display());
+                                if first_sweep_err.is_none() {
+                                    first_sweep_err = Some(e);
+                                }
+                            } else {
+                                removed += 1;
+                            }
                         }
+                    }
+                }
+                Err(e) => {
+                    warn!("[User] orphan sweep: read_dir({}) failed: {e}", dir_path.display());
+                    first_sweep_err = Some(e);
+                }
             }
         }
 
         info!(
-            "[User] save_dirty: wrote {} of {} users, cleaned {} orphan files (skipped {} with invalid uuid shape)",
-            written, users.len(), removed, skipped_invalid
+            "[User] save_dirty: wrote {} of {} attempted (failed {}), cleaned {} orphan files, skipped {} with invalid uuid shape ({} users in map)",
+            written, attempted, attempted - written, removed, skipped_invalid, users.len()
         );
-        Ok(())
+        match first_save_err.or(first_sweep_err) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -441,5 +584,117 @@ mod tests {
         let json = r#"{"uuid":"u","username":"a","balance":1.0}"#;
         let u: User = serde_json::from_str(json).unwrap();
         assert!(!u.operator);
+    }
+
+    #[test]
+    fn save_dirty_refuses_empty_map_to_prevent_accidental_wipe() {
+        // Pre-create two `*.json` files; an empty `users` map must NOT
+        // trigger the orphan sweep that would wipe them.
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json");
+        let f2 = dir.path().join("11111111-2222-3333-4444-555555555555.json");
+        fs::write(&f1, "{}").unwrap();
+        fs::write(&f2, "{}").unwrap();
+
+        let err = User::save_dirty_in_dir(&HashMap::new(), &HashSet::new(), dir.path())
+            .expect_err("empty map must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(f1.exists(), "pre-existing file 1 must survive");
+        assert!(f2.exists(), "pre-existing file 2 must survive");
+    }
+
+    #[test]
+    fn load_all_in_dir_drops_file_with_tampered_embedded_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json");
+        let json = r#"{"uuid":"../bar","username":"alice","balance":1.0}"#;
+        fs::write(&path, json).unwrap();
+
+        let users = User::load_all_in_dir(dir.path()).unwrap();
+        assert!(users.is_empty(), "tampered file must be dropped");
+        assert!(path.exists(), "load_all does NOT delete; file must remain");
+    }
+
+    #[test]
+    fn load_all_in_dir_drops_file_with_stem_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json");
+        // Embedded uuid is a different valid canonical UUID than the stem.
+        let json = r#"{"uuid":"11111111-2222-3333-4444-555555555555","username":"alice","balance":1.0}"#;
+        fs::write(&path, json).unwrap();
+
+        let users = User::load_all_in_dir(dir.path()).unwrap();
+        assert!(users.is_empty(), "stem-mismatched file must be dropped");
+    }
+
+    #[test]
+    fn load_all_in_dir_loads_well_formed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let path = dir.path().join(format!("{uuid}.json"));
+        let user = User {
+            uuid: uuid.to_string(),
+            username: "alice".to_string(),
+            balance: 7.5,
+            operator: true,
+        };
+        fs::write(&path, serde_json::to_string(&user).unwrap()).unwrap();
+
+        let users = User::load_all_in_dir(dir.path()).unwrap();
+        assert_eq!(users.len(), 1);
+        let loaded = users.get(uuid).expect("keyed by embedded uuid");
+        assert_eq!(loaded, &user);
+    }
+
+    #[test]
+    fn save_dirty_in_dir_skips_user_with_invalid_uuid_shape() {
+        // Mount the temp dir under a parent so we can assert no file
+        // escaped via the malformed `../etc/passwd` uuid into the parent.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("users");
+        fs::create_dir_all(&dir).unwrap();
+
+        let valid_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let valid = User {
+            uuid: valid_uuid.to_string(),
+            username: "alice".to_string(),
+            balance: 1.0,
+            operator: false,
+        };
+        let bogus = User {
+            uuid: "../etc/passwd".to_string(),
+            username: "mallory".to_string(),
+            balance: 0.0,
+            operator: false,
+        };
+
+        let mut users = HashMap::new();
+        users.insert(valid_uuid.to_string(), valid);
+        users.insert("bogus".to_string(), bogus);
+
+        let mut dirty = HashSet::new();
+        dirty.insert(valid_uuid.to_string());
+        dirty.insert("bogus".to_string());
+
+        User::save_dirty_in_dir(&users, &dirty, &dir).unwrap();
+
+        // (i) only the valid user's `.json` exists in `dir`.
+        let valid_path = dir.join(format!("{valid_uuid}.json"));
+        assert!(valid_path.exists(), "valid user must be persisted");
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(entries.len(), 1, "only one file expected, got {entries:?}");
+
+        // (ii) no file escaped the directory via the malformed uuid.
+        assert!(
+            !parent.path().join("etc").exists(),
+            "no `etc/` sibling should appear next to dir"
+        );
+        assert!(
+            !parent.path().join("etc/passwd.json").exists(),
+            "no escape file outside dir"
+        );
     }
 }

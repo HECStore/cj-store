@@ -270,7 +270,15 @@ fn code_fence_ranges(s: &str) -> Vec<(usize, usize)> {
             i += 1;
         }
     }
-    // Pass B — single-tick fences outside any triple region.
+    // Pass B — single-tick fences outside any triple region. Per
+    // CommonMark, single-tick code spans never span newlines: a `\n`
+    // between an opener and its matching backtick aborts the span and
+    // the opener is treated as a literal character. We follow that
+    // rule here so a stray backtick on a line cannot shield a later
+    // `<thinking>...</thinking>` block from `strip_reasoning` —
+    // treating an unclosed single tick as covering the rest of the
+    // input is anti-defensive for this function's actual job (CoT
+    // suppression).
     let triple_covered =
         |pos: usize| triples.iter().any(|&(a, b)| a <= pos && pos < b);
     let mut singles: Vec<(usize, usize)> = Vec::new();
@@ -281,6 +289,11 @@ fn code_fence_ranges(s: &str) -> Vec<(usize, usize)> {
             let mut j = i + 1;
             let mut found = false;
             while j < bytes.len() {
+                if bytes[j] == b'\n' {
+                    // Newline before a closing tick → not a span. Drop
+                    // the stray opener and resume scanning after it.
+                    break;
+                }
                 if bytes[j] == b'`' && !triple_covered(j) {
                     singles.push((open_start, j + 1));
                     i = j + 1;
@@ -290,10 +303,11 @@ fn code_fence_ranges(s: &str) -> Vec<(usize, usize)> {
                 j += 1;
             }
             if !found {
-                // Unclosed single backtick — same defensive choice as
-                // the triple-fence case.
-                singles.push((open_start, bytes.len()));
-                break;
+                // Either we hit a `\n` or we reached EOS without a
+                // closer. Drop the stray opener entirely — push no
+                // range — so any later `<thinking>` block remains
+                // strippable.
+                i = open_start + 1;
             }
         } else {
             i += 1;
@@ -390,6 +404,44 @@ pub fn strip_ai_tells(reply: &str) -> String {
         out.drain(..trimmed_start);
     }
     out
+}
+
+/// Sanitize an outbound chat reply by stripping every ASCII control
+/// character (0x00-0x1F, 0x7F) and collapsing whitespace runs.
+///
+/// The chat module ultimately funnels replies into
+/// `client.chat(format!("/msg {target} {message}"))`. Embedded `\r` /
+/// `\n` in `message` is a chat-command-injection vector against any
+/// LLM-emitted content: an attacker who can prompt-inject the model
+/// could exfiltrate a fresh command line (`\n/op foo`) into the server
+/// stream. Strip every C0 control byte plus DEL at the chat-module
+/// boundary so neither the public-chat sink nor the whisper sink can
+/// emit a raw control byte regardless of upstream cooperation.
+///
+/// Pipeline:
+/// 1. Replace each ASCII control char (0x00-0x1F, 0x7F) with a single
+///    space — keeps surrounding word boundaries instead of glueing
+///    tokens together.
+/// 2. Collapse runs of ASCII spaces into one space.
+/// 3. Trim leading/trailing ASCII whitespace.
+///
+/// Non-ASCII content is left untouched: this is a control-char gate,
+/// not a charset filter. A reply that becomes empty after stripping
+/// (e.g. pure `\n`) returns `""` so the caller's `is_empty` drop gate
+/// silences it.
+pub fn sanitize_outbound_chat(reply: &str) -> String {
+    let mut out = String::with_capacity(reply.len());
+    for c in reply.chars() {
+        if (c as u32) < 0x20 || c == '\u{7f}' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    while out.contains("  ") {
+        out = out.replace("  ", " ");
+    }
+    out.trim().to_string()
 }
 
 /// Hard ceiling on chat-message length (Unicode scalar values).
@@ -707,6 +759,16 @@ mod tests {
     }
 
     #[test]
+    fn strip_reasoning_strips_thinking_after_stray_single_backtick() {
+        // A stray unclosed single backtick must NOT shield a later
+        // `<thinking>` block from stripping. Single-tick spans are
+        // line-bounded (CommonMark) and a stray opener is dropped, so
+        // the reasoning block remains visible to the stripper.
+        let s = strip_reasoning("why ` did <thinking>real cot</thinking> happen");
+        assert_eq!(s, "why ` did  happen");
+    }
+
+    #[test]
     fn strip_reasoning_preserves_thinking_inside_single_backticks() {
         // Player asks about XML; bot quotes their tag back. The
         // backtick-fenced `<thinking>...</thinking>` is content the bot
@@ -835,5 +897,65 @@ mod tests {
         // per sentence is lowered.
         let s = lowercase_first_per_sentence("I went to Steve's place.");
         assert_eq!(s, "i went to Steve's place.");
+    }
+
+    // ---- sanitize_outbound_chat ----------------------------------------
+
+    #[test]
+    fn sanitize_strips_lf_to_space() {
+        // A bare `\n` between tokens collapses to a single space after
+        // the run-collapse pass.
+        let s = sanitize_outbound_chat("hello\nworld");
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn sanitize_strips_crlf_pair_to_single_space() {
+        // `\r\n` is two control bytes → two spaces → collapsed to one.
+        let s = sanitize_outbound_chat("hello\r\nworld");
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn sanitize_neutralizes_cr_command_injection() {
+        // The classic chat-command injection vector: a stray `\r/op foo`
+        // would, without sanitization, ship as a raw command line via
+        // `/msg <target> <message>`. After sanitize the leading `\r` is
+        // a space and the existing `starts_with('/')` guard at the
+        // call-site sees `/op foo` as the first non-whitespace content.
+        let s = sanitize_outbound_chat("\r/op foo");
+        assert_eq!(s, "/op foo");
+    }
+
+    #[test]
+    fn sanitize_strips_nul_byte() {
+        // NUL (0x00) is a control char; some chat proxies treat it as
+        // a string terminator. Replace and trim.
+        let s = sanitize_outbound_chat("hi\u{0000}there");
+        assert_eq!(s, "hi there");
+    }
+
+    #[test]
+    fn sanitize_strips_del_byte() {
+        // DEL (0x7F) sits outside the C0 range but is just as
+        // unsafe to emit; the function must catch it explicitly.
+        let s = sanitize_outbound_chat("hi\u{007f}there");
+        assert_eq!(s, "hi there");
+    }
+
+    #[test]
+    fn sanitize_leaves_benign_sentence_unchanged_modulo_trim() {
+        // Control-free input round-trips identically (after trim).
+        let input = "hello world, this is a normal reply.";
+        assert_eq!(sanitize_outbound_chat(input), input);
+        // Padded input trims but otherwise round-trips.
+        assert_eq!(sanitize_outbound_chat("  hi friend  "), "hi friend");
+    }
+
+    #[test]
+    fn sanitize_pure_control_input_becomes_empty() {
+        // A reply that is nothing but control chars must come back
+        // empty so the caller's `is_empty` drop gate silences it.
+        assert!(sanitize_outbound_chat("\r\n\t\u{0000}").is_empty());
     }
 }

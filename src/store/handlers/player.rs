@@ -129,10 +129,10 @@ pub async fn handle_player_command(
             info::handle_price(store, player_name, &item, quantity).await
         }
         Command::Balance { target } => {
-            info::handle_balance(store, player_name, target.as_deref()).await
+            info::handle_balance(store, player_name, &user_uuid, target.as_deref()).await
         }
         Command::Pay { target, amount } => {
-            info::handle_pay(store, player_name, &target, amount).await
+            info::handle_pay(store, player_name, &user_uuid, &target, amount).await
         }
         Command::Items { page } => info::handle_items(store, player_name, page).await,
         Command::Queue { page } => info::handle_queue(store, player_name, &user_uuid, page).await,
@@ -140,7 +140,9 @@ pub async fn handle_player_command(
             info::handle_cancel(store, player_name, &user_uuid, order_id).await
         }
         Command::Status => info::handle_status(store, player_name).await,
-        Command::Help { topic } => info::handle_help(store, player_name, topic.as_deref()).await,
+        Command::Help { topic } => {
+            info::handle_help(store, player_name, &user_uuid, topic.as_deref()).await
+        }
 
         // Operator commands: authorization is enforced here (not in the
         // parser) so `parse_command` stays a pure function on the input

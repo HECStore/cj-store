@@ -40,6 +40,16 @@ pub enum StoreError {
     #[error("Chest operation timed out after {after_ms}ms")]
     ChestTimeout { after_ms: u64 },
 
+    /// Outer-timeout fired while awaiting a oneshot ack from the bot for a
+    /// non-trade/non-chest instruction (currently: whisper send). The inner
+    /// string is a short call-site context tag (e.g. `"whisper ack"`) used
+    /// for log triage; it is not user-facing. Distinct from
+    /// `BotResponseDropped` (channel closed, bot likely crashed) and
+    /// `BotDisconnected` (mpsc unavailable): this fires when the bot accepted
+    /// the instruction but never produced a reply within the budget.
+    #[error("Bot ack timed out: {0}")]
+    BotAckTimeout(String),
+
     /// Bot returned a structured trade-failure reason.
     #[error("Trade rejected: {0}")]
     TradeRejected(String),
@@ -107,6 +117,7 @@ impl StoreError {
             | StoreError::Io(_)
             | StoreError::TradeTimeout { .. }
             | StoreError::ChestTimeout { .. }
+            | StoreError::BotAckTimeout(_)
             | StoreError::BotDisconnected => Cow::Borrowed(GENERIC),
         }
     }

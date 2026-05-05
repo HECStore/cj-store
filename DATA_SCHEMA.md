@@ -136,11 +136,24 @@ One file per trading pair. Filename is the canonical item id (no
 - On corrupt-JSON or unreadable pair files, `Pair::load_all` renames the
   bad file to `data/pairs/<item>.json.corrupt.<millis>` (the millisecond
   suffix avoids collisions if quarantine fires repeatedly) and continues
-  loading the rest. Two on-disk files that deserialize to the same
-  `pair.item` are also a quarantine case: the first wins, the second is
-  renamed. `Pair::save_all` refuses to run with an empty in-memory
-  `pairs` map (returns `InvalidInput`) so the orphan-cleanup pass cannot
-  wipe the pairs directory.
+  loading the rest. Per-entry IO errors during the directory scan are
+  warn-and-continue (a single locked/EACCES file no longer aborts the
+  whole load); the top-level `read_dir` failure is still fatal.
+  Two on-disk files that deserialize to the same `pair.item` are also a
+  quarantine case: the first wins, the second is renamed. A file whose
+  embedded `item` field doesn't sanitize back to the file stem (e.g.
+  `diamond.json` carrying `"item": "cobblestone"`) is also quarantined
+  — the stem-vs-content gate stops a misnamed/tampered file from
+  winning a duplicate-key race against the legitimate one. If the
+  quarantine rename itself fails the entry is just skipped this cycle
+  (the bad file stays in place, no insert into the in-memory map).
+  `Pair::save_all` refuses to run with an empty in-memory `pairs` map
+  (returns `InvalidInput`) so the orphan-cleanup pass cannot wipe the
+  pairs directory; on a per-pair write failure it still completes the
+  `expected_files` set and runs the orphan sweep before surfacing the
+  captured error so the on-disk directory keeps mirroring the in-memory
+  map. The orphan sweep itself is also warn-and-continue, and a
+  captured save error always wins over a sweep-only error.
 
 ## `data/users/<uuid>.json`
 
@@ -162,12 +175,21 @@ One file per known player. Filename is the hyphenated Mojang UUID. See
   withdraw/pay handlers reject when the result would go below zero.
 - `operator: true` unlocks `additem` / `removeitem` / `addcurrency` /
   `removecurrency` in whispers.
-- `User::save` validates the embedded `uuid` shape (canonical hyphenated
-  lowercase hex, or bare 32-char lowercase hex) before building the file
-  path; out-of-shape uuids fail with `InvalidInput`. `User::load_all`
-  additionally requires that the embedded `uuid` field equals the
-  filename stem and skips files where it doesn't, so a hand-renamed or
-  tampered user file can't smuggle a mismatched identity into the store.
+- The production save path (`User::save_dirty` →
+  `User::save_dirty_in_dir` → `User::save_in_dir`) validates the embedded
+  `uuid` shape (canonical hyphenated lowercase hex, or bare 32-char
+  lowercase hex) before building the file path; out-of-shape uuids fail
+  with `InvalidInput` (and a shape-failing user is skipped, not aborted,
+  so one bad entry doesn't block the rest of the dirty set).
+  `save_dirty` also refuses an empty `users` map (so a bug that empties
+  the in-memory map can't trigger the orphan sweep that would wipe every
+  persisted user), and on a write failure still completes the
+  `expected_files` set and runs the orphan sweep before surfacing the
+  captured error so the on-disk directory keeps mirroring the in-memory
+  map. `User::load_all` additionally requires that the embedded `uuid`
+  field equals the filename stem and skips files where it doesn't, so a
+  hand-renamed or tampered user file can't smuggle a mismatched identity
+  into the store.
 
 ## `data/storage/<node_id>.json`
 
@@ -290,6 +312,13 @@ startup means the previous run crashed mid chest I/O. See
 Historically serialized as a one-entry array for forward compatibility;
 `load_from` reads a `Vec<JournalEntry>` and keeps only the last.
 
+On startup, a non-empty journal is renamed aside to
+`data/journal.leftover-<unix-millis>.json` for operator review (so the
+in-flight evidence is preserved across the next persist). An unreadable
+journal is similarly quarantined to
+`data/journal.unreadable-<unix-millis>.json` and the bot continues with
+an empty journal. See [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-entry).
+
 ```json
 [
   {
@@ -389,7 +418,19 @@ when parsing.
 "DepositBalance" | "WithdrawBalance" | "AddCurrency" | "RemoveCurrency"`
 — see [src/types/trade.rs](src/types/trade.rs).
 On startup the Store loads at most `max_trades_in_memory` files (newest
-first); older files stay on disk untouched.
+first); older files stay on disk untouched. Files that fail to
+deserialize (or are unreadable) are quarantined to
+`data/trades/<timestamp>.json.corrupt.<millis>` mirroring the pair
+quarantine pattern — a quarantine rename failure is warn-and-continue
+(the bad file stays in place and is skipped this cycle, with a
+`quarantine_failed` counter in the load summary log) so a single
+permission/lock issue can't block loading tens of thousands of history
+files at startup. `Trade::save_all` refuses to run with an empty
+in-memory `trades` vec (would otherwise wipe the trades directory via
+the orphan sweep); on a per-trade write failure it still completes the
+`expected_files` set and runs the orphan sweep before surfacing the
+captured error, and the orphan sweep is warn-and-continue with a
+captured save error winning over any sweep-only error.
 
 ## Versioning policy
 

@@ -398,6 +398,7 @@ fn http_client() -> &'static reqwest::Client {
             // through the entire budget. 15 s allows 2 attempts + backoff to
             // fit inside 30 s while still tolerating slow networks.
             .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("Failed to create Anthropic HTTP client")
     })

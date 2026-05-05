@@ -38,8 +38,12 @@ use super::queue::QueuedOrder;
 /// own ~70-line copy of this loop with subtly different error handling.
 ///
 /// On success every step's `ChestSyncReport` has already been applied to
-/// store state. On failure the returned error identifies which step failed
-/// and why; the caller is responsible for rollback of any earlier steps.
+/// store state. On failure for `ChestDirection::Withdraw`, any successfully
+/// executed prefix is automatically rolled back (re-deposited into the source
+/// chests) BEFORE returning the original error — items physically pulled into
+/// the bot's inventory by the prefix would otherwise sit there while in-memory
+/// storage already shows the deduction. `ChestDirection::Deposit` callers own
+/// their own recovery (replaying as further deposits would double-credit).
 pub(crate) async fn execute_chest_transfers(
     store: &mut Store,
     transfers: &[ChestTransfer],
@@ -48,6 +52,7 @@ pub(crate) async fn execute_chest_transfers(
     direction: ChestDirection,
     log_tag: &'static str,
 ) -> Result<(), StoreError> {
+    let mut applied: Vec<ChestTransfer> = Vec::new();
     for t in transfers {
         let node_position = store.get_node_position(t.chest_id);
         let chest = rollback::chest_from_transfer(t);
@@ -67,7 +72,7 @@ pub(crate) async fn execute_chest_transfers(
         };
 
         let (tx, rx) = oneshot::channel();
-        store
+        if let Err(e) = store
             .bot_tx
             .send(BotInstruction::InteractWithChestAndSync {
                 target_chest: chest,
@@ -76,10 +81,11 @@ pub(crate) async fn execute_chest_transfers(
                 respond_to: tx,
             })
             .await
-            .map_err(|e| {
-                error!(phase = log_tag, chest_id = t.chest_id, "Failed to send chest instruction: {}", e);
-                StoreError::BotDisconnected
-            })?;
+        {
+            error!(phase = log_tag, chest_id = t.chest_id, "Failed to send chest instruction: {}", e);
+            rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
+            return Err(StoreError::BotDisconnected);
+        }
 
         let bot_result = match tokio::time::timeout(
             tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS),
@@ -90,6 +96,7 @@ pub(crate) async fn execute_chest_transfers(
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 error!(phase = log_tag, chest_id = t.chest_id, "Channel dropped: {}", e);
+                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
                 return Err(StoreError::BotResponseDropped(e.to_string()));
             }
             Err(_) => {
@@ -101,6 +108,7 @@ pub(crate) async fn execute_chest_transfers(
                     timeout_secs = CHEST_OP_TIMEOUT_SECS,
                     "Chest operation timed out"
                 );
+                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
                 return Err(StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
             }
         };
@@ -108,16 +116,40 @@ pub(crate) async fn execute_chest_transfers(
         match bot_result {
             Err(err) => {
                 error!(phase = log_tag, chest_id = t.chest_id, "Bot reported error: {}", err);
+                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
                 return Err(StoreError::ChestOp(err));
             }
             Ok(report) => {
                 if let Err(e) = store.apply_chest_sync(report) {
-                    warn!(phase = log_tag, chest_id = t.chest_id, "Chest sync warning: {}", e);
+                    error!(phase = log_tag, chest_id = t.chest_id, "Chest sync failed: {}", e);
+                    rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
+                    return Err(StoreError::ChestOp(e.to_string()));
                 }
+                applied.push(t.clone());
             }
         }
     }
     Ok(())
+}
+
+/// Roll back the successfully-applied prefix of a Withdraw plan by re-depositing
+/// it into the same chests. No-op for Deposit (caller owns recovery; replaying
+/// as deposits would double-credit) and for empty prefixes.
+async fn rollback_applied_prefix(
+    store: &mut Store,
+    direction: ChestDirection,
+    applied: &[ChestTransfer],
+    item: &str,
+    stack_size: i32,
+    log_tag: &'static str,
+) {
+    if applied.is_empty() {
+        return;
+    }
+    if !matches!(direction, ChestDirection::Withdraw) {
+        return;
+    }
+    let _ = rollback::deposit_transfers(store, applied, item, stack_size, log_tag).await;
 }
 
 /// Direction a chest transfer moves items.
@@ -205,13 +237,12 @@ struct BuyPlan {
 async fn validate_and_plan_buy(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     item: &str,
     quantity: u32,
 ) -> Result<Option<BuyPlan>, StoreError> {
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
-    utils::ensure_user_exists(store, player_name, &user_uuid);
+    utils::ensure_user_exists(store, player_name, user_uuid);
+    let user_uuid = user_uuid.to_string();
 
     if !store.pairs.contains_key(item) {
         warn!(phase = "buy.validate", player = %player_name, item = %item, "Attempted to buy unavailable item");
@@ -368,13 +399,14 @@ fn split_sell_payout(total_payout: f64) -> Option<(i32, f64)> {
 pub async fn handle_buy_order(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     item: &str,
     quantity: u32,
 ) -> Result<(), StoreError> {
     info!(phase = "buy.start", player = %player_name, item = %item, qty = quantity, "Buy order starting");
     state::assert_invariants(store, "pre-buy", false)?;
 
-    let plan = match validate_and_plan_buy(store, player_name, item, quantity).await? {
+    let plan = match validate_and_plan_buy(store, player_name, user_uuid, item, quantity).await? {
         Some(p) => p,
         None => return Ok(()), // player-facing rejection already sent
     };
@@ -715,13 +747,12 @@ struct SellPlan {
 async fn validate_and_plan_sell(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     item: &str,
     quantity: u32,
 ) -> Result<Option<SellPlan>, StoreError> {
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
-    utils::ensure_user_exists(store, player_name, &user_uuid);
+    utils::ensure_user_exists(store, player_name, user_uuid);
+    let user_uuid = user_uuid.to_string();
 
     if !store.pairs.contains_key(item) {
         warn!(phase = "sell.validate", player = %player_name, item = %item, "Attempted to sell unavailable item");
@@ -817,13 +848,14 @@ async fn validate_and_plan_sell(
 pub async fn handle_sell_order(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     item: &str,
     quantity: u32,
 ) -> Result<(), StoreError> {
     info!(phase = "sell.start", player = %player_name, item = %item, qty = quantity, "Sell order starting");
     state::assert_invariants(store, "pre-sell", false)?;
 
-    let plan = match validate_and_plan_sell(store, player_name, item, quantity).await? {
+    let plan = match validate_and_plan_sell(store, player_name, user_uuid, item, quantity).await? {
         Some(p) => p,
         None => return Ok(()),
     };
@@ -1151,19 +1183,19 @@ pub async fn execute_queued_order(
     let order_span = info_span!("order", order_id = order.id, player = %order.username);
     let result = async {
         match &order.order_type {
-            QueuedOrderType::Buy => handle_buy_order(store, &order.username, &order.item, order.quantity)
+            QueuedOrderType::Buy => handle_buy_order(store, &order.username, &order.user_uuid, &order.item, order.quantity)
                 .await
                 .map(|()| format!("Buy order completed: {} {} for {}", order.quantity, order.item, order.username)),
-            QueuedOrderType::Sell => handle_sell_order(store, &order.username, &order.item, order.quantity)
+            QueuedOrderType::Sell => handle_sell_order(store, &order.username, &order.user_uuid, &order.item, order.quantity)
                 .await
                 .map(|()| format!("Sell order completed: {} {} for {}", order.quantity, order.item, order.username)),
             QueuedOrderType::Deposit { amount } => {
-                super::handlers::player::handle_deposit_balance_queued(store, &order.username, *amount)
+                super::handlers::player::handle_deposit_balance_queued(store, &order.username, &order.user_uuid, *amount)
                     .await
                     .map(|()| format!("Deposit completed for {}", order.username))
             }
             QueuedOrderType::Withdraw { amount } => {
-                super::handlers::player::handle_withdraw_balance_queued(store, &order.username, *amount)
+                super::handlers::player::handle_withdraw_balance_queued(store, &order.username, &order.user_uuid, *amount)
                     .await
                     .map(|()| format!("Withdraw completed for {}", order.username))
             }
@@ -1358,7 +1390,7 @@ mod tests {
 
         // Request more than physical storage holds — handler rejects during
         // validation, before any bot instruction is sent.
-        let result = handle_buy_order(&mut store, "Alice", "cobblestone", 500).await;
+        let result = handle_buy_order(&mut store, "Alice", &test_uuid("Alice"), "cobblestone", 500).await;
 
         assert!(result.is_ok(), "handler should not propagate error: {:?}", result);
         assert_eq!(store.users.get(&uuid).unwrap().balance, 1000.0);
@@ -1383,7 +1415,7 @@ mod tests {
             storage,
         );
 
-        let result = handle_buy_order(&mut store, "Bob", "gunpowder", 10).await;
+        let result = handle_buy_order(&mut store, "Bob", &test_uuid("Bob"), "gunpowder", 10).await;
         assert!(result.is_ok());
         // No pair created, no user balance change.
         assert!(!store.pairs.contains_key("gunpowder"));
@@ -1409,7 +1441,7 @@ mod tests {
             storage,
         );
 
-        let result = player::pay_async(&mut store, "Payer", "Payee", 20.0).await;
+        let result = player::pay_async(&mut store, "Payer", &test_uuid("Payer"), "Payee", 20.0).await;
         assert!(result.is_ok(), "pay failed: {:?}", result);
         assert_eq!(store.users.get(&payer_uuid).unwrap().balance, 30.0);
         assert_eq!(store.users.get(&payee_uuid).unwrap().balance, 30.0);
@@ -1435,7 +1467,7 @@ mod tests {
             storage,
         );
 
-        let result = player::pay_async(&mut store, "Poor", "Rich", 50.0).await;
+        let result = player::pay_async(&mut store, "Poor", &test_uuid("Poor"), "Rich", 50.0).await;
         assert!(result.is_err());
         // Balances unchanged.
         assert_eq!(store.users.get(&payer_uuid).unwrap().balance, 5.0);
@@ -1460,7 +1492,7 @@ mod tests {
             storage,
         );
 
-        let result = handle_sell_order(&mut store, "Seller", "gunpowder", 10).await;
+        let result = handle_sell_order(&mut store, "Seller", &test_uuid("Seller"), "gunpowder", 10).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
         assert!(!store.pairs.contains_key("gunpowder"));
@@ -1482,7 +1514,7 @@ mod tests {
         let storage = make_storage("cobblestone", 100);
         let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
 
-        let result = handle_sell_order(&mut store, "Zed", "cobblestone", 0).await;
+        let result = handle_sell_order(&mut store, "Zed", &test_uuid("Zed"), "cobblestone", 0).await;
         assert!(result.is_ok());
         // Reserves unchanged.
         assert_eq!(store.pairs.get("cobblestone").unwrap().item_stock, 100);
@@ -1508,12 +1540,12 @@ mod tests {
         );
 
         // Zero amount
-        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", Some(0.0)).await;
+        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", &test_uuid("Depositor"), Some(0.0)).await;
         assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
         assert_eq!(store.users.get(&uuid).unwrap().balance, 10.0);
 
         // Negative amount
-        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", Some(-5.0)).await;
+        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", &test_uuid("Depositor"), Some(-5.0)).await;
         assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
         assert_eq!(store.users.get(&uuid).unwrap().balance, 10.0);
     }
@@ -1537,7 +1569,7 @@ mod tests {
         );
 
         // 12 stacks * 64 = 768 is the cap; 1000 exceeds it.
-        let result = player::handle_deposit_balance_queued(&mut store, "BigSpender", Some(1000.0)).await;
+        let result = player::handle_deposit_balance_queued(&mut store, "BigSpender", &test_uuid("BigSpender"), Some(1000.0)).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
     }
@@ -1560,7 +1592,7 @@ mod tests {
             storage,
         );
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "Broke", Some(50.0)).await;
+        let result = player::handle_withdraw_balance_queued(&mut store, "Broke", &test_uuid("Broke"), Some(50.0)).await;
         assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
         assert_eq!(store.users.get(&uuid).unwrap().balance, 3.0);
     }
@@ -1583,11 +1615,11 @@ mod tests {
             storage,
         );
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", Some(-1.0)).await;
+        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", &test_uuid("Neg"), Some(-1.0)).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", Some(0.0)).await;
+        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", &test_uuid("Neg"), Some(0.0)).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
     }
@@ -1661,7 +1693,7 @@ mod tests {
         let balance_before = store.users.get(&uuid).unwrap().balance;
         let pair_currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
 
-        let result = handle_buy_order(&mut store, "HappyBuyer", "cobblestone", 10).await;
+        let result = handle_buy_order(&mut store, "HappyBuyer", &test_uuid("HappyBuyer"), "cobblestone", 10).await;
         assert!(result.is_ok(), "buy failed: {:?}", result);
 
         // Trade journal + order history received one new entry each.
@@ -1763,7 +1795,7 @@ mod tests {
         let diamond_stock_before = store.storage.total_item_amount("diamond");
         assert_eq!(diamond_stock_before, 0);
 
-        let result = handle_buy_order(&mut store, "ShortPayer", "cobblestone", 1).await;
+        let result = handle_buy_order(&mut store, "ShortPayer", &test_uuid("ShortPayer"), "cobblestone", 1).await;
         assert!(result.is_ok(), "handler should recover gracefully: {:?}", result);
 
         // Diamond chest should now contain the partial payment.
@@ -1806,7 +1838,7 @@ mod tests {
         let orders_before = store.orders.len();
         let pair_currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
 
-        let result = handle_sell_order(&mut store, "HappySeller", "cobblestone", 10).await;
+        let result = handle_sell_order(&mut store, "HappySeller", &test_uuid("HappySeller"), "cobblestone", 10).await;
         assert!(result.is_ok(), "sell failed: {:?}", result);
 
         assert_eq!(store.trades.len(), trades_before + 1);
@@ -1835,7 +1867,7 @@ mod tests {
         );
 
         // Full-balance withdraw (amount=None) on <1 diamond balance: rejected.
-        let result = player::handle_withdraw_balance_queued(&mut store, "Empty", None).await;
+        let result = player::handle_withdraw_balance_queued(&mut store, "Empty", &test_uuid("Empty"), None).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.5);
     }

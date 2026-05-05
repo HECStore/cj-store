@@ -12,8 +12,12 @@
 //!
 //! ## Hard rules baked into this module
 //!
-//! - **UUID validation**: every UUID input is matched
-//!   against `^[0-9a-f-]{32,36}$` (lowercase, optional 4 hyphens).
+//! - **UUID validation**: every UUID input must be the canonical
+//!   hyphenated form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (lowercase
+//!   hex, exactly 4 hyphens). This is symmetric with the on-disk shape
+//!   produced by `mojang::resolve_user_uuid` and the `ctx.sender_uuid`
+//!   carried through the chat pipeline, so the case-insensitive equality
+//!   checks at the tool boundary cannot silently fail on bare-hex input.
 //! - **Sender binding (S10)**: `update_player_memory` must equal the
 //!   current event's sender UUID. No operator override — this is a hard
 //!   integrity boundary.
@@ -50,21 +54,20 @@ fn is_canonical_hyphen_uuid(s: &str) -> bool {
     true
 }
 
-/// Bare 32-char hex UUID (Mojang's wire format before hyphenation).
-fn is_bare_hex_uuid(s: &str) -> bool {
-    s.len() == 32
-        && s.bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-}
-
-/// Validate a UUID. Accepts canonical hyphenated form
-/// OR bare 32-char hex; rejects anything else (uppercase, missing
-/// hyphens, wrong length).
+/// Validate a UUID at the chat-tool boundary. Canonical hyphenated
+/// form ONLY — bare 32-char hex is rejected here even though it is a
+/// valid Mojang shape, because every downstream comparison
+/// (`ctx.sender_uuid` from chat/mod.rs, on-disk trade filenames, the
+/// `TradeView` JSON scan) is canonical hyphenated. Accepting bare hex
+/// at this boundary would let `eq_ignore_ascii_case` against a
+/// hyphenated sender silently fail and either deny a player their own
+/// self-scope history or (with `cross_player_balance_lookups`) return
+/// zero matches because no on-disk record is in bare form.
 pub fn validate_uuid(uuid: &str) -> Result<(), &'static str> {
-    if is_canonical_hyphen_uuid(uuid) || is_bare_hex_uuid(uuid) {
+    if is_canonical_hyphen_uuid(uuid) {
         Ok(())
     } else {
-        Err("uuid must be canonical hyphenated form or bare 32-char hex")
+        Err("uuid must be canonical hyphenated form (lowercase hex with 4 hyphens)")
     }
 }
 
@@ -395,10 +398,11 @@ pub fn tool_definitions(
                           querying another player's trades requires the operator \
                           opt-in `cross_player_balance_lookups` (trades are \
                           financial data of the same sensitivity class as balance). \
-                          Note: balances and pair stocks may be up to ~30s stale due to \
-                          autosave, but `query_trades` is always live (each trade is its \
-                          own file written immediately). Use sparingly; one call per \
-                          economy question is the norm.".to_string(),
+                          Note: balances and pair stocks may be up to \
+                          `autosave_interval_secs` (default ~2s) stale due to autosave, \
+                          but `query_trades` is always live (each trade is its own file \
+                          written immediately). Use sparingly; one call per economy \
+                          question is the norm.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -452,7 +456,8 @@ pub fn tool_definitions(
             description: "Look up a player's diamond balance. Provide either \
                           `uuid` or `username` (not both). Cross-player lookups are \
                           gated; a non-sender lookup returns 'access denied' unless the \
-                          operator opted in. Balance may be up to ~30s stale.".to_string(),
+                          operator opted in. Balance may be up to \
+                          `autosave_interval_secs` (default ~2s) stale.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -809,9 +814,14 @@ pub fn commit_self_memory_bullet(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create memory dir: {e}"))?;
     }
-    crate::fsutil::write_atomic(memory_path, &kept)
-        .map_err(|e| format!("write memory.md: {e}"))?;
 
+    // Write archive BEFORE the live memory.md so a transient archive
+    // write failure leaves the about-to-be-evicted bullets still in
+    // memory.md — the next commit attempt has another shot. The
+    // reverse order silently drops evicted bullets when the archive
+    // write fails after the live-file write succeeds. On rare archive
+    // success + memory.md failure the worst case is a duplicated
+    // bullet (recoverable; archive is union-shaped).
     if !evicted.is_empty() {
         if let Some(parent) = archive_path.parent() {
             std::fs::create_dir_all(parent)
@@ -831,6 +841,9 @@ pub fn commit_self_memory_bullet(
         crate::fsutil::write_atomic(archive_path, &combined)
             .map_err(|e| format!("write memory.archive.md: {e}"))?;
     }
+
+    crate::fsutil::write_atomic(memory_path, &kept)
+        .map_err(|e| format!("write memory.md: {e}"))?;
     Ok(())
 }
 
@@ -1232,9 +1245,11 @@ async fn web_fetch_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, 
 /// importing it: ASCII alphanumerics and `_` only, optional leading
 /// `minecraft:` prefix, non-empty after prefix-strip. The point is to
 /// reject path-traversal and shell-meta inputs (`../`, `;`, spaces)
-/// before they reach any filesystem code — `store_view::pair::get`
-/// already refuses to construct a path from input, but the validation
-/// gives the model a clear error message instead of a silent miss.
+/// before they reach any filesystem code — `store_view::pair::get`'s
+/// fast path also gates the normalized stem through its own shape
+/// check before reading `data/pairs/{stem}.json`, so this is
+/// belt-and-braces; the chat-side validation gives the model a clear
+/// error message instead of a silent miss.
 fn validate_item_id(item: &str) -> Result<String, &'static str> {
     let normalized = item.strip_prefix("minecraft:").unwrap_or(item);
     if normalized.is_empty() {
@@ -1249,7 +1264,11 @@ fn validate_item_id(item: &str) -> Result<String, &'static str> {
     {
         return Err("item id may only contain ASCII alphanumerics and underscore");
     }
-    Ok(normalized.to_string())
+    // Pair filenames and the `item` field inside trade JSON are
+    // always lowercase canonical Minecraft form. Lowercase here so
+    // every call site (get_pair catalog lookup, query_trades filter
+    // compare) sees the same shape regardless of model casing.
+    Ok(normalized.to_ascii_lowercase())
 }
 
 async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
@@ -1325,7 +1344,7 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
         trade_type,
     };
 
-    let trades = crate::chat::store_view::trade::scan_filtered(filter, limit)
+    let (trades, scan_truncated) = crate::chat::store_view::trade::scan_filtered(filter, limit)
         .await
         .map_err(|e| format!("scan_filtered: {e}"))?;
 
@@ -1356,8 +1375,9 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
         }
         serialized.push(entry);
     }
-    let mut body = serde_json::to_string(&serialized)
+    let bare_body = serde_json::to_string(&serialized)
         .map_err(|e| format!("serialize trades: {e}"))?;
+    let mut body = bare_body;
     if body.len() > ctx.history_max_bytes {
         // Account for the envelope wrapper bytes, otherwise the inner
         // array fits the cap but the wrapped response blows past it.
@@ -1365,6 +1385,7 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
             "truncated": true,
             "max_bytes": ctx.history_max_bytes,
             "returned": 0,
+            "scan_truncated": false,
             "trades": [],
         }))
         .map(|s| s.len())
@@ -1409,6 +1430,7 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
             "truncated": true,
             "max_bytes": ctx.history_max_bytes,
             "returned": acc.len(),
+            "scan_truncated": scan_truncated,
             "trades": acc,
         });
         if oversized_first_trade
@@ -1418,6 +1440,19 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
         }
         body = serde_json::to_string(&envelope)
             .unwrap_or_else(|_| "[truncated]".to_string());
+    } else if scan_truncated {
+        // Byte cap not hit, but the on-disk scan stopped at
+        // MAX_DESERIALIZE before `limit` matches accumulated. Wrap the
+        // bare array in an envelope so the model sees `scan_truncated:
+        // true` and knows the answer covers only the head of history.
+        let envelope = serde_json::json!({
+            "truncated": false,
+            "scan_truncated": true,
+            "returned": serialized.len(),
+            "trades": serialized,
+        });
+        body = serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| "[scan_truncated]".to_string());
     }
     Ok(body)
 }
@@ -1443,7 +1478,7 @@ async fn get_pair_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, S
     // hard requirement 3 (no flat-ratio price). The chat tool treats
     // `None` as "below MIN_RESERVE_FOR_PRICE; not currently quoting"
     // rather than inventing a number.
-    let fee = read_store_fee_or_default();
+    let fee = read_store_fee_or_default().await;
     let buy_price =
         crate::store::pricing::indicative_spot_buy_price(p.item_stock, p.currency_stock, fee);
     let sell_price =
@@ -1469,8 +1504,10 @@ async fn get_pair_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, S
 /// re-read on every call (chat is the cold path, the trade bot
 /// reloads on its own), and fall back to the canonical default if
 /// anything fails so a missing config doesn't break the price quote.
-fn read_store_fee_or_default() -> f64 {
-    let body = std::fs::read_to_string("data/config.json").unwrap_or_default();
+pub async fn read_store_fee_or_default() -> f64 {
+    let body = tokio::fs::read_to_string("data/config.json")
+        .await
+        .unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     v.get("fee")
         .and_then(|x| x.as_f64())
@@ -1524,6 +1561,13 @@ async fn get_user_balance_tool(
         unreachable!("exactly-one-of guard above");
     };
 
+    // Re-validate the resolved UUID before any path is constructed:
+    // the by-uuid arm runs `validate_uuid` on its input, but the
+    // username arm trusts `_index.json` and `mojang::resolve_user_uuid`,
+    // so a malformed value from either source would otherwise reach
+    // `get_by_uuid`'s `dir.join(format!("{uuid}.json"))` unchecked.
+    validate_uuid(&target_uuid).map_err(|e| format!("resolved uuid invalid: {e}"))?;
+
     // Defense-in-depth: balance is strictly more sensitive than the
     // memory bullets `cross_player_reads` covers. The auth check above
     // already gated by-username and by-uuid paths, but this re-check
@@ -1568,8 +1612,15 @@ mod tests {
     }
 
     #[test]
-    fn bare_32_hex_uuid_accepted() {
-        assert!(validate_uuid("1111111122223333444455555555ffff").is_ok());
+    fn bare_32_hex_uuid_rejected() {
+        // Bare hex is a valid Mojang shape but every chat-side
+        // comparison (`ctx.sender_uuid`, on-disk trade filenames,
+        // `TradeView` filter) is canonical hyphenated. Accepting bare
+        // hex here would let `eq_ignore_ascii_case` silently fail and
+        // deny a player their own self-scope history. Pin canonical-only
+        // at the tool boundary.
+        assert!(validate_uuid("1111111122223333444455555555ffff").is_err());
+        assert!(validate_uuid("00000000000000000000000000000000").is_err());
     }
 
     #[test]
@@ -2079,9 +2130,9 @@ mod tests {
     #[test]
     fn validate_item_id_rejects_traversal_and_meta() {
         // Any input that would let the path layer escape `data/pairs/`
-        // must be rejected at the chat boundary. `store_view::pair::get`
-        // never constructs a path from input either, so this is
-        // belt-and-braces.
+        // must be rejected at the chat boundary. `store_view::pair::get`'s
+        // fast path independently shape-gates its stem before
+        // constructing a path, so this is belt-and-braces.
         for bad in [
             "../../etc/passwd",
             "diamond/bad",
@@ -2114,6 +2165,29 @@ mod tests {
                 "should accept: {ok:?}",
             );
         }
+        // Returned stem is always lowercased so downstream lookups
+        // (pair filenames, trade `item` field) compare cleanly.
+        assert_eq!(
+            validate_item_id("ENCHANTED_GOLDEN_APPLE").unwrap(),
+            "enchanted_golden_apple",
+        );
+        assert_eq!(validate_item_id("diamond").unwrap(), "diamond");
+        assert_eq!(
+            validate_item_id("minecraft:iron_ingot").unwrap(),
+            "iron_ingot",
+        );
+    }
+
+    #[test]
+    fn validate_item_id_lowercases_mixed_case_input() {
+        // Pair filenames on disk and the `item` field inside trade
+        // JSON are always lowercase. A model that writes "Diamond"
+        // or "minecraft:Diamond" must still hit the canonical key.
+        assert_eq!(validate_item_id("Diamond").unwrap(), "diamond");
+        assert_eq!(
+            validate_item_id("minecraft:Diamond").unwrap(),
+            "diamond",
+        );
     }
 
     #[test]

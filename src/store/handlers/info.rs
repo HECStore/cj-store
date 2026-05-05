@@ -22,10 +22,37 @@ pub(super) async fn handle_price(
 pub(super) async fn handle_balance(
     store: &mut Store,
     player_name: &str,
+    caller_uuid: &str,
     target: Option<&str>,
 ) -> Result<(), StoreError> {
-    let target_name = target.unwrap_or(player_name);
+    // Self-lookup: the dispatcher already created the caller's record via
+    // `ensure_user_exists`, so reading by UUID is sound and avoids both a
+    // redundant Mojang round-trip and any risk of auto-creation drift.
+    if target.is_none() {
+        let bal = match store.users.get(caller_uuid) {
+            Some(u) => u.balance,
+            None => {
+                return utils::send_message_to_player(
+                    store,
+                    player_name,
+                    &format!("{} has no account yet (balance: 0 diamonds)", player_name),
+                )
+                .await;
+            }
+        };
+        if !bal.is_finite() || bal < 0.0 {
+            return utils::send_message_to_player(
+                store,
+                player_name,
+                "Internal error: invalid stored balance",
+            )
+            .await;
+        }
+        let message = format!("{}'s balance: {:.2} diamonds", player_name, bal);
+        return utils::send_message_to_player(store, player_name, &message).await;
+    }
 
+    let target_name = target.unwrap();
     match get_user_balance_async(store, target_name).await {
         Ok(balance) => {
             let message = format!("{}'s balance: {:.2} diamonds", target_name, balance);
@@ -49,10 +76,11 @@ pub(super) async fn handle_balance(
 pub(super) async fn handle_pay(
     store: &mut Store,
     player_name: &str,
+    payer_uuid: &str,
     recipient: &str,
     amount: f64,
 ) -> Result<(), StoreError> {
-    match pay_async(store, player_name, recipient, amount).await {
+    match pay_async(store, player_name, payer_uuid, recipient, amount).await {
         Ok(()) => {
             info!(
                 payer = player_name,
@@ -197,9 +225,10 @@ pub(super) async fn handle_status(
 pub(super) async fn handle_help(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     topic: Option<&str>,
 ) -> Result<(), StoreError> {
-    handle_help_command(store, player_name, topic).await
+    handle_help_command(store, player_name, user_uuid, topic).await
 }
 
 /// Reports buy and sell quotes for `quantity` of `item` (default one stack).
@@ -360,13 +389,10 @@ async fn handle_items_command(
 async fn handle_help_command(
     store: &mut Store,
     player_name: &str,
+    user_uuid: &str,
     command: Option<&str>,
 ) -> Result<(), StoreError> {
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name).await.ok();
-    let is_op = user_uuid
-        .as_ref()
-        .map(|u| utils::is_operator(store, u))
-        .unwrap_or(false);
+    let is_op = utils::is_operator(store, user_uuid);
 
     match command {
         Some("buy") | Some("b") => {
@@ -517,8 +543,14 @@ async fn handle_help_command(
 async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64, String> {
     state::assert_invariants(store, "pre-balance", false)?;
     let uuid = crate::mojang::resolve_user_uuid(username).await?;
-    utils::ensure_user_exists(store, username, &uuid);
-    let bal = store.users.get(&uuid).map(|u| u.balance).unwrap_or(0.0);
+    // Do NOT auto-create a User record for the lookup target: a balance
+    // query is read-only, and creating empty records on demand lets any
+    // caller pollute `store.users` with arbitrary names. The friendly
+    // "no account yet" branch in `handle_balance` keys off "not found".
+    let bal = match store.users.get(&uuid) {
+        Some(u) => u.balance,
+        None => return Err(format!("User '{}' not found", username)),
+    };
     if !bal.is_finite() || bal < 0.0 {
         return Err("Internal error: invalid stored balance".to_string());
     }
@@ -528,11 +560,14 @@ async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64
 /// Transfers `amount` diamonds from `payer_username` to `payee_username`.
 ///
 /// The payer must already exist in `store.users`; the payee is auto-created
-/// if missing. Both usernames are refreshed from their UUIDs on each call so
-/// a rename propagates into the user record.
+/// if missing. The payer's stored username is refreshed from the
+/// dispatcher-provided `payer_uuid` (the server-reported whisper sender), but
+/// an existing payee record's canonical username is preserved — the payer's
+/// typed casing must not overwrite a third-party's stored display name.
 pub async fn pay_async(
     store: &mut Store,
     payer_username: &str,
+    payer_uuid: &str,
     payee_username: &str,
     amount: f64,
 ) -> Result<(), StoreError> {
@@ -547,23 +582,38 @@ pub async fn pay_async(
         return Err(StoreError::ValidationError("Amount must be positive".to_string()));
     }
 
-    let payer_uuid = crate::mojang::resolve_user_uuid(payer_username)
-        .await
-        .map_err(StoreError::ValidationError)?;
     let payee_uuid = crate::mojang::resolve_user_uuid(payee_username)
         .await
         .map_err(StoreError::ValidationError)?;
 
-    if !store.users.contains_key(&payer_uuid) {
+    // UUID-level self-pay reject: usernames may differ in casing or via a
+    // Mojang rename, so canonical identity equality is the right check. A
+    // self-pay would otherwise debit-then-credit the same record (net zero)
+    // while still emitting two whispers, dirtying state, and polluting the
+    // audit log.
+    if payer_uuid == payee_uuid {
+        return Err(StoreError::ValidationError(
+            "You cannot pay yourself.".to_string(),
+        ));
+    }
+
+    if !store.users.contains_key(payer_uuid) {
         return Err(StoreError::ValidationError(format!(
             "Payer '{}' not found in store records",
             payer_username
         )));
     }
 
-    utils::ensure_user_exists(store, payee_username, &payee_uuid);
+    // Only seed the payee record when it does not yet exist — otherwise the
+    // payer-supplied `payee_username` would clobber the payee's canonical
+    // stored username (which can differ in casing or post-rename) both via
+    // `ensure_user_exists`'s drift-update branch and via the explicit write
+    // further down.
+    if !store.users.contains_key(&payee_uuid) {
+        utils::ensure_user_exists(store, payee_username, &payee_uuid);
+    }
 
-    let payer_balance = store.expect_user(&payer_uuid, "pay/payer-balance")?.balance;
+    let payer_balance = store.expect_user(payer_uuid, "pay/payer-balance")?.balance;
     if payer_balance < amount {
         warn!(
             payer = payer_username,
@@ -579,17 +629,16 @@ pub async fn pay_async(
     }
 
     {
-        let payer = store.expect_user_mut(&payer_uuid, "pay/payer-debit")?;
+        let payer = store.expect_user_mut(payer_uuid, "pay/payer-debit")?;
         payer.balance -= amount;
         payer.username = payer_username.to_owned();
     }
     {
         let payee = store.expect_user_mut(&payee_uuid, "pay/payee-credit")?;
         payee.balance += amount;
-        payee.username = payee_username.to_owned();
     }
     store.dirty = true;
-    store.dirty_users.insert(payer_uuid.clone());
+    store.dirty_users.insert(payer_uuid.to_string());
     store.dirty_users.insert(payee_uuid.clone());
 
     state::assert_invariants(store, "post-pay", true)?;
@@ -627,10 +676,18 @@ mod tests {
         Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), Storage::default())
     }
 
+    /// Mirrors the `test_uuid` convention used in `store::orders::tests` and
+    /// `handlers::player::tests` — keeps cross-module test fixtures aligned.
+    fn test_uuid(username: &str) -> String {
+        let trimmed: String = username.chars().take(12).collect();
+        let padded = format!("{:0>12}", trimmed);
+        format!("00000000-0000-0000-0000-{}", padded)
+    }
+
     #[tokio::test]
     async fn pay_async_rejects_zero_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", "Bob", 0.0).await.unwrap_err();
+        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", 0.0).await.unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(ref m) if m.contains("positive")),
             "expected ValidationError(positive), got {err:?}"
@@ -640,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn pay_async_rejects_negative_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", "Bob", -1.0).await.unwrap_err();
+        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", -1.0).await.unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(ref m) if m.contains("positive")),
             "expected ValidationError(positive), got {err:?}"
@@ -650,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn pay_async_rejects_nan_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", "Bob", f64::NAN)
+        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", f64::NAN)
             .await
             .unwrap_err();
         assert!(
@@ -662,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn pay_async_rejects_infinite_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", "Bob", f64::INFINITY)
+        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", f64::INFINITY)
             .await
             .unwrap_err();
         assert!(
@@ -676,7 +733,7 @@ mod tests {
         // No users in the store: the payer-not-found branch fires after the
         // amount guard passes.
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Ghost", "Bob", 5.0).await.unwrap_err();
+        let err = pay_async(&mut store, "Ghost", &test_uuid("Ghost"), "Bob", 5.0).await.unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(ref m) if m.contains("not found")),
             "expected ValidationError(not found), got {err:?}"

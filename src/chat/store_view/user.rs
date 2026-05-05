@@ -6,12 +6,16 @@
 //! surface — even a future "just serialize the whole struct" change
 //! wouldn't expose it, because the field never reaches memory.
 //!
-//! Path safety: `get_by_uuid` constructs `data/users/{uuid}.json` only
-//! AFTER the chat tool layer has run [`crate::chat::tools::validate_uuid`]
-//! on its input. UUIDs are 32–36 ASCII hex/hyphen characters, so the
-//! resulting filename can never escape `data/users/`. `get_by_username`
-//! never touches the path layer at all — it scans the catalog and
-//! returns whichever entry matches case-insensitively.
+//! Path safety: `get_by_uuid_in_dir` enforces a canonical-hyphenated
+//! 36-char lowercase-hex shape gate inline before constructing
+//! `data/users/{uuid}.json`, so the resulting filename can never escape
+//! `data/users/` regardless of caller validation. The chat tool layer
+//! (`crate::chat::tools::validate_uuid`) is still expected to run as
+//! the first perimeter; this gate is defense-in-depth at the
+//! path-construction site, mirroring `pair::is_safe_pair_stem`.
+//! Username lookups are not handled here — `crate::chat::tools::get_user_balance_tool`
+//! resolves usernames upstream via `chat::memory` + `mojang` and then
+//! calls `get_by_uuid`.
 
 use serde::Deserialize;
 
@@ -26,6 +30,21 @@ pub struct UserView {
     pub uuid: String,
     pub username: String,
     pub balance: f64,
+}
+
+/// Returns true iff `s` matches the canonical 36-char hyphenated
+/// lowercase-hex UUID form: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+/// Mirrors `crate::chat::tools::is_canonical_hyphen_uuid` and
+/// `crate::types::user::is_valid_uuid_shape` — duplicated inline by the
+/// same chat-independence rationale used elsewhere in this module.
+fn is_canonical_hyphen_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    s.bytes().enumerate().all(|(i, b)| match i {
+        8 | 13 | 18 | 23 => b == b'-',
+        _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+    })
 }
 
 /// Look up a user by canonical hyphenated UUID (the on-disk filename).
@@ -51,7 +70,18 @@ pub async fn get_by_uuid(uuid: &str) -> Option<UserView> {
 /// tmp-file + rename, so a chat-side read can land mid-rename and see
 /// either a transient `NotFound` or (rarely) a half-written body. The
 /// retry is sleepless — by the second attempt the rename has settled.
+///
+/// Defense-in-depth: rejects any `uuid` that is not the canonical
+/// 36-char hyphenated lowercase-hex form before joining the path.
+/// `pair::is_safe_pair_stem` and `types::user::get_user_file_path` both
+/// apply the same pattern at their respective storage boundaries.
 pub fn get_by_uuid_in_dir(dir: &std::path::Path, uuid: &str) -> Option<UserView> {
+    if !is_canonical_hyphen_uuid(uuid) {
+        tracing::warn!(
+            "[chat/user] rejecting non-canonical uuid at storage boundary: {uuid:?}"
+        );
+        return None;
+    }
     let path = dir.join(format!("{uuid}.json"));
     for attempt in 0..2 {
         match std::fs::read_to_string(&path) {

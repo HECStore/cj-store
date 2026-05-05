@@ -76,11 +76,18 @@ Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
 - A specific pair disappears from the `pairs` CLI menu and the Store log
   contains one of:
   - `[Pair] quarantining <path> (malformed: …)` /  `(unreadable: …)` /
-    `(duplicate key '…' already loaded)` — `Pair::load_all` could not
-    deserialize the file (or saw two files mapping to the same item),
-    and renamed the bad file to `data/pairs/<item>.json.corrupt.<millis>`
-    so the next `save_all` orphan-cleanup pass cannot delete it and so
-    subsequent `load_all` calls skip it.
+    `(duplicate key '…' already loaded)` /
+    `(stem mismatch: file stem "…" vs expected "…" from item "…")` —
+    `Pair::load_all` could not deserialize the file, saw two files
+    mapping to the same item, or saw a file whose embedded `item` field
+    didn't match its filename stem (e.g. `diamond.json` carrying
+    `"item": "cobblestone"`), and renamed the bad file to
+    `data/pairs/<item>.json.corrupt.<millis>` so the next `save_all`
+    orphan-cleanup pass cannot delete it and so subsequent `load_all`
+    calls skip it. If the quarantine rename itself fails (rare) the
+    entry is simply skipped this load cycle; you'll see a follow-up
+    `[Pair] quarantine rename failed for … (<reason>): …; skipping insert`
+    line.
   - `Skipping pair with empty item name …` / `Skipping pair with invalid
     item name '…' (normalized to empty)` — the file deserialized, but
     `Store::new`'s post-load normalization rejected its `item` field; the
@@ -139,8 +146,11 @@ Queued ─► Withdrawing ─► Trading ─► Depositing ─► Committed
 
 **Why this can happen**: hand-edit typo, disk full during an atomic write
 (rare — the rename step is atomic on both NTFS and POSIX), a half-synced
-backup restore, or two pair files on disk both deserializing to the same
-`pair.item` (duplicate key — the second-loaded file is quarantined).
+backup restore, two pair files on disk both deserializing to the same
+`pair.item` (duplicate key — the second-loaded file is quarantined), or
+a file whose `item` field was hand-edited to disagree with its filename
+(stem mismatch — quarantined to keep a misnamed file from winning a
+duplicate-key race against the legitimate one).
 
 ---
 
@@ -148,14 +158,19 @@ backup restore, or two pair files on disk both deserializing to the same
 
 The journal records one in-flight shulker operation at a time; it is
 cleared whenever the operation finishes. A non-empty file at startup means
-the previous run crashed mid chest I/O. Current behavior: the Store logs an
-info-level notice and clears the file automatically (see
-[src/store/journal.rs](src/store/journal.rs)). The world state may be
+the previous run crashed mid chest I/O. Current behavior: the bot logs an
+error-level notice and **renames the leftover journal aside** to
+`data/journal.leftover-<unix-millis>.json` so it's preserved for
+operator review (rather than silently overwritten on the next persist).
+If the journal file is unreadable on load, it is similarly quarantined to
+`data/journal.unreadable-<unix-millis>.json` and the bot continues with a
+fresh empty journal. See
+[src/store/journal.rs](src/store/journal.rs). The world state may be
 inconsistent — that's what this playbook is for.
 
 **Symptoms**
 
-- Startup log shows `[Journal] loaded leftover entry: op_id=… type=… chest_id=… slot=… state=…` (info level), followed by `[Journal] cleared leftover entry from "data/journal.json"` (info level). Both are emitted at `tracing::info!`, not `warn!`, so grep at info level (or unfiltered) — filtering by WARN/ERROR will hide them.
+- Startup log shows `[Journal] loaded leftover entry: op_id=… type=… chest_id=… slot=… state=…` (info level), followed by `[Bot] Crash recovery: previous run left an in-flight shulker op: …` and `[Bot] Quarantined leftover journal to "data/journal.leftover-<unix-millis>.json" — preserve for operator review` (both error level). The first line is `tracing::info!`, the latter two are `tracing::error!`, so an info-or-lower filter shows them all.
 - A shulker box is sitting on the station block instead of inside its
   chest.
 - A shulker box is in the bot's inventory on login.
@@ -184,9 +199,11 @@ re-using well-exercised code instead of hand-computing a sum.
 3. If items are on the ground, pick them up and deposit them into the
    overflow chest (node 0, chest 1) — the bot will triage them via the
    usual deposit flow once running.
-4. Restart the bot. It will clear the journal on load, and the next trade
-   involving that chest will do a fresh `apply_chest_sync`, reconciling
-   per-slot counts from what's actually in-world.
+4. Restart the bot. It will rename the leftover journal aside to
+   `data/journal.leftover-<unix-millis>.json` (preserved for review)
+   and the next trade involving that chest will do a fresh
+   `apply_chest_sync`, reconciling per-slot counts from what's actually
+   in-world.
 5. Run `audit-state` to confirm the pair's `item_stock` now matches the
    chest sum. If it doesn't, go to Option B.
 
@@ -207,9 +224,13 @@ Option A doesn't balance out.
 
 **When it's safe to just delete `data/journal.json`**
 
-Always, at startup. The bot self-heals by clearing it. The procedures
+Always, at startup. The bot self-heals by renaming any leftover entry to
+a `data/journal.leftover-<unix-millis>.json` archive (so the original
+file is no longer in place to interfere with the next run). The procedures
 above are for fixing the *world/ledger drift* that the journal merely
-points at — deleting the journal alone does not fix the drift.
+points at — deleting the journal alone does not fix the drift. The
+archived `journal.leftover-*.json` files are forensic-only and may be
+removed once their corresponding world state has been reconciled.
 
 ---
 

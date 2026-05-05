@@ -143,6 +143,7 @@ impl Trade {
         };
 
         let mut quarantined = 0usize;
+        let mut quarantine_failed = 0usize;
         for path in paths_to_load {
             match fs::read_to_string(path) {
                 Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
@@ -150,13 +151,31 @@ impl Trade {
                         trades.push(trade);
                     }
                     Err(e) => {
-                        quarantine_trade_file(path, &format!("malformed: {e}"))?;
-                        quarantined += 1;
+                        // Quarantine failure is non-fatal: a single rename
+                        // error must not abort loading tens of thousands of
+                        // history files at startup. The bad file stays in
+                        // place and is simply skipped this cycle.
+                        if let Err(qe) = quarantine_trade_file(path, &format!("malformed: {e}")) {
+                            tracing::warn!(
+                                "[Trade] quarantine failed for {}: {qe}",
+                                path.display(),
+                            );
+                            quarantine_failed += 1;
+                        } else {
+                            quarantined += 1;
+                        }
                     }
                 },
                 Err(e) => {
-                    quarantine_trade_file(path, &format!("unreadable: {e}"))?;
-                    quarantined += 1;
+                    if let Err(qe) = quarantine_trade_file(path, &format!("unreadable: {e}")) {
+                        tracing::warn!(
+                            "[Trade] quarantine failed for {}: {qe}",
+                            path.display(),
+                        );
+                        quarantine_failed += 1;
+                    } else {
+                        quarantined += 1;
+                    }
                 }
             }
         }
@@ -166,11 +185,12 @@ impl Trade {
         trades.sort_by_key(|a| a.timestamp);
 
         tracing::info!(
-            "[Trade] loaded {} of {} trades (limit {}, quarantined {})",
+            "[Trade] loaded {} of {} trades (limit {}, quarantined {}, quarantine_failed {})",
             trades.len(),
             file_count,
             max_trades,
             quarantined,
+            quarantine_failed,
         );
 
         Ok(trades)
@@ -199,34 +219,91 @@ impl Trade {
         }
 
         let mut expected_files = std::collections::HashSet::new();
+        let mut written = 0usize;
+        let mut first_save_err: Option<io::Error> = None;
 
         for trade in trades {
-            trade.save()?;
+            // Always populate `expected_files` regardless of save outcome so
+            // a transient write failure on one trade does not cause the
+            // orphan sweep below to delete that trade's existing on-disk file.
             let timestamp_str = trade.timestamp.to_rfc3339().replace(':', "-");
             let filename = format!("{timestamp_str}.json");
             expected_files.insert(filename);
+            // Attempt every trade even after a previous failure: each
+            // `write_atomic` is independent, so one transient hiccup must
+            // not silently drop later trades. Capture only the first error
+            // to surface to the caller.
+            if let Err(e) = trade.save() {
+                tracing::warn!("[Trade] save failed for {}: {e}", trade.timestamp);
+                if first_save_err.is_none() {
+                    first_save_err = Some(e);
+                }
+            } else {
+                written += 1;
+            }
         }
 
+        // Orphan sweep: warn-and-continue on per-entry IO errors so a single
+        // locked/transient failure doesn't abort the whole sweep, and so a
+        // captured `first_save_err` always wins over a sweep-only error
+        // (stale orphans self-heal next cycle; a swallowed save error makes
+        // callers think state was persisted when it wasn't).
         let mut removed = 0usize;
+        let mut first_sweep_err: Option<io::Error> = None;
         if dir_path.exists() {
-            for entry in fs::read_dir(dir_path)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    && let Some(filename) = path.file_name().and_then(|n| n.to_str())
-                        && !expected_files.contains(filename) {
-                            fs::remove_file(&path)?;
-                            removed += 1;
+            match fs::read_dir(dir_path) {
+                Ok(read_dir) => {
+                    for entry in read_dir {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!("[Trade] orphan sweep: unreadable entry: {e}");
+                                if first_sweep_err.is_none() {
+                                    first_sweep_err = Some(e);
+                                }
+                                continue;
+                            }
+                        };
+                        let path = entry.path();
+                        if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                            && let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                            && !expected_files.contains(filename)
+                        {
+                            if let Err(e) = fs::remove_file(&path) {
+                                tracing::warn!(
+                                    "[Trade] orphan sweep: remove_file({}) failed: {e}",
+                                    path.display(),
+                                );
+                                if first_sweep_err.is_none() {
+                                    first_sweep_err = Some(e);
+                                }
+                            } else {
+                                removed += 1;
+                            }
                         }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[Trade] orphan sweep: read_dir({}) failed: {e}",
+                        dir_path.display(),
+                    );
+                    first_sweep_err = Some(e);
+                }
             }
         }
 
         tracing::info!(
-            "[Trade] save_all: wrote {} trades, cleaned {} orphan files",
+            "[Trade] save_all: wrote {} of {} trades (failed {}), cleaned {} orphan files",
+            written,
             trades.len(),
+            trades.len() - written,
             removed,
         );
-        Ok(())
+        match first_save_err.or(first_sweep_err) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 

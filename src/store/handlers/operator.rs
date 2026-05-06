@@ -843,6 +843,18 @@ mod tests {
         storage
     }
 
+    /// Build a `MockChestState` map matching what `make_storage(_, stock)`
+    /// produces — chest id 2, slot 0 holds `stock`, all other slots are zero.
+    /// Use with `spawn_mock_bot_with_state` so the mock returns truthful
+    /// `prior + delta` results for tests that assert post-op `pair.item_stock`.
+    fn mock_state_seeded_like_storage(stock: i32) -> MockChestState {
+        let mut slots = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        slots[0] = stock;
+        let mut map = HashMap::new();
+        map.insert(2, slots);
+        Arc::new(std::sync::Mutex::new(map))
+    }
+
     fn make_pair(item: &str, item_stock: i32, currency_stock: f64) -> (String, Pair) {
         (
             item.to_string(),
@@ -862,6 +874,57 @@ mod tests {
         spawn_mock_bot_with_fail_flag(rx, None);
     }
 
+    /// Per-chest amounts the mock should track as authoritative prior state.
+    ///
+    /// Tests that exercise post-chest-op invariants (`pair.item_stock` resync,
+    /// rollback accounting) need the mock to compute correct
+    /// `prior + delta` results. The instruction's `target_chest.amounts` is
+    /// always zero-filled by `chest_from_transfer` (see its doc comment — the
+    /// real bot reads the world; the synthesized chest is purely a routing
+    /// payload), so the mock can't derive prior state from there. A test can
+    /// pre-seed this map with the chest's actual slot amounts and the mock
+    /// will read/update it on every interaction.
+    type MockChestState = Arc<std::sync::Mutex<HashMap<i32, Vec<i32>>>>;
+
+    /// Apply a chest action to the optional shared chest state and return the
+    /// `ChestSyncReport` payload. When `chest_state` is `Some`, the prior slot
+    /// amounts come from the map and are updated in place. When `None`, the
+    /// legacy behavior fires (prior derived from the always-zero
+    /// `target_chest.amounts`, suitable for tests that don't assert
+    /// post-state).
+    fn mock_apply_chest_action(
+        target_chest: &Chest,
+        action: crate::messages::ChestAction,
+        chest_state: Option<&MockChestState>,
+    ) -> ChestSyncReport {
+        let (item, delta) = match action {
+            crate::messages::ChestAction::Withdraw { item, amount, .. } => (item, -amount),
+            crate::messages::ChestAction::Deposit { item, amount, .. } => (item, amount),
+        };
+        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+        if let Some(state) = chest_state {
+            let mut map = state.lock().expect("mock chest state mutex poisoned");
+            let slots = map
+                .entry(target_chest.id)
+                .or_insert_with(|| vec![0; crate::constants::DOUBLE_CHEST_SLOTS]);
+            slots[0] = (slots[0] + delta).max(0);
+            // Mirror the full known state back so apply_chest_sync overwrites
+            // every slot — sentinels in untouched slots would leave stale
+            // values that diverge from the mock's tracked truth.
+            for (i, v) in slots.iter().enumerate().take(amounts.len()) {
+                amounts[i] = *v;
+            }
+        } else {
+            let prior = target_chest.amounts.first().copied().unwrap_or(0);
+            amounts[0] = (prior + delta).max(0);
+        }
+        ChestSyncReport {
+            chest_id: target_chest.id,
+            item,
+            amounts,
+        }
+    }
+
     /// Variant of `spawn_mock_bot` with an optional one-shot fail-injection toggle:
     /// when `fail_next_chest_op` is `Some(flag)` and the flag is `true` at the moment
     /// a chest interaction arrives, the mock atomically clears the flag and replies
@@ -871,8 +934,33 @@ mod tests {
     /// `TradeWithPlayer` after an additem deposit-step failure) without blocking on
     /// the channel.
     fn spawn_mock_bot_with_fail_flag(
-        mut rx: mpsc::Receiver<BotInstruction>,
+        rx: mpsc::Receiver<BotInstruction>,
         fail_next_chest_op: Option<Arc<AtomicBool>>,
+    ) {
+        spawn_mock_bot_full(rx, None, fail_next_chest_op, None);
+    }
+
+    /// Variant that tracks per-chest state (so post-op invariants are checkable)
+    /// and optionally arms the trade arm with a one-shot fail flag — used by
+    /// the trade-rejection rollback test, which needs both behaviours.
+    /// (Standalone trade-fail-flag spawner exists in git history if a future
+    /// test wants the chest-stateless variant; trivial to re-add via
+    /// `spawn_mock_bot_full(rx, None, None, Some(flag))`.)
+    fn spawn_mock_bot_with_state(
+        rx: mpsc::Receiver<BotInstruction>,
+        chest_state: MockChestState,
+        fail_next_trade: Option<Arc<AtomicBool>>,
+    ) {
+        spawn_mock_bot_full(rx, Some(chest_state), None, fail_next_trade);
+    }
+
+    /// All-knobs spawner. Public callers go through the convenience wrappers
+    /// above; this is the single place the message-loop logic lives.
+    fn spawn_mock_bot_full(
+        mut rx: mpsc::Receiver<BotInstruction>,
+        chest_state: Option<MockChestState>,
+        fail_next_chest_op: Option<Arc<AtomicBool>>,
+        fail_next_trade: Option<Arc<AtomicBool>>,
     ) {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -896,22 +984,12 @@ mod tests {
                                 .send(Err("simulated bot chest failure".to_string()));
                             continue;
                         }
-                        let (item, delta) = match action {
-                            crate::messages::ChestAction::Withdraw {
-                                item, amount, ..
-                            } => (item, -amount),
-                            crate::messages::ChestAction::Deposit {
-                                item, amount, ..
-                            } => (item, amount),
-                        };
-                        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
-                        let prior = target_chest.amounts.first().copied().unwrap_or(0);
-                        amounts[0] = (prior + delta).max(0);
-                        let _ = respond_to.send(Ok(ChestSyncReport {
-                            chest_id: target_chest.id,
-                            item,
-                            amounts,
-                        }));
+                        let report = mock_apply_chest_action(
+                            &target_chest,
+                            action,
+                            chest_state.as_ref(),
+                        );
+                        let _ = respond_to.send(Ok(report));
                     }
                     BotInstruction::TradeWithPlayer {
                         bot_offers: _,
@@ -919,60 +997,9 @@ mod tests {
                         respond_to,
                         ..
                     } => {
-                        let _ = respond_to.send(Ok(player_offers));
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
-
-    /// Sibling of `spawn_mock_bot_with_fail_flag` that arms the trade arm instead
-    /// of the chest arm: when `fail_next_trade` is `Some(flag)` and the flag is
-    /// `true` at the moment a `TradeWithPlayer` arrives, the mock atomically
-    /// clears the flag and replies with `Err`, which `perform_trade` surfaces as
-    /// `StoreError::TradeRejected`. All other instructions (whisper, chest ops,
-    /// later trades) succeed as in the default mock so the rollback path can run.
-    fn spawn_mock_bot_with_trade_fail_flag(
-        mut rx: mpsc::Receiver<BotInstruction>,
-        fail_next_trade: Arc<AtomicBool>,
-    ) {
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    BotInstruction::Whisper { respond_to, .. } => {
-                        let _ = respond_to.send(Ok(()));
-                    }
-                    BotInstruction::InteractWithChestAndSync {
-                        target_chest,
-                        action,
-                        respond_to,
-                        ..
-                    } => {
-                        let (item, delta) = match action {
-                            crate::messages::ChestAction::Withdraw {
-                                item, amount, ..
-                            } => (item, -amount),
-                            crate::messages::ChestAction::Deposit {
-                                item, amount, ..
-                            } => (item, amount),
-                        };
-                        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
-                        let prior = target_chest.amounts.first().copied().unwrap_or(0);
-                        amounts[0] = (prior + delta).max(0);
-                        let _ = respond_to.send(Ok(ChestSyncReport {
-                            chest_id: target_chest.id,
-                            item,
-                            amounts,
-                        }));
-                    }
-                    BotInstruction::TradeWithPlayer {
-                        bot_offers: _,
-                        player_offers,
-                        respond_to,
-                        ..
-                    } => {
-                        if fail_next_trade.swap(false, Ordering::SeqCst) {
+                        if let Some(flag) = fail_next_trade.as_ref()
+                            && flag.swap(false, Ordering::SeqCst)
+                        {
                             let _ = respond_to
                                 .send(Err("simulated trade rejection".to_string()));
                         } else {
@@ -1514,7 +1541,8 @@ mod tests {
         // and the mock bot's deposit reply syncs that slot to 150.
         let item = "cobblestone";
         let (tx, rx) = mpsc::channel(64);
-        spawn_mock_bot(rx);
+        let chest_state = mock_state_seeded_like_storage(50);
+        spawn_mock_bot_with_state(rx, chest_state, None);
 
         let mut pairs = HashMap::new();
         let (k, p) = make_pair(item, 50, 0.0);
@@ -1752,7 +1780,8 @@ mod tests {
         // operator-targeted trade.
         let item = "cobblestone";
         let (tx, rx) = mpsc::channel(64);
-        spawn_mock_bot(rx);
+        let chest_state = mock_state_seeded_like_storage(50);
+        spawn_mock_bot_with_state(rx, chest_state, None);
 
         let mut pairs = HashMap::new();
         let (k, p) = make_pair(item, 50, 0.0);
@@ -1837,7 +1866,8 @@ mod tests {
         let item = "cobblestone";
         let (tx, rx) = mpsc::channel(64);
         let trade_fail_flag = Arc::new(AtomicBool::new(true));
-        spawn_mock_bot_with_trade_fail_flag(rx, Arc::clone(&trade_fail_flag));
+        let chest_state = mock_state_seeded_like_storage(50);
+        spawn_mock_bot_with_state(rx, chest_state, Some(Arc::clone(&trade_fail_flag)));
 
         let mut pairs = HashMap::new();
         let (k, p) = make_pair(item, 50, 0.0);

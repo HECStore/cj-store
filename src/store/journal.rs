@@ -359,15 +359,12 @@ impl Journal {
     }
 
     fn persist(&self) -> io::Result<()> {
-        let path = &self.path;
-        if let Some(parent) = path.parent()
-            && !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
         let entries: Vec<&JournalEntry> = self.entry.iter().collect();
-        let json = serde_json::to_string_pretty(&entries)
-            .map_err(io::Error::other)?;
-        write_atomic(path, &json)?;
+        // Compact JSON: the file is machine-only and rewritten on every
+        // shulker-state transition, so pretty-printing is wasted bytes and
+        // CPU on the hot path. `write_atomic` handles parent-dir creation.
+        let json = serde_json::to_string(&entries).map_err(io::Error::other)?;
+        write_atomic(&self.path, &json)?;
         Ok(())
     }
 }

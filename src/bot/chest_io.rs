@@ -1267,7 +1267,13 @@ async fn place_shulker_on_station(
     // are post-physical and stay log-and-continue, since aborting after the
     // shulker has moved makes the world state strictly worse.)
     {
-        if let Err(e) = bot.journal.lock().begin(journal_op, chest_id, slot_idx) {
+        // `block_in_place` lets the multi-thread runtime migrate other tasks
+        // off this worker while the synchronous file write inside `begin`
+        // (serde + fsync via `write_atomic`) holds the parking_lot::Mutex.
+        let res = tokio::task::block_in_place(|| {
+            bot.journal.lock().begin(journal_op, chest_id, slot_idx)
+        });
+        if let Err(e) = res {
             error!(
                 "[Journal] begin failed before shulker pickup at chest {} slot {}: {}",
                 chest_id, slot_idx, e
@@ -1343,7 +1349,10 @@ async fn place_shulker_on_station(
 
     // Journal: shulker is now on the station.
     {
-        if let Err(e) = bot.journal.lock().advance(JournalState::ShulkerOnStation) {
+        let res = tokio::task::block_in_place(|| {
+            bot.journal.lock().advance(JournalState::ShulkerOnStation)
+        });
+        if let Err(e) = res {
             warn!("[Journal] advance(ShulkerOnStation) failed: {}", e);
         }
     }
@@ -1385,7 +1394,10 @@ async fn finish_shulker_round_trip(
 
     // Journal: items have been transferred (or 0 moved, still advancing state).
     {
-        if let Err(e) = bot.journal.lock().advance(JournalState::ItemsTransferred) {
+        let res = tokio::task::block_in_place(|| {
+            bot.journal.lock().advance(JournalState::ItemsTransferred)
+        });
+        if let Err(e) = res {
             warn!("[Journal] advance(ItemsTransferred) failed: {}", e);
         }
     }
@@ -1405,7 +1417,10 @@ async fn finish_shulker_round_trip(
 
     // Journal: shulker is back in bot inventory; station is clear.
     {
-        if let Err(e) = bot.journal.lock().advance(JournalState::ShulkerPickedUp) {
+        let res = tokio::task::block_in_place(|| {
+            bot.journal.lock().advance(JournalState::ShulkerPickedUp)
+        });
+        if let Err(e) = res {
             warn!("[Journal] advance(ShulkerPickedUp) failed: {}", e);
         }
     }
@@ -1437,11 +1452,16 @@ async fn finish_shulker_round_trip(
 
     // Journal: shulker is back in its chest slot; round-trip complete.
     {
-        let mut j = bot.journal.lock();
-        if let Err(e) = j.advance(JournalState::ShulkerReplaced) {
+        let (advance_res, complete_res) = tokio::task::block_in_place(|| {
+            let mut j = bot.journal.lock();
+            let a = j.advance(JournalState::ShulkerReplaced);
+            let c = j.complete();
+            (a, c)
+        });
+        if let Err(e) = advance_res {
             warn!("[Journal] advance(ShulkerReplaced) failed: {}", e);
         }
-        if let Err(e) = j.complete() {
+        if let Err(e) = complete_res {
             warn!("[Journal] complete failed: {}", e);
         }
     }

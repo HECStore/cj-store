@@ -178,18 +178,69 @@ impl Store {
         let rate_limiter = RateLimiter::new();
 
         // Detect a trade that was in flight when the previous process exited.
-        // We surface the incident loudly and clear the file; automatic
+        // We surface the incident loudly and ARCHIVE the file (rename to a
+        // timestamped sibling) rather than deleting it: a leftover trade
+        // state is the highest-stakes piece of crash evidence and must
+        // survive the next startup so an operator can reconcile. Automatic
         // recovery (rollback/re-queue) is deliberately out of scope here
         // because it would need to touch physical chests and trade state,
-        // which must be done with the operator in the loop.
+        // which must be done with the operator in the loop. We do NOT block
+        // startup: auto-restart deployments would crash-loop forever.
         match trade_state::load_persisted() {
             Ok(Some(state)) => {
-                tracing::error!(
-                    "Found interrupted trade on startup: {}. The previous session crashed mid-trade - \
-                     operator should inspect in-world state (bot inventory, chests, player) before resuming.",
-                    state
-                );
-                let _ = trade_state::clear_persisted();
+                let phase = state.phase();
+                let order = state.order();
+                match phase {
+                    "committed" | "rolled_back" => {
+                        // Distinct, louder log: the trade reached a terminal
+                        // state but the file wasn't cleared, meaning the
+                        // ledger mutation may have happened (Committed) or
+                        // not (RolledBack) without the persistence handshake
+                        // completing. Operator must audit ledger
+                        // reconciliation against the body fields below.
+                        let (item, quantity, currency_amount) = match &state {
+                            trade_state::TradeState::Committed(c) => {
+                                (c.item.as_str(), c.quantity, c.currency_amount)
+                            }
+                            _ => (order.item.as_str(), order.quantity as i32, 0.0),
+                        };
+                        error!(
+                            "TRADE STATE TERMINAL-BUT-UNFLUSHED on startup (phase={}): \
+                             order_id={} player={} item={} quantity={} currency_amount={:.2} - \
+                             OPERATOR MUST AUDIT LEDGER RECONCILIATION (player may be owed goods/diamonds \
+                             or balance update). Full state: {}",
+                            phase,
+                            order.id,
+                            order.username,
+                            item,
+                            quantity,
+                            currency_amount,
+                            state
+                        );
+                    }
+                    _ => {
+                        tracing::error!(
+                            "Found interrupted trade on startup: {}. The previous session crashed mid-trade - \
+                             operator should inspect in-world state (bot inventory, chests, player) before resuming.",
+                            state
+                        );
+                    }
+                }
+                match trade_state::archive_persisted() {
+                    Ok(archived) => {
+                        error!(
+                            "Archived leftover trade state to {:?} - preserve for operator review",
+                            archived
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to archive leftover trade state ({}); falling back to clear_persisted",
+                            e
+                        );
+                        let _ = trade_state::clear_persisted();
+                    }
+                }
             }
             Ok(None) => {}
             Err(e) => warn!("Failed to load persisted trade state: {}", e),

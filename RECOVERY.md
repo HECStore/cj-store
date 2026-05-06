@@ -296,12 +296,19 @@ being popped from the queue but before reaching a terminal state.
   recovery happens.
 
 > [!WARNING]
-> Current behavior: `Store::new` calls `trade_state::clear_persisted()`
-> on the next startup, so `data/current_trade.json` is **deleted on the
-> first restart** after the crash. Operators must read/copy the file
-> **before restarting** the bot, or recover it from a `data.bak.*`
-> snapshot — once the bot has come back up, the only on-disk evidence of
-> the interrupted trade is gone.
+> Current behavior: `Store::new` **archives** any leftover
+> `data/current_trade.json` by renaming it aside to a timestamped sibling
+> `data/current_trade.leftover-<unix-millis>.json` on the next startup
+> (mirroring the `data/journal.leftover-*` pattern from §2). The original
+> path is then free for the next trade. Operators should consult that
+> archived sibling — not `data/current_trade.json` itself, which will be
+> empty/absent post-restart — when reconstructing what crashed. The
+> archive is forensic-only and may be deleted once the affected trade has
+> been reconciled. If both the rename and a copy+remove fallback fail
+> (rare; e.g. another process holds a handle and the disk is full), the
+> bot logs the error and falls back to deleting the file so startup is
+> not blocked — only in that exotic failure mode is the file gone with no
+> archive, and operators should recover it from a `data.bak.*` snapshot.
 
 > [!TIP]
 > If the *only* symptom is that the queue has stopped advancing (no
@@ -350,8 +357,10 @@ The bot had started moving items out of storage but had not opened the
 trade GUI. No player-side effect yet.
 
 1. Stop the bot.
-2. Read/copy `data/current_trade.json` aside (the §2 restart will delete
-   it via `Store::new` auto-clear).
+2. Read/copy `data/current_trade.json` aside if you want a working copy
+   under a stable name (the §2 restart will archive it aside to
+   `data/current_trade.leftover-<unix-millis>.json` via `Store::new`'s
+   auto-archive — see the WARNING block above).
 3. Branch on whether the journal also has a leftover entry:
    - **If the journal has a leftover entry** (you'll see the §2
      `[Journal] loaded leftover entry: …` startup line — i.e. the crash
@@ -374,9 +383,11 @@ trade GUI. No player-side effect yet.
 4. Restart the bot and run `audit-state` from the CLI to verify pair
    `item_stock` matches chest sums; if it doesn't, drop down to
    [§ 2 Option B](#2-stuck-datajournaljson-entry) for the affected pair.
-5. Confirm `data/current_trade.json` is absent — the restart already
-   cleared it; if it still exists because you skipped the restart, delete
-   it now. The order is cancelled.
+5. Confirm `data/current_trade.json` is absent at the active path — the
+   restart already archived it aside to
+   `data/current_trade.leftover-<unix-millis>.json`; if it still exists at
+   the active path because you skipped the restart, delete it now. The
+   order is cancelled.
 6. Inform the player no trade happened; no balance change needed.
 
 ### Phase: `Trading`
@@ -386,8 +397,10 @@ almost always reconstruct whether the trade confirmed by looking at the
 bot's inventory — reach for player reports only if that's ambiguous.
 
 1. Stop the bot.
-2. Read/copy `data/current_trade.json` aside (any §2 restart invoked
-   below will delete it via `Store::new` auto-clear).
+2. Read/copy `data/current_trade.json` aside if you want a working copy
+   under a stable name (any §2 restart invoked below will archive it
+   aside to `data/current_trade.leftover-<unix-millis>.json` via
+   `Store::new`'s auto-archive — see the WARNING block at the top of §4).
 3. **Physical inventory check first.** Look at the bot's inventory and
    the buffer chest (if configured). The "bot offers" half of the trade
    either:
@@ -402,9 +415,10 @@ bot's inventory — reach for player reports only if that's ambiguous.
 4. **Only if step 3 is ambiguous**, contact the affected player. If they
    say the trade went through, treat as committed; otherwise treat as
    cancelled. Server logs can corroborate either way.
-5. Confirm `data/current_trade.json` is absent — any §2 restart already
-   cleared it; if it still exists because you skipped the restart, delete
-   it now.
+5. Confirm `data/current_trade.json` is absent at the active path — any
+   §2 restart already archived it aside to
+   `data/current_trade.leftover-<unix-millis>.json`; if it still exists
+   at the active path because you skipped the restart, delete it now.
 
 ### Phase: `Depositing`
 
@@ -413,8 +427,11 @@ when it crashed. This is the most common crash point because it involves
 multiple chest ops.
 
 1. Stop the bot.
-2. Read/copy `data/current_trade.json` aside BEFORE any restart (any §2
-   restart invoked below will delete it via `Store::new` auto-clear).
+2. Read/copy `data/current_trade.json` aside BEFORE any restart if you
+   want a working copy under a stable name (any §2 restart invoked
+   below will archive it aside to
+   `data/current_trade.leftover-<unix-millis>.json` via `Store::new`'s
+   auto-archive — see the WARNING block at the top of §4).
 3. Read `trade_result.items_received` from the copy of
    `current_trade.json` — that is what the player actually sent. Compare
    against `deposit_plan` (what the bot intended to deposit).
@@ -427,9 +444,10 @@ multiple chest ops.
 6. Append a manual entry to `data/trades/<now>.json` matching the
    completed trade so the audit log isn't missing it. Shape is in
    [DATA_SCHEMA.md](DATA_SCHEMA.md#datatradestimestampjson).
-7. Confirm `data/current_trade.json` is absent — any §2 restart already
-   cleared it; if it still exists because you skipped the restart, delete
-   it now.
+7. Confirm `data/current_trade.json` is absent at the active path — any
+   §2 restart already archived it aside to
+   `data/current_trade.leftover-<unix-millis>.json`; if it still exists
+   at the active path because you skipped the restart, delete it now.
 8. Start the bot and run `audit-state` — it must report no drift.
 
 ### Phase: `Committed` / `RolledBack`
@@ -443,9 +461,11 @@ so usually nothing is missing.
 Don't just delete the file blindly, though:
 
 1. Stop the bot.
-2. Read/copy `data/current_trade.json` aside BEFORE any restart (any §2
-   or §Depositing restart invoked below will delete it via `Store::new`
-   auto-clear).
+2. Read/copy `data/current_trade.json` aside BEFORE any restart if you
+   want a working copy under a stable name (any §2 or §Depositing
+   restart invoked below will archive it aside to
+   `data/current_trade.leftover-<unix-millis>.json` via `Store::new`'s
+   auto-archive — see the WARNING block at the top of §4).
 3. Open the copy of `data/current_trade.json`. Note the `order` body
    (item, quantity, user, `order_type`).
 4. For `Committed`: branch on `order.order_type`, because buys and sells
@@ -467,9 +487,10 @@ Don't just delete the file blindly, though:
 5. For `RolledBack`: verify the ledger is *unchanged* (no pair or
    balance update for this order), and that no stray shulker is in the
    bot's inventory or on the station (section 3 if there is).
-6. Confirm `data/current_trade.json` is absent — any §2 or §Depositing
-   restart already cleared it; if it still exists because you skipped
-   the restart, delete it now.
+6. Confirm `data/current_trade.json` is absent at the active path — any
+   §2 or §Depositing restart already archived it aside to
+   `data/current_trade.leftover-<unix-millis>.json`; if it still exists
+   at the active path because you skipped the restart, delete it now.
 
 ---
 

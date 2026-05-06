@@ -320,6 +320,22 @@ pub fn clear_persisted() -> io::Result<()> {
     clear_persisted_from(Path::new(TRADE_STATE_FILE))
 }
 
+/// Quarantine the on-disk trade state by renaming it to a timestamped sibling.
+///
+/// Preferred over [`clear_persisted`] at startup: a leftover trade state is
+/// the highest-stakes piece of crash evidence in the system (it pinpoints a
+/// trade that was in flight and possibly committed but not flushed), and
+/// silently zeroing the file means a second crash before an operator notices
+/// wipes that evidence. Renaming preserves the artifact while still freeing
+/// the active path so the bot can boot. Mirrors `Journal::archive_leftover`.
+///
+/// Falls back to copy+remove if the file lives on a different device than
+/// the destination (rare on a single-disk deploy, but rename on Windows can
+/// also fail if another process holds a handle).
+pub fn archive_persisted() -> io::Result<std::path::PathBuf> {
+    archive_persisted_to(Path::new(TRADE_STATE_FILE))
+}
+
 /// Path-parameterized persist, separated so tests can round-trip without
 /// touching the production `TRADE_STATE_FILE`.
 fn persist_to(path: &Path, state: &TradeState) -> io::Result<()> {
@@ -349,6 +365,28 @@ fn clear_persisted_from(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+/// Path-parameterized archive, separated so tests can round-trip without
+/// touching the production `TRADE_STATE_FILE`. Mirrors
+/// `Journal::archive_leftover`'s rename → copy+remove fallback.
+pub fn archive_persisted_to(path: &Path) -> io::Result<std::path::PathBuf> {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let archived = match path.parent() {
+        Some(parent) => parent.join(format!("current_trade.leftover-{unix_ms}.json")),
+        None => std::path::PathBuf::from(format!("current_trade.leftover-{unix_ms}.json")),
+    };
+    match std::fs::rename(path, &archived) {
+        Ok(()) => Ok(archived),
+        Err(_) => {
+            std::fs::copy(path, &archived)?;
+            std::fs::remove_file(path)?;
+            Ok(archived)
+        }
     }
 }
 
@@ -783,6 +821,44 @@ mod tests {
             load_persisted_from(&path).expect("load after clear").is_none(),
             "second load after clear must return Ok(None)"
         );
+    }
+
+    /// Crash-evidence preservation: persist mid-trade, archive via
+    /// `archive_persisted_to`, then `load_persisted_from` on the original path
+    /// must return `Ok(None)` while the archived sibling still carries the
+    /// original payload byte-for-byte. Mirrors the `Journal::archive_leftover`
+    /// contract for the trade_state subsystem.
+    #[test]
+    fn persist_archive_load_roundtrip() {
+        let dir = TmpDir::new("archive");
+        let path = dir.path("current_trade.json");
+
+        let state = TradeState::new(sample_order())
+            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_trading().unwrap();
+
+        persist_to(&path, &state).expect("persist must succeed");
+        let original_payload = std::fs::read_to_string(&path).expect("read original");
+
+        let archived = archive_persisted_to(&path).expect("archive must succeed");
+
+        // Original active path is now free.
+        assert!(
+            load_persisted_from(&path).expect("load after archive").is_none(),
+            "after archive, load on original path must return Ok(None)"
+        );
+
+        // Archived sibling exists and carries the original payload.
+        assert!(archived.exists(), "archived sibling must exist at {archived:?}");
+        let archived_payload = std::fs::read_to_string(&archived).expect("read archived");
+        assert_eq!(archived_payload, original_payload, "archived payload must match original");
+
+        // Sanity: the archived file is in the same directory and follows the
+        // expected naming pattern.
+        assert_eq!(archived.parent(), path.parent());
+        let name = archived.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("current_trade.leftover-"), "got {name}");
+        assert!(name.ends_with(".json"), "got {name}");
     }
 
     #[test]

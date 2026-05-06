@@ -15,7 +15,22 @@ use super::Store;
 /// UUIDs are the canonical identity key (usernames can change), so we look up
 /// by UUID and only update the stored username when it has drifted. Marks the
 /// store dirty on any mutation so the change is persisted on the next flush.
+///
+/// Defense-in-depth: rejects malformed UUIDs at the live-map mutation boundary
+/// so a buggy or future caller cannot pollute `store.users` under a malformed
+/// key. Without this gate the in-memory record would mutate but the persistence
+/// layer (`User::save_dirty_in_dir`'s shape gate) would silently skip the
+/// write, losing every subsequent balance/operator change across restart with
+/// no caller-visible error.
 pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
+    if !crate::types::user::is_valid_uuid_shape(uuid) {
+        tracing::warn!(
+            uuid = uuid,
+            username = username,
+            "rejecting ensure_user_exists with malformed uuid"
+        );
+        return;
+    }
     if !store.users.contains_key(uuid) {
         store.users.insert(
             uuid.to_string(),
@@ -271,11 +286,16 @@ mod tests {
         Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), crate::types::Storage::default())
     }
 
+    /// Canonical 36-char hyphenated UUID used as the test fixture for
+    /// `ensure_user_exists` callers. Matches the shape gate that rejects
+    /// malformed keys at the live-map mutation boundary.
+    const ALICE_UUID: &str = "00000000-0000-0000-0000-000000000001";
+
     #[test]
     fn ensure_user_exists_creates_new_user_and_marks_dirty() {
         let mut store = test_store();
-        ensure_user_exists(&mut store, "Alice", "uuid-a");
-        let u = store.users.get("uuid-a").expect("user inserted");
+        ensure_user_exists(&mut store, "Alice", ALICE_UUID);
+        let u = store.users.get(ALICE_UUID).expect("user inserted");
         assert_eq!(u.username, "Alice");
         assert_eq!(u.balance, 0.0);
         assert!(!u.operator);
@@ -285,21 +305,39 @@ mod tests {
     #[test]
     fn ensure_user_exists_updates_username_on_drift_and_marks_dirty() {
         let mut store = test_store();
-        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        ensure_user_exists(&mut store, "Alice", ALICE_UUID);
         store.dirty = false;
 
-        ensure_user_exists(&mut store, "AliceRenamed", "uuid-a");
-        assert_eq!(store.users.get("uuid-a").unwrap().username, "AliceRenamed");
+        ensure_user_exists(&mut store, "AliceRenamed", ALICE_UUID);
+        assert_eq!(store.users.get(ALICE_UUID).unwrap().username, "AliceRenamed");
         assert!(store.dirty);
+    }
+
+    #[test]
+    fn ensure_user_exists_rejects_malformed_uuid_and_does_not_mark_dirty() {
+        // Defense-in-depth: a malformed UUID must not produce an in-memory
+        // record (the persistence layer would silently skip it later).
+        let mut store = test_store();
+        for bad in ["", "not-a-uuid", "../traversal", "uuid-a"] {
+            ensure_user_exists(&mut store, "Alice", bad);
+            assert!(
+                !store.users.contains_key(bad),
+                "malformed uuid {bad:?} must not be inserted"
+            );
+            assert!(
+                !store.dirty,
+                "malformed uuid {bad:?} must not mark store dirty"
+            );
+        }
     }
 
     #[test]
     fn ensure_user_exists_is_noop_when_username_matches() {
         let mut store = test_store();
-        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        ensure_user_exists(&mut store, "Alice", ALICE_UUID);
         store.dirty = false;
 
-        ensure_user_exists(&mut store, "Alice", "uuid-a");
+        ensure_user_exists(&mut store, "Alice", ALICE_UUID);
         assert!(!store.dirty, "no change should not mark dirty");
     }
 
@@ -312,16 +350,16 @@ mod tests {
     #[test]
     fn is_operator_returns_false_for_regular_user() {
         let mut store = test_store();
-        ensure_user_exists(&mut store, "Alice", "uuid-a");
-        assert!(!is_operator(&store, "uuid-a"));
+        ensure_user_exists(&mut store, "Alice", ALICE_UUID);
+        assert!(!is_operator(&store, ALICE_UUID));
     }
 
     #[test]
     fn is_operator_returns_true_when_operator_flag_set() {
         let mut store = test_store();
-        ensure_user_exists(&mut store, "Alice", "uuid-a");
-        store.users.get_mut("uuid-a").unwrap().operator = true;
-        assert!(is_operator(&store, "uuid-a"));
+        ensure_user_exists(&mut store, "Alice", ALICE_UUID);
+        store.users.get_mut(ALICE_UUID).unwrap().operator = true;
+        assert!(is_operator(&store, ALICE_UUID));
     }
 
     #[test]

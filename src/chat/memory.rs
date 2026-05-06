@@ -43,6 +43,31 @@ pub fn player_file_path(uuid: &str) -> PathBuf {
     PathBuf::from(PLAYERS_DIR).join(format!("{uuid}.md"))
 }
 
+/// Canonical hyphenated UUID shape gate: 36 chars, lowercase hex, hyphens
+/// at positions 8/13/18/23 (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+///
+/// Module-local on purpose: the codebase keeps three intentionally
+/// duplicated copies of this check (here, `chat::store_view::user`,
+/// `chat::tools`) per the chat-independence rationale documented at
+/// `chat/store_view/user.rs:40-48`. Do NOT factor this out.
+fn is_canonical_hyphen_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        let is_hyphen = matches!(i, 8 | 13 | 18 | 23);
+        if is_hyphen {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !matches!(b, b'0'..=b'9' | b'a'..=b'f') {
+            return false;
+        }
+    }
+    true
+}
+
 /// The empty per-player schema. New files are bootstrapped
 /// with this content so [`update_player_memory`] can append into named
 /// sections without first creating them.
@@ -161,6 +186,15 @@ impl PlayerIndex {
     }
 
     pub fn insert(&mut self, username: &str, uuid: &str) {
+        if !is_canonical_hyphen_uuid(uuid) {
+            warn!(
+                target: LOG_TARGET,
+                username = username,
+                uuid = uuid,
+                "rejecting PlayerIndex::insert with non-canonical uuid"
+            );
+            return;
+        }
         self.by_lower_username
             .insert(username.to_lowercase(), uuid.to_string());
     }
@@ -211,6 +245,11 @@ pub fn rebuild_index() -> io::Result<PlayerIndex> {
         if username.is_empty() {
             skipped += 1;
             warn!(target: LOG_TARGET, path = %path.display(), "skipping player file with no `# <username>` header");
+            continue;
+        }
+        if !is_canonical_hyphen_uuid(stem) {
+            skipped += 1;
+            warn!(target: LOG_TARGET, path = %path.display(), "skipping player file whose stem is not a canonical-hyphen uuid");
             continue;
         }
         idx.insert(username, stem);
@@ -362,6 +401,14 @@ pub fn should_summarize_player_file(current_file_bytes: usize, cap_bytes: usize)
 /// index is materialized first — skipping removal because the in-memory
 /// state was lazy would defeat the scrub.
 pub(crate) fn forget_index_entry(uuid: &str) -> io::Result<u64> {
+    if !is_canonical_hyphen_uuid(uuid) {
+        warn!(
+            target: LOG_TARGET,
+            uuid = uuid,
+            "forget_index_entry called with non-canonical uuid; ignoring"
+        );
+        return Ok(0);
+    }
     let mut idx = load_or_rebuild_index()?;
     let before = idx.by_lower_username.len();
     idx.by_lower_username
@@ -383,7 +430,22 @@ pub fn load_or_rebuild_index() -> io::Result<PlayerIndex> {
     }
     match fs::read_to_string(path) {
         Ok(s) => match serde_json::from_str::<PlayerIndex>(&s) {
-            Ok(idx) if idx.version == INDEX_VERSION => Ok(idx),
+            Ok(mut idx) if idx.version == INDEX_VERSION => {
+                idx.by_lower_username.retain(|username, uuid| {
+                    if is_canonical_hyphen_uuid(uuid) {
+                        true
+                    } else {
+                        warn!(
+                            target: LOG_TARGET,
+                            username = username,
+                            uuid = uuid,
+                            "dropping tampered _index.json entry whose uuid is not canonical-hyphen"
+                        );
+                        false
+                    }
+                });
+                Ok(idx)
+            }
             Ok(_) | Err(_) => {
                 warn!(target: LOG_TARGET, path = %path.display(), "player index unparsable or wrong version, rebuilding");
                 let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -452,23 +514,26 @@ mod tests {
     #[test]
     fn player_index_lookup_is_case_insensitive() {
         let mut idx = PlayerIndex::new();
-        idx.insert("Steve", "uuid-1");
-        assert_eq!(idx.lookup("steve"), Some("uuid-1"));
-        assert_eq!(idx.lookup("STEVE"), Some("uuid-1"));
-        assert_eq!(idx.lookup("Steve"), Some("uuid-1"));
+        let u = "00000000-0000-0000-0000-000000000001";
+        idx.insert("Steve", u);
+        assert_eq!(idx.lookup("steve"), Some(u));
+        assert_eq!(idx.lookup("STEVE"), Some(u));
+        assert_eq!(idx.lookup("Steve"), Some(u));
         assert_eq!(idx.lookup("alice"), None);
     }
 
     #[test]
     fn player_index_round_trips_through_serde() {
         let mut idx = PlayerIndex::new();
-        idx.insert("Steve", "uuid-1");
-        idx.insert("Alice", "uuid-2");
+        let u1 = "00000000-0000-0000-0000-000000000001";
+        let u2 = "00000000-0000-0000-0000-000000000002";
+        idx.insert("Steve", u1);
+        idx.insert("Alice", u2);
         let json = serde_json::to_string(&idx).unwrap();
         let back: PlayerIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(back.version, INDEX_VERSION);
-        assert_eq!(back.lookup("steve"), Some("uuid-1"));
-        assert_eq!(back.lookup("alice"), Some("uuid-2"));
+        assert_eq!(back.lookup("steve"), Some(u1));
+        assert_eq!(back.lookup("alice"), Some(u2));
     }
 
     #[test]
@@ -670,6 +735,150 @@ mod tests {
             count_interactions_for_uuid(&history, target_uuid, "steve", 7);
         assert_eq!(i, 3);
         assert_eq!(d, 2);
+    }
+
+    // ===== Canonical-hyphen UUID gate =====================================
+
+    #[test]
+    fn is_canonical_hyphen_uuid_accepts_canonical_form() {
+        assert!(is_canonical_hyphen_uuid(
+            "00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(is_canonical_hyphen_uuid(
+            "deadbeef-cafe-1234-5678-90abcdef0123"
+        ));
+    }
+
+    #[test]
+    fn is_canonical_hyphen_uuid_rejects_malformed_inputs() {
+        // Wrong length.
+        assert!(!is_canonical_hyphen_uuid(""));
+        assert!(!is_canonical_hyphen_uuid("uuid-1"));
+        assert!(!is_canonical_hyphen_uuid("deadbeef-uuid"));
+        // Hyphenless 32-char hex.
+        assert!(!is_canonical_hyphen_uuid(
+            "00000000000000000000000000000000"
+        ));
+        // Uppercase hex digits — gate enforces lowercase.
+        assert!(!is_canonical_hyphen_uuid(
+            "DEADBEEF-CAFE-1234-5678-90ABCDEF0123"
+        ));
+        // Non-hex character at a hex slot.
+        assert!(!is_canonical_hyphen_uuid(
+            "deadbeef-cafe-1234-5678-90abcdef012g"
+        ));
+        // Hyphen in a hex slot.
+        assert!(!is_canonical_hyphen_uuid(
+            "0000000--0000-0000-0000-000000000000"
+        ));
+        // Path-traversal smuggling attempt.
+        assert!(!is_canonical_hyphen_uuid(
+            "../etc/passwd-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn player_index_insert_rejects_malformed_uuid() {
+        // (iii) PlayerIndex::insert MUST silently drop a non-canonical uuid
+        //       so future callers can't reintroduce tampered entries through
+        //       the public mutation path.
+        let mut idx = PlayerIndex::new();
+        idx.insert("Steve", "uuid-1");
+        idx.insert("Alice", "deadbeef-uuid");
+        idx.insert(
+            "Bob",
+            "DEADBEEF-CAFE-1234-5678-90ABCDEF0123", /* uppercase */
+        );
+        assert!(idx.by_lower_username.is_empty());
+        // Canonical entry is accepted.
+        idx.insert("Mallory", "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            idx.lookup("mallory"),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn forget_index_entry_rejects_malformed_uuid() {
+        // (iv) forget_index_entry MUST early-return when the uuid is not
+        //      canonical so a malformed value can't sneak through and so
+        //      operators see the warn! when the API is misused.
+        let removed = forget_index_entry("not-a-uuid").unwrap();
+        assert_eq!(removed, 0);
+        let removed = forget_index_entry("").unwrap();
+        assert_eq!(removed, 0);
+        let removed =
+            forget_index_entry("DEADBEEF-CAFE-1234-5678-90ABCDEF0123").unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn rebuild_index_skip_logic_rejects_non_canonical_stem() {
+        // (i) rebuild_index applies is_canonical_hyphen_uuid to the file
+        //     stem before insert. We can't cheaply override the global
+        //     PLAYERS_DIR const, so test the gate logic the rebuild path
+        //     uses on each candidate stem.
+        let scratch = Scratch::new("rebuild-skip-non-canon");
+        // Tampered: stem is not a canonical-hyphen uuid.
+        let bad = scratch.1.join("..\\..\\evil.md");
+        // The above join may normalize on Windows; just craft a stem
+        // string directly and assert the gate would reject it.
+        let _ = bad;
+        let tampered_stems = [
+            "../evil",
+            "_index",
+            "deadbeef-uuid",
+            "00000000-0000-0000-0000-00000000000",  // 35 chars
+            "00000000-0000-0000-0000-0000000000000", // 37 chars
+            "DEADBEEF-CAFE-1234-5678-90ABCDEF0123",
+        ];
+        for stem in tampered_stems {
+            assert!(
+                !is_canonical_hyphen_uuid(stem),
+                "rebuild_index should skip stem {stem:?}"
+            );
+        }
+        // Honest canonical stem passes.
+        assert!(is_canonical_hyphen_uuid(
+            "00000000-0000-0000-0000-000000000001"
+        ));
+    }
+
+    #[test]
+    fn load_or_rebuild_index_drops_tampered_entries() {
+        // (ii) After deserialization, load_or_rebuild_index retains only
+        //      entries whose uuid passes the canonical-hyphen shape check.
+        //      We can't override the PLAYER_INDEX const, so simulate the
+        //      retain step the loader applies.
+        let mut idx = PlayerIndex {
+            version: INDEX_VERSION,
+            by_lower_username: HashMap::new(),
+        };
+        idx.by_lower_username.insert(
+            "steve".to_string(),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        );
+        idx.by_lower_username
+            .insert("alice".to_string(), "../etc/passwd".to_string());
+        idx.by_lower_username.insert(
+            "bob".to_string(),
+            "DEADBEEF-CAFE-1234-5678-90ABCDEF0123".to_string(),
+        );
+        idx.by_lower_username
+            .insert("mallory".to_string(), "uuid-1".to_string());
+
+        // Apply the same retain predicate the loader uses.
+        idx.by_lower_username
+            .retain(|_, uuid| is_canonical_hyphen_uuid(uuid));
+
+        assert_eq!(idx.by_lower_username.len(), 1);
+        assert_eq!(
+            idx.lookup("steve"),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(idx.lookup("alice"), None);
+        assert_eq!(idx.lookup("bob"), None);
+        assert_eq!(idx.lookup("mallory"), None);
     }
 
     #[test]

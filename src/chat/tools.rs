@@ -662,6 +662,13 @@ async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
     } else {
         return Err("require either uuid or username".to_string());
     };
+    // Style-parity re-validation with `get_user_balance_tool`: the index
+    // and Mojang resolver paths feed `target_uuid` from sources we don't
+    // own, and `resolve_player_path_runtime` below re-validates anyway,
+    // but checking here first keeps the boundary-validation idiom uniform
+    // across sibling tools so a future refactor that drops the resolver
+    // re-check can't silently regress.
+    validate_uuid(&target_uuid).map_err(|e| format!("resolved uuid invalid: {e}"))?;
     let auth = authorize_player_read(&target_uuid, ctx.sender_uuid, ctx.cross_player_reads);
     if matches!(auth, ReadAuthorization::Denied) {
         return Err("access denied (cross-player reads disabled)".to_string());

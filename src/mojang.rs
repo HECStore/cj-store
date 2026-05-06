@@ -68,9 +68,22 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
             return Err(format!("Player '{username}' not found"));
         }
         // After the shape gate the username is guaranteed ASCII, so byte-level
-        // padding produces exactly 12 ASCII bytes in the trailing segment.
-        let padded = format!("{:0>12}", username);
-        Ok(format!("00000000-0000-0000-0000-{}", padded))
+        // trim-then-pad produces exactly 12 ASCII bytes in the trailing
+        // segment. `format!("{:0>12}", _)` only LEFT-PADS — it never
+        // truncates — so 13-16 char usernames must be trimmed first to keep
+        // the canonical 36-char UUID contract documented above. Take the
+        // first 12 chars to match the convention used by sibling test
+        // helpers in store/orders.rs, store/handlers/info.rs,
+        // store/handlers/operator.rs, store/handlers/player.rs.
+        let trimmed: String = username.chars().take(12).collect();
+        let padded = format!("{:0>12}", trimmed);
+        let out = format!("00000000-0000-0000-0000-{}", padded);
+        debug_assert_eq!(
+            out.len(),
+            36,
+            "test fixture produced non-canonical UUID for {username:?}: {out:?}"
+        );
+        Ok(out)
     }
     #[cfg(not(test))]
     {
@@ -326,12 +339,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_user_uuid_cfg_test_branch_pads_deterministically() {
         // Mirror the production cfg(test) recipe so we never hand-count. The
-        // post-shape-gate branch always pads to 12 ASCII bytes, so for any
-        // valid Mojang-shape username (3-16 ASCII alphanumeric+_) the
-        // expected output is `format!("{:0>12}", username)` in the trailing
-        // segment.
+        // post-shape-gate branch trims to the first 12 chars and then
+        // left-pads, so for any valid Mojang-shape username (3-16 ASCII
+        // alphanumeric+_) the trailing segment is the first 12 chars zero-
+        // padded on the left to width 12.
         fn expected_test_uuid(username: &str) -> String {
-            format!("00000000-0000-0000-0000-{:0>12}", username)
+            let trimmed: String = username.chars().take(12).collect();
+            format!("00000000-0000-0000-0000-{:0>12}", trimmed)
         }
 
         // (a) normal short username — left-padded with zeros.
@@ -364,16 +378,20 @@ mod tests {
             expected_test_uuid(twelve),
         );
 
-        // (d) maximum-length valid username (16 chars) — fits the embedded
-        // segment after truncation to 12 bytes via formatter width.
+        // (d) maximum-length valid username (16 chars) — explicitly trimmed
+        // to the first 12 chars before padding, so the trailing segment is
+        // exactly 12 bytes and the full UUID stays canonical 36-char.
         let sixteen = "abcdefghijklmnop";
         assert_eq!(sixteen.len(), 16);
-        // `format!("{:0>12}", "abcdefghijklmnop")` returns the string
-        // unchanged because it's already wider than 12; no truncation.
         assert_eq!(
             resolve_user_uuid(sixteen).await.unwrap(),
             expected_test_uuid(sixteen),
         );
+        assert_eq!(
+            resolve_user_uuid(sixteen).await.unwrap(),
+            "00000000-0000-0000-0000-abcdefghijkl",
+        );
+        assert_eq!(resolve_user_uuid(sixteen).await.unwrap().len(), 36);
     }
 
     #[tokio::test]

@@ -156,9 +156,11 @@ recovered). The usual async discipline — never hold the guard across
 7. **Memory usage** — all users, pairs, and (up to `max_trades_in_memory`)
    trades load into memory on startup. Tune in config for large stores.
 8. **Interrupted-trade recovery is detection-only** — `current_trade.json`
-   is mirrored at every phase. On startup the Store logs and clears it;
-   automatic re-queue/rollback is planned but not yet implemented (design
-   sketch in [ARCHITECTURE.md § Planned: automatic crash-resume](ARCHITECTURE.md#planned-automatic-crash-resume);
+   is mirrored at every phase. On startup the Store logs and archives it
+   aside to `data/current_trade.leftover-<unix-millis>.json` so the
+   crash evidence survives subsequent restarts; automatic re-queue/rollback
+   is planned but not yet implemented (design sketch in
+   [ARCHITECTURE.md § Planned: automatic crash-resume](ARCHITECTURE.md#planned-automatic-crash-resume);
    manual playbook in [RECOVERY.md § 4](RECOVERY.md#4-interrupted-datacurrent_tradejson)).
    CLI menu option 15 "Clear stuck order" releases the `processing_order`
    flag without requiring JSON edits when the only symptom is a frozen

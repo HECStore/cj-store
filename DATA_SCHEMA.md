@@ -339,7 +339,11 @@ an empty journal. See [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-ent
 
 In-flight `TradeState` snapshot, rewritten on every phase transition and
 deleted on terminal state. Any non-empty file at startup means a mid-trade
-crash. See [src/store/trade_state.rs](src/store/trade_state.rs).
+crash; `Store::new` then renames it aside to a timestamped sibling
+`data/current_trade.leftover-<unix-millis>.json` (mirroring the
+`data/journal.leftover-*.json` pattern) so the crash evidence is
+preserved for operator review while the active path is freed for the
+next trade. See [src/store/trade_state.rs](src/store/trade_state.rs).
 
 The file holds one `TradeState` serialized as an externally-tagged enum —
 shape differs by variant. Two examples matter most for recovery:

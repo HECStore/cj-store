@@ -906,7 +906,13 @@ incomplete; defenses cover:
 
 - **URL parsing** rejects non-`http(s)` schemes, hostnames in numeric
   forms (decimal `2130706433`, octal `017700000001`, hex `0x7f000001`),
-  zero-page hosts (`0.0.0.0/8`), and userinfo (`user@host`).
+  zero-page hosts (`0.0.0.0/8`), and userinfo (`user@host`). An
+  explicit port that is not on the `ALLOWED_PORTS` allow-list (`80`,
+  `443`) is rejected with `UrlError::DisallowedPort(p)` for both the
+  IPv4/hostname branch and the bracketed-IPv6 branch — a public host
+  like `victim.example.com:6379` would otherwise let an attacker
+  reach an internal-protocol service (Redis, Ollama, SMTP, …) via a
+  permitted resolved IP.
 - **Custom resolver** — a `reqwest::dns::Resolve` impl resolves once,
   IPs are validated, and the connection is **pinned to the validated
   IP** via `ClientBuilder::resolve_to_addrs`. Closes the
@@ -1297,7 +1303,7 @@ injection defense, SSRF defense) are real safety/cost guards.
 | Off-tone phrases                | `pacing::strip_ai_tells` removes em-dashes, smart quotes, "As an AI", "I'm Claude", "language model", etc. — these are tonally wrong for Minecraft chat regardless of identity. |
 | Cost-DoS via classifier flood   | Per-sender classifier rate cap; per-call sample-rate roll on undirected public chat; separate `daily_classifier_token_cap`; spam-suppressed senders skip classifier entirely.                |
 | Cost-DoS via composer flood     | `daily_input_token_cap` + `daily_output_token_cap` + `daily_dollar_cap_usd`; client-side rate limiter with RPM and ITPM accounting; classifier pre-filter gates composer dispatch. |
-| SSRF via web_fetch              | URL-parse rejects numeric/octal/hex hosts and userinfo; pinned-IP DNS; deny-list including cloud metadata; manual redirect re-validation; streaming size cap.              |
+| SSRF via web_fetch              | URL-parse rejects numeric/octal/hex hosts, userinfo, and explicit ports off the `ALLOWED_PORTS` allow-list (`80`, `443` only); pinned-IP DNS; deny-list including cloud metadata; manual redirect re-validation; streaming size cap.              |
 
 ## Where to start reading
 

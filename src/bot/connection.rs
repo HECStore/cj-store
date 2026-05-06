@@ -83,6 +83,13 @@ pub async fn connect(
     };
 
     let shutdown = bot.shutdown.clone();
+    // Defense-in-depth: release the connecting latch when the local task ends,
+    // independent of whether `Event::Init` or `Event::Disconnect` ever fires.
+    // If `start(...)` returns AppExit on pre-Init auth failure / immediate
+    // refusal / ViaProxy startup failure, neither event handler runs, so
+    // without this the latch stays `true` forever and every subsequent
+    // `connect()` short-circuits silently above.
+    let connecting = bot.connecting.clone();
     let task_account = account_name.clone();
     let task_server = server_address.clone();
 
@@ -97,6 +104,7 @@ pub async fn connect(
     // (see main.rs). tokio::spawn would fail to compile.
     let handle = tokio::task::spawn_local(async move {
         if shutdown.load(Ordering::SeqCst) {
+            connecting.store(false, Ordering::SeqCst);
             return;
         }
 
@@ -115,6 +123,7 @@ pub async fn connect(
             "[Connection] ClientBuilder::start returned: account={} server={} exit={:?}",
             task_account, task_server, exit
         );
+        connecting.store(false, Ordering::SeqCst);
     });
 
     *bot.client_task.lock().await = Some(handle);

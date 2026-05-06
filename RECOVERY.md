@@ -160,17 +160,17 @@ The journal records one in-flight shulker operation at a time; it is
 cleared whenever the operation finishes. A non-empty file at startup means
 the previous run crashed mid chest I/O. Current behavior: the bot logs an
 error-level notice and **renames the leftover journal aside** to
-`data/journal.leftover-<unix-millis>.json` so it's preserved for
+`data/journal.leftover-<unix-millis>-<seq>.json` so it's preserved for
 operator review (rather than silently overwritten on the next persist).
 If the journal file is unreadable on load, it is similarly quarantined to
-`data/journal.unreadable-<unix-millis>.json` and the bot continues with a
+`data/journal.unreadable-<unix-millis>-<seq>.json` and the bot continues with a
 fresh empty journal. See
 [src/store/journal.rs](src/store/journal.rs). The world state may be
 inconsistent — that's what this playbook is for.
 
 **Symptoms**
 
-- Startup log shows `[Journal] loaded leftover entry: op_id=… type=… chest_id=… slot=… state=…` (info level), followed by `[Bot] Crash recovery: previous run left an in-flight shulker op: …` and `[Bot] Quarantined leftover journal to "data/journal.leftover-<unix-millis>.json" — preserve for operator review` (both error level). The first line is `tracing::info!`, the latter two are `tracing::error!`, so an info-or-lower filter shows them all.
+- Startup log shows `[Journal] loaded leftover entry: op_id=… type=… chest_id=… slot=… state=…` (info level), followed by `[Bot] Crash recovery: previous run left an in-flight shulker op: …` and `[Bot] Quarantined leftover journal to "data/journal.leftover-<unix-millis>-<seq>.json" — preserve for operator review` (both error level). The first line is `tracing::info!`, the latter two are `tracing::error!`, so an info-or-lower filter shows them all.
 - A shulker box is sitting on the station block instead of inside its
   chest.
 - A shulker box is in the bot's inventory on login.
@@ -200,7 +200,7 @@ re-using well-exercised code instead of hand-computing a sum.
    overflow chest (node 0, chest 1) — the bot will triage them via the
    usual deposit flow once running.
 4. Restart the bot. It will rename the leftover journal aside to
-   `data/journal.leftover-<unix-millis>.json` (preserved for review)
+   `data/journal.leftover-<unix-millis>-<seq>.json` (preserved for review)
    and the next trade involving that chest will do a fresh
    `apply_chest_sync`, reconciling per-slot counts from what's actually
    in-world.
@@ -225,7 +225,7 @@ Option A doesn't balance out.
 **When it's safe to just delete `data/journal.json`**
 
 Always, at startup. The bot self-heals by renaming any leftover entry to
-a `data/journal.leftover-<unix-millis>.json` archive (so the original
+a `data/journal.leftover-<unix-millis>-<seq>.json` archive (so the original
 file is no longer in place to interfere with the next run). The procedures
 above are for fixing the *world/ledger drift* that the journal merely
 points at — deleting the journal alone does not fix the drift. The
@@ -298,7 +298,7 @@ being popped from the queue but before reaching a terminal state.
 > [!WARNING]
 > Current behavior: `Store::new` **archives** any leftover
 > `data/current_trade.json` by renaming it aside to a timestamped sibling
-> `data/current_trade.leftover-<unix-millis>.json` on the next startup
+> `data/current_trade.leftover-<unix-millis>-<seq>.json` on the next startup
 > (mirroring the `data/journal.leftover-*` pattern from §2). The original
 > path is then free for the next trade. Operators should consult that
 > archived sibling — not `data/current_trade.json` itself, which will be
@@ -359,7 +359,7 @@ trade GUI. No player-side effect yet.
 1. Stop the bot.
 2. Read/copy `data/current_trade.json` aside if you want a working copy
    under a stable name (the §2 restart will archive it aside to
-   `data/current_trade.leftover-<unix-millis>.json` via `Store::new`'s
+   `data/current_trade.leftover-<unix-millis>-<seq>.json` via `Store::new`'s
    auto-archive — see the WARNING block above).
 3. Branch on whether the journal also has a leftover entry:
    - **If the journal has a leftover entry** (you'll see the §2
@@ -385,7 +385,7 @@ trade GUI. No player-side effect yet.
    [§ 2 Option B](#2-stuck-datajournaljson-entry) for the affected pair.
 5. Confirm `data/current_trade.json` is absent at the active path — the
    restart already archived it aside to
-   `data/current_trade.leftover-<unix-millis>.json`; if it still exists at
+   `data/current_trade.leftover-<unix-millis>-<seq>.json`; if it still exists at
    the active path because you skipped the restart, delete it now. The
    order is cancelled.
 6. Inform the player no trade happened; no balance change needed.
@@ -399,7 +399,7 @@ bot's inventory — reach for player reports only if that's ambiguous.
 1. Stop the bot.
 2. Read/copy `data/current_trade.json` aside if you want a working copy
    under a stable name (any §2 restart invoked below will archive it
-   aside to `data/current_trade.leftover-<unix-millis>.json` via
+   aside to `data/current_trade.leftover-<unix-millis>-<seq>.json` via
    `Store::new`'s auto-archive — see the WARNING block at the top of §4).
 3. **Physical inventory check first.** Look at the bot's inventory and
    the buffer chest (if configured). The "bot offers" half of the trade
@@ -417,7 +417,7 @@ bot's inventory — reach for player reports only if that's ambiguous.
    cancelled. Server logs can corroborate either way.
 5. Confirm `data/current_trade.json` is absent at the active path — any
    §2 restart already archived it aside to
-   `data/current_trade.leftover-<unix-millis>.json`; if it still exists
+   `data/current_trade.leftover-<unix-millis>-<seq>.json`; if it still exists
    at the active path because you skipped the restart, delete it now.
 
 ### Phase: `Depositing`
@@ -430,7 +430,7 @@ multiple chest ops.
 2. Read/copy `data/current_trade.json` aside BEFORE any restart if you
    want a working copy under a stable name (any §2 restart invoked
    below will archive it aside to
-   `data/current_trade.leftover-<unix-millis>.json` via `Store::new`'s
+   `data/current_trade.leftover-<unix-millis>-<seq>.json` via `Store::new`'s
    auto-archive — see the WARNING block at the top of §4).
 3. Read `trade_result.items_received` from the copy of
    `current_trade.json` — that is what the player actually sent. Compare
@@ -446,7 +446,7 @@ multiple chest ops.
    [DATA_SCHEMA.md](DATA_SCHEMA.md#datatradestimestampjson).
 7. Confirm `data/current_trade.json` is absent at the active path — any
    §2 restart already archived it aside to
-   `data/current_trade.leftover-<unix-millis>.json`; if it still exists
+   `data/current_trade.leftover-<unix-millis>-<seq>.json`; if it still exists
    at the active path because you skipped the restart, delete it now.
 8. Start the bot and run `audit-state` — it must report no drift.
 
@@ -464,7 +464,7 @@ Don't just delete the file blindly, though:
 2. Read/copy `data/current_trade.json` aside BEFORE any restart if you
    want a working copy under a stable name (any §2 or §Depositing
    restart invoked below will archive it aside to
-   `data/current_trade.leftover-<unix-millis>.json` via `Store::new`'s
+   `data/current_trade.leftover-<unix-millis>-<seq>.json` via `Store::new`'s
    auto-archive — see the WARNING block at the top of §4).
 3. Open the copy of `data/current_trade.json`. Note the `order` body
    (item, quantity, user, `order_type`).
@@ -489,7 +489,7 @@ Don't just delete the file blindly, though:
    bot's inventory or on the station (section 3 if there is).
 6. Confirm `data/current_trade.json` is absent at the active path — any
    §2 or §Depositing restart already archived it aside to
-   `data/current_trade.leftover-<unix-millis>.json`; if it still exists
+   `data/current_trade.leftover-<unix-millis>-<seq>.json`; if it still exists
    at the active path because you skipped the restart, delete it now.
 
 ---

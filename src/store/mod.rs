@@ -243,7 +243,12 @@ impl Store {
                 }
             }
             Ok(None) => {}
-            Err(e) => warn!("Failed to load persisted trade state: {}", e),
+            Err(e) => error!(
+                "Failed to load persisted trade state and quarantine also failed: {} - \
+                 the corrupt file is still on disk and the next persist() will overwrite it; \
+                 OPERATOR MUST PRESERVE current_trade.json BEFORE THE NEXT TRADE STARTS",
+                e
+            ),
         }
 
         info!(
@@ -510,18 +515,59 @@ impl Store {
     /// completion and error messages to the player; only the "Now processing"
     /// notification and lifecycle logging are emitted here.
     async fn process_next_order(&mut self) {
-        let order = match self.order_queue.pop() {
-            Some(o) => o,
+        // Handover invariant: an order must be present in EITHER `queue.json`
+        // OR `current_trade.json`, never neither. We achieve this by writing
+        // the trade-state mirror BEFORE removing the order from the queue:
+        //
+        //   1. peek front → build `Queued` TradeState → persist mirror.
+        //   2. only on persist success, `pop_committed` removes from queue.json.
+        //
+        // A crash between (1) and (2) leaves the order in queue.json AND a
+        // matching mirror on disk; the next startup falls into the existing
+        // recovery branch in `Store::new` (archive + operator alert), which
+        // is the desired outcome.
+        let order = match self.order_queue.peek_front() {
+            Some(o) => o.clone(),
             None => {
                 // Invariant violation: the main loop only calls this when the
                 // queue is non-empty. Surface loudly but stay running.
-                warn!("[Store] Queue was empty when trying to pop");
+                warn!("[Store] Queue was empty when trying to peek");
                 return;
             }
         };
 
+        let queued_state = trade_state::TradeState::new(order.clone());
+        if let Err(e) = trade_state::persist(&queued_state) {
+            error!(
+                order_id = order.id,
+                player = %order.username,
+                error = %e,
+                "[Store] Failed to persist queued trade-state mirror; leaving order in queue for retry"
+            );
+            return;
+        }
+
+        match self.order_queue.pop_committed(order.id) {
+            Ok(_) => {}
+            Err(e) => {
+                error!(
+                    order_id = order.id,
+                    player = %order.username,
+                    error = %e,
+                    "[Store] pop_committed failed after trade-state mirror was written; clearing orphaned mirror"
+                );
+                if let Err(clear_err) = trade_state::clear_persisted() {
+                    warn!(
+                        "[Store] Best-effort clear of orphaned trade-state mirror failed: {}",
+                        clear_err
+                    );
+                }
+                return;
+            }
+        }
+
         self.processing_order = true;
-        self.current_trade = Some(trade_state::TradeState::new(order.clone()));
+        self.current_trade = Some(queued_state);
 
         let started = std::time::Instant::now();
         info!(

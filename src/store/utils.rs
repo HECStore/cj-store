@@ -45,6 +45,21 @@ pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
         debug!(uuid = uuid, username = username, "Created new user record");
     } else if let Some(user) = store.users.get_mut(uuid)
         && user.username != username {
+            // Defense-in-depth: enforce the invariant "User.username field is
+            // never UUID-shaped" once for all callers (orders, deposit,
+            // withdraw, operator, info, player). A buggy caller passing
+            // `username == uuid` would otherwise corrupt the stored username
+            // with a 32/36-char hex string and break every downstream code
+            // path that displays or matches by username.
+            if crate::types::user::is_valid_uuid_shape(username) {
+                tracing::warn!(
+                    uuid = uuid,
+                    proposed_username = username,
+                    existing_username = %user.username,
+                    "rejecting UUID-shaped username drift in ensure_user_exists"
+                );
+                return;
+            }
             let old = std::mem::replace(&mut user.username, username.to_string());
             store.dirty = true;
             debug!(

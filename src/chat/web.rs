@@ -21,6 +21,13 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Egress port allow-list. SSRF defenses gate not just on resolved IP
+/// but also on destination port — a public host like
+/// `victim.example.com:6379` would otherwise let an attacker reach an
+/// internal-protocol service (Redis, Ollama, SMTP, …) via a permitted
+/// IP. Only the standard HTTP(S) ports are accepted.
+const ALLOWED_PORTS: &[u16] = &[80, 443];
+
 /// A URL the SSRF primitives accept. Only constructible via
 /// [`validate_url`], which establishes the scheme, host shape, and
 /// userinfo invariants.
@@ -59,6 +66,23 @@ pub enum UrlError {
     BadHost,
     /// Generic parse error — URL did not look like an http(s) URL.
     BadFormat,
+    /// Explicit port is not on the [`ALLOWED_PORTS`] allow-list.
+    DisallowedPort(u16),
+}
+
+impl std::fmt::Display for UrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UrlError::BadScheme => write!(f, "scheme is not http or https"),
+            UrlError::HasUserinfo => write!(f, "URL contains userinfo"),
+            UrlError::NumericHostname => write!(f, "hostname is in numeric form"),
+            UrlError::BadHost => write!(f, "hostname is empty or malformed"),
+            UrlError::BadFormat => write!(f, "URL is malformed"),
+            UrlError::DisallowedPort(p) => {
+                write!(f, "port {p} is not in the allow-list (only 80, 443 permitted)")
+            }
+        }
+    }
 }
 
 /// Validate a URL string first three bullets. Performs
@@ -125,6 +149,15 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
         {
             return Err(UrlError::BadHost);
         }
+        // Gate the explicit port (if any) against the allow-list. An
+        // implicit (absent) port is fine — `port_for` will substitute
+        // 80/443 per scheme, both of which are on the list.
+        if let Some(port_str) = after.strip_prefix(':') {
+            let p: u16 = port_str.parse().map_err(|_| UrlError::BadHost)?;
+            if !ALLOWED_PORTS.contains(&p) {
+                return Err(UrlError::DisallowedPort(p));
+            }
+        }
         return inner
             .parse::<Ipv6Addr>()
             .map(|ip| SafeUrl {
@@ -136,16 +169,25 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
     }
 
     // Strip optional `:port` (single trailing colon-decimal).
-    let host_str = match authority.rsplit_once(':') {
+    let (host_str, explicit_port) = match authority.rsplit_once(':') {
         Some((h, port))
             if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
         {
-            h
+            let p: u16 = port.parse().map_err(|_| UrlError::BadHost)?;
+            (h, Some(p))
         }
-        _ => authority,
+        _ => (authority, None),
     };
     if host_str.is_empty() {
         return Err(UrlError::BadHost);
+    }
+    // Gate the explicit port (if any) against the allow-list. An
+    // implicit (absent) port is fine — `port_for` will substitute
+    // 80/443 per scheme, both of which are on the list.
+    if let Some(p) = explicit_port
+        && !ALLOWED_PORTS.contains(&p)
+    {
+        return Err(UrlError::DisallowedPort(p));
     }
 
     // IPv4 literal? Reject decimal, octal, hex obfuscation forms; ONLY
@@ -509,11 +551,6 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
             }
         };
 
-        let host_str = match &safe.host {
-            Host::Name(n) => n.clone(),
-            Host::Ip(ip) => ip.to_string(),
-        };
-
         // Build a fresh reqwest client per call: we pin the resolver
         // to the validated IPs, which is a per-host config.
         let mut builder = reqwest::Client::builder()
@@ -521,8 +558,17 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
             .connect_timeout(remaining().min(Duration::from_secs(2)))
             .redirect(reqwest::redirect::Policy::none())
             .https_only(false); // operator may explicitly fetch http URLs
-        for addr in &resolved_addrs {
-            builder = builder.resolve_to_addrs(&host_str, &[*addr]);
+        // Pin the full vetted IP set in ONE `resolve_to_addrs` call.
+        // reqwest's `resolve_to_addrs` overwrites any prior override for
+        // the same domain key (it's a HashMap insert), so calling it in a
+        // loop with single-element slices leaves only the LAST accepted
+        // IP pinned and lets the connect path fall back to system DNS for
+        // anything else. For `Host::Ip` literals, skip the call entirely
+        // — reqwest connects directly to the URL's literal IP, and the
+        // override map keys on the URL host string which doesn't match a
+        // synthesized IP-as-name anyway.
+        if let Host::Name(name) = &safe.host {
+            builder = builder.resolve_to_addrs(name, &resolved_addrs);
         }
         let client = builder
             .build()
@@ -537,6 +583,10 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         // Operator-visible log of every hop (initial + each redirect).
         // Deliberately host+status only — never path/query, so secrets
         // embedded in URLs cannot leak via logs.
+        let host_str = match &safe.host {
+            Host::Name(n) => n.clone(),
+            Host::Ip(ip) => ip.to_string(),
+        };
         tracing::info!(
             host = %host_str,
             status = resp.status().as_u16(),
@@ -1000,7 +1050,8 @@ mod tests {
 
     #[test]
     fn http_with_port_accepted() {
-        let u = validate_url("http://example.com:8080/").unwrap();
+        // Port 80 is on the allow-list.
+        let u = validate_url("http://example.com:80/").unwrap();
         assert!(matches!(u.host, Host::Name(ref n) if n == "example.com"));
     }
 
@@ -1054,8 +1105,8 @@ mod tests {
     #[test]
     fn port_preserved_with_query_only() {
         // The port must still be stripped correctly when the authority
-        // is followed by `?` rather than `/`.
-        let u = validate_url("http://example.com:8080?x=1").unwrap();
+        // is followed by `?` rather than `/`. Use 443 (on the allow-list).
+        let u = validate_url("http://example.com:443?x=1").unwrap();
         assert!(matches!(u.host, Host::Name(ref n) if n == "example.com"));
     }
 
@@ -1111,6 +1162,97 @@ mod tests {
     #[test]
     fn rejects_empty_host() {
         assert!(validate_url("http:///path").is_err());
+    }
+
+    // ---- port allow-list ------------------------------------------------
+
+    #[test]
+    fn rejects_disallowed_port_smtp() {
+        // 25 — SMTP. Public host with internal-protocol port must be
+        // rejected even though the IP itself would be allowed.
+        assert_eq!(
+            validate_url("http://example.com:25/").unwrap_err(),
+            UrlError::DisallowedPort(25)
+        );
+    }
+
+    #[test]
+    fn rejects_disallowed_port_redis() {
+        // 6379 — Redis. The headline case: `victim.example.com:6379`.
+        assert_eq!(
+            validate_url("http://example.com:6379/").unwrap_err(),
+            UrlError::DisallowedPort(6379)
+        );
+    }
+
+    #[test]
+    fn rejects_disallowed_port_ollama() {
+        // 11434 — Ollama default. Local LLM exfil vector.
+        assert_eq!(
+            validate_url("http://example.com:11434/").unwrap_err(),
+            UrlError::DisallowedPort(11434)
+        );
+    }
+
+    #[test]
+    fn implicit_port_allowed_baseline() {
+        // No explicit port → port_for substitutes 80/443. Must validate.
+        validate_url("http://example.com/").unwrap();
+        validate_url("https://example.com/").unwrap();
+    }
+
+    #[test]
+    fn explicit_port_80_and_443_allowed() {
+        validate_url("http://example.com:80/").unwrap();
+        validate_url("https://example.com:443/").unwrap();
+        // Cross-pairings (https on :80, http on :443) are still allowed
+        // by the port gate — the deny semantic is "port not in list",
+        // not "port matches scheme default".
+        validate_url("https://example.com:80/").unwrap();
+        validate_url("http://example.com:443/").unwrap();
+    }
+
+    #[test]
+    fn ipv6_literal_disallowed_port_rejected() {
+        // IPv6 path has its own port-parse branch — must enforce too.
+        assert_eq!(
+            validate_url("http://[2001:db8::1]:6379/").unwrap_err(),
+            UrlError::DisallowedPort(6379)
+        );
+        assert_eq!(
+            validate_url("http://[2001:db8::1]:25/").unwrap_err(),
+            UrlError::DisallowedPort(25)
+        );
+        assert_eq!(
+            validate_url("http://[2001:db8::1]:11434/").unwrap_err(),
+            UrlError::DisallowedPort(11434)
+        );
+    }
+
+    #[test]
+    fn ipv6_literal_allowed_ports_accepted() {
+        // Implicit port (no `:port` after `]`).
+        validate_url("http://[2001:db8::1]/").unwrap();
+        // Explicit :80 / :443.
+        validate_url("http://[2001:db8::1]:80/").unwrap();
+        validate_url("https://[2001:db8::1]:443/").unwrap();
+    }
+
+    #[test]
+    fn ipv4_literal_disallowed_port_rejected() {
+        assert_eq!(
+            validate_url("http://1.2.3.4:6379/").unwrap_err(),
+            UrlError::DisallowedPort(6379)
+        );
+    }
+
+    #[test]
+    fn disallowed_port_display_is_operator_readable() {
+        // The Display impl surfaces a human-friendly message including
+        // the offending port. Used by `fetch`'s error formatting.
+        let msg = format!("{}", UrlError::DisallowedPort(6379));
+        assert!(msg.contains("6379"), "got {msg:?}");
+        assert!(msg.contains("allow"), "got {msg:?}");
     }
 
     // ---- is_denied_ip --------------------------------------------------

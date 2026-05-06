@@ -47,7 +47,8 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             // quarantines on next save while emitting a misleading success
             // log. Loud rejection at the input boundary fixes this.
             let trimmed = username_or_uuid.trim();
-            let uuid = if crate::types::user::is_valid_uuid_shape(trimmed) {
+            let input_was_uuid = crate::types::user::is_valid_uuid_shape(trimmed);
+            let uuid = if input_was_uuid {
                 // Accepts both 36-char canonical hyphenated and 32-char bare
                 // hex, matching what the persistence layer accepts.
                 trimmed.to_string()
@@ -63,9 +64,28 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                     .await
                     .map_err(StoreError::ValidationError)?
             };
-            // Auto-create the user record so operators can be granted to
-            // players who have never interacted with the store.
-            utils::ensure_user_exists(store, trimmed, &uuid);
+            // When the operator typed a UUID, we must NOT pass `trimmed` as a
+            // username to `ensure_user_exists` — `trimmed == uuid` in that
+            // branch, which would corrupt an existing user's `username` field
+            // with the UUID string (the drift branch overwrites unconditionally).
+            // For an unknown UUID, refuse rather than fabricate a phantom record.
+            // For a known UUID, look up the existing username so the drift
+            // branch is a no-op.
+            if input_was_uuid {
+                let Some(existing) = store.users.get(&uuid) else {
+                    warn!("[CLI-Store] SetOperator: unknown UUID {}", uuid);
+                    let _ = respond_to.send(Err(
+                        "unknown UUID — grant operator by username instead, or pre-onboard the user first".into()
+                    ));
+                    return Ok(());
+                };
+                let existing_username = existing.username.clone();
+                utils::ensure_user_exists(store, &existing_username, &uuid);
+            } else {
+                // Auto-create the user record so operators can be granted to
+                // players who have never interacted with the store.
+                utils::ensure_user_exists(store, trimmed, &uuid);
+            }
             if let Some(user) = store.users.get_mut(&uuid) {
                 user.operator = is_operator;
                 store.dirty = true;
@@ -245,7 +265,30 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 }
             };
             let normalized_item = item_id.to_string();
-            if store.pairs.contains_key(&normalized_item) {
+            // `OVERFLOW_CHEST_ITEM` is the literal `item` field on node 0's
+            // chest 1 (used as a sentinel for misplaced shulkers). Adding it
+            // as a tradeable pair would let pair-stock recompute sum the
+            // sentinel chest into the new pair's stock and corrupt AMM
+            // pricing. `BASE_CURRENCY_ITEM` is the diamond pair the rest of
+            // the code expects to be the canonical currency surface; a
+            // duplicate created here would invalidate node 0's
+            // forced-diamond invariant on every later add_node. Reject both
+            // after `ItemId::new` normalization so case/prefix variants
+            // (`Overflow`, `OVERFLOW`, `minecraft:overflow`, …) all hit the
+            // same gate. RemovePair already rejects BASE_CURRENCY_ITEM at
+            // line 283; this is the symmetric AddPair gate.
+            if normalized_item == crate::constants::OVERFLOW_CHEST_ITEM
+                || normalized_item == crate::constants::BASE_CURRENCY_ITEM
+            {
+                warn!(
+                    "[CLI-Store] AddPair: '{}' is a reserved chest sentinel",
+                    normalized_item
+                );
+                let _ = respond_to.send(Err(format!(
+                    "'{}' is a reserved chest sentinel and cannot be a tradeable pair",
+                    normalized_item
+                )));
+            } else if store.pairs.contains_key(&normalized_item) {
                 warn!("[CLI-Store] AddPair: pair '{}' already exists", normalized_item);
                 let _ = respond_to.send(Err(format!("Pair '{}' already exists", normalized_item)));
             } else {
@@ -510,5 +553,107 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             info!("[CLI-Store] Shutdown complete");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for `handle_cli_message`. The Mojang lookup path
+    //! requires network and is exercised separately; these tests focus on the
+    //! UUID-input branch which must never round-trip the UUID string into
+    //! `User.username`.
+
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::sync::{mpsc, oneshot};
+
+    fn test_config() -> crate::config::Config {
+        crate::config::Config {
+            position: crate::types::Position { x: 0, y: 64, z: 0 },
+            fee: 0.125,
+            account_email: String::new(),
+            server_address: "test".to_string(),
+            buffer_chest_position: None,
+            trade_timeout_ms: 5_000,
+            pathfinding_timeout_ms: 5_000,
+            max_orders: 1000,
+            max_trades_in_memory: 1000,
+            autosave_interval_secs: 10,
+            chat: crate::config::ChatConfig::default(),
+        }
+    }
+
+    /// Canonical 36-char hyphenated UUID for "Alice". Must satisfy
+    /// `is_valid_uuid_shape` so the SetOperator handler takes the UUID branch.
+    const ALICE_UUID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[tokio::test]
+    async fn set_operator_by_uuid_does_not_overwrite_username() {
+        // Pre-populate a User with username "Alice" and the canonical UUID.
+        let mut users: HashMap<String, User> = HashMap::new();
+        users.insert(
+            ALICE_UUID.to_string(),
+            User {
+                uuid: ALICE_UUID.to_string(),
+                username: "Alice".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+        let (bot_tx, _bot_rx) = mpsc::channel::<BotInstruction>(16);
+        let mut store = Store::new_for_test(
+            bot_tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            crate::types::Storage::default(),
+        );
+
+        let (resp_tx, resp_rx) = oneshot::channel::<Result<(), String>>();
+        let msg = CliMessage::SetOperator {
+            username_or_uuid: ALICE_UUID.to_string(),
+            is_operator: true,
+            respond_to: resp_tx,
+        };
+
+        handle_cli_message(&mut store, msg).await.expect("handler ok");
+        let result = resp_rx.await.expect("response received");
+        assert!(result.is_ok(), "SetOperator by known UUID should succeed: {:?}", result);
+
+        let user = store.users.get(ALICE_UUID).expect("user still present");
+        assert_eq!(
+            user.username, "Alice",
+            "username must NOT be overwritten with the UUID string"
+        );
+        assert!(user.operator, "operator flag should be set to true");
+    }
+
+    #[tokio::test]
+    async fn set_operator_by_unknown_uuid_is_rejected() {
+        // No pre-existing user. Typing an unknown UUID must be a hard error
+        // rather than fabricating a phantom record.
+        let (bot_tx, _bot_rx) = mpsc::channel::<BotInstruction>(16);
+        let mut store = Store::new_for_test(
+            bot_tx,
+            test_config(),
+            HashMap::new(),
+            HashMap::new(),
+            crate::types::Storage::default(),
+        );
+
+        let (resp_tx, resp_rx) = oneshot::channel::<Result<(), String>>();
+        let msg = CliMessage::SetOperator {
+            username_or_uuid: ALICE_UUID.to_string(),
+            is_operator: true,
+            respond_to: resp_tx,
+        };
+
+        handle_cli_message(&mut store, msg).await.expect("handler ok");
+        let result = resp_rx.await.expect("response received");
+        assert!(result.is_err(), "unknown UUID must be rejected");
+        assert!(
+            !store.users.contains_key(ALICE_UUID),
+            "no phantom record should be created for an unknown UUID"
+        );
     }
 }

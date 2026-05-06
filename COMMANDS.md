@@ -95,7 +95,14 @@ rather than killing the CLI.
 
 1. **Get user balances** — list all users + balances.
 2. **Get pairs** — all pairs with stock, reserve, calculated buy/sell.
-3. **Set operator status** — prompt for username/UUID, toggle `operator`.
+3. **Set operator status** — prompt for username or UUID, then a
+   `dialoguer::Confirm` for both grant AND revoke (parity with the chat
+   variant); negative confirm prints `Cancelled.` and bails. Username
+   inputs are resolved via Mojang and the user record is auto-created if
+   missing. UUID inputs (canonical 36-char hyphenated or bare 32-char hex)
+   only succeed for users already known to the store; an unknown UUID is
+   rejected with `unknown UUID — grant operator by username instead, or
+   pre-onboard the user first` rather than fabricating a phantom record.
 4. **Add node (no validation)** — writes model-only; operator must ensure
    the physical node exists.
 5. **Add node (with bot validation)** — bot navigates, opens all 4 chests
@@ -108,7 +115,14 @@ rather than killing the CLI.
 7. **Remove node** — deletes `data/storage/{id}.json`. Destructive; a
    `dialoguer::Confirm` prompt asks for confirmation before proceeding.
 8. **Add pair** — prompts for item + stack size {1, 16, 64}. Stocks start
-   zero; seed via `additem` / `addcurrency`.
+   zero; seed via `additem` / `addcurrency`. The reserved chest sentinels
+   `OVERFLOW_CHEST_ITEM` (`overflow`) and `BASE_CURRENCY_ITEM` (`diamond`)
+   are rejected after `ItemId::new` normalization with `'<name>' is a
+   reserved chest sentinel and cannot be a tradeable pair`, so case /
+   `minecraft:` prefix variants all hit the same gate (`overflow` would
+   let pair-stock recompute fold the sentinel chest into a real pair's
+   stock; a duplicate `diamond` pair would invalidate node 0's
+   forced-diamond invariant).
 9. **Remove pair** — warns if stock > 0. Cannot remove `diamond`.
    Destructive; a `dialoguer::Confirm` prompt asks for confirmation
    before proceeding.

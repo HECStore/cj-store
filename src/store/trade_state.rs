@@ -17,8 +17,18 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+/// Per-process disambiguator for archived crash-evidence filenames.
+///
+/// Two archive operations colliding on the same `unix_ms` (or both falling
+/// back to `unwrap_or(0)` from a clock error) would otherwise produce the
+/// same path and `fs::rename` would silently overwrite the older artifact —
+/// destroying exactly the crash evidence these helpers exist to preserve.
+/// A monotonically-bumped suffix keeps each archive distinct within one run.
+static ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::messages::TradeItem;
 use crate::store::queue::QueuedOrder;
@@ -346,15 +356,93 @@ fn persist_to(path: &Path, state: &TradeState) -> io::Result<()> {
 
 /// Path-parameterized load, separated so tests can round-trip without
 /// touching the production `TRADE_STATE_FILE`.
+///
+/// On a parse error or a non-NotFound IO error, the offending file is
+/// quarantined to a sibling `current_trade.unreadable-{unix_ms}.json`
+/// (mirroring `Journal::load_from`'s preservation policy: the trade-state
+/// file is the highest-stakes piece of crash evidence in the system, so a
+/// silent overwrite by the next `persist()` would destroy forensic data).
+/// On successful quarantine we return `Ok(None)` so the bot can boot; only
+/// a quarantine failure surfaces as `Err`.
 fn load_persisted_from(path: &Path) -> io::Result<Option<TradeState>> {
     match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let state: TradeState = serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(Some(state))
-        }
+        Ok(content) => match serde_json::from_str::<TradeState>(&content) {
+            Ok(state) => Ok(Some(state)),
+            Err(parse_err) => {
+                tracing::warn!(
+                    "[TradeState] failed to parse trade-state file {:?}: {parse_err} - attempting to quarantine before falling back to empty state",
+                    path
+                );
+                match quarantine_unreadable_to(path) {
+                    Ok(archived) => {
+                        tracing::error!(
+                            "[TradeState] quarantined unreadable trade-state to {:?} - preserve for operator review",
+                            archived
+                        );
+                        Ok(None)
+                    }
+                    Err(rename_err) => {
+                        tracing::error!(
+                            "[TradeState] could not quarantine unreadable trade-state {:?}: {rename_err}",
+                            path
+                        );
+                        Err(io::Error::new(io::ErrorKind::InvalidData, parse_err))
+                    }
+                }
+            }
+        },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+        Err(read_err) => {
+            tracing::warn!(
+                "[TradeState] failed to read trade-state file {:?}: {read_err} - attempting to quarantine before falling back to empty state",
+                path
+            );
+            match quarantine_unreadable_to(path) {
+                Ok(archived) => {
+                    tracing::error!(
+                        "[TradeState] quarantined unreadable trade-state to {:?} - preserve for operator review",
+                        archived
+                    );
+                    Ok(None)
+                }
+                Err(rename_err) => {
+                    tracing::error!(
+                        "[TradeState] could not quarantine unreadable trade-state {:?}: {rename_err} - returning original read error so caller is aware",
+                        path
+                    );
+                    Err(read_err)
+                }
+            }
+        }
+    }
+}
+
+/// Move an unreadable trade-state file aside to a timestamped sibling so the
+/// active path is free for a fresh persist without clobbering the original.
+///
+/// Used by [`load_persisted_from`] when the file is present but `read_to_string`
+/// fails (transient IO: AV scanner hold, lost handle, permission flap) or
+/// `serde_json::from_str` cannot parse the contents. Mirrors
+/// [`archive_persisted_to`]'s rename → copy+remove fallback for cross-device
+/// or held-handle cases. Returns the archived path on success so callers can
+/// log it.
+fn quarantine_unreadable_to(path: &Path) -> io::Result<std::path::PathBuf> {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let archived = match path.parent() {
+        Some(parent) => parent.join(format!("current_trade.unreadable-{unix_ms}-{seq}.json")),
+        None => std::path::PathBuf::from(format!("current_trade.unreadable-{unix_ms}-{seq}.json")),
+    };
+    match std::fs::rename(path, &archived) {
+        Ok(()) => Ok(archived),
+        Err(_) => {
+            std::fs::copy(path, &archived)?;
+            std::fs::remove_file(path)?;
+            Ok(archived)
+        }
     }
 }
 
@@ -376,9 +464,10 @@ pub fn archive_persisted_to(path: &Path) -> io::Result<std::path::PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let archived = match path.parent() {
-        Some(parent) => parent.join(format!("current_trade.leftover-{unix_ms}.json")),
-        None => std::path::PathBuf::from(format!("current_trade.leftover-{unix_ms}.json")),
+        Some(parent) => parent.join(format!("current_trade.leftover-{unix_ms}-{seq}.json")),
+        None => std::path::PathBuf::from(format!("current_trade.leftover-{unix_ms}-{seq}.json")),
     };
     match std::fs::rename(path, &archived) {
         Ok(()) => Ok(archived),
@@ -862,6 +951,47 @@ mod tests {
     }
 
     #[test]
+    fn archive_persisted_disambiguates_rapid_successive_calls() {
+        // Two archive operations colliding on the same unix_ms (or both falling
+        // back to unwrap_or(0) from a clock error) must not clobber each other:
+        // the per-process SEQ counter is what guarantees distinct paths.
+        let dir = TmpDir::new("archive-seq");
+        let path = dir.path("current_trade.json");
+
+        std::fs::write(&path, "alpha").unwrap();
+        let archived1 = archive_persisted_to(&path).expect("first archive");
+
+        std::fs::write(&path, "beta").unwrap();
+        let archived2 = archive_persisted_to(&path).expect("second archive");
+
+        assert_ne!(archived1, archived2, "archive paths must differ");
+        assert!(archived1.exists(), "first archive must still exist");
+        assert!(archived2.exists(), "second archive must exist");
+        assert_eq!(std::fs::read_to_string(&archived1).unwrap(), "alpha");
+        assert_eq!(std::fs::read_to_string(&archived2).unwrap(), "beta");
+    }
+
+    #[test]
+    fn quarantine_unreadable_disambiguates_rapid_successive_calls() {
+        // Same disambiguator contract for the quarantine path: two unreadable
+        // events in the same millisecond must each produce their own archive.
+        let dir = TmpDir::new("quarantine-seq");
+        let path = dir.path("current_trade.json");
+
+        std::fs::write(&path, "first-unreadable").unwrap();
+        let archived1 = quarantine_unreadable_to(&path).expect("first quarantine");
+
+        std::fs::write(&path, "second-unreadable").unwrap();
+        let archived2 = quarantine_unreadable_to(&path).expect("second quarantine");
+
+        assert_ne!(archived1, archived2, "quarantine paths must differ");
+        assert!(archived1.exists(), "first quarantine must still exist");
+        assert!(archived2.exists(), "second quarantine must exist");
+        assert_eq!(std::fs::read_to_string(&archived1).unwrap(), "first-unreadable");
+        assert_eq!(std::fs::read_to_string(&archived2).unwrap(), "second-unreadable");
+    }
+
+    #[test]
     fn load_from_missing_file_returns_none() {
         let dir = TmpDir::new("missing");
         let path = dir.path("absent.json");
@@ -869,11 +999,52 @@ mod tests {
     }
 
     #[test]
-    fn load_from_malformed_json_returns_err() {
+    fn load_from_malformed_json_quarantines_file() {
+        // A corrupt trade-state file at startup is the highest-stakes piece
+        // of crash evidence in the system; a parse error must NOT propagate
+        // an Err that the caller logs as a warning while leaving the file in
+        // place — the next `persist()` would overwrite it and destroy the
+        // forensic record. Instead, the file is renamed to a timestamped
+        // sibling and the load returns Ok(None) so the bot can boot. Mirrors
+        // `Journal::load_from`'s quarantine_unreadable contract.
         let dir = TmpDir::new("malformed");
         let path = dir.path("current_trade.json");
-        std::fs::write(&path, "{ this is not json").unwrap();
-        let err = load_persisted_from(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let payload = "{ this is not json";
+        std::fs::write(&path, payload).unwrap();
+
+        // (a) Successful quarantine returns Ok(None).
+        assert!(
+            load_persisted_from(&path)
+                .expect("malformed file should be quarantined, not propagated as Err")
+                .is_none(),
+            "after quarantine, load must return Ok(None) so the bot can boot"
+        );
+
+        // (b) The active path is gone (the next persist gets a clean slate).
+        assert!(
+            !path.exists(),
+            "active path must be freed after quarantine"
+        );
+
+        // (c) A sibling current_trade.unreadable-*.json exists with the
+        //     original payload byte-for-byte.
+        let parent = path.parent().expect("path must have a parent");
+        let mut quarantined: Option<std::path::PathBuf> = None;
+        for entry in std::fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("current_trade.unreadable-") && name.ends_with(".json") {
+                quarantined = Some(entry.path());
+                break;
+            }
+        }
+        let quarantined = quarantined.expect(
+            "a sibling current_trade.unreadable-*.json must exist after quarantine",
+        );
+        let archived_payload = std::fs::read_to_string(&quarantined).expect("read archived");
+        assert_eq!(
+            archived_payload, payload,
+            "archived payload must match the original byte-for-byte"
+        );
     }
 }

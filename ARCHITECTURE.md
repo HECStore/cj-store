@@ -151,7 +151,9 @@ through the handler chain.
          └────── (quick-reply commands     │
                   like balance/price/items │
                   return inline)           ▼
-                                   later pop -> execute_queued_order
+                                   later peek_front -> persist
+                                   trade-state mirror -> pop_committed ->
+                                   execute_queued_order
                                               (src/store/orders.rs)
 ```
 
@@ -206,8 +208,10 @@ file: its presence means the previous run crashed mid-trade.
 
 **Today** the startup behavior is *log-and-archive*: the leftover state
 is written to the log and the file is renamed aside to a timestamped
-`data/current_trade.leftover-<unix-millis>.json` sibling (mirroring the
-journal's leftover-archive behavior — see § 2 of
+`data/current_trade.leftover-<unix-millis>-<seq>.json` sibling (the
+`<seq>` is a per-process atomic counter that disambiguates same-ms /
+clock-fallback collisions so back-to-back archives never clobber each
+other; mirroring the journal's leftover-archive behavior — see § 2 of
 [RECOVERY.md](RECOVERY.md#2-stuck-datajournaljson-entry)) so the
 crash evidence survives subsequent restarts; the active path is then
 free and the Store starts fresh. Physical chests and the ledger may be
@@ -261,11 +265,13 @@ code path. See [src/store/journal.rs](src/store/journal.rs).
 
 Every state change atomically rewrites `data/journal.json`. On startup the
 Store reads any leftover entry, logs it at error level as a diagnostic,
-and renames the file to `data/journal.leftover-<unix-millis>.json` so
+and renames the file to `data/journal.leftover-<unix-millis>-<seq>.json` so
 the in-flight evidence is preserved for operator review (rather than
 silently overwritten). If the file is unreadable on load, it is similarly
-quarantined to `data/journal.unreadable-<unix-millis>.json` and the bot
-continues with a fresh empty journal. Automatic replay of partial
+quarantined to `data/journal.unreadable-<unix-millis>-<seq>.json` and the bot
+continues with a fresh empty journal. The `<seq>` is a per-process atomic
+counter so two rapid-succession archives produce distinct files even when
+their unix-millis timestamps collide. Automatic replay of partial
 shulker ops is
 [planned](#planned-automatic-crash-resume) but not yet implemented; today
 the operator works through [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-entry).

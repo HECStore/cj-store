@@ -19,7 +19,7 @@ existing file.
 | `data/users/<uuid>.json`         | `Store.users`         | on deposit / withdraw / pay + debounced autosave | created on first observe  | No         |
 | `data/storage/<node_id>.json`    | `Store.storage`       | on every `apply_chest_sync` + debounced autosave | ≥1 before first trade     | No         |
 | `data/orders.json`               | `Store.orders`        | on debounced autosave (cleared at startup)       | runtime-created           | No         |
-| `data/queue.json`                | `Store.order_queue`   | on every push / pop (survives restart)           | runtime-created           | No         |
+| `data/queue.json`                | `Store.order_queue`   | on every add / pop_committed / cancel (each save runs BEFORE the in-memory mutation it commits, with rollback on save failure; survives restart) | runtime-created           | No         |
 | `data/journal.json`              | `Journal` (chest I/O) | on every shulker-op phase change                 | runtime-created           | No         |
 | `data/current_trade.json`        | `Store.current_trade` | on every `TradeState` transition                 | runtime-created           | No         |
 | `data/trades/<timestamp>.json`   | `Store.trades`        | once per committed trade (immutable thereafter)  | runtime-created           | No         |
@@ -170,7 +170,15 @@ One file per known player. Filename is the hyphenated Mojang UUID. See
 ```
 
 - `username` is the *last-seen* name — it can change if the player renames
-  on Mojang, and the bot updates it on next sighting.
+  on Mojang, and the bot updates it on next sighting. The invariant
+  "`User.username` is never UUID-shaped" is enforced once for all callers
+  at the live-map mutation boundary in `store::utils::ensure_user_exists`:
+  the drift branch checks the proposed username via
+  `is_valid_uuid_shape` and refuses to overwrite the stored name with a
+  32/36-char hex string. (The CLI `SetOperator` handler routes UUID
+  inputs around the drift branch by passing the existing user's stored
+  username; this gate is a defense-in-depth backstop against a future
+  caller forgetting to do that.)
 - `balance` is measured in diamonds. Negative balances are not permitted;
   withdraw/pay handlers reject when the result would go below zero.
 - `operator: true` unlocks `additem` / `removeitem` / `addcurrency` /
@@ -294,6 +302,27 @@ Pending orders waiting to be processed. Survives restarts. See
   variants on top of plain `"Buy"` / `"Sell"`.
 - `queued_at` is RFC 3339 UTC.
 - Length capped by `MAX_QUEUE_SIZE = 128` globally; 8 per user.
+- Persistence is rollback-safe on every mutation:
+  - `OrderQueue::add` pushes to the in-memory `VecDeque` and saves; on
+    save failure the push is rolled back via `pop_back` (`next_id` is
+    deliberately NOT decremented — the id may already have appeared in
+    log lines or been quoted to the player on a prior attempt) and the
+    caller receives `Queue temporarily unavailable, please retry.`
+    which the buy/sell/deposit/withdraw handlers surface to the player.
+  - `OrderQueue::pop_committed(order_id)` writes a "queue minus the
+    head" projection FIRST and only then drops the front order from
+    the in-memory `VecDeque` — closing the crash window the older
+    "pop then save with rollback" pattern still had on a failed
+    write. Verifies the front id matches `order_id` before doing any
+    work. `OrderQueue::peek_front` lets callers inspect without
+    mutating; the legacy in-memory-only `pop` survives only as a
+    `#[cfg(test)]` helper. `Store::process_next_order` is the sole
+    production caller and the order is `peek_front → persist Queued
+    TradeState mirror → pop_committed`.
+  - `OrderQueue::cancel` removes the order from the in-memory queue and
+    saves; on save failure the order is re-inserted at its original
+    position and the caller receives `Cancellation failed to persist;
+    please retry.` (routed to the player by `handlers/info.rs`).
 - On corrupt-JSON load (`InvalidData`), `OrderQueue::load_from` renames the
   bad file to `data/queue.json.corrupt-<stamp>` before starting with an
   empty queue, so the raw bytes survive for forensic recovery instead of
@@ -313,11 +342,13 @@ Historically serialized as a one-entry array for forward compatibility;
 `load_from` reads a `Vec<JournalEntry>` and keeps only the last.
 
 On startup, a non-empty journal is renamed aside to
-`data/journal.leftover-<unix-millis>.json` for operator review (so the
+`data/journal.leftover-<unix-millis>-<seq>.json` for operator review (so the
 in-flight evidence is preserved across the next persist). An unreadable
 journal is similarly quarantined to
-`data/journal.unreadable-<unix-millis>.json` and the bot continues with
-an empty journal. See [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-entry).
+`data/journal.unreadable-<unix-millis>-<seq>.json` and the bot continues with
+an empty journal. `<seq>` is a per-process atomic counter that
+disambiguates archives produced in the same millisecond (or against a
+non-monotonic clock fallback) so neither file overwrites a sibling. See [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-entry).
 
 ```json
 [
@@ -340,10 +371,16 @@ an empty journal. See [RECOVERY.md § 2](RECOVERY.md#2-stuck-datajournaljson-ent
 In-flight `TradeState` snapshot, rewritten on every phase transition and
 deleted on terminal state. Any non-empty file at startup means a mid-trade
 crash; `Store::new` then renames it aside to a timestamped sibling
-`data/current_trade.leftover-<unix-millis>.json` (mirroring the
-`data/journal.leftover-*.json` pattern) so the crash evidence is
-preserved for operator review while the active path is freed for the
-next trade. See [src/store/trade_state.rs](src/store/trade_state.rs).
+`data/current_trade.leftover-<unix-millis>-<seq>.json` (mirroring the
+`data/journal.leftover-*.json` pattern; `<seq>` is a per-process atomic
+disambiguator that prevents same-ms collisions from clobbering each
+other) so the crash evidence is preserved for operator review while
+the active path is freed for the next trade. A subsequent load that
+encounters an unreadable file (parse error or non-NotFound IO error) is
+similarly quarantined to
+`data/current_trade.unreadable-<unix-millis>-<seq>.json` and the Store
+boots with no active trade. See
+[src/store/trade_state.rs](src/store/trade_state.rs).
 
 The file holds one `TradeState` serialized as an externally-tagged enum —
 shape differs by variant. Two examples matter most for recovery:

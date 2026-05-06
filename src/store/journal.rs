@@ -106,6 +106,15 @@ impl Default for Journal {
 /// unique within a run for logging/correlation.
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Per-process disambiguator for archived crash-evidence filenames.
+///
+/// Two archive operations colliding on the same `unix_ms` (or both falling
+/// back to `unwrap_or(0)` from a clock error) would otherwise produce the
+/// same path and `fs::rename` would silently overwrite the older artifact —
+/// destroying exactly the crash evidence these helpers exist to preserve.
+/// A monotonically-bumped suffix keeps each archive distinct within one run.
+static ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl Journal {
     /// Load the journal from disk, returning `(journal, leftover)`.
     ///
@@ -218,9 +227,10 @@ impl Journal {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
+        let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
         let archived = match self.path.parent() {
-            Some(parent) => parent.join(format!("journal.leftover-{unix_ms}.json")),
-            None => std::path::PathBuf::from(format!("journal.leftover-{unix_ms}.json")),
+            Some(parent) => parent.join(format!("journal.leftover-{unix_ms}-{seq}.json")),
+            None => std::path::PathBuf::from(format!("journal.leftover-{unix_ms}-{seq}.json")),
         };
         match fs::rename(&self.path, &archived) {
             Ok(()) => Ok(archived),
@@ -245,9 +255,10 @@ impl Journal {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
+        let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
         let archived = match path.parent() {
-            Some(parent) => parent.join(format!("journal.unreadable-{unix_ms}.json")),
-            None => PathBuf::from(format!("journal.unreadable-{unix_ms}.json")),
+            Some(parent) => parent.join(format!("journal.unreadable-{unix_ms}-{seq}.json")),
+            None => PathBuf::from(format!("journal.unreadable-{unix_ms}-{seq}.json")),
         };
         match fs::rename(path, &archived) {
             Ok(()) => Ok(archived),
@@ -492,6 +503,65 @@ mod tests {
 
         j.complete().unwrap();
         assert!(j.current().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_leftover_disambiguates_rapid_successive_calls() {
+        // Two archive operations colliding on the same unix_ms (or both falling
+        // back to unwrap_or(0) from a clock error) must not clobber each other:
+        // the per-process SEQ counter is what guarantees distinct paths.
+        let dir = std::env::temp_dir().join(format!(
+            "cj-store-journal-archive-seq-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.json");
+
+        // First archive: distinct payload "alpha".
+        std::fs::write(&path, "alpha").unwrap();
+        let j1 = Journal { entry: None, path: path.clone() };
+        let archived1 = j1.archive_leftover().expect("first archive");
+
+        // Second archive: distinct payload "beta", in rapid succession.
+        std::fs::write(&path, "beta").unwrap();
+        let j2 = Journal { entry: None, path: path.clone() };
+        let archived2 = j2.archive_leftover().expect("second archive");
+
+        assert_ne!(archived1, archived2, "archive paths must differ");
+        assert!(archived1.exists(), "first archive must still exist");
+        assert!(archived2.exists(), "second archive must exist");
+        assert_eq!(std::fs::read_to_string(&archived1).unwrap(), "alpha");
+        assert_eq!(std::fs::read_to_string(&archived2).unwrap(), "beta");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_unreadable_disambiguates_rapid_successive_calls() {
+        // Same disambiguator contract for the quarantine path: two unreadable
+        // events in the same millisecond must each produce their own archive.
+        let dir = std::env::temp_dir().join(format!(
+            "cj-store-journal-quarantine-seq-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.json");
+
+        std::fs::write(&path, "first-unreadable").unwrap();
+        let archived1 = Journal::quarantine_unreadable(&path).expect("first quarantine");
+
+        std::fs::write(&path, "second-unreadable").unwrap();
+        let archived2 = Journal::quarantine_unreadable(&path).expect("second quarantine");
+
+        assert_ne!(archived1, archived2, "quarantine paths must differ");
+        assert!(archived1.exists(), "first quarantine must still exist");
+        assert!(archived2.exists(), "second quarantine must exist");
+        assert_eq!(std::fs::read_to_string(&archived1).unwrap(), "first-unreadable");
+        assert_eq!(std::fs::read_to_string(&archived2).unwrap(), "second-unreadable");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

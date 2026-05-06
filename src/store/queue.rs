@@ -182,6 +182,20 @@ impl OrderQueue {
         item: String,
         quantity: u32,
     ) -> Result<(u64, usize), String> {
+        self.add_at_path(user_uuid, username, order_type, item, quantity, Path::new(QUEUE_FILE))
+    }
+
+    /// Path-parameterized enqueue, separated so tests can simulate a save
+    /// failure without touching the production `QUEUE_FILE`.
+    fn add_at_path(
+        &mut self,
+        user_uuid: String,
+        username: String,
+        order_type: QueuedOrderType,
+        item: String,
+        quantity: u32,
+        path: &Path,
+    ) -> Result<(u64, usize), String> {
         // Global backpressure. MAX_ORDERS_PER_USER alone is not enough — a
         // coordinated burst of distinct users could still blow the queue past
         // any memory or latency budget.
@@ -223,9 +237,19 @@ impl OrderQueue {
 
         let position = self.orders.len();
 
-        // Persist on every mutation so an unexpected shutdown never loses a queued order.
-        if let Err(e) = self.save() {
-            error!("[Queue] Failed to persist after adding order #{}: {}", id, e);
+        // Persist on every mutation so an unexpected shutdown never loses a
+        // queued order. If the save fails, roll back the in-memory push so we
+        // don't return a "queued" confirmation for an order that won't survive
+        // a restart. We deliberately do NOT decrement `next_id`: the ID may
+        // already have been emitted in info!() logs / quoted to the player on
+        // a prior attempt, and burning the ID is safer than reusing it.
+        if let Err(e) = self.save_to(path) {
+            error!(
+                "[Queue] Failed to persist after adding order #{}: {} (rolling back)",
+                id, e
+            );
+            self.orders.pop_back();
+            return Err("Queue temporarily unavailable, please retry.".to_string());
         }
 
         info!(
@@ -235,6 +259,11 @@ impl OrderQueue {
         Ok((id, position))
     }
 
+    /// Legacy in-memory-only pop kept for the existing
+    /// `add_then_pop_returns_same_order_and_empties_queue` test. Production
+    /// code uses [`pop_committed`] (and [`peek_front`]) so the on-disk view
+    /// is always consistent with the in-memory queue.
+    #[cfg(test)]
     pub fn pop(&mut self) -> Option<QueuedOrder> {
         let order = self.orders.pop_front();
 
@@ -243,12 +272,90 @@ impl OrderQueue {
                 "[Queue] Popped order #{}: {} for {} (remaining: {})",
                 o.id, o.description(), o.username, self.orders.len()
             );
-            if let Err(e) = self.save() {
-                error!("[Queue] Failed to persist after popping order #{}: {}", o.id, e);
-            }
         }
 
         order
+    }
+
+    /// Borrow the front order without removing it.
+    ///
+    /// Used by `Store::process_next_order` to inspect the next order so the
+    /// trade-state mirror can be persisted BEFORE the order is dropped from
+    /// `queue.json`. See `pop_committed` for the second half of the handover.
+    pub fn peek_front(&self) -> Option<&QueuedOrder> {
+        self.orders.front()
+    }
+
+    /// Persist-then-pop variant of [`pop`] used by the queue→trade-state
+    /// handover. Verifies the front order's id still matches `order_id`,
+    /// writes the new (popped) queue to disk, and only then removes the
+    /// order from the in-memory `VecDeque`.
+    ///
+    /// Order matters: saving FIRST and popping in-memory SECOND closes the
+    /// in-memory-vs-disk divergence window the simpler "pop then save with
+    /// rollback" pattern still has on a failed write — the same defect the
+    /// `add_at_path` rollback path already mitigates.
+    pub fn pop_committed(&mut self, order_id: u64) -> Result<QueuedOrder, String> {
+        self.pop_committed_at_path(order_id, Path::new(QUEUE_FILE))
+    }
+
+    /// Path-parameterized form of [`pop_committed`], separated so tests can
+    /// simulate a save failure without touching the production `QUEUE_FILE`.
+    fn pop_committed_at_path(
+        &mut self,
+        order_id: u64,
+        path: &Path,
+    ) -> Result<QueuedOrder, String> {
+        let front = match self.orders.front() {
+            Some(o) => o,
+            None => {
+                warn!(
+                    "[Queue] pop_committed(#{}) called on empty queue",
+                    order_id
+                );
+                return Err("queue head changed: queue is empty".to_string());
+            }
+        };
+
+        if front.id != order_id {
+            warn!(
+                "[Queue] pop_committed(#{}) but front is now #{} — queue head changed",
+                order_id, front.id
+            );
+            return Err(format!(
+                "queue head changed: expected #{}, found #{}",
+                order_id, front.id
+            ));
+        }
+
+        // Clone front so we can save a "queue without it" view BEFORE mutating
+        // the in-memory `VecDeque`. On save failure the in-memory state is
+        // untouched, which means a retry on the next tick is a clean re-run.
+        let cloned = front.clone();
+
+        let projected = QueuePersist {
+            orders: self.orders.iter().skip(1).cloned().collect(),
+            next_id: self.next_id,
+        };
+        let json = serde_json::to_string_pretty(&projected)
+            .map_err(|e| format!("failed to serialize queue: {}", e))?;
+        if let Err(e) = write_atomic(path, &json) {
+            error!(
+                "[Queue] Failed to persist queue after popping order #{}: {} (leaving in queue for retry)",
+                order_id, e
+            );
+            return Err(format!("failed to persist queue after pop: {}", e));
+        }
+
+        // Save succeeded — now remove from the in-memory queue. This cannot
+        // fail (we already verified `front` is `Some`).
+        let popped = self.orders.pop_front().expect("front was Some above");
+        debug_assert_eq!(popped.id, cloned.id);
+        debug!(
+            "[Queue] Committed pop of order #{}: {} for {} (remaining: {})",
+            popped.id, popped.description(), popped.username, self.orders.len()
+        );
+        Ok(popped)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -293,6 +400,21 @@ impl OrderQueue {
     /// the order is missing or owned by another user (kept distinct in logs
     /// so operators can tell misuse from a stale client).
     pub fn cancel(&mut self, user_uuid: &str, order_id: u64) -> Result<(), String> {
+        self.cancel_at_path(user_uuid, order_id, Path::new(QUEUE_FILE))
+    }
+
+    /// Path-parameterized cancel, separated so tests can simulate a save
+    /// failure without touching the production `QUEUE_FILE`. On save error
+    /// we re-insert the removed order at its original position so the
+    /// in-memory queue stays consistent with the on-disk view — otherwise
+    /// the player would see a "cancelled" reply for an order that the next
+    /// restart would silently resurrect and process.
+    fn cancel_at_path(
+        &mut self,
+        user_uuid: &str,
+        order_id: u64,
+        path: &Path,
+    ) -> Result<(), String> {
         let position = self
             .orders
             .iter()
@@ -300,18 +422,25 @@ impl OrderQueue {
 
         match position {
             Some(pos) => {
-                let order = self.orders.remove(pos).unwrap();
-                info!(
-                    "[Queue] Order #{} cancelled by uuid={} (was: {}, position {})",
-                    order_id, user_uuid, order.description(), pos + 1
-                );
+                let order = self
+                    .orders
+                    .remove(pos)
+                    .expect("position just verified above");
+                let description = order.description();
 
-                if let Err(e) = self.save() {
+                if let Err(e) = self.save_to(path) {
                     error!(
-                        "[Queue] Failed to persist after cancelling order #{}: {}",
+                        "[Queue] Failed to persist after cancelling order #{}: {} (rolling back)",
                         order_id, e
                     );
+                    self.orders.insert(pos, order);
+                    return Err("Cancellation failed to persist; please retry.".to_string());
                 }
+
+                info!(
+                    "[Queue] Order #{} cancelled by uuid={} (was: {}, position {})",
+                    order_id, user_uuid, description, pos + 1
+                );
 
                 Ok(())
             }
@@ -390,19 +519,40 @@ mod tests {
         }
     }
 
+    /// Test-only `add` helper that routes the persistence path to a
+    /// per-test scratch directory rather than the production `QUEUE_FILE`.
+    /// Without this, parallel tests race on `data/queue.json.tmp`/`.bak`
+    /// and trip over each other's writes.
+    fn add_to(
+        queue: &mut OrderQueue,
+        path: &Path,
+        user_uuid: &str,
+        username: &str,
+        order_type: QueuedOrderType,
+        item: &str,
+        quantity: u32,
+    ) -> Result<(u64, usize), String> {
+        queue.add_at_path(
+            user_uuid.to_string(),
+            username.to_string(),
+            order_type,
+            item.to_string(),
+            quantity,
+            path,
+        )
+    }
+
     #[test]
     fn add_then_pop_returns_same_order_and_empties_queue() {
+        let dir = TmpDir::new("add-then-pop");
+        let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
 
-        let (id, pos) = queue
-            .add(
-                "uuid1".to_string(),
-                "player1".to_string(),
-                QueuedOrderType::Buy,
-                "cobblestone".to_string(),
-                64,
-            )
-            .unwrap();
+        let (id, pos) = add_to(
+            &mut queue, &path,
+            "uuid1", "player1", QueuedOrderType::Buy, "cobblestone", 64,
+        )
+        .unwrap();
 
         assert_eq!(id, 1);
         assert_eq!(pos, 1);
@@ -416,65 +566,49 @@ mod tests {
 
     #[test]
     fn per_user_cap_rejects_ninth_order_but_other_users_unaffected() {
+        let dir = TmpDir::new("per-user-cap");
+        let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
 
         for i in 0..MAX_ORDERS_PER_USER {
-            queue
-                .add(
-                    "uuid1".to_string(),
-                    "player1".to_string(),
-                    QueuedOrderType::Buy,
-                    format!("item{}", i),
-                    64,
-                )
-                .expect("within per-user cap");
+            add_to(
+                &mut queue, &path,
+                "uuid1", "player1", QueuedOrderType::Buy, &format!("item{}", i), 64,
+            )
+            .expect("within per-user cap");
         }
 
-        let err = queue
-            .add(
-                "uuid1".to_string(),
-                "player1".to_string(),
-                QueuedOrderType::Buy,
-                "overflow".to_string(),
-                64,
-            )
-            .expect_err("per-user cap must reject");
+        let err = add_to(
+            &mut queue, &path,
+            "uuid1", "player1", QueuedOrderType::Buy, "overflow", 64,
+        )
+        .expect_err("per-user cap must reject");
         assert!(err.contains(&MAX_ORDERS_PER_USER.to_string()));
 
-        assert!(queue
-            .add(
-                "uuid2".to_string(),
-                "player2".to_string(),
-                QueuedOrderType::Buy,
-                "different_user".to_string(),
-                64,
-            )
-            .is_ok());
+        assert!(add_to(
+            &mut queue, &path,
+            "uuid2", "player2", QueuedOrderType::Buy, "different_user", 64,
+        )
+        .is_ok());
     }
 
     #[test]
     fn cancel_rejects_other_users_order_and_accepts_own() {
+        let dir = TmpDir::new("cancel-rejects");
+        let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
 
-        let (id1, _) = queue
-            .add(
-                "uuid1".to_string(),
-                "player1".to_string(),
-                QueuedOrderType::Buy,
-                "item1".to_string(),
-                64,
-            )
-            .unwrap();
+        let (id1, _) = add_to(
+            &mut queue, &path,
+            "uuid1", "player1", QueuedOrderType::Buy, "item1", 64,
+        )
+        .unwrap();
 
-        let (id2, _) = queue
-            .add(
-                "uuid2".to_string(),
-                "player2".to_string(),
-                QueuedOrderType::Buy,
-                "item2".to_string(),
-                64,
-            )
-            .unwrap();
+        let (id2, _) = add_to(
+            &mut queue, &path,
+            "uuid2", "player2", QueuedOrderType::Buy, "item2", 64,
+        )
+        .unwrap();
 
         assert!(queue.cancel("uuid1", id2).is_err());
         assert!(queue.cancel("uuid1", id1).is_ok());
@@ -490,45 +624,37 @@ mod tests {
 
     #[test]
     fn global_cap_rejects_even_fresh_users() {
+        let dir = TmpDir::new("global-cap");
+        let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
 
         for i in 0..MAX_QUEUE_SIZE {
-            queue
-                .add(
-                    format!("uuid-{}", i),
-                    format!("player-{}", i),
-                    QueuedOrderType::Buy,
-                    "cobblestone".to_string(),
-                    1,
-                )
-                .expect("within global cap");
+            add_to(
+                &mut queue, &path,
+                &format!("uuid-{}", i), &format!("player-{}", i),
+                QueuedOrderType::Buy, "cobblestone", 1,
+            )
+            .expect("within global cap");
         }
 
-        let err = queue
-            .add(
-                "uuid-overflow".to_string(),
-                "overflow-player".to_string(),
-                QueuedOrderType::Buy,
-                "cobblestone".to_string(),
-                1,
-            )
-            .expect_err("global cap must reject");
+        let err = add_to(
+            &mut queue, &path,
+            "uuid-overflow", "overflow-player", QueuedOrderType::Buy, "cobblestone", 1,
+        )
+        .expect_err("global cap must reject");
         assert!(err.contains("full"));
     }
 
     #[test]
     fn position_helpers_report_1_indexed_positions() {
+        let dir = TmpDir::new("position-helpers");
+        let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
 
-        queue
-            .add("uuid1".to_string(), "p1".to_string(), QueuedOrderType::Buy, "a".to_string(), 1)
-            .unwrap();
-        let (id2, _) = queue
-            .add("uuid2".to_string(), "p2".to_string(), QueuedOrderType::Buy, "b".to_string(), 1)
-            .unwrap();
-        queue
-            .add("uuid1".to_string(), "p1".to_string(), QueuedOrderType::Buy, "c".to_string(), 1)
-            .unwrap();
+        add_to(&mut queue, &path, "uuid1", "p1", QueuedOrderType::Buy, "a", 1).unwrap();
+        let (id2, _) =
+            add_to(&mut queue, &path, "uuid2", "p2", QueuedOrderType::Buy, "b", 1).unwrap();
+        add_to(&mut queue, &path, "uuid1", "p1", QueuedOrderType::Buy, "c", 1).unwrap();
 
         assert_eq!(queue.get_user_position("uuid1"), Some(1));
         assert_eq!(queue.get_user_position("uuid2"), Some(2));
@@ -538,10 +664,12 @@ mod tests {
 
     #[test]
     fn get_user_orders_returns_every_match_with_positions() {
+        let dir = TmpDir::new("get-user-orders");
+        let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
-        queue.add("a".into(), "pa".into(), QueuedOrderType::Buy, "x".into(), 1).unwrap();
-        queue.add("b".into(), "pb".into(), QueuedOrderType::Buy, "y".into(), 1).unwrap();
-        queue.add("a".into(), "pa".into(), QueuedOrderType::Sell, "z".into(), 2).unwrap();
+        add_to(&mut queue, &path, "a", "pa", QueuedOrderType::Buy, "x", 1).unwrap();
+        add_to(&mut queue, &path, "b", "pb", QueuedOrderType::Buy, "y", 1).unwrap();
+        add_to(&mut queue, &path, "a", "pa", QueuedOrderType::Sell, "z", 2).unwrap();
 
         let orders = queue.get_user_orders("a");
         assert_eq!(orders.len(), 2);
@@ -665,6 +793,203 @@ mod tests {
         fs::write(&path, "{ this is not json").unwrap();
         let err = OrderQueue::load_from(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn add_at_path_rolls_back_on_save_failure() {
+        // Simulate a save failure by pointing `add_at_path` at a destination
+        // whose parent is a regular file rather than a directory. The atomic
+        // write goes through `fs::create_dir_all` for the parent, which fails
+        // portably on Unix and Windows when the parent path is a file.
+        let dir = TmpDir::new("add-rollback");
+        let parent_as_file = dir.path("not-a-dir");
+        fs::write(&parent_as_file, "i am a file, not a directory").unwrap();
+        let dest = parent_as_file.join("queue.json");
+
+        let mut queue = OrderQueue::new();
+        let next_id_before = queue.next_id;
+        let len_before = queue.len();
+
+        let result = queue.add_at_path(
+            "uuid-rollback".to_string(),
+            "rollback-player".to_string(),
+            QueuedOrderType::Buy,
+            "diamond".to_string(),
+            1,
+            &dest,
+        );
+
+        // (a) add_at_path returns Err.
+        let err = result.expect_err("save failure must surface as Err");
+        assert!(
+            err.contains("retry"),
+            "user-facing error should suggest retry, got: {}",
+            err
+        );
+
+        // (b) queue.len() unchanged after the failed call (the push was
+        // rolled back via pop_back).
+        assert_eq!(queue.len(), len_before, "len must roll back on save failure");
+
+        // (c) queue.next_id is NOT rolled back: the ID may already have
+        // appeared in info!() logs / been quoted to the player on a prior
+        // attempt, so burning the ID (advancing once, then never reusing) is
+        // safer than reusing it for a future order.
+        assert_eq!(
+            queue.next_id,
+            next_id_before + 1,
+            "next_id must NOT be decremented on save failure (burned ID is safer than reuse)"
+        );
+    }
+
+    #[test]
+    fn pop_committed_save_failure_leaves_queue_intact() {
+        // Simulate a save failure by pointing `pop_committed_at_path` at a
+        // destination whose parent is a regular file rather than a directory.
+        // The atomic write goes through `fs::create_dir_all` for the parent,
+        // which fails portably on Unix and Windows when the parent is a file.
+        let dir = TmpDir::new("pop-committed-save-fail");
+        let parent_as_file = dir.path("not-a-dir");
+        fs::write(&parent_as_file, "i am a file, not a directory").unwrap();
+        let dest = parent_as_file.join("queue.json");
+
+        let mut queue = OrderQueue::new();
+        let writable = dir.path("queue.json");
+        let (id, _) = add_to(
+            &mut queue, &writable,
+            "uuid-stay", "stayplayer", QueuedOrderType::Buy, "diamond", 1,
+        )
+        .unwrap();
+
+        let len_before = queue.len();
+        let front_id_before = queue.peek_front().map(|o| o.id);
+
+        let err = queue
+            .pop_committed_at_path(id, &dest)
+            .expect_err("save failure must surface as Err");
+        assert!(
+            err.contains("persist") || err.contains("queue"),
+            "error should mention persistence/queue, got: {}",
+            err
+        );
+
+        assert_eq!(
+            queue.len(),
+            len_before,
+            "in-memory queue must be unchanged on save failure"
+        );
+        assert_eq!(
+            queue.peek_front().map(|o| o.id),
+            front_id_before,
+            "front order must be unchanged on save failure"
+        );
+    }
+
+    #[test]
+    fn pop_committed_id_mismatch_returns_err() {
+        let dir = TmpDir::new("pop-committed-id-mismatch");
+        let path = dir.path("queue.json");
+        let mut queue = OrderQueue::new();
+
+        let (id, _) = add_to(
+            &mut queue, &path,
+            "uuid-7", "player7", QueuedOrderType::Buy, "diamond", 1,
+        )
+        .unwrap();
+        assert_eq!(id, 1, "first add gets id 1; reusing variable name to avoid confusion");
+
+        // Pre-load id 7 by burning ids until next_id = 7. Cleanest path: just
+        // assert against a wrong id directly.
+        let wrong_id: u64 = 99;
+        assert_ne!(wrong_id, id, "test sanity: wrong_id must differ");
+
+        let len_before = queue.len();
+        let err = queue
+            .pop_committed_at_path(wrong_id, &path)
+            .expect_err("id mismatch must surface as Err");
+        assert!(
+            err.contains("queue head changed"),
+            "error should mention head change, got: {}",
+            err
+        );
+        assert_eq!(queue.len(), len_before, "queue length must be unchanged");
+    }
+
+    #[test]
+    fn peek_front_does_not_mutate() {
+        let dir = TmpDir::new("peek-front");
+        let path = dir.path("queue.json");
+        let mut queue = OrderQueue::new();
+
+        // Empty queue: peek returns None and stays empty.
+        assert!(queue.peek_front().is_none());
+        assert!(queue.is_empty());
+
+        let (id, _) = add_to(
+            &mut queue, &path,
+            "uuid-peek", "peekplayer", QueuedOrderType::Buy, "diamond", 3,
+        )
+        .unwrap();
+
+        let len_before = queue.len();
+        let peeked_id = queue.peek_front().expect("front present after add").id;
+        assert_eq!(peeked_id, id);
+        // Peek again — still there, length unchanged.
+        let peeked_id2 = queue.peek_front().expect("still present").id;
+        assert_eq!(peeked_id2, id);
+        assert_eq!(queue.len(), len_before);
+    }
+
+    #[test]
+    fn cancel_at_path_rolls_back_on_save_failure() {
+        // Simulate a save failure by pointing `cancel_at_path` at a destination
+        // whose parent is a regular file rather than a directory. The atomic
+        // write goes through `fs::create_dir_all` for the parent, which fails
+        // portably on Unix and Windows when the parent path is a file.
+        let dir = TmpDir::new("cancel-rollback");
+        let writable = dir.path("queue.json");
+        let parent_as_file = dir.path("not-a-dir");
+        fs::write(&parent_as_file, "i am a file, not a directory").unwrap();
+        let dest = parent_as_file.join("queue.json");
+
+        let mut queue = OrderQueue::new();
+
+        // Pre-load two orders so we can verify the rollback restores the
+        // original front position (not just the count).
+        let (id1, _) = add_to(
+            &mut queue, &writable,
+            "uuid-cancel", "cancelplayer", QueuedOrderType::Buy, "diamond", 1,
+        )
+        .unwrap();
+        add_to(
+            &mut queue, &writable,
+            "uuid-cancel", "cancelplayer", QueuedOrderType::Sell, "iron", 2,
+        )
+        .unwrap();
+
+        let len_before = queue.len();
+        let front_id_before = queue.peek_front().map(|o| o.id);
+
+        // (a) the call returns Err.
+        let err = queue
+            .cancel_at_path("uuid-cancel", id1, &dest)
+            .expect_err("save failure must surface as Err");
+        assert!(
+            err.contains("retry"),
+            "user-facing error should suggest retry, got: {}",
+            err
+        );
+
+        // (b) queue.len() unchanged.
+        assert_eq!(queue.len(), len_before, "len must roll back on save failure");
+
+        // (c) front order id is the same as before — i.e. the rollback
+        // insert restored the original position, not just appended somewhere.
+        assert_eq!(
+            queue.peek_front().map(|o| o.id),
+            front_id_before,
+            "front order id must be restored to its original position on rollback"
+        );
     }
 
     #[test]

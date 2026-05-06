@@ -157,8 +157,10 @@ recovered). The usual async discipline — never hold the guard across
    trades load into memory on startup. Tune in config for large stores.
 8. **Interrupted-trade recovery is detection-only** — `current_trade.json`
    is mirrored at every phase. On startup the Store logs and archives it
-   aside to `data/current_trade.leftover-<unix-millis>.json` so the
-   crash evidence survives subsequent restarts; automatic re-queue/rollback
+   aside to `data/current_trade.leftover-<unix-millis>-<seq>.json` so the
+   crash evidence survives subsequent restarts (the `<seq>` is a
+   per-process atomic counter so same-ms archives don't clobber each
+   other); automatic re-queue/rollback
    is planned but not yet implemented (design sketch in
    [ARCHITECTURE.md § Planned: automatic crash-resume](ARCHITECTURE.md#planned-automatic-crash-resume);
    manual playbook in [RECOVERY.md § 4](RECOVERY.md#4-interrupted-datacurrent_tradejson)).

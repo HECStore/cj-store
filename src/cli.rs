@@ -818,6 +818,21 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
             .interact()
     }) == 1;
 
+    let verb = if is_operator { "GRANT" } else { "REVOKE" };
+    let confirmed = with_retry("Failed to read confirmation", || {
+        Confirm::new()
+            .with_prompt(format!(
+                "{verb} store-operator rights for '{}'?",
+                username_or_uuid
+            ))
+            .default(false)
+            .interact()
+    });
+    if !confirmed {
+        println!("Cancelled.");
+        return;
+    }
+
     info!("[CLI] Setting operator status for {} to {}", username_or_uuid, is_operator);
 
     let (response_tx, response_rx) = oneshot::channel();

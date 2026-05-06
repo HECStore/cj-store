@@ -512,9 +512,12 @@ pub async fn chat_task(
                         // wrapping this dispatch bails between iterations
                         // (or before the typing-delay sleep finishes), then
                         // mint a fresh token for subsequent dispatches so
-                        // they aren't born already-cancelled. The decision
-                        // log preserves the cost-audit signal even though
-                        // `record_composer` is skipped on the cancel path.
+                        // they aren't born already-cancelled. `run_loop`
+                        // returns a partial `ComposerRun` on cancel, so
+                        // `record_composer` and the tool-call counter
+                        // increments do run for tokens billed up to abort
+                        // — the decision log captures the cancel reason
+                        // alongside the regular `composer` cost-audit row.
                         info!("[Chat] bot disconnected; cancelling any in-flight composer");
                         if !composer_cancel.is_cancelled() {
                             composer_cancel.cancel();
@@ -925,55 +928,51 @@ pub async fn chat_task(
                         // concurrent-message policy). Priority order in the
                         // drain: most-recent direct-address > most-recent.
                         //
-                        // CHAT.md cancellation contract: race the dispatch
-                        // against `composer_cancel.cancelled()` so a
-                        // BotDisconnected or Shutdown signal aborts the
-                        // in-flight composer at the next iteration boundary.
-                        // The cancel arm does NOT save state here — the
-                        // Shutdown branch owns the save+ack flow — and does
-                        // NOT log the decision (the cancel originator does
-                        // that with the proper reason).
-                        let cancelled = composer_cancel.clone();
-                        let mut cancelled_during_live = false;
-                        tokio::select! {
-                            biased;
-                            _ = cancelled.cancelled() => {
-                                cancelled_during_live = true;
-                            }
-                            process_result = process_event(
-                                &event,
-                                &api_key,
-                                &config,
-                                &pricing,
-                                &mut runtime_state,
-                                &bot_username,
-                                &persona_body,
-                                &persona_nicknames,
-                                persona_lowercase_default,
-                                &common_words,
-                                &blocklist,
-                                &system_senders_re,
-                                &system_senders_exact,
-                                &moderation_patterns,
-                                &mut window,
-                                &mut classifier_counter,
-                                &mut spam_guard,
-                                &mut recent_speakers,
-                                &mut recent_bot_send_times,
-                                &mut last_bot_send_at,
-                                &in_critical_section,
-                                &bot_tx,
-                                &composer_limiter,
-                                &classifier_limiter,
-                                composer_cancel.clone(),
-                                &mut online_roster,
-                            ) => {
-                                if let Err(e) = process_result {
-                                    warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
-                                }
-                            }
+                        // CHAT.md cancellation contract: cancellation is
+                        // observed at the run_loop iteration boundary
+                        // (inside `composer::run_loop`) and around the
+                        // typing-delay sleep (inside `process_event`).
+                        // We do NOT race process_event in a `tokio::select!`
+                        // here — dropping the future at any await would
+                        // skip the post-call accounting that records
+                        // tokens billed up to abort against the daily
+                        // cap and bumps tool-call meters. The post-await
+                        // `is_cancelled()` check below replicates the old
+                        // "skip backlog drain" behavior without the drop
+                        // race.
+                        let process_result = process_event(
+                            &event,
+                            &api_key,
+                            &config,
+                            &pricing,
+                            &mut runtime_state,
+                            &bot_username,
+                            &persona_body,
+                            &persona_nicknames,
+                            persona_lowercase_default,
+                            &common_words,
+                            &blocklist,
+                            &system_senders_re,
+                            &system_senders_exact,
+                            &moderation_patterns,
+                            &mut window,
+                            &mut classifier_counter,
+                            &mut spam_guard,
+                            &mut recent_speakers,
+                            &mut recent_bot_send_times,
+                            &mut last_bot_send_at,
+                            &in_critical_section,
+                            &bot_tx,
+                            &composer_limiter,
+                            &classifier_limiter,
+                            composer_cancel.clone(),
+                            &mut online_roster,
+                        )
+                        .await;
+                        if let Err(e) = process_result {
+                            warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
                         }
-                        if cancelled_during_live {
+                        if composer_cancel.is_cancelled() {
                             // Skip the backlog drain — Shutdown is exiting,
                             // and BotDisconnected wants events from the
                             // post-disconnect window to be re-evaluated by
@@ -1019,47 +1018,45 @@ pub async fn chat_task(
                                 }
                                 window.push_back(backlog_ev.clone());
                             }
-                            let cancelled = composer_cancel.clone();
-                            let mut cancelled_during_backlog = false;
-                            tokio::select! {
-                                biased;
-                                _ = cancelled.cancelled() => {
-                                    cancelled_during_backlog = true;
-                                }
-                                backlog_result = process_event(
-                                    &backlog_ev,
-                                    &api_key,
-                                    &config,
-                                    &pricing,
-                                    &mut runtime_state,
-                                    &bot_username,
-                                    &persona_body,
-                                    &persona_nicknames,
-                                    persona_lowercase_default,
-                                    &common_words,
-                                    &blocklist,
-                                    &system_senders_re,
-                                    &system_senders_exact,
-                                    &moderation_patterns,
-                                    &mut window,
-                                    &mut classifier_counter,
-                                    &mut spam_guard,
-                                    &mut recent_speakers,
-                                    &mut recent_bot_send_times,
-                                    &mut last_bot_send_at,
-                                    &in_critical_section,
-                                    &bot_tx,
-                                    &composer_limiter,
-                                    &classifier_limiter,
-                                    composer_cancel.clone(),
-                                    &mut online_roster,
-                                ) => {
-                                    if let Err(e) = backlog_result {
-                                        warn!(sender = %backlog_ev.sender, error = %e, "[Chat] backlog event processing error");
-                                    }
-                                }
+                            // See live-event branch above: we no longer
+                            // race process_event in a `tokio::select!` —
+                            // dropping it would skip post-call accounting.
+                            // Cancellation is observed at the run_loop
+                            // iteration boundary; the post-await
+                            // `is_cancelled()` check breaks the drain.
+                            let backlog_result = process_event(
+                                &backlog_ev,
+                                &api_key,
+                                &config,
+                                &pricing,
+                                &mut runtime_state,
+                                &bot_username,
+                                &persona_body,
+                                &persona_nicknames,
+                                persona_lowercase_default,
+                                &common_words,
+                                &blocklist,
+                                &system_senders_re,
+                                &system_senders_exact,
+                                &moderation_patterns,
+                                &mut window,
+                                &mut classifier_counter,
+                                &mut spam_guard,
+                                &mut recent_speakers,
+                                &mut recent_bot_send_times,
+                                &mut last_bot_send_at,
+                                &in_critical_section,
+                                &bot_tx,
+                                &composer_limiter,
+                                &classifier_limiter,
+                                composer_cancel.clone(),
+                                &mut online_roster,
+                            )
+                            .await;
+                            if let Err(e) = backlog_result {
+                                warn!(sender = %backlog_ev.sender, error = %e, "[Chat] backlog event processing error");
                             }
-                            if cancelled_during_backlog {
+                            if composer_cancel.is_cancelled() {
                                 break;
                             }
                         }
@@ -1332,37 +1329,42 @@ pub async fn chat_task(
                                     serde_json::Value::from(secs_bot.unwrap_or(0)),
                                 ),
                         );
-                        let cancelled = composer_cancel.clone();
-                        tokio::select! {
-                            biased;
-                            _ = cancelled.cancelled() => {
-                                decisions::write(
-                                    &decisions::DecisionRecord::new("composer_cancelled")
-                                        .with_sender(&partner.username)
-                                        .with_reason("bot_disconnected_during_proactive"),
-                                );
-                            }
-                            res = process_proactive_tick(
-                                &partner,
-                                &api_key,
-                                &config,
-                                &pricing,
-                                &mut runtime_state,
-                                &bot_username,
-                                &persona_body,
-                                persona_lowercase_default,
-                                &mut recent_bot_send_times,
-                                &mut last_bot_send_at,
-                                &in_critical_section,
-                                &bot_tx,
-                                &composer_limiter,
-                                composer_cancel.clone(),
-                                &online_roster,
-                            ) => {
-                                if let Err(e) = res {
-                                    warn!(partner = %partner.username, error = %e, "[Chat] proactive composer dispatch error");
-                                }
-                            }
+                        // Cancellation is observed at the run_loop
+                        // iteration boundary inside process_proactive_tick;
+                        // we no longer race here because dropping the
+                        // future would skip post-call accounting (record
+                        // composer tokens, bump tool-call daily meters).
+                        // The partner-scoped composer_cancelled record is
+                        // emitted in the post-await branch when the cancel
+                        // token observed a cancel during dispatch.
+                        let was_cancelled_before = composer_cancel.is_cancelled();
+                        let res = process_proactive_tick(
+                            &partner,
+                            &api_key,
+                            &config,
+                            &pricing,
+                            &mut runtime_state,
+                            &bot_username,
+                            &persona_body,
+                            persona_lowercase_default,
+                            &mut recent_bot_send_times,
+                            &mut last_bot_send_at,
+                            &in_critical_section,
+                            &bot_tx,
+                            &composer_limiter,
+                            composer_cancel.clone(),
+                            &online_roster,
+                        )
+                        .await;
+                        if let Err(e) = res {
+                            warn!(partner = %partner.username, error = %e, "[Chat] proactive composer dispatch error");
+                        }
+                        if !was_cancelled_before && composer_cancel.is_cancelled() {
+                            decisions::write(
+                                &decisions::DecisionRecord::new("composer_cancelled")
+                                    .with_sender(&partner.username)
+                                    .with_reason("bot_disconnected_during_proactive"),
+                            );
                         }
                         if let Err(e) = runtime_state.save() {
                             warn!(error = %e, "[Chat] state save failed after proactive tick");
@@ -1969,13 +1971,13 @@ async fn process_event(
         cross_player_balance_lookups: config.tools_store_cross_player_balance_lookups,
     };
 
-    // CHAT.md cancellation contract: between iterations only. We cannot
-    // cancel mid-tool-dispatch (would tear an in-flight `update_self_memory`
-    // write), so the per-iteration wrap belongs inside `composer::run_loop`.
-    // Until that plumbing lands, the safe checkpoints we own here are
-    // BEFORE the run_loop call (no work yet) and AFTER it returns
-    // (every tool dispatched in that run has completed) — both honor
-    // the no-torn-write rule.
+    // CHAT.md cancellation contract: between iterations only. The
+    // per-iteration `is_cancelled()` check lives inside
+    // `composer::run_loop` so the no-torn-write rule for tool dispatches
+    // is honored there; on cancel run_loop returns a partial ComposerRun
+    // carrying every counter accrued so far, and the post-call accounting
+    // below runs unconditionally. The pre-dispatch check stays — it's the
+    // "skip when already cancelled" fast path the operator asked for.
     if composer_cancel.is_cancelled() {
         return Ok(());
     }
@@ -1987,6 +1989,7 @@ async fn process_event(
         true,
         Some(composer_limiter),
         &nonce,
+        &composer_cancel,
     )
     .await
     {
@@ -2122,9 +2125,11 @@ async fn process_event(
         // USD bucket (`record_classifier` below), so once the operator's
         // ceiling is hit the filter must stop too — otherwise the cap
         // gates classifier traffic but silently leaks cost through filter
-        // calls. Mirrors the pre-flight at line 1525-1539.
+        // calls. Reserve exactly the budget the request authorizes via
+        // `max_tokens` (`MAX_VERDICT_TOKENS`); a smaller fudge factor lets
+        // the gate admit calls that genuinely breach the daily ceiling.
         let cap_in = filter_input_estimate as u64;
-        let cap_out = 64u64;
+        let cap_out = reasoning_filter::MAX_VERDICT_TOKENS as u64;
         let cap_usd = pricing_table.usd_for_tokens(
             &config.reasoning_filter_model,
             cap_in,
@@ -2275,7 +2280,7 @@ async fn process_event(
                         / 4)
                         .max(1) as u32;
                     let s_cap_in = shorten_in_est as u64;
-                    let s_cap_out = 64u64;
+                    let s_cap_out = reasoning_filter::MAX_VERDICT_TOKENS as u64;
                     let s_cap_usd = pricing_table.usd_for_tokens(
                         &config.reasoning_filter_model,
                         s_cap_in,
@@ -2342,7 +2347,57 @@ async fn process_event(
                             }
                             match reasoning_filter::parse_verdict(&text_buf) {
                                 Ok(verdict) => {
-                                    let new_m = verdict.message.trim().to_string();
+                                    // The shorten prompt schema bakes in
+                                    // `"action": "rewrite"`. Any other
+                                    // action is a model bug — `parse_verdict`
+                                    // only enforces the four-variant
+                                    // allowlist, not "must be rewrite". A
+                                    // Reject/Send/Strip with non-empty
+                                    // `message` would otherwise overwrite
+                                    // the already-vetted `m` with arbitrary
+                                    // unchecked text, re-introducing the
+                                    // very leak the original filter call
+                                    // cleaned up. Gate strictly on Rewrite;
+                                    // anything else logs and breaks,
+                                    // leaving downstream truncate to cap
+                                    // the prior `m` as a last resort.
+                                    if verdict.action != reasoning_filter::VerdictAction::Rewrite {
+                                        decisions::write(
+                                            &decisions::DecisionRecord::new(
+                                                "reasoning_filter_shorten_unexpected_action",
+                                            )
+                                            .with_sender(&event.sender)
+                                            .with_event_ts(event.recv_at)
+                                            .with_latency(
+                                                shorten_started.elapsed().as_millis() as u64,
+                                            )
+                                            .with_tokens(
+                                                resp.usage.input_tokens,
+                                                resp.usage.output_tokens,
+                                                usd,
+                                            )
+                                            .with_cache_tokens(
+                                                resp.usage.cache_creation_input_tokens,
+                                                resp.usage.cache_read_input_tokens,
+                                            )
+                                            .extra("iter", serde_json::Value::from(iters))
+                                            .extra(
+                                                "action",
+                                                serde_json::Value::from(format!(
+                                                    "{:?}",
+                                                    verdict.action
+                                                )),
+                                            )
+                                            .extra(
+                                                "reason",
+                                                serde_json::Value::from(verdict.reason),
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                    let new_m = reasoning_filter::unescape_trusted_block(
+                                        verdict.message.trim(),
+                                    );
                                     let before = m.chars().count() as u64;
                                     let after = new_m.chars().count() as u64;
                                     decisions::write(
@@ -2511,8 +2566,8 @@ async fn process_event(
     // race can flip it to a different identity. Either way, sending the
     // staged reply against a stale username is wasteful — convert the
     // would-be `send_error` into a `pacing_drop` signal. Composer tokens
-    // were already burned upstream; skip `record_composer` to match the
-    // cancellation-path convention.
+    // were already accounted for upstream (`record_composer` ran before
+    // the typing-delay sleep) so no extra accounting is needed here.
     if bot_username.read().await.is_none() {
         decisions::write(
             &decisions::DecisionRecord::new("pacing_drop")
@@ -2650,6 +2705,14 @@ async fn process_proactive_tick(
     composer_cancel: CancellationToken,
     online_roster: &online_players::OnlinePlayers,
 ) -> Result<(), String> {
+    // Roll the daily meter forward FIRST so cap checks below read
+    // today's counters, not yesterday's. The proactive `select!` arm
+    // doesn't go through `process_event`'s per-event roll, so without
+    // this an end-of-UTC-day rollover would leave the first proactive
+    // tick of the new day reading stale (saturated) totals and
+    // returning `CapVerdict::ComposerCap` until a reactive event
+    // finally rolled the meter.
+    runtime_state.roll_to_today();
     // Backoff guards — same as the per-event composer dispatch.
     if client::is_model_404_backed_off(runtime_state.model_404_backoff_until.as_deref()) {
         decisions::write(
@@ -2793,6 +2856,7 @@ async fn process_proactive_tick(
         true,
         Some(composer_limiter),
         &nonce,
+        &composer_cancel,
     )
     .await
     {

@@ -105,13 +105,25 @@ pub fn recheck_after_sleep(
 ///
 /// Operator-managed `data/chat/strip_patterns.txt` extends this list at
 /// runtime (added in Phase 8). The seed below is the always-on baseline.
+///
+/// Matched ASCII-case-insensitively by `strip_ai_tells`, so duplicate
+/// case variants (e.g. an `"as an AI"` row alongside `"As an AI"`) are
+/// not needed.
+///
+/// **What is NOT here, deliberately:** `"I'm an AI"`, `"as a language
+/// model"`, `"as an assistant"`, etc. The persona explicitly mandates
+/// honest disclosure that the bot is an AI when sincerely asked
+/// (`data/chat/persona.md`, `src/chat/persona.rs`); stripping those
+/// phrases would gut the persona's openly-an-AI contract. Only
+/// model-identity / vendor leaks (Claude, Anthropic, "language model")
+/// belong here.
 pub const BUILT_IN_AI_TELLS: &[&str] = &[
     "As an AI",
-    "as an AI",
     "I cannot",
     "I'm Claude",
     "I am Claude",
     "language model",
+    "Anthropic",
 ];
 
 /// XML-style reasoning-container tag names recognized by
@@ -358,8 +370,11 @@ fn squeeze_colon_whitespace(s: &str) -> String {
 
 /// Strip AI tells, smart quotes, and em-dashes.
 ///
-/// This is a literal-substring strip — nothing fancy. Operators who want
-/// regex matching extend `strip_patterns.txt` (Phase 8).
+/// Match is ASCII-case-insensitive — the persona is "lowercase-leaning"
+/// (per `data/chat/persona.md`), so a literal-case match would silently
+/// miss the most common leak shape (`"i'm Claude"`, `"i cannot"`,
+/// `"language Model"`). Operators who want regex matching extend
+/// `strip_patterns.txt` (Phase 8).
 pub fn strip_ai_tells(reply: &str) -> String {
     // Unicode-normalize FIRST so that smart-apostrophe variants like
     // "I\u{2019}m Claude" collapse to the literal ASCII forms that
@@ -373,10 +388,23 @@ pub fn strip_ai_tells(reply: &str) -> String {
         .replace('\u{2019}', "'")
         .replace('\u{2014}', " - ")
         .replace('\u{2013}', "-");
+    // ASCII-case-insensitive splice: `to_ascii_lowercase` is byte-length
+    // preserving (every ASCII char maps to a same-byte-length ASCII char,
+    // and non-ASCII chars are passed through unchanged), so byte indices
+    // in the lowered view map straight back into `out` without re-encoding.
+    // This is the same invariant `strip_reasoning` relies on for its tag
+    // scan above.
     for tell in BUILT_IN_AI_TELLS {
-        // Two-pass with case variants would be tighter but produces the
-        // same effect since BUILT_IN_AI_TELLS already includes both cases.
-        out = out.replace(tell, "");
+        let needle = tell.to_ascii_lowercase();
+        loop {
+            let haystack = out.to_ascii_lowercase();
+            match haystack.find(&needle) {
+                Some(idx) => {
+                    out.drain(idx..idx + needle.len());
+                }
+                None => break,
+            }
+        }
     }
     // Cleanup pass — collapse the punctuation/whitespace debris left
     // behind when a tell is excised mid-sentence. The rules below are
@@ -684,6 +712,69 @@ mod tests {
         let s = strip_ai_tells("I\u{2019}m Claude, here.");
         assert!(!s.contains("I'm Claude"));
         assert!(!s.contains("Claude"));
+    }
+
+    #[test]
+    fn strip_ai_tells_catches_lowercase_im_claude() {
+        // The persona is lowercase-leaning, so the most common leak shape
+        // is the all-lowercase form. Match must be ASCII-case-insensitive
+        // against the canonical-case "I'm Claude" entry.
+        let s = strip_ai_tells("i'm Claude here, here's what i think");
+        assert!(
+            !s.to_ascii_lowercase().contains("laude"),
+            "expected no 'laude' substring (any case) after strip, got {s:?}"
+        );
+        let s2 = strip_ai_tells("i'm claude here");
+        assert!(
+            !s2.to_ascii_lowercase().contains("laude"),
+            "expected no 'laude' substring (any case) after strip, got {s2:?}"
+        );
+    }
+
+    #[test]
+    fn strip_ai_tells_catches_uppercase_as_an_ai() {
+        // Shouty-caps leak: must match against the "As an AI" / "as an AI"
+        // entries case-insensitively rather than relying on an exact-case hit.
+        let s = strip_ai_tells("AS AN AI, here we go");
+        assert!(
+            !s.to_ascii_lowercase().contains("as an ai"),
+            "expected 'AS AN AI' to be stripped (any case), got {s:?}"
+        );
+    }
+
+    #[test]
+    fn strip_ai_tells_catches_mixed_case_language_model() {
+        // The seed entry is all-lowercase "language model"; a Title-Case
+        // emission like "Language Model" must still be caught.
+        let s = strip_ai_tells("a Language Model can do that");
+        assert!(
+            !s.to_ascii_lowercase().contains("language model"),
+            "expected 'Language Model' to be stripped (any case), got {s:?}"
+        );
+    }
+
+    #[test]
+    fn strip_ai_tells_catches_lowercase_i_cannot() {
+        // The persona-shaped lowercase variant of the canonical "I cannot"
+        // entry. Must strip case-insensitively.
+        let s = strip_ai_tells("i cannot help you");
+        assert!(
+            !s.to_ascii_lowercase().contains("i cannot"),
+            "expected 'i cannot' to be stripped (any case), got {s:?}"
+        );
+    }
+
+    #[test]
+    fn strip_ai_tells_preserves_self_identification_as_ai() {
+        // Persona contract (data/chat/persona.md, src/chat/persona.rs):
+        // when sincerely asked, the bot must answer honestly that it is an
+        // AI. Adding "I'm an AI" to BUILT_IN_AI_TELLS would silently break
+        // that disclosure rule. This is the regression guard.
+        let s = strip_ai_tells("yeah i'm an ai bot here");
+        assert!(
+            s.to_ascii_lowercase().contains("ai bot"),
+            "honest AI-disclosure phrasing must survive strip_ai_tells, got {s:?}"
+        );
     }
 
     // ---- strip_reasoning -----------------------------------------------

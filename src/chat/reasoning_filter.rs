@@ -41,7 +41,11 @@ use serde::Deserialize;
 /// truncation can't silently turn a long-rewrite into a JSON parse error
 /// — which would short-circuit `parse_verdict` and ship the *original*
 /// (possibly leak-heavy) reply via the `Send` fallback.
-const MAX_VERDICT_TOKENS: u32 = 512;
+///
+/// Public so the call site in `crate::chat::mod` can reserve exactly
+/// this budget against the daily classifier output-token cap rather
+/// than guessing a smaller fudge factor.
+pub const MAX_VERDICT_TOKENS: u32 = 512;
 
 /// Hard cap on `Verdict::reason` length (chars) at parse time. The
 /// system prompt bounds it at ~120 chars; this cap is defense in depth
@@ -417,6 +421,18 @@ pub fn parse_verdict(text: &str) -> Result<Verdict, String> {
     Ok(v)
 }
 
+/// Reverse the `escape_for_trusted_block` entity encoding (`&lt;` → `<`,
+/// `&gt;` → `>`) on text that has already passed the reasoning filter.
+///
+/// Centralizes the unescape so every filter exit (Strip arm, Rewrite arm,
+/// shorten loop in `crate::chat::mod`) routes through the same helper —
+/// a future change to the escape mechanics forces a paired change here
+/// via grep-able callers, instead of one site silently shipping literal
+/// `&lt;`/`&gt;` to chat.
+pub fn unescape_trusted_block(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">")
+}
+
 fn sanitize_reason(s: &str) -> String {
     let collapsed: String = s
         .chars()
@@ -442,21 +458,33 @@ pub fn verdict_to_action(verdict: Verdict, original: &str) -> FilterAction {
         VerdictAction::Send => FilterAction::Send,
         VerdictAction::Reject => FilterAction::Reject,
         VerdictAction::Strip => {
-            let m = verdict.message.trim();
-            if m.is_empty() {
+            // Haiku saw the candidate after `escape_for_trusted_block`
+            // (`<` → `&lt;`, `>` → `&gt;`), so a faithful `strip` of a
+            // reply containing literal angle brackets carries the
+            // entity form. Reverse the escape on `m` before storing so
+            // chat output never ships HTML entities, and compare the
+            // pre-reversed `m` against `escape_for_trusted_block(original)`
+            // so the substring contract holds in escaped space.
+            let m_raw = verdict.message.trim();
+            if m_raw.is_empty() {
                 FilterAction::Reject
-            } else if !original.contains(m) {
-                FilterAction::Rewrite(m.to_string())
             } else {
-                FilterAction::Strip(m.to_string())
+                let escaped_original = crate::chat::persona::escape_for_trusted_block(original);
+                let in_escaped = escaped_original.contains(m_raw);
+                let m = unescape_trusted_block(m_raw);
+                if in_escaped {
+                    FilterAction::Strip(m)
+                } else {
+                    FilterAction::Rewrite(m)
+                }
             }
         }
         VerdictAction::Rewrite => {
-            let m = verdict.message.trim();
-            if m.is_empty() {
+            let m_raw = verdict.message.trim();
+            if m_raw.is_empty() {
                 FilterAction::Reject
             } else {
-                FilterAction::Rewrite(m.to_string())
+                FilterAction::Rewrite(unescape_trusted_block(m_raw))
             }
         }
     }
@@ -692,6 +720,41 @@ mod tests {
     }
 
     #[test]
+    fn verdict_to_action_strip_unescapes_angle_brackets_and_keeps_strip() {
+        // Haiku saw `escape_for_trusted_block(original)`, so a faithful
+        // strip of an `<3` reply carries `&lt;3`. The substring contract
+        // must hold in escaped space (so the audit label stays `strip`,
+        // not silently downgraded to `rewrite`), AND the entity form must
+        // be reversed before storing so chat output never ships raw HTML
+        // entities.
+        let v = Verdict {
+            action: VerdictAction::Strip,
+            message: "yo &lt;3".to_string(),
+            reason: String::new(),
+        };
+        assert_eq!(
+            verdict_to_action(v, "thinking. yo <3"),
+            FilterAction::Strip("yo <3".to_string()),
+        );
+    }
+
+    #[test]
+    fn verdict_to_action_rewrite_unescapes_angle_brackets() {
+        // A rewrite verdict carrying entity-encoded angle brackets must
+        // be unescaped before the action payload is constructed so the
+        // raw `<` / `>` chars (not `&lt;` / `&gt;`) reach chat.
+        let v = Verdict {
+            action: VerdictAction::Rewrite,
+            message: "&gt;be me, a helpful bot".to_string(),
+            reason: String::new(),
+        };
+        assert_eq!(
+            verdict_to_action(v, ""),
+            FilterAction::Rewrite(">be me, a helpful bot".to_string()),
+        );
+    }
+
+    #[test]
     fn verdict_to_action_rewrite_carries_message() {
         let v = Verdict {
             action: VerdictAction::Rewrite,
@@ -851,6 +914,13 @@ mod tests {
         assert_eq!(user_text.matches("</draft>").count(), 1);
         // The original closer is escaped to its harmless entity form.
         assert!(user_text.contains("&lt;/draft&gt;"));
+    }
+
+    #[test]
+    fn unescape_trusted_block_reverses_angle_bracket_entities() {
+        assert_eq!(unescape_trusted_block("yo &lt;3"), "yo <3");
+        assert_eq!(unescape_trusted_block("a &lt;b&gt; c"), "a <b> c");
+        assert_eq!(unescape_trusted_block("plain text"), "plain text");
     }
 
     #[test]

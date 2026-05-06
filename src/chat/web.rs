@@ -822,6 +822,20 @@ pub fn strip_html_tags(input: &str) -> String {
             }
             continue;
         }
+        // CDATA: `<![CDATA[ … ]]>`. Must be matched BEFORE the generic
+        // `<!` markup-declaration branch below, which only scans for the
+        // next `>` byte and would terminate at the first `>` inside the
+        // CDATA body — re-emitting attacker text (e.g. the contents of a
+        // smuggled `<script>` opener) into the tool_result. The
+        // Content-Type allow-list accepts XML/XHTML/RSS/Atom, where CDATA
+        // is legal markup, so this branch is reachable in production.
+        if bytes[i..].starts_with(b"<![CDATA[") {
+            match find_subslice(&bytes[i + 9..], b"]]>") {
+                Some(rel) => i += 9 + rel + 3,
+                None => return finalize_strip(&out),
+            }
+            continue;
+        }
         // Other markup declarations (`<!DOCTYPE …>`) and processing
         // instructions (`<? … ?>`): drop up to the next `>`, or the
         // tail if unterminated.
@@ -1484,6 +1498,24 @@ mod tests {
     fn strip_html_tags_unterminated_script_drops_tail() {
         let s = strip_html_tags("<script>foo");
         assert!(s.is_empty(), "got {s:?}");
+    }
+
+    #[test]
+    fn strip_html_tags_drops_cdata_block() {
+        // The Content-Type allow-list accepts XML/XHTML/RSS/Atom, where
+        // `<![CDATA[ … ]]>` is legal markup. The generic `<!` branch
+        // would terminate at the first `>` inside the CDATA body —
+        // re-emitting attacker `alert(1)` text into tool_result.
+        let s = strip_html_tags("<![CDATA[<script>alert(1)</script>]]>");
+        assert!(!s.contains("alert(1)"), "got {s:?}");
+    }
+
+    #[test]
+    fn strip_html_tags_drops_unterminated_cdata() {
+        // No `]]>` and no `</script>` either — the unterminated-CDATA
+        // path must drop the tail rather than re-emit raw attacker text.
+        let s = strip_html_tags("<![CDATA[<script>alert(1)");
+        assert!(!s.contains("alert(1)"), "got {s:?}");
     }
 
     #[test]

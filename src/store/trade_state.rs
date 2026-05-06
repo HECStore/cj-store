@@ -440,7 +440,12 @@ fn quarantine_unreadable_to(path: &Path) -> io::Result<std::path::PathBuf> {
         Ok(()) => Ok(archived),
         Err(_) => {
             std::fs::copy(path, &archived)?;
-            std::fs::remove_file(path)?;
+            if let Err(remove_err) = std::fs::remove_file(path) {
+                tracing::warn!(
+                    "[TradeState] quarantined unreadable trade-state to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
+                    archived, path
+                );
+            }
             Ok(archived)
         }
     }
@@ -473,7 +478,12 @@ pub fn archive_persisted_to(path: &Path) -> io::Result<std::path::PathBuf> {
         Ok(()) => Ok(archived),
         Err(_) => {
             std::fs::copy(path, &archived)?;
-            std::fs::remove_file(path)?;
+            if let Err(remove_err) = std::fs::remove_file(path) {
+                tracing::warn!(
+                    "[TradeState] archived persisted trade-state to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
+                    archived, path
+                );
+            }
             Ok(archived)
         }
     }

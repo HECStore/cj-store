@@ -282,6 +282,9 @@ impl ChatState {
     ///
     /// `estimated_usd_added` is the cost of THIS call only; the meter
     /// adds the historical day-total.
+    ///
+    /// Caller must `roll_to_today` (or `roll_to_day`) first; this
+    /// method does not roll the meter.
     pub fn would_exceed_caps_composer(
         &self,
         input_tokens: u64,
@@ -307,6 +310,8 @@ impl ChatState {
         CapVerdict::Ok
     }
 
+    /// Caller must `roll_to_today` (or `roll_to_day`) first; this
+    /// method does not roll the meter.
     pub fn would_exceed_caps_classifier(
         &self,
         input_tokens: u64,
@@ -483,6 +488,41 @@ mod tests {
     }
 
     #[test]
+    fn record_composer_ignores_negative_usd() {
+        // The guard is `is_finite() && >= 0.0`; pin the second half too —
+        // a negative cost-estimate would decrement estimated_usd and
+        // unblock the daily USD cap.
+        let mut s = ChatState::default();
+        let day = s.last_meter_day_utc.clone();
+        s.tokens_today.estimated_usd = 1.5;
+        s.record_composer(&day, 1000, 200, -1.5);
+        assert_eq!(s.tokens_today.estimated_usd, 1.5);
+    }
+
+    #[test]
+    fn record_classifier_ignores_nan_usd() {
+        // Symmetric to record_composer_ignores_nan_usd. record_classifier
+        // carries the same `is_finite() && >= 0.0` guard, so an asymmetric
+        // removal on the classifier path would silently disable the
+        // daily USD cap.
+        let mut s = ChatState::default();
+        let day = s.last_meter_day_utc.clone();
+        s.record_classifier(&day, 1000, 200, f64::NAN);
+        assert_eq!(s.tokens_today.estimated_usd, 0.0);
+        assert_eq!(s.tokens_today.classifier_input, 1000);
+        assert_eq!(s.tokens_today.classifier_output, 200);
+    }
+
+    #[test]
+    fn record_classifier_ignores_negative_usd() {
+        let mut s = ChatState::default();
+        let day = s.last_meter_day_utc.clone();
+        s.tokens_today.estimated_usd = 1.5;
+        s.record_classifier(&day, 1000, 200, -1.5);
+        assert_eq!(s.tokens_today.estimated_usd, 1.5);
+    }
+
+    #[test]
     fn record_composer_attributes_to_started_day() {
         // CHAT.md: tokens count against the day the call STARTED, not
         // finished. If the dispatch day was today, recording today is
@@ -525,6 +565,29 @@ mod tests {
         let cfg = cfg_with_caps(1_000_000, 1_000_000, 1_000_000.0, 5_000_000);
         let v = s.would_exceed_caps_composer(1_000, 100, 0.0, &cfg);
         assert_eq!(v, CapVerdict::ComposerCap);
+    }
+
+    #[test]
+    fn cap_check_reads_stale_counters_until_rolled() {
+        // Regression: `would_exceed_caps_composer` does not roll the
+        // meter. If `last_meter_day_utc` is stale (e.g. UTC midnight
+        // just passed) and yesterday's counters are saturated, the
+        // call returns `ComposerCap` until the caller rolls. After
+        // `roll_to_today()` zeros the bucket, the same inputs pass.
+        let mut s = ChatState::default();
+        s.last_meter_day_utc = "2025-01-01".to_string();
+        let cfg = cfg_with_caps(1_000_000, 1_000_000, 1_000_000.0, 5_000_000);
+        s.tokens_today.composer_input = cfg.daily_input_token_cap;
+
+        // Stale meter — the cap check trips on yesterday's totals.
+        let v_before = s.would_exceed_caps_composer(1_000, 100, 0.0, &cfg);
+        assert_eq!(v_before, CapVerdict::ComposerCap);
+
+        // Roll forward (idempotent if today already matches), then
+        // re-check: counters reset, so the same call now passes.
+        s.roll_to_today();
+        let v_after = s.would_exceed_caps_composer(1_000, 100, 0.0, &cfg);
+        assert_eq!(v_after, CapVerdict::Ok);
     }
 
     #[test]

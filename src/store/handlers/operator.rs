@@ -49,8 +49,25 @@ pub async fn handle_additem_order(
     // Plan deposit against a read-only view of storage so we don't pay the
     // cost of cloning the entire structure just to preview placement.
     let stack_size = store.expect_pair(item, "additem/preview")?.stack_size;
-    let (preview_deposit_plan, _) =
+    let (preview_deposit_plan, preview_planned) =
         store.storage.simulate_deposit_plan(item, qty_i32, stack_size);
+    // The deposit planner is bounded by current storage capacity; if it can't
+    // place every requested item, accepting the trade anyway would orphan the
+    // overflow in the bot's inventory and falsify the audit row that records
+    // `qty_i32` as added stock. Reject up front, mirroring the symmetric guard
+    // in handle_removeitem_order.
+    if preview_planned != qty_i32 {
+        return utils::send_message_to_player(
+            store,
+            player_name,
+            &format!(
+                "Insufficient storage capacity for '{}': can only place {} of {} items. \
+                 Operator should add a storage node.",
+                item, preview_planned, qty_i32
+            ),
+        )
+        .await;
+    }
 
     utils::send_message_to_player(
         store,
@@ -162,14 +179,26 @@ pub async fn handle_additem_order(
     // undeposited remainder is sitting in the bot's inventory. Return it via a reverse
     // trade so the operator is made whole. If that reverse trade also fails, the items
     // are genuinely stuck and need manual admin recovery (logged at error level).
+    //
+    // Every failure branch below funnels into `final_status` / `final_result` instead of
+    // returning early — the tail block after this `if` MUST always run so that
+    // `pair.item_stock` is resynced from physical storage and the post-additem invariant
+    // check fires in repair mode. Returning early here would leave cached `pair.item_stock`
+    // under-reporting physical inventory by `items_deposited`, poisoning the next handler's
+    // `pre-*` checkpoint and the buy-handler stock gate.
+    let mut final_status: Option<String> = None;
+    let mut final_result: Result<(), StoreError> = Ok(());
+    let mut record_audit = true;
+
     if deposit_failed {
+        record_audit = false;
         let items_in_bot_inventory = qty_i32 - items_deposited;
         if items_in_bot_inventory > 0 {
             warn!(
                 "[Additem] deposit failed, returning to operator: operator={} item={} deposited={} stuck={} reason={}",
                 player_name, item, items_deposited, items_in_bot_inventory, failed_reason
             );
-            
+
             let (rb_tx, rb_rx) = tokio::sync::oneshot::channel();
             let rb_send_result = store.bot_tx
                 .send(crate::messages::BotInstruction::TradeWithPlayer {
@@ -193,84 +222,69 @@ pub async fn handle_additem_order(
                     {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} err={}",
                     items_in_bot_inventory, item, player_name, items_deposited, e
                 );
-                return Err(StoreError::BotSendFailed(format!(
+                final_result = Err(StoreError::BotSendFailed(format!(
                     "return-to-operator trade instruction after deposit failure ({} {} stuck in bot): {}",
                     items_in_bot_inventory, item, e
                 )));
-            }
-
-            match tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), rb_rx).await {
-                Ok(Ok(Ok(_))) => {
-                    info!(
-                        "[Additem] returned items to operator: operator={} item={} returned={} deposited={}",
-                        player_name, item, items_in_bot_inventory, items_deposited
-                    );
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        &format!(
+            } else {
+                match tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), rb_rx).await {
+                    Ok(Ok(Ok(_))) => {
+                        info!(
+                            "[Additem] returned items to operator: operator={} item={} returned={} deposited={}",
+                            player_name, item, items_in_bot_inventory, items_deposited
+                        );
+                        final_status = Some(format!(
                             "Additem failed: {}. {} items were returned to you. {} items were stored successfully.",
                             failed_reason, items_in_bot_inventory, items_deposited
-                        ),
-                    ).await;
-                }
-                Ok(Ok(Err(err))) => {
-                    error!(
-                        "[Additem] CRITICAL: return-to-operator trade rejected by bot (structured failure) — \
-                        {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} bot_err={}",
-                        items_in_bot_inventory, item, player_name, items_deposited, err
-                    );
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        &format!(
+                        ));
+                    }
+                    Ok(Ok(Err(err))) => {
+                        error!(
+                            "[Additem] CRITICAL: return-to-operator trade rejected by bot (structured failure) — \
+                            {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} bot_err={}",
+                            items_in_bot_inventory, item, player_name, items_deposited, err
+                        );
+                        final_status = Some(format!(
                             "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (bot rejected return trade: {}). Contact administrator. {} items were stored.",
                             failed_reason, items_in_bot_inventory, err, items_deposited
-                        ),
-                    ).await;
-                }
-                Ok(Err(e)) => {
-                    error!(
-                        "[Additem] CRITICAL: return-to-operator oneshot dropped before reply (bot dropped response sender, likely crashed) — \
-                        {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} err={}",
-                        items_in_bot_inventory, item, player_name, items_deposited, e
-                    );
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        &format!(
+                        ));
+                    }
+                    Ok(Err(e)) => {
+                        error!(
+                            "[Additem] CRITICAL: return-to-operator oneshot dropped before reply (bot dropped response sender, likely crashed) — \
+                            {} item(s) of '{}' stuck in bot inventory; operator={} deposited={} err={}",
+                            items_in_bot_inventory, item, player_name, items_deposited, e
+                        );
+                        final_status = Some(format!(
                             "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (bot dropped response). Contact administrator. {} items were stored.",
                             failed_reason, items_in_bot_inventory, items_deposited
-                        ),
-                    ).await;
-                }
-                Err(_) => {
-                    error!(
-                        "[Additem] CRITICAL: return-to-operator trade timed out after {}ms — \
-                        {} item(s) of '{}' stuck in bot inventory; operator={} deposited={}",
-                        store.config.trade_timeout_ms, items_in_bot_inventory, item, player_name, items_deposited
-                    );
-                    return utils::send_message_to_player(
-                        store,
-                        player_name,
-                        &format!(
+                        ));
+                    }
+                    Err(_) => {
+                        error!(
+                            "[Additem] CRITICAL: return-to-operator trade timed out after {}ms — \
+                            {} item(s) of '{}' stuck in bot inventory; operator={} deposited={}",
+                            store.config.trade_timeout_ms, items_in_bot_inventory, item, player_name, items_deposited
+                        );
+                        final_status = Some(format!(
                             "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (return trade timed out). Contact administrator. {} items were stored.",
                             failed_reason, items_in_bot_inventory, items_deposited
-                        ),
-                    ).await;
+                        ));
+                    }
                 }
             }
         } else {
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!("Additem failed: {}", failed_reason),
-            ).await;
+            final_status = Some(format!("Additem failed: {}", failed_reason));
         }
     }
 
     // Resync pair stock from authoritative storage totals (chest syncs above may have
     // moved the real amount by more than `items_deposited` if there was drift).
+    //
+    // This block runs unconditionally — even on partial-failure paths — so cached
+    // `pair.item_stock` always reflects what physical storage actually holds after the
+    // deposit loop. Skipping this on failure would under-report inventory by
+    // `items_deposited` and trip the next handler's `pre-*` invariant checkpoint.
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "additem/commit")?;
     pair.item_stock = new_stock;
@@ -280,39 +294,47 @@ pub async fn handle_additem_order(
         item, pair.item_stock);
     store.dirty = true;
 
-    store.trades.push(Trade::new(
-        TradeType::AddStock,
-        ItemId::from_normalized(item.to_string()),
-        qty_i32,
-        0.0,
-        user_uuid.clone(),
-    ));
+    if record_audit {
+        store.trades.push(Trade::new(
+            TradeType::AddStock,
+            ItemId::from_normalized(item.to_string()),
+            qty_i32,
+            0.0,
+            user_uuid.clone(),
+        ));
 
-    store.orders.push_back(Order {
-        order_type: crate::types::order::OrderType::AddItem,
-        item: ItemId::from_normalized(item.to_string()),
-        amount: qty_i32,
-        currency_amount: 0.0,
-        user_uuid: user_uuid.clone(),
-    });
+        store.orders.push_back(Order {
+            order_type: crate::types::order::OrderType::AddItem,
+            item: ItemId::from_normalized(item.to_string()),
+            amount: qty_i32,
+            currency_amount: 0.0,
+            user_uuid: user_uuid.clone(),
+        });
 
-    info!(
-        "[Additem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
-        player_name, user_uuid, item, quantity, stock_before, new_stock
-    );
+        info!(
+            "[Additem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
+            player_name, user_uuid, item, quantity, stock_before, new_stock
+        );
+    }
 
+    // Repair-mode invariant check fires regardless of success/failure so any drift
+    // detected post-deposit gets logged + saved rather than poisoning later handlers.
     if let Err(e) = state::assert_invariants(store, "post-additem", true) {
         error!("[Additem] invariant violation after commit: operator={} item={} err={}",
             player_name, item, e);
         let _ = state::save(store);
     }
 
-    utils::send_message_to_player(
-        store,
-        player_name,
-        &format!("Added {} {} to storage. New stock: {}", quantity, item, new_stock),
-    )
-    .await
+    let whisper_text = final_status
+        .unwrap_or_else(|| format!("Added {} {} to storage. New stock: {}", quantity, item, new_stock));
+    let whisper_result = utils::send_message_to_player(store, player_name, &whisper_text).await;
+
+    // Failure-path Err propagation (e.g. BotSendFailed) takes precedence over a successful
+    // whisper; on the success path `final_result` is Ok and we return the whisper outcome.
+    match final_result {
+        Err(e) => Err(e),
+        Ok(()) => whisper_result,
+    }
 }
 
 /// Operator command: withdraw items from storage chests into the bot's inventory,
@@ -424,9 +446,21 @@ pub async fn handle_removeitem_order(
     )
     .await;
 
+    // Every failure branch below funnels into `final_status` / `final_result` instead of
+    // returning early — the tail block after this `match` MUST always run so that
+    // `pair.item_stock` is resynced from physical storage and the post-removeitem invariant
+    // check fires in repair mode. Returning early on a partial-rollback path would leave
+    // cached `pair.item_stock` at the pre-removeitem value while physical storage is mid-
+    // rollback, poisoning the next handler's `pre-*` checkpoint and short-circuiting an
+    // unrelated legitimate operation.
+    let mut final_status: Option<String> = None;
+    let mut final_result: Result<(), StoreError> = Ok(());
+    let mut record_audit = true;
+
     match trade_outcome {
         Ok(_) => {}
         Err(StoreError::BotDisconnected) => {
+            record_audit = false;
             // Rollback: withdrawal already moved items from chests into the bot.
             // Re-deposit each planned chunk back into its source chest via the shared helper.
             let stack_size = store.pairs.get(item).map(|p| p.stack_size).unwrap_or(64);
@@ -451,9 +485,10 @@ pub async fn handle_removeitem_order(
                     rb.operations_failed,
                 );
             }
-            return Err(StoreError::BotDisconnected);
+            final_result = Err(StoreError::BotDisconnected);
         }
         Err(StoreError::TradeRejected(err)) => {
+            record_audit = false;
             warn!("[Removeitem] trade failed, rolling back to storage: operator={} item={} qty={} err={}",
                 player_name, item, quantity, err);
             // Items are still in the bot's inventory; re-deposit them via the same plan.
@@ -480,28 +515,30 @@ pub async fn handle_removeitem_order(
                     rb.items_returned,
                     rb.operations_failed,
                 );
-                return utils::send_message_to_player(
-                    store,
-                    player_name,
-                    &format!(
-                        "Removeitem CRITICAL ERROR: trade failed and rollback also partially failed. \
-                        {} item(s) may be stuck in bot inventory. Contact administrator. trade_error='{}'",
-                        qty_i32 - rb.items_returned, err
-                    ),
-                )
-                .await;
+                final_status = Some(format!(
+                    "Removeitem CRITICAL ERROR: trade failed and rollback also partially failed. \
+                    {} item(s) may be stuck in bot inventory. Contact administrator. trade_error='{}'",
+                    qty_i32 - rb.items_returned, err
+                ));
+            } else {
+                final_status = Some(format!(
+                    "Removeitem aborted: trade failed: {}. Items returned to storage.",
+                    err
+                ));
             }
-
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!("Removeitem aborted: trade failed: {}. Items returned to storage.", err),
-            )
-            .await;
         }
         Err(other) => return Err(other),
     }
 
+    // Resync pair stock from authoritative storage totals (chest syncs above may have
+    // moved the real amount by more than the planned withdrawal if there was drift, and
+    // a partially-failed rollback leaves physical storage somewhere between pre- and
+    // post-removeitem).
+    //
+    // This block runs unconditionally — even on partial-rollback paths — so cached
+    // `pair.item_stock` always reflects what physical storage actually holds. Skipping
+    // this on failure would leave the cache at the pre-removeitem value while storage
+    // is mid-rollback, tripping the next handler's `pre-*` invariant checkpoint.
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "removeitem/commit")?;
     pair.item_stock = new_stock;
@@ -511,39 +548,47 @@ pub async fn handle_removeitem_order(
         item, pair.item_stock);
     store.dirty = true;
 
-    store.trades.push(Trade::new(
-        TradeType::RemoveStock,
-        ItemId::from_normalized(item.to_string()),
-        qty_i32,
-        0.0,
-        user_uuid.clone(),
-    ));
+    if record_audit {
+        store.trades.push(Trade::new(
+            TradeType::RemoveStock,
+            ItemId::from_normalized(item.to_string()),
+            qty_i32,
+            0.0,
+            user_uuid.clone(),
+        ));
 
-    store.orders.push_back(Order {
-        order_type: crate::types::order::OrderType::RemoveItem,
-        item: ItemId::from_normalized(item.to_string()),
-        amount: qty_i32,
-        currency_amount: 0.0,
-        user_uuid: user_uuid.clone(),
-    });
+        store.orders.push_back(Order {
+            order_type: crate::types::order::OrderType::RemoveItem,
+            item: ItemId::from_normalized(item.to_string()),
+            amount: qty_i32,
+            currency_amount: 0.0,
+            user_uuid: user_uuid.clone(),
+        });
 
-    info!(
-        "[Removeitem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
-        player_name, user_uuid, item, quantity, stock_before, new_stock
-    );
+        info!(
+            "[Removeitem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
+            player_name, user_uuid, item, quantity, stock_before, new_stock
+        );
+    }
 
+    // Repair-mode invariant check fires regardless of success/failure so any drift
+    // detected post-rollback gets logged + saved rather than poisoning later handlers.
     if let Err(e) = state::assert_invariants(store, "post-removeitem", true) {
         error!("[Removeitem] invariant violation after commit: operator={} item={} err={}",
             player_name, item, e);
         let _ = state::save(store);
     }
 
-    utils::send_message_to_player(
-        store,
-        player_name,
-        &format!("Removed {} {} from storage. Remaining stock: {}", quantity, item, new_stock),
-    )
-    .await
+    let whisper_text = final_status
+        .unwrap_or_else(|| format!("Removed {} {} from storage. Remaining stock: {}", quantity, item, new_stock));
+    let whisper_result = utils::send_message_to_player(store, player_name, &whisper_text).await;
+
+    // Failure-path Err propagation (e.g. BotDisconnected) takes precedence over a successful
+    // whisper; on the success path `final_result` is Ok and we return the whisper outcome.
+    match final_result {
+        Err(e) => Err(e),
+        Ok(()) => whisper_result,
+    }
 }
 
 /// Operator command: credit a pair's currency reserve by `amount` diamonds. No
@@ -737,6 +782,8 @@ mod tests {
     use crate::messages::{BotInstruction, ChestSyncReport};
     use crate::types::{Chest, Node, Pair, Position, Storage, User};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::mpsc;
     use crate::types::order::OrderType;
     use crate::types::trade::TradeType;
@@ -811,7 +858,85 @@ mod tests {
     /// Spawn a mock bot task that auto-responds to every `BotInstruction`. Only
     /// `Whisper` is exercised by `handle_add_currency`; we cover the other
     /// variants too so the channel never blocks a future test addition.
-    fn spawn_mock_bot(mut rx: mpsc::Receiver<BotInstruction>) {
+    fn spawn_mock_bot(rx: mpsc::Receiver<BotInstruction>) {
+        spawn_mock_bot_with_fail_flag(rx, None);
+    }
+
+    /// Variant of `spawn_mock_bot` with an optional one-shot fail-injection toggle:
+    /// when `fail_next_chest_op` is `Some(flag)` and the flag is `true` at the moment
+    /// a chest interaction arrives, the mock atomically clears the flag and replies
+    /// with `Err`, simulating a bot-side failure mid-deposit. All other instructions
+    /// (whisper, trade, subsequent chest ops) are answered with synthetic success so
+    /// the handler can exercise its rollback path (e.g. the return-to-operator
+    /// `TradeWithPlayer` after an additem deposit-step failure) without blocking on
+    /// the channel.
+    fn spawn_mock_bot_with_fail_flag(
+        mut rx: mpsc::Receiver<BotInstruction>,
+        fail_next_chest_op: Option<Arc<AtomicBool>>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BotInstruction::Whisper { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    BotInstruction::InteractWithChestAndSync {
+                        target_chest,
+                        action,
+                        respond_to,
+                        ..
+                    } => {
+                        // If the caller armed the fail flag, consume it and reply Err.
+                        // `swap` ensures only the FIRST chest op after arming fails;
+                        // subsequent ones (e.g. those issued during recovery) succeed.
+                        if let Some(flag) = fail_next_chest_op.as_ref()
+                            && flag.swap(false, Ordering::SeqCst)
+                        {
+                            let _ = respond_to
+                                .send(Err("simulated bot chest failure".to_string()));
+                            continue;
+                        }
+                        let (item, delta) = match action {
+                            crate::messages::ChestAction::Withdraw {
+                                item, amount, ..
+                            } => (item, -amount),
+                            crate::messages::ChestAction::Deposit {
+                                item, amount, ..
+                            } => (item, amount),
+                        };
+                        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                        let prior = target_chest.amounts.first().copied().unwrap_or(0);
+                        amounts[0] = (prior + delta).max(0);
+                        let _ = respond_to.send(Ok(ChestSyncReport {
+                            chest_id: target_chest.id,
+                            item,
+                            amounts,
+                        }));
+                    }
+                    BotInstruction::TradeWithPlayer {
+                        bot_offers: _,
+                        player_offers,
+                        respond_to,
+                        ..
+                    } => {
+                        let _ = respond_to.send(Ok(player_offers));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Sibling of `spawn_mock_bot_with_fail_flag` that arms the trade arm instead
+    /// of the chest arm: when `fail_next_trade` is `Some(flag)` and the flag is
+    /// `true` at the moment a `TradeWithPlayer` arrives, the mock atomically
+    /// clears the flag and replies with `Err`, which `perform_trade` surfaces as
+    /// `StoreError::TradeRejected`. All other instructions (whisper, chest ops,
+    /// later trades) succeed as in the default mock so the rollback path can run.
+    fn spawn_mock_bot_with_trade_fail_flag(
+        mut rx: mpsc::Receiver<BotInstruction>,
+        fail_next_trade: Arc<AtomicBool>,
+    ) {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
@@ -847,7 +972,12 @@ mod tests {
                         respond_to,
                         ..
                     } => {
-                        let _ = respond_to.send(Ok(player_offers));
+                        if fail_next_trade.swap(false, Ordering::SeqCst) {
+                            let _ = respond_to
+                                .send(Err("simulated trade rejection".to_string()));
+                        } else {
+                            let _ = respond_to.send(Ok(player_offers));
+                        }
                     }
                     _ => {}
                 }
@@ -1352,5 +1482,420 @@ mod tests {
         );
 
         assert!(store.dirty, "store.dirty must be true after mutation");
+    }
+
+    // ======================================================================
+    // handle_additem_order tests
+    // ----------------------------------------------------------------------
+    // `handle_additem_order` is a 300-line stateful chest-I/O handler with five
+    // distinct failure branches and two load-bearing invariants:
+    //
+    //   1. "Audit-skip-on-failure" — `Trade { AddStock }` and `Order { AddItem }`
+    //      rows are appended ONLY when the deposit loop completed end-to-end
+    //      (i.e. `record_audit == true`). A regression that audited on partial
+    //      failure would write phantom stock into the journal.
+    //
+    //   2. "Unconditional resync" — the tail block that writes
+    //      `pair.item_stock = storage.total_item_amount(item)` runs on every
+    //      path, including failure. A regression that returned early on deposit
+    //      failure would leave cached stock under-reporting physical inventory
+    //      and trip the next handler's `pre-*` invariant checkpoint.
+    //
+    // The three tests below pin happy path, pre-trade-rejection (the just-added
+    // capacity guard), and the deposit-step-failure rollback path that exercises
+    // both invariants together.
+    // ======================================================================
+
+    #[tokio::test]
+    async fn additem_happy_path_deposits_and_appends_audit() {
+        // Seed a single-node storage with 50 cobblestone in chest 2 (non-reserved)
+        // and a matching pair stock so `pre-additem` invariants pass. Add 100 more;
+        // shulker capacity per slot is 27*64=1728, so all 100 land in chest 2 slot 0
+        // and the mock bot's deposit reply syncs that slot to 150.
+        let item = "cobblestone";
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair(item, 50, 0.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage(item, 50);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+
+        let result = handle_additem_order(&mut store, "Alice", item, 100).await;
+        assert!(result.is_ok(), "handle_additem_order failed: {:?}", result);
+
+        // Pair stock matches physical storage post-deposit.
+        let physical_after = store.storage.total_item_amount(item);
+        let pair_after = store.pairs.get(item).expect("pair must exist").item_stock;
+        assert_eq!(
+            pair_after, physical_after,
+            "pair.item_stock must equal storage.total_item_amount after deposit"
+        );
+        assert_eq!(
+            pair_after, 150,
+            "pair.item_stock expected 150 (50 + 100), got {}",
+            pair_after
+        );
+
+        // Exactly one new Trade audit row of type AddStock.
+        assert_eq!(
+            store.trades.len(),
+            trades_before + 1,
+            "expected exactly one new trade audit row"
+        );
+        let trade: &Trade = &store.trades[trades_before];
+        assert!(
+            matches!(trade.trade_type, TradeType::AddStock),
+            "expected AddStock trade type, got {:?}",
+            trade.trade_type
+        );
+        assert_eq!(trade.amount, 100);
+        assert!(
+            trade.amount_currency.abs() < 1e-9,
+            "trade.amount_currency expected 0.0, got {}",
+            trade.amount_currency
+        );
+        assert_eq!(trade.item.as_str(), item);
+        assert_eq!(trade.user_uuid, test_uuid("Alice"));
+
+        // Exactly one new Order audit row of type AddItem.
+        assert_eq!(
+            store.orders.len(),
+            orders_before + 1,
+            "expected exactly one new order audit row"
+        );
+        let order: &Order = &store.orders[orders_before];
+        assert!(
+            matches!(order.order_type, OrderType::AddItem),
+            "expected AddItem order type, got {:?}",
+            order.order_type
+        );
+        assert_eq!(order.amount, 100);
+        assert_eq!(order.item.as_str(), item);
+
+        assert!(store.dirty, "store.dirty must be true after mutation");
+    }
+
+    #[tokio::test]
+    async fn additem_insufficient_capacity_rejects_before_trade() {
+        // Pin the just-added pre-trade guard mirroring `handle_removeitem_order`.
+        // With an empty Storage (zero nodes) `simulate_deposit_plan` cannot place
+        // any items, so `preview_planned == 0 != qty_i32 (10)` and the handler
+        // must whisper the operator and abort BEFORE initiating a trade. No
+        // audit rows must be written and `pair.item_stock` must be untouched.
+        let item = "cobblestone";
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut pairs = HashMap::new();
+        // Pair item_stock=0 to match empty physical storage (invariant gate).
+        let (k, p) = make_pair(item, 0, 0.0);
+        pairs.insert(k, p);
+
+        // Empty Storage — no nodes at all, so deposit planner has nowhere to put
+        // anything. This is the simplest way to trip the capacity guard without
+        // needing to fully fill 16+ chests of node-0 with shulker-stacks.
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+        let dirty_before = store.dirty;
+        let stock_before = store.pairs.get(item).expect("pair must exist").item_stock;
+
+        let result = handle_additem_order(&mut store, "Alice", item, 10).await;
+        assert!(
+            result.is_ok(),
+            "handler should whisper, not propagate error: {:?}",
+            result
+        );
+
+        // No trade was initiated, so no audit rows.
+        assert_eq!(
+            store.trades.len(),
+            trades_before,
+            "no trade audit on capacity rejection"
+        );
+        assert_eq!(
+            store.orders.len(),
+            orders_before,
+            "no order audit on capacity rejection"
+        );
+        assert_eq!(
+            store.dirty, dirty_before,
+            "store.dirty must remain unchanged on pre-trade rejection"
+        );
+        assert_eq!(
+            store.pairs.get(item).expect("pair must exist").item_stock,
+            stock_before,
+            "pair.item_stock must remain unchanged on capacity rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn additem_deposit_failure_skips_audit_but_resyncs_stock() {
+        // Pins both load-bearing invariants of `handle_additem_order`:
+        //
+        //   * "Audit-skip-on-failure" — when the deposit loop bails out via
+        //     `record_audit = false`, NO `Trade::AddStock` and NO `Order::AddItem`
+        //     rows are appended.
+        //
+        //   * "Unconditional resync" — the tail block that rewrites
+        //     `pair.item_stock = storage.total_item_amount(item)` MUST run on
+        //     the failure path. The mock bot sends a "simulated chest failure"
+        //     for the FIRST `InteractWithChestAndSync` arriving after the trade
+        //     succeeds; `apply_chest_sync` therefore never runs for that step
+        //     so physical storage is untouched and the resync should leave
+        //     `pair.item_stock` at its pre-additem value (50). `store.dirty`
+        //     must also be `true` because the tail-block resync sets it.
+        let item = "cobblestone";
+        let (tx, rx) = mpsc::channel(64);
+        let fail_flag = Arc::new(AtomicBool::new(true));
+        spawn_mock_bot_with_fail_flag(rx, Some(Arc::clone(&fail_flag)));
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair(item, 50, 0.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage(item, 50);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+        let physical_before = store.storage.total_item_amount(item);
+
+        let result = handle_additem_order(&mut store, "Alice", item, 100).await;
+        // Handler returns Ok because the failure is reported via whisper, not Err.
+        // (The only Err propagation paths are validation/StoreError::BotSendFailed;
+        // a bot-reported chest error funnels into `final_status` whisper text.)
+        assert!(
+            result.is_ok(),
+            "handler should whisper failure, not propagate error: {:?}",
+            result
+        );
+
+        // Audit-skip invariant: `record_audit == false` ⇒ no Trade/Order rows.
+        assert_eq!(
+            store.trades.len(),
+            trades_before,
+            "no trade audit row on deposit-step failure (record_audit=false)"
+        );
+        assert_eq!(
+            store.orders.len(),
+            orders_before,
+            "no order audit row on deposit-step failure (record_audit=false)"
+        );
+
+        // Unconditional-resync invariant: tail block runs even on failure.
+        // The mock failed BEFORE applying the chest sync, so physical storage
+        // is still 50 and the resynced pair stock must equal that.
+        let physical_after = store.storage.total_item_amount(item);
+        assert_eq!(
+            physical_after, physical_before,
+            "physical storage should be unchanged when chest op failed pre-sync"
+        );
+        let pair_after = store.pairs.get(item).expect("pair must exist").item_stock;
+        assert_eq!(
+            pair_after, physical_after,
+            "pair.item_stock must equal storage.total_item_amount even on failure path"
+        );
+        // `store.dirty` is set by the unconditional tail block (and by the
+        // return-to-operator trade's bot interactions); pin that the dirty flag
+        // is true so the persistence layer would flush the (unchanged but
+        // re-affirmed) state on the next tick.
+        assert!(
+            store.dirty,
+            "store.dirty must be true after handler runs (unconditional resync sets it)"
+        );
+
+        // The fail flag must have been consumed (swap cleared it), proving the
+        // mock injected the failure on the first chest op rather than later.
+        assert!(
+            !fail_flag.load(Ordering::SeqCst),
+            "fail flag should have been consumed by the first chest op"
+        );
+    }
+
+    // ======================================================================
+    // handle_removeitem_order tests
+    // ----------------------------------------------------------------------
+    // `handle_removeitem_order` mirrors `handle_additem_order` in reverse — a
+    // chest-withdraw loop followed by a return-to-operator trade — and shares
+    // the same two load-bearing invariants:
+    //
+    //   1. "Audit-skip-on-failure" — `Trade { RemoveStock }` and
+    //      `Order { RemoveItem }` rows are appended ONLY when the trade
+    //      completed end-to-end (`record_audit == true`). On a TradeRejected
+    //      branch the rollback re-deposits and we MUST NOT audit a non-trade.
+    //
+    //   2. "Unconditional resync" — the tail block that writes
+    //      `pair.item_stock = storage.total_item_amount(item)` runs on every
+    //      path, including the rollback path, so cached pair stock always
+    //      reflects post-rollback physical storage.
+    //
+    // The two tests below pin the happy path and the TradeRejected rollback
+    // path (which logs CRITICAL on partial-rollback failure — exactly the
+    // silent-desync regression a unit test pins).
+    // ======================================================================
+
+    #[tokio::test]
+    async fn removeitem_happy_path_withdraws_and_appends_audit() {
+        // Seed a single-node storage with 50 cobblestone in chest 2 and a
+        // matching pair stock so `pre-removeitem` invariants pass. Remove 20;
+        // the planner emits one withdrawal from slot 0 (50 → 30), the mock
+        // bot syncs the chest to 30, and `perform_trade` auto-accepts the
+        // operator-targeted trade.
+        let item = "cobblestone";
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair(item, 50, 0.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage(item, 50);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+
+        let result = handle_removeitem_order(&mut store, "Alice", item, 20).await;
+        assert!(result.is_ok(), "handle_removeitem_order failed: {:?}", result);
+
+        // Pair stock matches physical storage post-withdraw.
+        let physical_after = store.storage.total_item_amount(item);
+        let pair_after = store.pairs.get(item).expect("pair must exist").item_stock;
+        assert_eq!(
+            pair_after, physical_after,
+            "pair.item_stock must equal storage.total_item_amount after withdraw"
+        );
+        assert_eq!(
+            pair_after, 30,
+            "pair.item_stock expected 30 (50 - 20), got {}",
+            pair_after
+        );
+
+        // Exactly one new Trade audit row of type RemoveStock.
+        assert_eq!(
+            store.trades.len(),
+            trades_before + 1,
+            "expected exactly one new trade audit row"
+        );
+        let trade: &Trade = &store.trades[trades_before];
+        assert!(
+            matches!(trade.trade_type, TradeType::RemoveStock),
+            "expected RemoveStock trade type, got {:?}",
+            trade.trade_type
+        );
+        assert_eq!(trade.amount, 20);
+        assert!(
+            trade.amount_currency.abs() < 1e-9,
+            "trade.amount_currency expected 0.0, got {}",
+            trade.amount_currency
+        );
+        assert_eq!(trade.item.as_str(), item);
+        assert_eq!(trade.user_uuid, test_uuid("Alice"));
+
+        // Exactly one new Order audit row of type RemoveItem.
+        assert_eq!(
+            store.orders.len(),
+            orders_before + 1,
+            "expected exactly one new order audit row"
+        );
+        let order: &Order = &store.orders[orders_before];
+        assert!(
+            matches!(order.order_type, OrderType::RemoveItem),
+            "expected RemoveItem order type, got {:?}",
+            order.order_type
+        );
+        assert_eq!(order.amount, 20);
+        assert_eq!(order.item.as_str(), item);
+
+        assert!(store.dirty, "store.dirty must be true after mutation");
+    }
+
+    #[tokio::test]
+    async fn removeitem_trade_rejected_rolls_back_and_skips_audit() {
+        // Pins both load-bearing invariants of `handle_removeitem_order`:
+        //
+        //   * "Audit-skip-on-failure" — when `perform_trade` returns
+        //     `StoreError::TradeRejected`, the handler sets `record_audit = false`
+        //     and `rollback::deposit_transfers` re-deposits the withdrawn items;
+        //     NO `Trade::RemoveStock` and NO `Order::RemoveItem` rows appear.
+        //
+        //   * "Unconditional resync" — the tail block that rewrites
+        //     `pair.item_stock = storage.total_item_amount(item)` MUST run on
+        //     the rollback path. After the withdraw chest sync (50 → 30) and
+        //     the rollback deposit chest sync (30 → 50), physical storage is
+        //     back to 50 and the resync should leave `pair.item_stock` at 50.
+        //     `store.dirty` must also be `true` because the tail block sets it.
+        let item = "cobblestone";
+        let (tx, rx) = mpsc::channel(64);
+        let trade_fail_flag = Arc::new(AtomicBool::new(true));
+        spawn_mock_bot_with_trade_fail_flag(rx, Arc::clone(&trade_fail_flag));
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair(item, 50, 0.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage(item, 50);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+        let stock_before = store.pairs.get(item).expect("pair must exist").item_stock;
+
+        let result = handle_removeitem_order(&mut store, "Alice", item, 20).await;
+        // Handler returns Ok because the failure is reported via whisper, not Err.
+        // (TradeRejected funnels into `final_status`; only BotDisconnected propagates.)
+        assert!(
+            result.is_ok(),
+            "handler should whisper failure, not propagate error: {:?}",
+            result
+        );
+
+        // Audit-skip invariant: `record_audit == false` ⇒ no Trade/Order rows.
+        assert_eq!(
+            store.trades.len(),
+            trades_before,
+            "no trade audit row on TradeRejected (record_audit=false)"
+        );
+        assert_eq!(
+            store.orders.len(),
+            orders_before,
+            "no order audit row on TradeRejected (record_audit=false)"
+        );
+
+        // Unconditional-resync invariant: tail block runs on the rollback path.
+        // Withdraw moved 50 → 30; rollback deposit moved 30 → 50; resync rewrites
+        // pair.item_stock to total_item_amount, which is back to the pre-removeitem 50.
+        let physical_after = store.storage.total_item_amount(item);
+        let pair_after = store.pairs.get(item).expect("pair must exist").item_stock;
+        assert_eq!(
+            pair_after, physical_after,
+            "pair.item_stock must equal storage.total_item_amount even on rollback path"
+        );
+        assert_eq!(
+            pair_after, stock_before,
+            "pair.item_stock must be back to pre-removeitem value (50) after rollback"
+        );
+
+        // `store.dirty` is set by the unconditional tail block.
+        assert!(
+            store.dirty,
+            "store.dirty must be true after handler runs (unconditional resync sets it)"
+        );
+
+        // The fail flag must have been consumed (swap cleared it), proving the
+        // mock injected the rejection on the first trade rather than later.
+        assert!(
+            !trade_fail_flag.load(Ordering::SeqCst),
+            "trade fail flag should have been consumed by the first trade"
+        );
     }
 }

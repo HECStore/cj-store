@@ -585,10 +585,21 @@ pub struct ComposerRun {
 /// results as a new user turn, and iterates until either:
 ///
 /// - the model emits a `text`-only turn (terminal), OR
-/// - we hit `max_iterations`.
+/// - we hit `max_iterations`, OR
+/// - `cancel_token` fires between iterations.
 ///
 /// Best-effort recovery on cap: if the model produced any
 /// text alongside the final tool calls, that text is taken as the reply.
+///
+/// Cancellation contract: the token is sampled ONLY at the top of each
+/// iteration of the main loop — never mid-HTTP and never mid-tool-dispatch.
+/// CHAT.md "between iterations" rule: an in-flight `update_self_memory`
+/// write or `web_fetch` cache write must not be torn, and a Shutdown
+/// fired during a slow Anthropic round-trip should let that round-trip
+/// finish so the tokens it billed are observed by the caller. On cancel,
+/// the function returns `Ok(ComposerRun { reply: None, .. })` carrying
+/// every accrued counter (input/output/cache tokens, tool-call counts)
+/// so the orchestrator's post-call accounting runs unconditionally.
 ///
 /// Note: with `max_iterations < 2`, the cap check (`iterations >= max_iterations`)
 /// trips before any tool dispatch, returning `hit_cap = true` immediately on any
@@ -601,6 +612,7 @@ pub async fn run_loop(
     use_extended_cache: bool,
     rate_limiter: Option<&crate::chat::client::RateLimiter>,
     nonce: &str,
+    cancel_token: &tokio_util::sync::CancellationToken,
 ) -> Result<ComposerRun, String> {
     let mut req = initial_request;
     let mut input_tokens = 0u64;
@@ -616,6 +628,26 @@ pub async fn run_loop(
     let mut store_tool_calls_this_turn = 0u32;
 
     loop {
+        // CHAT.md "between iterations" cancellation checkpoint. Sampling
+        // the token here (and only here) preserves the no-torn-write
+        // rule for tools and lets the most recent Anthropic round-trip
+        // finish so its tokens are observed by the caller. The partial
+        // ComposerRun returned here surfaces every counter accrued so
+        // far so the orchestrator can record_composer / bump daily
+        // tool-call meters even on the cancel path.
+        if cancel_token.is_cancelled() {
+            return Ok(ComposerRun {
+                reply: None,
+                iterations,
+                hit_cap: false,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                update_self_memory_calls,
+                web_fetch_calls,
+            });
+        }
         iterations += 1;
         if let Some(limiter) = rate_limiter {
             // Estimate weight as the cumulative system+user byte size /

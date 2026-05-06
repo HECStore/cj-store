@@ -240,7 +240,12 @@ impl Journal {
             Ok(()) => Ok(archived),
             Err(_) => {
                 fs::copy(&self.path, &archived)?;
-                fs::remove_file(&self.path)?;
+                if let Err(remove_err) = fs::remove_file(&self.path) {
+                    tracing::warn!(
+                        "[Journal] archived leftover to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
+                        archived, self.path
+                    );
+                }
                 Ok(archived)
             }
         }
@@ -268,7 +273,12 @@ impl Journal {
             Ok(()) => Ok(archived),
             Err(_) => {
                 fs::copy(path, &archived)?;
-                fs::remove_file(path)?;
+                if let Err(remove_err) = fs::remove_file(path) {
+                    tracing::warn!(
+                        "[Journal] quarantined unreadable journal to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
+                        archived, path
+                    );
+                }
                 Ok(archived)
             }
         }

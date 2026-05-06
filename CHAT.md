@@ -482,12 +482,18 @@ in plain prose. Haiku reads the candidate and emits one of:
 
 - `send` — clean line, ship verbatim;
 - `strip` — reasoning preamble + real chat-line tail; emit ONLY the
-  trailing chat-line portion. The substring contract is enforced: a
-  `strip` whose `message` is not a contiguous substring of the original
-  candidate is downgraded to `rewrite` so a paraphrasing model can't
-  claim verbatim provenance in the audit log;
+  trailing chat-line portion. The substring contract is enforced
+  against the candidate Haiku actually saw — i.e.
+  `escape_for_trusted_block(original)` — and a `strip` whose `message`
+  is not a contiguous substring of that escaped form is downgraded to
+  `rewrite` so a paraphrasing model can't claim verbatim provenance in
+  the audit log. After the contract check, `&lt;` / `&gt;` entities on
+  `message` are reversed before being stored (Haiku saw the escaped
+  candidate, so its faithful output may carry entity form), so chat
+  output never ships HTML-escaped angle brackets;
 - `rewrite` — leak and message mangled together; emit a fresh in-voice
-  line conveying the salvageable intent;
+  line conveying the salvageable intent. Same `&lt;`/`&gt;` reversal as
+  `strip` so the rewrite never ships HTML entities either;
 - `reject` — pure deliberation with nothing to send; bot stays silent.
 
 Best-effort: any error / decode failure / cap-trip / rate-limit-skip
@@ -523,6 +529,13 @@ The filter writes one of these `kind` values to today's
   `send`/`strip`/`rewrite`/`reject`.
 - `reasoning_filter_shorten` — one record per shorten loop iteration;
   see extras above.
+- `reasoning_filter_shorten_unexpected_action` — the shorten prompt's
+  schema bakes in `"action": "rewrite"`; if Haiku returns any other
+  action (`send` / `strip` / `reject`), the loop refuses to overwrite
+  the already-vetted `m` with arbitrary unchecked text, logs this kind
+  with `extra.action` + `extra.reason`, and breaks. Downstream
+  `pacing::truncate_to_chat_limit` does the final hard cut on the prior
+  `m`.
 - `reasoning_filter_skip` — local rate-limit denied dispatch;
   `extra.source` is `reasoning_filter` or `reasoning_filter_shorten` so
   operators can grep by phase.
@@ -556,9 +569,15 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
 2. Strip telltale tokens via `pacing::strip_ai_tells`, then apply
    operator regex in `data/chat/strip_patterns.txt`. If persona declares
    "lowercase-by-default", lowercase first-of-sentence.
-   - Literal-substring strip using `pacing::BUILT_IN_AI_TELLS`, which
-     is exactly six entries: `"As an AI"`, `"as an AI"`, `"I cannot"`,
-     `"I'm Claude"`, `"I am Claude"`, `"language model"`.
+   - ASCII-case-insensitive substring strip using
+     `pacing::BUILT_IN_AI_TELLS`, which is exactly six entries:
+     `"As an AI"`, `"I cannot"`, `"I'm Claude"`, `"I am Claude"`,
+     `"language model"`, `"Anthropic"`. The list is deliberately narrow:
+     model-identity / vendor leaks only. Phrasings like `"I'm an AI"`,
+     `"as a language model"`, `"as an assistant"` are NOT stripped — the
+     persona explicitly mandates honest disclosure that the bot is an
+     AI when sincerely asked (`data/chat/persona.md`,
+     `src/chat/persona.rs`).
    - Unicode normalization hard-coded inside `strip_ai_tells` (not in
      the seed list): smart quotes `\u{201c}\u{201d}\u{2018}\u{2019}` →
      ASCII `"`/`'`; em-dash `\u{2014}` → `" - "`; en-dash `\u{2013}` →
@@ -1125,16 +1144,22 @@ after login, so it lives in
   the same token: BotDisconnected mints a fresh token afterwards so
   subsequent dispatches aren't born already-cancelled, while Shutdown
   fires the token *before* the existing drain + state save + ack so the
-  CLI doesn't block up to ~60s on a slow Anthropic round-trip.
-  Cancellation only takes effect *between iterations* of the composer
-  loop and around the typing-delay sleep — never mid-tool-dispatch, so
-  an in-flight `update_self_memory` write or `web_fetch` can't be torn.
-  Each cancel originator writes a `composer_cancelled` decision-log
-  entry with `reason = "bot_disconnected"` or `reason = "shutdown"` so
-  cost auditing has a signal even though `record_composer` is skipped
-  on the cancel path (the upstream provider may have charged for a
-  partial call, but the local meter doesn't double-count). Tokens
-  billed up to abort still count against the daily cap.
+  CLI doesn't block on the next composer round-trip. Cancellation is
+  sampled *only between iterations* of the composer loop (inside
+  `composer::run_loop`) and around the typing-delay sleep — never
+  mid-HTTP and never mid-tool-dispatch, so neither an in-flight
+  Anthropic round-trip nor an `update_self_memory` / `web_fetch` write
+  can be torn. On cancel, `run_loop` returns a partial `ComposerRun`
+  carrying every counter accrued so far (input/output/cache tokens,
+  `update_self_memory_calls`, `web_fetch_calls`) and the orchestrator's
+  post-call block runs unconditionally — `record_composer`,
+  `update_self_memory_today`, `web_fetches_today`, and the throttle /
+  404 backoff timers all see the same accounting on the cancel path as
+  on the success path, so tokens billed up to abort genuinely count
+  against the daily cap and a throttle-flap can't be reset by a
+  reconnect race. Each cancel originator writes a `composer_cancelled`
+  decision-log entry with `reason = "bot_disconnected"` or
+  `reason = "shutdown"` for the audit trail.
 - **`is_bot` history tag** — every line written by the bot's own
   `SendChat`/`Whisper` is tagged `"is_bot": true`, independent of
   sender comparison. Events from the pre-username-known window are

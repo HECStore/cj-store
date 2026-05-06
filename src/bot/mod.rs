@@ -1378,12 +1378,22 @@ fn parse_chat_line(
 /// - `+ Foo`, `[+] Foo` (proxy/2b2t-style join markers)
 /// - `Welcome Foo` / `Welcome, Foo` (server-driven greeter plugins)
 fn parse_join_broadcast(content: &str) -> Option<String> {
-    let lc = content.to_lowercase();
-    let has_cue = lc.contains("joined")
-        || lc.contains("joining")
-        || lc.contains("connected")
+    // ASCII-only fold for byte-length-preservation; cues are ASCII.
+    let lc = content.to_ascii_lowercase();
+    // Single-word cues must match a WHOLE token, not a substring — otherwise
+    // "disconnected" gets misclassified as "connected" and every leave
+    // broadcast is swallowed by the join parser before `parse_leave_broadcast`
+    // ever sees it. Multi-word phrases like "logged in" / "has risen" /
+    // "continue the journey" legitimately span tokens, so they keep using
+    // `lc.contains(...)`.
+    const TOKEN_CUES: &[&str] = &[
+        "joined", "joining", "connected", "connecting", "connect", "welcome",
+    ];
+    let has_token_cue = lc
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| TOKEN_CUES.contains(&tok));
+    let has_cue = has_token_cue
         || lc.contains("logged in")
-        || lc.contains("welcome")
         || lc.contains("has risen")
         || lc.contains("continue the journey")
         || lc.starts_with("+ ")
@@ -1433,9 +1443,19 @@ fn parse_join_broadcast(content: &str) -> Option<String> {
 /// - `Foo timed out`, `Foo was kicked`
 /// - `- Foo`, `[-] Foo` (proxy/2b2t-style leave markers)
 fn parse_leave_broadcast(content: &str) -> Option<String> {
-    let lc = content.to_lowercase();
-    let has_cue = lc.contains("left")
-        || lc.contains("disconnected")
+    // ASCII-only fold for byte-length-preservation; cues are ASCII.
+    let lc = content.to_ascii_lowercase();
+    // Single-word cues must match a WHOLE token, not a substring — otherwise
+    // "Cleftvale earned an advancement" gets misclassified as a leave event
+    // because of the substring "left", silently ejecting the wrong player from
+    // the OnlinePlayers roster. Multi-word phrases like "timed out" /
+    // "was kicked" / "logged out" legitimately span tokens, so they keep using
+    // `lc.contains(...)`. Mirrors the same fix in `parse_join_broadcast`.
+    const TOKEN_CUES: &[&str] = &["left", "disconnected"];
+    let has_token_cue = lc
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| TOKEN_CUES.contains(&tok));
+    let has_cue = has_token_cue
         || lc.contains("timed out")
         || lc.contains("was kicked")
         || lc.contains("logged out")
@@ -1482,7 +1502,12 @@ fn parse_leave_broadcast(content: &str) -> Option<String> {
 /// "withered", …). We accept the first Mojang-shaped token as the
 /// victim if the line carries one of these cues.
 fn parse_death_broadcast(content: &str) -> Option<(String, String)> {
-    let lc = content.to_lowercase();
+    // ASCII-only fold so byte indices in `lc` remain valid byte indices in
+    // `content` — `String::to_lowercase()` is locale-aware and not byte-length-
+    // preserving (e.g. `İ` U+0130 → `i\u{307}` grows by one byte), so a
+    // non-ASCII server prefix would make `&content[..cause_idx]` panic at a
+    // non-char-boundary slice. All death cues are ASCII so this is sufficient.
+    let lc = content.to_ascii_lowercase();
     // Death cues — broad. False positives are tolerable because the chat
     // module already short-circuits unrecognized senders, and the
     // synthetic "*just died: …*" content is itself the signal that the
@@ -1747,6 +1772,23 @@ mod tests {
     fn parse_leave_broadcast_returns_none_without_cue() {
         assert!(parse_leave_broadcast("hello everyone").is_none());
         assert!(parse_leave_broadcast("Foo said hi").is_none());
+    }
+
+    #[test]
+    fn parse_join_broadcast_does_not_match_disconnected() {
+        // "disconnected" contains "connected" as a substring; the join cue
+        // check must be tokenized so leave broadcasts aren't swallowed
+        // before `parse_leave_broadcast` runs (which would defeat the
+        // online-players roster's mark_left semantics).
+        assert_eq!(parse_join_broadcast("Foo disconnected"), None);
+    }
+
+    #[test]
+    fn parse_leave_broadcast_matches_disconnected() {
+        assert_eq!(
+            parse_leave_broadcast("Foo disconnected").as_deref(),
+            Some("Foo")
+        );
     }
 
     #[test]

@@ -339,6 +339,17 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
            or \"hey <name>\" is often appropriate, especially if the persona \
            knows them or the channel has been quiet, but don't greet every \
            single join if the server is bursty.\n\
+         - Leave broadcasts arrive as content \"*just left the server*\" and \
+           death broadcasts as content starting with \"*just died\". For leave \
+           events ALWAYS respond=false — the player is gone and cannot read \
+           a reply. For death events, respond=false unless the bot has an \
+           especially apt one-word reaction (\"f\", \"oof\") and the channel \
+           isn't already noisy.\n\
+         - The system prompt may include an \"Online players\" roster. Treat \
+           it as authoritative for who is currently on the server. If a \
+           message references a player not on that roster, do not assume \
+           they are present. Never address a player whose name is absent \
+           from the roster — they have left.\n\
          - Set ai_callout.detected = true ONLY when a player accuses the bot of \
            being AI / scripted / a robot. Quote the exact trigger.\n\
          - Confidence reflects how sure you are about responding/not — not how \
@@ -358,18 +369,21 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
 /// consideration. The adjustments block carries a cache-control marker
 /// so the prefix is cached across calls.
 ///
-/// The system prompt is laid out as THREE blocks:
+/// The system prompt is laid out as up to FOUR blocks:
 ///
 /// 1. Persona summary — uncached (block boundary, no cache_control).
 /// 2. Adjustments — `cache_control: ephemeral`. CHAT.md places the
 ///    cache breakpoint here so reflection-pass writes to adjustments.md
 ///    invalidate only the adjustments-onward prefix (the persona block
 ///    is implicitly cached by being before the breakpoint).
-/// 3. Recent history slice — uncached, varies per call.
+/// 3. Online players roster — uncached, varies as players come and go.
+///    Empty `online_players` skips the block entirely.
+/// 4. Recent history slice — uncached, varies per call.
 pub fn build_request(
     model: &str,
     persona_summary: &str,
     adjustments_md: &str,
+    online_players: &str,
     history_slice: &str,
     event: &crate::messages::ChatEvent,
     cache_ttl: crate::chat::client::CacheTtl,
@@ -380,7 +394,7 @@ pub fn build_request(
     let (persona_block, adjustments_block) =
         system_prompt_blocks(persona_summary, adjustments_md);
 
-    let system = vec![
+    let mut system = vec![
         SystemBlock::Text {
             text: persona_block,
             cache_control: None,
@@ -389,11 +403,17 @@ pub fn build_request(
             text: adjustments_block,
             cache_control: Some(CacheControl::ephemeral(cache_ttl)),
         },
-        SystemBlock::Text {
-            text: format!("=== Recent history ===\n{history_slice}"),
-            cache_control: None,
-        },
     ];
+    if !online_players.is_empty() {
+        system.push(SystemBlock::Text {
+            text: format!("=== Online players ===\n{online_players}"),
+            cache_control: None,
+        });
+    }
+    system.push(SystemBlock::Text {
+        text: format!("=== Recent history ===\n{history_slice}"),
+        cache_control: None,
+    });
 
     let user_text = format!(
         "Event:\nfrom: {}\ncontent: {}",
@@ -906,13 +926,14 @@ mod tests {
             "claude-haiku-4-5-20251001",
             "persona summary text",
             "no adjustments yet",
+            "",
             "recent: hi from Alice",
             &event,
             crate::chat::client::CacheTtl::Ephemeral1Hour,
             Some(0.0),
         );
         // Three blocks: persona (uncached), adjustments (cached),
-        // history (uncached).
+        // history (uncached). Empty `online_players` skips its block.
         assert_eq!(req.system.len(), 3);
         match &req.system[0] {
             crate::chat::client::SystemBlock::Text { cache_control, .. } => {
@@ -941,6 +962,7 @@ mod tests {
             "claude-haiku-4-5-20251001",
             "PERSONA_SUMMARY_MARKER",
             "ADJUSTMENTS_MARKER",
+            "",
             "history",
             &event,
             crate::chat::client::CacheTtl::Ephemeral5Min,
@@ -960,6 +982,31 @@ mod tests {
                 assert!(text.contains("ADJUSTMENTS_MARKER"));
                 assert!(!text.contains("PERSONA_SUMMARY_MARKER"));
                 assert!(cache_control.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_online_players_block_appears_when_non_empty() {
+        let event = ev("hi", "Alice");
+        let req = build_request(
+            "claude-haiku-4-5-20251001",
+            "persona",
+            "adjustments",
+            "Online: Alice, Bob",
+            "history",
+            &event,
+            crate::chat::client::CacheTtl::Ephemeral5Min,
+            Some(0.0),
+        );
+        // 4 blocks: persona, adjustments, online_players, history
+        assert_eq!(req.system.len(), 4);
+        match &req.system[2] {
+            crate::chat::client::SystemBlock::Text { text, cache_control } => {
+                assert!(text.contains("Online players"));
+                assert!(text.contains("Alice"));
+                assert!(text.contains("Bob"));
+                assert!(cache_control.is_none());
             }
         }
     }

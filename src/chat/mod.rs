@@ -14,6 +14,7 @@ pub mod decisions;
 pub mod history;
 pub(crate) mod jsonl;
 pub mod memory;
+pub mod online_players;
 pub mod pacing;
 pub mod persona;
 pub mod pricing;
@@ -113,13 +114,16 @@ pub async fn chat_task(
         config.dry_run
     );
 
-    // Scaffold-only warning: the proactive Fire arm logs a
-    // `proactive_fire_pending` decision-log entry but does not yet
-    // dispatch a composer call. Surface this loudly at startup so
-    // operators tuning thresholds don't believe replies are being sent.
+    // Proactive composer dispatch is now wired: when
+    // `proactive_threading_enabled = true`, a passing tick fires a real
+    // composer call against a partner picked from the live online
+    // roster. Operators should tune `proactive_probability_pct` and the
+    // partner-time thresholds to control how often the bot speaks
+    // unsolicited; the model itself is also told it MAY return empty to
+    // stay silent.
     if config.proactive_threading_enabled {
-        warn!(
-            "[Chat] proactive_threading_enabled = true but composer dispatch is not yet wired; ticks will only emit proactive_fire_pending decision-log entries (no replies will be sent)"
+        info!(
+            "[Chat] proactive composer dispatch wired; ticks will dispatch real composer calls when gates pass"
         );
     }
 
@@ -248,6 +252,10 @@ pub async fn chat_task(
 
     // Per-channel sliding window of last 8 events for dyad detection.
     let mut window: VecDeque<ChatEvent> = VecDeque::with_capacity(8);
+    // Live roster of currently-online players. Empty on startup; rebuilt
+    // from join/leave/death markers and from any inbound chat. Cleared
+    // on `BotDisconnected` so a reconnect starts from an empty roster.
+    let mut online_roster = online_players::OnlinePlayers::new();
     // Per-sender classifier dispatch counter.
     let mut classifier_counter = classifier::PerSenderCounter::new();
     // Per-sender spam guard.
@@ -380,11 +388,12 @@ pub async fn chat_task(
                             web_fetches_today: runtime_state.web_fetches_today,
                             classifier_active_senders: classifier_counter.active_senders(),
                             proactive_threading_enabled: config.proactive_threading_enabled,
-                            // Scaffold-only: the proactive Fire arm only
-                            // logs `proactive_fire_pending` today. Flip
-                            // this literal to `true` once composer
-                            // dispatch is wired.
-                            proactive_dispatch_wired: false,
+                            // Composer dispatch is now wired: the Fire
+                            // arm builds a synthetic user turn and calls
+                            // `process_proactive_tick`, which honors the
+                            // same caps + pacing + send path as a
+                            // reactive turn.
+                            proactive_dispatch_wired: true,
                         };
                         let _ = respond_to.send(report);
                     }
@@ -515,6 +524,16 @@ pub async fn chat_task(
                             );
                         }
                         composer_cancel = CancellationToken::new();
+                        // Wipe the online roster — the next session
+                        // starts empty and is rebuilt from inbound
+                        // events / join broadcasts.
+                        if !online_roster.is_empty() {
+                            info!(
+                                online_count = online_roster.len(),
+                                "[Chat] clearing online-players roster on disconnect"
+                            );
+                            online_roster.clear();
+                        }
                     }
                     Some(ChatCommand::ShowDecisionLog { last_n, respond_to }) => {
                         // Read today's decisions JSONL and return the trailing
@@ -947,6 +966,7 @@ pub async fn chat_task(
                                 &composer_limiter,
                                 &classifier_limiter,
                                 composer_cancel.clone(),
+                                &mut online_roster,
                             ) => {
                                 if let Err(e) = process_result {
                                     warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
@@ -1032,6 +1052,7 @@ pub async fn chat_task(
                                     &composer_limiter,
                                     &classifier_limiter,
                                     composer_cancel.clone(),
+                                    &mut online_roster,
                                 ) => {
                                     if let Err(e) = backlog_result {
                                         warn!(sender = %backlog_ev.sender, error = %e, "[Chat] backlog event processing error");
@@ -1059,6 +1080,17 @@ pub async fn chat_task(
                         let now_prune = Instant::now();
                         classifier_counter.prune(now_prune);
                         spam_guard.prune(now_prune);
+                        // Belt-and-braces against missed leave broadcasts
+                        // on flaky servers: drop roster entries we
+                        // haven't observed in `proactive_max_secs_since_partner`
+                        // seconds (the same staleness threshold the
+                        // proactive picker uses to consider a partner
+                        // "still in conversation"). Without this, the
+                        // roster could grow stale after an extended
+                        // quiet period.
+                        online_roster.prune_stale(Duration::from_secs(
+                            config.proactive_max_secs_since_partner.max(60) as u64 * 4,
+                        ));
 
                         // Persist runtime state after each event so token
                         // counters survive a crash.
@@ -1156,7 +1188,10 @@ pub async fn chat_task(
                 };
 
                 // Pick the partner: most-recent non-bot, non-system event
-                // in the window, with a SystemTime delta to "now".
+                // in the window, with a SystemTime delta to "now". Players
+                // who are no longer in the live online roster are skipped
+                // — there is no point starting a conversation with someone
+                // who already left the server.
                 let now_st = std::time::SystemTime::now();
                 let partner_candidate: Option<(String, u64)> = window
                     .iter()
@@ -1168,6 +1203,7 @@ pub async fn chat_task(
                                 &system_senders_re,
                                 &system_senders_exact,
                             )
+                            && online_roster.contains(&ev.sender)
                     })
                     .map(|ev| {
                         let secs = now_st
@@ -1220,33 +1256,63 @@ pub async fn chat_task(
                         decisions::write(&rec);
                     }
                     conversation::ProactiveDecision::Fire(partner) => {
-                        // Partner identified and gates passed. The
-                        // composer-side dispatch (loading the partner's
-                        // per-player memory, building a synthetic user
-                        // message that tells the model the convo state,
-                        // running pacing/send) is the next slice of work
-                        // — for now we record the decision so operators
-                        // can audit how often gates would fire and tune
-                        // the probability / time thresholds before any
-                        // tokens are spent.
-                        //
-                        // When `process_self_tick` lands it MUST also
-                        // gate on: `daily caps (USD/tokens)`,
-                        // `recent_bot_send_times` (max-replies-per-min),
-                        // `spam_guard.is_suppressed(&partner)`,
-                        // `spam_guard.is_blocklisted(&partner)`,
-                        // `dry_run`. The synthetic event fed to the
-                        // composer MUST NOT be inserted into `window`
-                        // (would re-trigger itself on the next tick) and
-                        // MUST NOT update `last_bot_send_at` until after
-                        // a successful real send.
+                        // Partner identified and gates passed. Honor the
+                        // same caps + spam + blocklist gates the
+                        // per-event path enforces, then dispatch the
+                        // composer with a synthetic "self-initiated" user
+                        // turn. The synthetic event MUST NOT be inserted
+                        // into `window` (would re-trigger itself on the
+                        // next tick) and MUST NOT update
+                        // `last_bot_send_at` until after a successful
+                        // real send.
+                        if conversation::SpamGuard::is_blocklisted(
+                            &partner.username.to_lowercase(),
+                            None,
+                            &blocklist,
+                        ) {
+                            decisions::write(
+                                &decisions::DecisionRecord::new("proactive_skip")
+                                    .with_sender(&partner.username)
+                                    .with_reason("blocklisted"),
+                            );
+                            continue;
+                        }
+                        if spam_guard.is_suppressed(&partner.username, Instant::now()) {
+                            decisions::write(
+                                &decisions::DecisionRecord::new("proactive_skip")
+                                    .with_sender(&partner.username)
+                                    .with_reason("spam_suppressed"),
+                            );
+                            continue;
+                        }
+                        // Max-replies-per-minute floor: the proactive
+                        // path counts toward the same per-minute budget
+                        // as reactive replies.
+                        let cutoff = Instant::now() - Duration::from_secs(60);
+                        while let Some(&t) = recent_bot_send_times.front() {
+                            if t < cutoff {
+                                recent_bot_send_times.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if recent_bot_send_times.len() as u32
+                            >= config.max_replies_per_minute
+                        {
+                            decisions::write(
+                                &decisions::DecisionRecord::new("proactive_skip")
+                                    .with_sender(&partner.username)
+                                    .with_reason("max_replies_per_minute"),
+                            );
+                            continue;
+                        }
                         info!(
                             partner = %partner.username,
                             secs_ago = partner.their_last_msg_secs_ago,
-                            "[Chat] proactive tick would fire (composer dispatch not yet wired)"
+                            "[Chat] proactive tick firing — dispatching composer"
                         );
                         decisions::write(
-                            &decisions::DecisionRecord::new("proactive_fire_pending")
+                            &decisions::DecisionRecord::new("proactive_fire")
                                 .with_sender(&partner.username)
                                 .extra(
                                     "their_last_msg_secs_ago",
@@ -1257,6 +1323,41 @@ pub async fn chat_task(
                                     serde_json::Value::from(secs_bot.unwrap_or(0)),
                                 ),
                         );
+                        let cancelled = composer_cancel.clone();
+                        tokio::select! {
+                            biased;
+                            _ = cancelled.cancelled() => {
+                                decisions::write(
+                                    &decisions::DecisionRecord::new("composer_cancelled")
+                                        .with_sender(&partner.username)
+                                        .with_reason("bot_disconnected_during_proactive"),
+                                );
+                            }
+                            res = process_proactive_tick(
+                                &partner,
+                                &api_key,
+                                &config,
+                                &pricing,
+                                &mut runtime_state,
+                                &bot_username,
+                                &persona_body,
+                                persona_lowercase_default,
+                                &mut recent_bot_send_times,
+                                &mut last_bot_send_at,
+                                &in_critical_section,
+                                &bot_tx,
+                                &composer_limiter,
+                                composer_cancel.clone(),
+                                &online_roster,
+                            ) => {
+                                if let Err(e) = res {
+                                    warn!(partner = %partner.username, error = %e, "[Chat] proactive composer dispatch error");
+                                }
+                            }
+                        }
+                        if let Err(e) = runtime_state.save() {
+                            warn!(error = %e, "[Chat] state save failed after proactive tick");
+                        }
                     }
                 }
             }
@@ -1295,6 +1396,7 @@ async fn process_event(
     composer_limiter: &client::RateLimiter,
     classifier_limiter: &client::RateLimiter,
     composer_cancel: CancellationToken,
+    online_players: &mut online_players::OnlinePlayers,
 ) -> Result<(), String> {
     let now = Instant::now();
 
@@ -1365,6 +1467,44 @@ async fn process_event(
     // self-echo guard.
     if event.sender.eq_ignore_ascii_case(&bot_name) {
         return Ok(());
+    }
+
+    // Live online-roster maintenance. Synthetic join/leave/death events
+    // (salvaged in `bot::parse_chat_line`) carry well-known marker
+    // strings so the chat module can update the roster without needing
+    // a separate event channel. Anything else is a real chat line, which
+    // is itself proof the sender is online — `mark_seen` lazily admits
+    // them in case we missed the join broadcast.
+    let content_trim = event.content.trim();
+    let is_join_marker = content_trim == "*just joined the server*";
+    let is_leave_marker = content_trim == "*just left the server*";
+    let is_death_marker = content_trim.starts_with("*just died");
+    if is_join_marker {
+        online_players.mark_joined(&event.sender);
+    } else if is_leave_marker {
+        // Drop the player from the roster and short-circuit the
+        // pipeline — there is no point spending classifier/composer
+        // tokens on a player who can no longer read chat. The history
+        // writer still records the event upstream of process_event, so
+        // operator-facing logs preserve the leave signal.
+        online_players.mark_left(&event.sender);
+        decisions::write(
+            &decisions::DecisionRecord::new("pre_filter_skip")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason("player_left"),
+        );
+        return Ok(());
+    } else if is_death_marker {
+        // Death is a soft signal. Per the user-stated requirement, we
+        // remove the dier from the roster: if they respawn and speak
+        // again, `mark_seen` re-admits them on the next inbound event.
+        online_players.mark_left(&event.sender);
+        // Fall through — the classifier may still decide to react with
+        // a one-word reaction ("f", "oof"). The classifier's prompt
+        // guidance treats death-marker content conservatively.
+    } else {
+        online_players.mark_seen(&event.sender);
     }
 
     // moderation backoff — silently observe while in backoff.
@@ -1551,10 +1691,21 @@ async fn process_event(
     } else {
         client::CacheTtl::Ephemeral5Min
     };
+    // Compact roster (usernames only) for the classifier — the
+    // classifier just needs to know who is reachable so it can refuse
+    // to reply to a player who already left. Per-player memory snippets
+    // are too costly for every classifier call and live only on the
+    // composer block.
+    let classifier_online_block = if online_players.is_empty() {
+        String::new()
+    } else {
+        format!("Currently online: {}\n", online_players.format_usernames())
+    };
     let classifier_req = classifier::build_request(
         &config.classifier_model,
         &persona_summary(persona_body),
         &read_adjustments_or_empty(),
+        &classifier_online_block,
         &history_slice,
         event,
         cache_ttl,
@@ -1748,12 +1899,14 @@ async fn process_event(
     let nonce = composer::fresh_nonce();
     let wrapped = composer::wrap_untrusted("chat", &nonce, &event.content)
         .unwrap_or_else(|_| "[content withheld]".to_string());
+    let online_players_block = build_online_players_block(online_players);
     let snapshot = composer::PromptSnapshot {
         static_rules: composer::static_rules_text(&nonce),
         persona: persona_body.to_string(),
         memory_md: read_global_or_empty(),
         adjustments_md: read_adjustments_or_empty(),
         player_memory: player_memory_block,
+        online_players: online_players_block,
         history_slice,
     };
     let user_content = vec![client::ContentBlock::Text {
@@ -2458,6 +2611,395 @@ async fn process_event(
     Ok(())
 }
 
+/// Self-initiated composer turn driven by the proactive-tick gate. Runs
+/// the composer with a synthetic user message that explains the
+/// situation ("a player was chatting with you a moment ago — start a
+/// conversation if it feels natural; otherwise stay silent"), then
+/// honors the same pacing + dry-run + send path as the per-event flow.
+///
+/// Crucially:
+/// - The synthetic event is NEVER added to `window`, so the next
+///   proactive tick won't re-fire on the bot's own turn.
+/// - `last_bot_send_at` is updated only after a real successful send.
+/// - Cap checks, throttle backoffs, and model-404 backoffs are honored
+///   identically to `process_event`.
+#[allow(clippy::too_many_arguments)]
+async fn process_proactive_tick(
+    partner: &conversation::ProactivePartner,
+    api_key: &client::ApiKey,
+    config: &ChatConfig,
+    pricing_table: &pricing::PricingTable,
+    runtime_state: &mut state::ChatState,
+    bot_username: &Arc<RwLock<Option<String>>>,
+    persona_body: &str,
+    persona_lowercase_default: bool,
+    recent_bot_send_times: &mut VecDeque<Instant>,
+    last_bot_send_at: &mut Option<Instant>,
+    in_critical_section: &Arc<AtomicBool>,
+    bot_tx: &mpsc::Sender<BotInstruction>,
+    composer_limiter: &client::RateLimiter,
+    composer_cancel: CancellationToken,
+    online_roster: &online_players::OnlinePlayers,
+) -> Result<(), String> {
+    // Backoff guards — same as the per-event composer dispatch.
+    if client::is_model_404_backed_off(runtime_state.model_404_backoff_until.as_deref()) {
+        decisions::write(
+            &decisions::DecisionRecord::new("proactive_skip")
+                .with_sender(&partner.username)
+                .with_reason("model_404_backoff"),
+        );
+        return Ok(());
+    }
+    if let Some(ref until) = runtime_state.composer_throttle_backoff_until {
+        match chrono::DateTime::parse_from_rfc3339(until) {
+            Ok(t) if t.with_timezone(&chrono::Utc) > chrono::Utc::now() => {
+                decisions::write(
+                    &decisions::DecisionRecord::new("proactive_skip")
+                        .with_sender(&partner.username)
+                        .with_reason("composer_throttle_backoff"),
+                );
+                return Ok(());
+            }
+            _ => {
+                runtime_state.composer_throttle_backoff_until = None;
+            }
+        }
+    }
+
+    // Cap check before composer dispatch (mirrors process_event).
+    let estimated_composer_input = 4000u64;
+    let estimated_composer_usd =
+        pricing_table.usd_for_tokens(&config.composer_model, estimated_composer_input, 200);
+    let cap_v = runtime_state.would_exceed_caps_composer(
+        estimated_composer_input,
+        200,
+        estimated_composer_usd,
+        config,
+    );
+    if !matches!(cap_v, state::CapVerdict::Ok) {
+        decisions::write(
+            &decisions::DecisionRecord::new("cap_tripped")
+                .with_sender(&partner.username)
+                .with_reason(format!("proactive_composer {cap_v:?}")),
+        );
+        return Ok(());
+    }
+
+    // Resolve partner UUID for player-memory loading (best-effort: fall
+    // back to the sentinel UUID so update_player_memory's sender-binding
+    // check fails closed if the partner isn't yet known to Mojang).
+    let resolved_partner_uuid = crate::mojang::resolve_user_uuid(&partner.username)
+        .await
+        .ok();
+    let player_memory_block = if let Some(ref uuid) = resolved_partner_uuid {
+        let _ = memory::ensure_player_file(uuid, &partner.username);
+        memory::read_player(uuid).ok().flatten()
+    } else {
+        None
+    };
+
+    // Build the synthetic user message. The model is given full context
+    // (partner name, time-since-last-message, online roster) and is told
+    // it MAY stay silent — explicit permission to refuse keeps proactive
+    // ticks from generating filler chatter.
+    let cache_ttl = if client::extended_cache_available() {
+        client::CacheTtl::Ephemeral1Hour
+    } else {
+        client::CacheTtl::Ephemeral5Min
+    };
+    let history_slice = recent_history_slice_blocking(30).await;
+    let nonce = composer::fresh_nonce();
+    let online_block = build_online_players_block(online_roster);
+    let snapshot = composer::PromptSnapshot {
+        static_rules: composer::static_rules_text(&nonce),
+        persona: persona_body.to_string(),
+        memory_md: read_global_or_empty(),
+        adjustments_md: read_adjustments_or_empty(),
+        player_memory: player_memory_block,
+        online_players: online_block,
+        history_slice,
+    };
+    let synthetic = format!(
+        "Self-initiated turn (no inbound chat). The chat has gone quiet. \
+         Recent partner: `{}` (last spoke ~{}s ago). They are still online. \
+         If it feels natural, start a casual conversation with them — ask a \
+         question, follow up on something they mentioned, or share an \
+         observation in your usual voice. If nothing feels worth saying \
+         right now, reply with literally NOTHING (empty content) and stay \
+         silent. Do not narrate this decision; just speak or stay silent.",
+        partner.username, partner.their_last_msg_secs_ago,
+    );
+    let user_content = vec![client::ContentBlock::Text {
+        text: synthetic,
+        cache_control: None,
+    }];
+    let req = composer::build_request(
+        config.composer_model.clone(),
+        320,
+        config.composer_temperature,
+        &snapshot,
+        user_content,
+        tools::tool_definitions(
+            config.web_search_enabled,
+            config.web_fetch_enabled,
+            config.tools_store_enabled,
+        ),
+        cache_ttl,
+    );
+
+    let sender_uuid = resolved_partner_uuid
+        .clone()
+        .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+    let tool_ctx = tools::ToolContext {
+        sender_uuid: &sender_uuid,
+        cross_player_reads: config.cross_player_reads,
+        history_max_bytes: config.tools_history_max_bytes as usize,
+        update_bullet_max_chars: config.update_bullet_max_chars as usize,
+        history_search_max_days: config.history_search_max_days,
+        web_fetch_max_bytes: config.web_fetch_max_bytes as usize,
+        web_fetch_enabled: config.web_fetch_enabled,
+        today: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        player_memory_max_bytes: config.player_memory_max_bytes,
+        update_self_memory_today: runtime_state.update_self_memory_today,
+        update_self_memory_max_per_day: config.update_self_memory_max_per_day,
+        memory_max_inferred_bullets: config.memory_max_inferred_bullets,
+        web_fetches_today: runtime_state.web_fetches_today,
+        web_fetch_daily_max: config.web_fetch_daily_max,
+        store_tools_enabled: config.tools_store_enabled,
+        store_tool_calls_max_per_turn: config.tools_store_max_calls_per_turn,
+        store_tool_trade_query_max_results: config.tools_store_trade_query_max_results,
+        cross_player_balance_lookups: config.tools_store_cross_player_balance_lookups,
+    };
+
+    if composer_cancel.is_cancelled() {
+        return Ok(());
+    }
+    let started_day = state::capture_today_utc();
+    let started = Instant::now();
+    let run = match composer::run_loop(
+        api_key,
+        req,
+        &tool_ctx,
+        config.composer_max_tool_iterations,
+        true,
+        Some(composer_limiter),
+        &nonce,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if e.contains("model not found") {
+                runtime_state.model_404_backoff_until =
+                    Some(client::model_404_backoff_until_now_plus_1h());
+            }
+            if config.composer_throttle_backoff_secs > 0 && e.contains("upstream-throttled") {
+                let until = state::iso_utc(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(
+                            config.composer_throttle_backoff_secs as i64,
+                        ),
+                );
+                runtime_state.composer_throttle_backoff_until = Some(until);
+            }
+            decisions::write(
+                &decisions::DecisionRecord::new("composer_error")
+                    .with_sender(&partner.username)
+                    .with_reason(e),
+            );
+            return Ok(());
+        }
+    };
+    let composer_usd = pricing_table.usd_for_call(
+        &config.composer_model,
+        run.input_tokens,
+        run.output_tokens,
+        run.cache_creation_input_tokens,
+        run.cache_read_input_tokens,
+    );
+    runtime_state.record_composer(&started_day, run.input_tokens, run.output_tokens, composer_usd);
+    runtime_state.last_composer_call = Some(state::LastCallSummary {
+        at_utc: state::iso_utc(chrono::Utc::now()),
+        usd: composer_usd,
+        input_tokens: run.input_tokens,
+        output_tokens: run.output_tokens,
+    });
+    if run.update_self_memory_calls > 0 {
+        runtime_state.update_self_memory_today =
+            runtime_state.update_self_memory_today.saturating_add(run.update_self_memory_calls);
+    }
+    if run.web_fetch_calls > 0 {
+        runtime_state.web_fetches_today =
+            runtime_state.web_fetches_today.saturating_add(run.web_fetch_calls);
+    }
+    decisions::write(
+        &decisions::DecisionRecord::new("composer")
+            .with_sender(&partner.username)
+            .with_latency(started.elapsed().as_millis() as u64)
+            .with_tokens(run.input_tokens, run.output_tokens, composer_usd)
+            .with_cache_tokens(run.cache_creation_input_tokens, run.cache_read_input_tokens)
+            .extra("iterations", serde_json::Value::from(run.iterations))
+            .extra("hit_cap", serde_json::Value::from(run.hit_cap))
+            .extra("had_text_reply", serde_json::Value::from(run.reply.is_some()))
+            .extra("source", serde_json::Value::from("proactive")),
+    );
+
+    // Empty / no reply — model declined to start a conversation. That's
+    // a valid outcome; we already paid for the call but we don't speak.
+    let Some(reply) = run.reply else {
+        decisions::write(
+            &decisions::DecisionRecord::new("proactive_silent")
+                .with_sender(&partner.username)
+                .with_reason("model_declined"),
+        );
+        return Ok(());
+    };
+    let reply_trimmed = reply.trim();
+    if reply_trimmed.is_empty() {
+        decisions::write(
+            &decisions::DecisionRecord::new("proactive_silent")
+                .with_sender(&partner.username)
+                .with_reason("empty_reply"),
+        );
+        return Ok(());
+    }
+
+    // Apply the same outbound-shaping pipeline as process_event (minus
+    // the reasoning filter — it's an extra Haiku call and a proactive
+    // silent-decline already saves cost where it matters most). The
+    // pacing knobs are read straight from config.
+    let mut reply = pacing::strip_reasoning(&reply);
+    reply = pacing::strip_ai_tells(&reply);
+    if persona_lowercase_default {
+        reply = pacing::lowercase_first_per_sentence(&reply);
+    }
+    reply = pacing::sanitize_outbound_chat(&reply);
+    reply = pacing::truncate_to_chat_limit(&reply, config.composer_max_chars as usize);
+    if reply.trim().is_empty() {
+        decisions::write(
+            &decisions::DecisionRecord::new("proactive_silent")
+                .with_sender(&partner.username)
+                .with_reason("empty_after_sanitize"),
+        );
+        return Ok(());
+    }
+    if reply.trim_start().starts_with('/') {
+        decisions::write(
+            &decisions::DecisionRecord::new("reply_blocked")
+                .with_sender(&partner.username)
+                .with_reason("leading_slash"),
+        );
+        return Ok(());
+    }
+
+    // Pacing — typing delay then post-sleep recheck.
+    let mut rng_unit = rand_unit_f32;
+    let jitter_ms = pacing::gaussian_jitter_ms(0, config.typing_delay_jitter_ms, &mut rng_unit);
+    let delay = pacing::compute_typing_delay(
+        reply.chars().count(),
+        config.typing_delay_base_ms,
+        config.typing_delay_per_char_ms,
+        jitter_ms,
+        config.typing_delay_floor_ms,
+        config.typing_delay_max_ms,
+    );
+    tokio::select! {
+        _ = composer_cancel.cancelled() => {
+            return Ok(());
+        }
+        _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
+    }
+    if bot_username.read().await.is_none() {
+        decisions::write(
+            &decisions::DecisionRecord::new("pacing_drop")
+                .with_sender(&partner.username)
+                .with_reason("bot_disconnected_during_pacing"),
+        );
+        return Ok(());
+    }
+
+    let now_post_sleep = Instant::now();
+    let cutoff = now_post_sleep - Duration::from_secs(60);
+    while let Some(&t) = recent_bot_send_times.front() {
+        if t < cutoff {
+            recent_bot_send_times.pop_front();
+        } else {
+            break;
+        }
+    }
+    let secs_since_last = last_bot_send_at.map(|t| now_post_sleep.duration_since(t).as_secs());
+    let decision = pacing::recheck_after_sleep(
+        false,                             // never directly addressed (self-initiated)
+        in_critical_section.load(Ordering::Acquire),
+        true,                              // public-channel send
+        recent_bot_send_times.len() as u32,
+        config.max_replies_per_minute,
+        secs_since_last,
+        config.min_silence_secs,
+    );
+    if !matches!(decision, pacing::SendDecision::Send) {
+        decisions::write(
+            &decisions::DecisionRecord::new("pacing_drop")
+                .with_sender(&partner.username)
+                .with_reason(decision.reason_code()),
+        );
+        return Ok(());
+    }
+
+    let dry = config.dry_run || runtime_state.dry_run_runtime_override;
+    if dry {
+        decisions::write(
+            &decisions::DecisionRecord::new("dry_run")
+                .with_sender(&partner.username)
+                .extra("would_send", serde_json::Value::from(reply.clone()))
+                .extra("source", serde_json::Value::from("proactive")),
+        );
+        return Ok(());
+    }
+
+    // Public send — proactive turns are always public. Whisper-style
+    // self-initiation would be jarring on most servers and isn't
+    // supported until an operator asks for it.
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if bot_tx
+        .send(BotInstruction::SendChat {
+            content: reply.clone(),
+            respond_to: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        warn!("[Chat] bot channel closed before proactive send");
+        return Ok(());
+    }
+    match resp_rx.await {
+        Ok(Ok(())) => {
+            let sent_at = Instant::now();
+            recent_bot_send_times.push_back(sent_at);
+            *last_bot_send_at = Some(sent_at);
+            decisions::write(
+                &decisions::DecisionRecord::new("sent")
+                    .with_sender(&partner.username)
+                    .extra("reply_len", serde_json::Value::from(reply.len()))
+                    .extra("source", serde_json::Value::from("proactive")),
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "[Chat] bot send failed (proactive)");
+            decisions::write(
+                &decisions::DecisionRecord::new("send_error")
+                    .with_sender(&partner.username)
+                    .with_reason(e)
+                    .extra("source", serde_json::Value::from("proactive")),
+            );
+        }
+        Err(_) => {
+            warn!("[Chat] proactive send response channel dropped");
+        }
+    }
+    Ok(())
+}
+
 /// Stats returned by [`scrub_history_for_player`] for the operator log.
 #[derive(Debug, Clone, Copy, Default)]
 struct ForgetScrubStats {
@@ -2897,6 +3439,9 @@ async fn build_replay_prompt(
         memory_md: read_global_or_empty(),
         adjustments_md: read_adjustments_or_empty(),
         player_memory: None,
+        // Replay is a historical render — the live online roster is not
+        // recorded, so we leave this empty rather than inventing one.
+        online_players: String::new(),
         history_slice: recent_history_slice_blocking(30).await,
     };
     let mut out = String::new();
@@ -3085,6 +3630,61 @@ fn read_global_or_empty() -> String {
 
 fn read_adjustments_or_empty() -> String {
     memory::read_adjustments().unwrap_or_default()
+}
+
+/// Build the composer's online-players prompt block, with one short
+/// memory excerpt per online player. Excerpts are pulled from the
+/// player's memory file (best-effort: no network) and capped at ~120
+/// chars so the block doesn't blow up the prompt when the server is
+/// busy.
+///
+/// The closure does only on-disk work (cached UUID lookup + memory
+/// file read) so it stays cheap on a hot path.
+fn build_online_players_block(roster: &online_players::OnlinePlayers) -> String {
+    roster.format_for_composer(|username| memory_one_liner_for(username))
+}
+
+/// Compact one-line memory excerpt for `username`, used by the
+/// composer's online-players block. Prefers the trust line and the
+/// first non-empty bullet under "Stated preferences" or "Inferred";
+/// falls back to `None` if no memory file or no bullets exist.
+fn memory_one_liner_for(username: &str) -> Option<String> {
+    let uuid = crate::mojang::lookup_cached_uuid(username)?;
+    let body = memory::read_player(&uuid).ok().flatten()?;
+    let trust_line = body.lines().find(|l| l.starts_with("## Trust:"));
+    let first_bullet = body
+        .lines()
+        .filter(|l| l.starts_with("- "))
+        // Skip identity bullets — the username/UUID/dates are already
+        // implicit in the roster line itself.
+        .find(|l| {
+            let after = l.trim_start_matches("- ");
+            !(after.starts_with("UUID")
+                || after.starts_with("Known names")
+                || after.starts_with("First seen")
+                || after.starts_with("Last seen"))
+        });
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = trust_line {
+        parts.push(t.trim_start_matches("## ").trim().to_string());
+    }
+    if let Some(b) = first_bullet {
+        let trimmed = b.trim_start_matches("- ").trim();
+        if !trimmed.is_empty() {
+            // Cap excerpt length so a long memory line doesn't bloat
+            // the system prompt across many online players.
+            let mut excerpt: String = trimmed.chars().take(80).collect();
+            if trimmed.chars().count() > 80 {
+                excerpt.push_str("…");
+            }
+            parts.push(excerpt);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 /// Extract the first balanced `{...}` substring from `text`. Used by

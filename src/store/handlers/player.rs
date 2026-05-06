@@ -379,13 +379,20 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_creates_user_record_on_first_command() {
+        // The mojang `cfg(test)` fixture embeds the username's literal
+        // characters in the trailing UUID segment, and `ensure_user_exists`
+        // now rejects non-canonical UUIDs (lowercase hex / hyphens only).
+        // Pick a username whose first 12 chars are all valid hex digits so
+        // the synthetic UUID passes the shape gate and the auto-created
+        // user lands in `store.users`.
+        let username = "abcdef";
         let (mut store, mut whispers) = make_store();
-        handle_player_command(&mut store, "Newbie", "status").await.unwrap();
+        handle_player_command(&mut store, username, "status").await.unwrap();
         let _ = recv_whisper(&mut whispers).await;
 
-        let uuid = expected_test_uuid("Newbie");
+        let uuid = expected_test_uuid(username);
         let user = store.users.get(&uuid).expect("user auto-created");
-        assert_eq!(user.username, "Newbie");
+        assert_eq!(user.username, username);
         assert!(!user.operator);
     }
 }

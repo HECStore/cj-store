@@ -87,7 +87,11 @@ impl VerdictAction {
     /// Stable lowercase label used in the audit-log JSONL. Kept as a
     /// `&'static str` so the byte sequence is identical to the previous
     /// `String`-based implementation — log greppers and downstream
-    /// parsers see no change.
+    /// parsers see no change. Currently no internal caller invokes
+    /// it — `process_event` writes its own action label inline — but
+    /// the helper is the canonical mapping for any future audit-trail
+    /// consumer.
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             VerdictAction::Send => "send",

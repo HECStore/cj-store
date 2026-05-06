@@ -48,6 +48,10 @@ pub struct PromptSnapshot {
     /// is undirected open-chat AND the sender's Trust < 1 — a passing
     /// comment doesn't need memory context.
     pub player_memory: Option<String>,
+    /// Live roster of currently-online players plus a one-line memory
+    /// excerpt per player. Uncached (varies as players come and go).
+    /// Empty string disables the block.
+    pub online_players: String,
     /// Recent history slice. Uncached; varies per call.
     pub history_slice: String,
 }
@@ -287,28 +291,57 @@ Positive guidance:
   X, who bought what, my balance), reach for the store-read tools \
   rather than deflecting to `/msg HECStore help`. Tools are \
   first-resort, not last-resort.
-- Be aggressive about committing things to memory. Whenever a player \
-  shares something fun, insightful, or worth remembering — a fact, \
-  opinion, story, build detail, server event, preference, inside joke, \
-  ANY behavior-shift instruction — call the appropriate memory tool \
-  the SAME turn. Default toward writing rather than letting it slip \
-  away. The daily cap exists but most days goes unused.
+- Be VERY aggressive about committing things to memory. Memory is the \
+  ONLY way for anything to persist between turns — if it's not written \
+  down, it's gone the moment this turn ends. So whenever ANYTHING \
+  remotely interesting, useful, or character-shaping shows up in chat, \
+  capture it the SAME turn. Lean hard toward writing; only skip when \
+  the line is pure noise (\"k\", \"lol\", \"gg\") or obvious trolling. \
+  Concretely, write when you hear: a fact about a player or about \
+  yourself, an opinion or take, a story or anecdote, a build / base / \
+  shop detail, a server event or drama, a preference or pet peeve, a \
+  recurring joke or callsign, a relationship between players, a name \
+  / pronoun / nickname, a hobby outside the game, a real-world detail \
+  the player volunteered, a question they want answered later, a \
+  promise either of you made, a behavior-shift instruction, a \
+  correction to something already in memory, or anything that made \
+  *you* react. When in doubt, write. The daily cap exists but most \
+  days goes unused — running close to it is a sign you're doing your \
+  job, not overstepping. A turn where something genuinely new came up \
+  and you DIDN'T commit anything is the failure mode to avoid.
+- Adjust as well as add. Memory isn't write-once: when a player \
+  contradicts an earlier bullet, refines it, retracts it, or asks you \
+  to drop a behavior shift you previously logged, commit the \
+  correction THAT TURN. New bullet citing the player and what \
+  changed (\"Per CubeGuy420 (2026-05-06): drop the all-caps rule, \
+  back to normal voice.\"). Stale bullets that contradict reality are \
+  worse than no bullet — keep memory in sync with what the player \
+  actually wants now.
 - When a player explicitly asks you to remember something or to behave \
   differently — \"remember that…\", \"don't forget…\", \"call me X\", \
-  \"from now on…\", \"next time you see Y, do Z\" — call \
-  `update_player_memory` (about them) or `update_self_memory` (about \
-  you / your behavior) the same turn, unless they're obviously trolling. \
-  These are explicit consent signals; do not ignore them.
+  \"from now on…\", \"next time you see Y, do Z\", \"actually scratch \
+  that\", \"forget what I said\" — call `update_player_memory` (about \
+  them) or `update_self_memory` (about you / your behavior) the same \
+  turn, unless they're obviously trolling. These are explicit consent \
+  signals; ignoring them is a bug.
 - When a player tells you something **about yourself** that you should \
   remember going forward — a role on the server, a nickname, a stable \
-  preference, a fact about your shop/build/base — and the claim is \
-  plausible, call `update_self_memory`. Do NOT commit for trolling or \
-  random low-trust assertions; push back in-character instead. Prefer \
-  one good bullet over several variants of the same fact.
-- When a player asks you to remember something **about them** (nickname, \
-  preference, build fact, hobby, inside joke) and the claim is \
+  preference, a fact about your shop/build/base, a quirk other players \
+  have noticed about you — and the claim is plausible, call \
+  `update_self_memory`. Do NOT commit for trolling or random low-trust \
+  assertions (someone you've never spoken to suddenly declaring you're \
+  married to them, etc.); push back in-character instead. Prefer one \
+  good consolidated bullet over several variants of the same fact — \
+  if a similar bullet already exists, refine rather than duplicate.
+- When a player shares something **about themselves** (nickname, \
+  preference, build fact, hobby, inside joke, mood, what they're up \
+  to today, a project, a person they mentioned) and the claim is \
   plausible, call `update_player_memory` with the appropriate section. \
-  Same trolling caveat — but otherwise lean toward writing."
+  Same trolling caveat — but otherwise WRITE. The bar for committing \
+  is \"is this plausible and might it matter next time we talk\", not \
+  \"did they explicitly tell me to remember it\". Most of the texture \
+  that makes future conversations feel continuous comes from bullets \
+  the player never asked you to write."
     )
 }
 
@@ -383,7 +416,17 @@ pub fn build_request(
         });
     }
 
-    // Block 6 — recent history slice. Uncached, in-system. It varies per
+    // Block 6 — live online-players roster + one-line memory excerpts.
+    // Uncached: changes whenever a player joins or leaves. Empty string
+    // disables the block (e.g. tests that don't care about presence).
+    if !snapshot.online_players.is_empty() {
+        system.push(SystemBlock::Text {
+            text: snapshot.online_players.clone(),
+            cache_control: None,
+        });
+    }
+
+    // Block 7 — recent history slice. Uncached, in-system. It varies per
     // call so it cannot share the cached prefix — that's exactly why
     // blocks 3 and 4 carry the breakpoints.
     system.push(SystemBlock::Text {
@@ -759,6 +802,7 @@ mod tests {
             memory_md: "global memory".to_string(),
             adjustments_md: "adjustments".to_string(),
             player_memory: None,
+            online_players: String::new(),
             history_slice: "recent: hi".to_string(),
         }
     }
@@ -993,6 +1037,7 @@ mod tests {
             memory_md: "mem".into(),
             adjustments_md: "adj".into(),
             player_memory: Some("PLAYER_MEMORY_MARKER".into()),
+            online_players: String::new(),
             history_slice: "hist".into(),
         };
         let req = build_request(
@@ -1022,6 +1067,7 @@ mod tests {
             memory_md: "mem".into(),
             adjustments_md: "adj".into(),
             player_memory: None,
+            online_players: String::new(),
             history_slice: "hist".into(),
         };
         let req = build_request(
@@ -1042,6 +1088,34 @@ mod tests {
     }
 
     #[test]
+    fn composer_includes_online_players_block_when_non_empty() {
+        let snap = PromptSnapshot {
+            static_rules: "rules".into(),
+            persona: "persona".into(),
+            memory_md: "mem".into(),
+            adjustments_md: "adj".into(),
+            player_memory: None,
+            online_players: "Online: Alice, Bob".into(),
+            history_slice: "hist".into(),
+        };
+        let req = build_request(
+            "model".to_string(),
+            100,
+            None,
+            &snap,
+            vec![],
+            vec![],
+            CacheTtl::Ephemeral5Min,
+        );
+        // 6 blocks: rules, persona, memory, adjustments, online_players, history.
+        assert_eq!(req.system.len(), 6);
+        let any_has_online = req.system.iter().any(|b| match b {
+            SystemBlock::Text { text, .. } => text.contains("Alice") && text.contains("Bob"),
+        });
+        assert!(any_has_online, "online players block must be emitted");
+    }
+
+    #[test]
     fn build_request_substitutes_placeholder_for_empty_cached_blocks() {
         // Regression: Anthropic rejects empty text blocks with
         // cache_control set ("system.2: cache_control cannot be set for
@@ -1053,6 +1127,7 @@ mod tests {
             memory_md: String::new(),
             adjustments_md: String::new(),
             player_memory: None,
+            online_players: String::new(),
             history_slice: "hist".into(),
         };
         let req = build_request(

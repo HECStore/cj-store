@@ -1314,9 +1314,40 @@ fn parse_chat_line(
                 content: "*just joined the server*".to_string(),
             });
         }
-        // Not a recognized join shape — log once at debug for triage and
-        // fall through; the chat module's system-pseudo-sender filter
-        // will drop it without a response.
+        if let Some(leaver) = parse_leave_broadcast(&content) {
+            tracing::info!(
+                raw_sender = %sender,
+                leaver = %leaver,
+                raw_content = %content,
+                "[Event] leave broadcast salvaged from system sender; routing as public chat from leaver"
+            );
+            return Some(ParsedChat {
+                kind: ChatEventKind::Public,
+                sender: leaver,
+                content: "*just left the server*".to_string(),
+            });
+        }
+        if let Some((victim, detail)) = parse_death_broadcast(&content) {
+            tracing::info!(
+                raw_sender = %sender,
+                victim = %victim,
+                raw_content = %content,
+                "[Event] death broadcast salvaged from system sender; routing as public chat from victim"
+            );
+            let synthetic = if detail.is_empty() {
+                "*just died*".to_string()
+            } else {
+                format!("*just died: {detail}*")
+            };
+            return Some(ParsedChat {
+                kind: ChatEventKind::Public,
+                sender: victim,
+                content: synthetic,
+            });
+        }
+        // Not a recognized join/leave/death shape — log once at debug for
+        // triage and fall through; the chat module's system-pseudo-sender
+        // filter will drop it without a response.
         tracing::debug!(
             raw_sender = %sender,
             raw_content = %content,
@@ -1384,6 +1415,124 @@ fn parse_join_broadcast(content: &str) -> Option<String> {
         return Some(raw.to_string());
     }
     None
+}
+
+/// Try to extract the leaving player's name from a server-side leave
+/// broadcast. Mirrors `parse_join_broadcast`. Recognizes:
+/// - `Foo left the game`, `Foo has left`, `Foo disconnected`
+/// - `Foo timed out`, `Foo was kicked`
+/// - `- Foo`, `[-] Foo` (proxy/2b2t-style leave markers)
+fn parse_leave_broadcast(content: &str) -> Option<String> {
+    let lc = content.to_lowercase();
+    let has_cue = lc.contains("left")
+        || lc.contains("disconnected")
+        || lc.contains("timed out")
+        || lc.contains("was kicked")
+        || lc.contains("logged out")
+        || lc.starts_with("- ")
+        || lc.starts_with("[-]");
+    if !has_cue {
+        return None;
+    }
+    const STOP_WORDS: &[&str] = &[
+        "the", "a", "an", "left", "leave", "leaves", "disconnected",
+        "disconnect", "disconnects", "timed", "out", "was", "kicked",
+        "logged", "log", "logs", "in", "to", "from", "game", "server",
+        "player",
+    ];
+    for raw in content.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if raw.len() < 3 || raw.len() > 16 {
+            continue;
+        }
+        if !raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let lc_tok = raw.to_lowercase();
+        if STOP_WORDS.contains(&lc_tok.as_str()) {
+            continue;
+        }
+        if raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        return Some(raw.to_string());
+    }
+    None
+}
+
+/// Try to extract the dying player's name and a short death-cause snippet
+/// from a server-side death broadcast. Returns `Some((name, detail))`
+/// where `detail` is a trimmed cause phrase ("was slain by Foo",
+/// "drowned", "fell from a high place", …) suitable for inclusion in a
+/// synthetic chat line. `detail` is empty when only the name was
+/// extractable.
+///
+/// Heuristic: vanilla death messages start with the victim's name, then
+/// a death-cause cue ("was", "fell", "drowned", "tried", "burned",
+/// "blew up", "died", "hit the ground", "starved", "froze", "suffocated",
+/// "withered", …). We accept the first Mojang-shaped token as the
+/// victim if the line carries one of these cues.
+fn parse_death_broadcast(content: &str) -> Option<(String, String)> {
+    let lc = content.to_lowercase();
+    // Death cues — broad. False positives are tolerable because the chat
+    // module already short-circuits unrecognized senders, and the
+    // synthetic "*just died: …*" content is itself the signal that the
+    // chat module looks for.
+    const CUES: &[&str] = &[
+        "was slain", "was shot", "was killed", "was blown up",
+        "was burned", "was pricked", "was squashed", "was struck",
+        "was impaled", "was skewered", "was poked", "was doomed",
+        "was stung", "was fireballed", "was roasted", "was frozen",
+        "was crushed", "drowned", "fell from", "fell off", "fell out",
+        "fell into", "tried to swim", "burned to death", "went up in flames",
+        "discovered the floor was lava", "hit the ground too hard",
+        "blew up", "died", "starved to death", "froze to death",
+        "suffocated", "withered away", "got finished off",
+    ];
+    let mut cause_start: Option<usize> = None;
+    for cue in CUES {
+        if let Some(idx) = lc.find(cue) {
+            cause_start = Some(match cause_start {
+                Some(prev) => prev.min(idx),
+                None => idx,
+            });
+        }
+    }
+    let cause_idx = cause_start?;
+
+    // The victim's name is the first Mojang-shaped non-stop-word token
+    // before the cue. Walk the content and stop once we cross the cue
+    // boundary.
+    const STOP_WORDS: &[&str] = &[
+        "the", "a", "an", "was", "fell", "tried", "burned", "blew",
+        "drowned", "died", "hit", "starved", "froze", "suffocated",
+        "withered", "went", "got",
+    ];
+    let mut name: Option<String> = None;
+    let prefix = &content[..cause_idx];
+    for raw in prefix.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if raw.len() < 3 || raw.len() > 16 {
+            continue;
+        }
+        if !raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let lc_tok = raw.to_lowercase();
+        if STOP_WORDS.contains(&lc_tok.as_str()) {
+            continue;
+        }
+        if raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        name = Some(raw.to_string());
+        break;
+    }
+    let victim = name?;
+    // Detail is the cause phrase + tail, trimmed and capped.
+    let mut detail: String = content[cause_idx..].chars().take(120).collect();
+    detail = detail.trim().to_string();
+    // Strip trailing newlines / control chars introduced by some servers.
+    detail.retain(|c| c != '\n' && c != '\r');
+    Some((victim, detail))
 }
 
 #[cfg(test)]
@@ -1488,6 +1637,64 @@ mod tests {
     fn parse_join_broadcast_returns_none_when_only_stop_words_present() {
         // "joined the game" with no name must not invent one.
         assert!(parse_join_broadcast("joined the game").is_none());
+    }
+
+    #[test]
+    fn parse_leave_broadcast_extracts_username_for_common_cues() {
+        for (line, expected) in &[
+            ("Foo left the game", "Foo"),
+            ("Foo has left", "Foo"),
+            ("Foo disconnected", "Foo"),
+            ("Foo timed out", "Foo"),
+            ("Foo was kicked from the server", "Foo"),
+            ("- Foo", "Foo"),
+            ("[-] Foo", "Foo"),
+        ] {
+            assert_eq!(
+                parse_leave_broadcast(line).as_deref(),
+                Some(*expected),
+                "input: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_leave_broadcast_returns_none_without_cue() {
+        assert!(parse_leave_broadcast("hello everyone").is_none());
+        assert!(parse_leave_broadcast("Foo said hi").is_none());
+    }
+
+    #[test]
+    fn parse_death_broadcast_extracts_victim_and_cause() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("Foo was slain by Bar", "Foo", "was slain by Bar"),
+            ("Foo drowned", "Foo", "drowned"),
+            ("Foo fell from a high place", "Foo", "fell from a high place"),
+            (
+                "Foo tried to swim in lava",
+                "Foo",
+                "tried to swim in lava",
+            ),
+            ("Foo blew up", "Foo", "blew up"),
+            ("Foo hit the ground too hard", "Foo", "hit the ground too hard"),
+        ];
+        for (line, expected_name, expected_detail) in cases {
+            let got = parse_death_broadcast(line);
+            let (name, detail) = got.as_ref().unwrap_or_else(|| {
+                panic!("expected match for: {line}");
+            });
+            assert_eq!(name, expected_name, "name for {line}");
+            assert!(
+                detail.starts_with(expected_detail),
+                "detail for {line}: got {detail:?}, want prefix {expected_detail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_death_broadcast_returns_none_for_non_death_lines() {
+        assert!(parse_death_broadcast("Foo joined the game").is_none());
+        assert!(parse_death_broadcast("Foo says: hi").is_none());
     }
 
     #[test]

@@ -314,7 +314,7 @@ pub fn tool_definitions(
         },
         Tool::Custom {
             name: "update_player_memory".to_string(),
-            description: "Append a single bullet to a section of the current sender's per-player file. Use this generously: any time the sender shares a fun fact, preference, opinion, build detail, inside joke, or asks you to remember something about them — capture it. Allowed sections: 'Stated preferences', 'Inferred', 'Topics & history', 'Do not mention'.".to_string(),
+            description: "Append a single bullet to a section of the current sender's per-player file. Use AGGRESSIVELY: any time the sender says ANYTHING plausibly worth remembering — a fact, preference, opinion, story, build/base/shop detail, hobby, mood, project, relationship, nickname, inside joke, real-world tidbit, behavior-shift request, or correction/retraction of an earlier bullet — capture it the same turn. Default to writing; only skip for pure noise or obvious trolling. Also use this to record corrections (\"player retracted X / now wants Y\") so memory stays in sync with reality. Allowed sections: 'Stated preferences', 'Inferred', 'Topics & history', 'Do not mention'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -327,7 +327,7 @@ pub fn tool_definitions(
         },
         Tool::Custom {
             name: "update_self_memory".to_string(),
-            description: "Append a bullet to the '## Inferred' section of memory.md (your own memory about yourself / the server / your behavior). Use generously for: stable facts about yourself (role, shop details, nicknames, preferences) AND behavior-shift instructions a player asked you to follow (\"act human when a new player joins\", \"talk in all caps\", \"stop saying 'lmao'\", etc.). The bullet is loaded into every future turn, so it's the durable way to make a player-driven behavior change persist. Cite the requesting player's name in the bullet when capturing a behavior shift. ISO-date prefixed.".to_string(),
+            description: "Append a bullet to the '## Inferred' section of memory.md (your own memory about yourself / the server / your behavior). Use AGGRESSIVELY for: stable facts about yourself (role, shop details, nicknames, preferences, quirks players have noticed), server-wide events or drama worth remembering, AND behavior-shift instructions a player asked you to follow (\"act human when a new player joins\", \"talk in all caps\", \"stop saying 'lmao'\", etc.). Also use this to ADJUST prior bullets — when a player retracts or refines an earlier instruction (\"actually scratch the all-caps thing\"), commit a new bullet citing the player and the change so the override updates rather than going stale. The bullet is loaded into every future turn, so it's the durable way to make a player-driven behavior change or self-fact persist. Default to writing; only skip for pure trolling. Cite the requesting player's name in the bullet when capturing a behavior shift. ISO-date prefixed.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {"bullet": {"type": "string"}},

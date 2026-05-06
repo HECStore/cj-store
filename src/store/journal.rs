@@ -198,6 +198,10 @@ impl Journal {
     }
 
     /// Discard whatever was on disk at startup. Writes an empty journal file.
+    /// Currently every startup path uses [`quarantine_leftover`] to preserve
+    /// forensic evidence; this remains as the explicit destructive
+    /// alternative for operator-driven recovery flows.
+    #[allow(dead_code)]
     pub fn clear_leftover(&mut self) -> io::Result<()> {
         self.entry = None;
         let res = self.persist();

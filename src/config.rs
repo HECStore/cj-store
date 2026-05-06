@@ -88,6 +88,25 @@ pub struct ChatConfig {
     /// the API default if a future classifier model needs spread.
     #[serde(default = "default_chat_classifier_temperature")]
     pub classifier_temperature: Option<f32>,
+
+    /// Reasoning-leak filter — when `true`, every composer reply is
+    /// passed through a small Haiku call before pacing/strip. The filter
+    /// decides one of `send` / `strip` / `rewrite` / `reject`, catching
+    /// the prose-style reasoning leaks that the pattern-based
+    /// `pacing::strip_reasoning` cannot — e.g. "per my memory I should
+    /// act like a human and not admit AI status. hey welcome." Default
+    /// `true`; opt out only if the cost (one extra Haiku call per
+    /// composer reply) is undesirable.
+    #[serde(default = "default_chat_reasoning_filter_enabled")]
+    pub reasoning_filter_enabled: bool,
+    /// Model used for the reasoning-leak filter. Defaults to Haiku 4.5.
+    #[serde(default = "default_chat_reasoning_filter_model")]
+    pub reasoning_filter_model: String,
+    /// Sampling temperature for the reasoning-leak filter. Default `0.0`
+    /// because the filter must emit a single JSON object.
+    #[serde(default = "default_chat_reasoning_filter_temperature")]
+    pub reasoning_filter_temperature: Option<f32>,
+
     #[serde(default)]
     pub persona_seed: String,
 
@@ -317,6 +336,9 @@ impl Default for ChatConfig {
             classifier_model: default_chat_classifier_model(),
             composer_temperature: default_chat_composer_temperature(),
             classifier_temperature: default_chat_classifier_temperature(),
+            reasoning_filter_enabled: default_chat_reasoning_filter_enabled(),
+            reasoning_filter_model: default_chat_reasoning_filter_model(),
+            reasoning_filter_temperature: default_chat_reasoning_filter_temperature(),
             persona_seed: String::new(),
             command_prefixes: default_chat_command_prefixes(),
             command_typo_max_distance: default_chat_command_typo_max_distance(),
@@ -399,6 +421,9 @@ fn default_chat_composer_model() -> String { "claude-sonnet-4-6".to_string() }
 fn default_chat_classifier_model() -> String { "claude-haiku-4-5-20251001".to_string() }
 fn default_chat_composer_temperature() -> Option<f32> { Some(0.8) }
 fn default_chat_classifier_temperature() -> Option<f32> { Some(0.0) }
+fn default_chat_reasoning_filter_enabled() -> bool { true }
+fn default_chat_reasoning_filter_model() -> String { "claude-haiku-4-5-20251001".to_string() }
+fn default_chat_reasoning_filter_temperature() -> Option<f32> { Some(0.0) }
 fn default_chat_command_typo_max_distance() -> u32 { 2 }
 fn default_chat_daily_input_token_cap() -> u64 { 2_000_000 }
 fn default_chat_daily_output_token_cap() -> u64 { 200_000 }
@@ -606,6 +631,7 @@ impl ChatConfig {
         for (name, val) in [
             ("composer_temperature", self.composer_temperature),
             ("classifier_temperature", self.classifier_temperature),
+            ("reasoning_filter_temperature", self.reasoning_filter_temperature),
         ] {
             if let Some(t) = val
                 && (!t.is_finite() || !(0.0..=1.0).contains(&t))

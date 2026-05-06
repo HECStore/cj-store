@@ -17,6 +17,7 @@ pub mod memory;
 pub mod pacing;
 pub mod persona;
 pub mod pricing;
+pub mod reasoning_filter;
 pub mod reflection;
 pub mod retention;
 pub mod state;
@@ -1914,10 +1915,148 @@ async fn process_event(
     let Some(reply) = run.reply else {
         return Ok(());
     };
+
+    // Reasoning-leak filter — Haiku post-process pass that catches the
+    // prose-style leaks the pattern-based `pacing::strip_reasoning`
+    // can't see (no `<thinking>` tags, no `Reasoning:` prefix, just
+    // narrated planning shipped as the chat line). The mission is to
+    // never leak reasoning into a sent message again. The filter
+    // returns one of: send (use original), strip (use extracted
+    // substring), rewrite (use a clean rewrite), reject (stay silent).
+    //
+    // Best-effort: any error short-circuits to `Send` (the original
+    // reply rides into the existing pattern strip below) so a Haiku
+    // outage doesn't black-hole the bot. Token usage is recorded into
+    // the classifier counters since this IS another Haiku call against
+    // the same daily budget.
+    let reply = if config.reasoning_filter_enabled {
+        let filter_started = Instant::now();
+        let filter_req = reasoning_filter::build_request(
+            &config.reasoning_filter_model,
+            &reply,
+            cache_ttl,
+            config.reasoning_filter_temperature,
+        );
+        // Local rate limiter — share the classifier bucket since the
+        // filter is the same model and the same per-day Haiku budget.
+        let filter_input_estimate = ((filter_req
+            .system
+            .iter()
+            .map(|b| match b {
+                client::SystemBlock::Text { text, .. } => text.len() as u64,
+            })
+            .sum::<u64>()
+            + filter_req
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .map(|cb| match cb {
+                    client::ContentBlock::Text { text, .. } => text.len() as u64,
+                    _ => 0,
+                })
+                .sum::<u64>())
+            / 4)
+            .max(1) as u32;
+        let limiter_ok = classifier_limiter
+            .acquire(filter_input_estimate)
+            .await
+            .is_ok();
+        let action = if !limiter_ok {
+            decisions::write(
+                &decisions::DecisionRecord::new("reasoning_filter_skip")
+                    .with_sender(&event.sender)
+                    .with_event_ts(event.recv_at)
+                    .with_reason("local_rate_limit"),
+            );
+            reasoning_filter::FilterAction::Send
+        } else {
+            match client::call_with_retry(api_key, &filter_req, true).await {
+                Ok(resp) => {
+                    let usd = pricing_table.usd_for_call(
+                        &config.reasoning_filter_model,
+                        resp.usage.input_tokens,
+                        resp.usage.output_tokens,
+                        resp.usage.cache_creation_input_tokens,
+                        resp.usage.cache_read_input_tokens,
+                    );
+                    runtime_state.record_classifier(
+                        &started_day,
+                        resp.usage.input_tokens,
+                        resp.usage.output_tokens,
+                        usd,
+                    );
+                    let mut text_buf = String::new();
+                    for b in &resp.content {
+                        if let client::ContentBlock::Text { text, .. } = b {
+                            text_buf.push_str(text);
+                        }
+                    }
+                    match reasoning_filter::parse_verdict(&text_buf) {
+                        Ok(verdict) => {
+                            let reason = verdict.reason.clone();
+                            let action = reasoning_filter::verdict_to_action(verdict);
+                            let action_label = match &action {
+                                reasoning_filter::FilterAction::Send => "send",
+                                reasoning_filter::FilterAction::Strip(_) => "strip",
+                                reasoning_filter::FilterAction::Rewrite(_) => "rewrite",
+                                reasoning_filter::FilterAction::Reject => "reject",
+                            };
+                            decisions::write(
+                                &decisions::DecisionRecord::new("reasoning_filter")
+                                    .with_sender(&event.sender)
+                                    .with_event_ts(event.recv_at)
+                                    .with_latency(filter_started.elapsed().as_millis() as u64)
+                                    .with_tokens(
+                                        resp.usage.input_tokens,
+                                        resp.usage.output_tokens,
+                                        usd,
+                                    )
+                                    .with_cache_tokens(
+                                        resp.usage.cache_creation_input_tokens,
+                                        resp.usage.cache_read_input_tokens,
+                                    )
+                                    .extra("action", serde_json::Value::from(action_label))
+                                    .extra("reason", serde_json::Value::from(reason)),
+                            );
+                            action
+                        }
+                        Err(e) => {
+                            decisions::write(
+                                &decisions::DecisionRecord::new("reasoning_filter_decode_error")
+                                    .with_sender(&event.sender)
+                                    .with_event_ts(event.recv_at)
+                                    .with_reason(e),
+                            );
+                            reasoning_filter::FilterAction::Send
+                        }
+                    }
+                }
+                Err(e) => {
+                    decisions::write(
+                        &decisions::DecisionRecord::new("reasoning_filter_error")
+                            .with_sender(&event.sender)
+                            .with_event_ts(event.recv_at)
+                            .with_reason(e.to_string()),
+                    );
+                    reasoning_filter::FilterAction::Send
+                }
+            }
+        };
+        match action {
+            reasoning_filter::FilterAction::Send => reply,
+            reasoning_filter::FilterAction::Strip(m)
+            | reasoning_filter::FilterAction::Rewrite(m) => m,
+            reasoning_filter::FilterAction::Reject => return Ok(()),
+        }
+    } else {
+        reply
+    };
+
     // Defensive reasoning strip — the composer system prompt forbids
     // chain-of-thought in the visible reply, but a backstop here
     // prevents any leaked `<thinking>` block or "Reasoning:" preamble
-    // from reaching a player. Runs before `strip_ai_tells` so that
+    // from reaching a player. Runs after the Haiku filter (which
+    // catches prose-style leaks) and before `strip_ai_tells` so that
     // reasoning lines holding AI-tell phrases vanish whole rather than
     // being half-stripped into incoherent debris.
     let reply = pacing::strip_reasoning(&reply);

@@ -1934,7 +1934,6 @@ async fn process_event(
         let filter_req = reasoning_filter::build_request(
             &config.reasoning_filter_model,
             &reply,
-            cache_ttl,
             config.reasoning_filter_temperature,
         );
         // Local rate limiter — share the classifier bucket since the
@@ -1957,17 +1956,45 @@ async fn process_event(
                 .sum::<u64>())
             / 4)
             .max(1) as u32;
-        let limiter_ok = classifier_limiter
-            .acquire(filter_input_estimate)
-            .await
-            .is_ok();
-        let action = if !limiter_ok {
+        // Cap check: the filter records into the classifier daily token /
+        // USD bucket (`record_classifier` below), so once the operator's
+        // ceiling is hit the filter must stop too — otherwise the cap
+        // gates classifier traffic but silently leaks cost through filter
+        // calls. Mirrors the pre-flight at line 1525-1539.
+        let cap_in = filter_input_estimate as u64;
+        let cap_out = 64u64;
+        let cap_usd = pricing_table.usd_for_tokens(
+            &config.reasoning_filter_model,
+            cap_in,
+            cap_out,
+        );
+        let cap_v = runtime_state
+            .would_exceed_caps_classifier(cap_in, cap_out, cap_usd, config);
+        let cap_ok = matches!(cap_v, state::CapVerdict::Ok);
+        if !cap_ok {
             decisions::write(
-                &decisions::DecisionRecord::new("reasoning_filter_skip")
+                &decisions::DecisionRecord::new("cap_tripped")
                     .with_sender(&event.sender)
                     .with_event_ts(event.recv_at)
-                    .with_reason("local_rate_limit"),
+                    .with_reason(format!("reasoning_filter {cap_v:?}"))
+                    .extra("source", serde_json::Value::from("reasoning_filter")),
             );
+        }
+        let limiter_ok = cap_ok
+            && classifier_limiter
+                .acquire(filter_input_estimate)
+                .await
+                .is_ok();
+        let action = if !limiter_ok {
+            if cap_ok {
+                decisions::write(
+                    &decisions::DecisionRecord::new("reasoning_filter_skip")
+                        .with_sender(&event.sender)
+                        .with_event_ts(event.recv_at)
+                        .with_reason("local_rate_limit")
+                        .extra("source", serde_json::Value::from("reasoning_filter")),
+                );
+            }
             reasoning_filter::FilterAction::Send
         } else {
             match client::call_with_retry(api_key, &filter_req, true).await {
@@ -1994,7 +2021,7 @@ async fn process_event(
                     match reasoning_filter::parse_verdict(&text_buf) {
                         Ok(verdict) => {
                             let reason = verdict.reason.clone();
-                            let action = reasoning_filter::verdict_to_action(verdict);
+                            let action = reasoning_filter::verdict_to_action(verdict, &reply);
                             let action_label = match &action {
                                 reasoning_filter::FilterAction::Send => "send",
                                 reasoning_filter::FilterAction::Strip(_) => "strip",
@@ -2041,6 +2068,202 @@ async fn process_event(
                     reasoning_filter::FilterAction::Send
                 }
             }
+        };
+        // Chat-line-cap shorten loop: a `strip` / `rewrite` whose message
+        // overshoots `FILTER_MESSAGE_CHAR_LIMIT` is fed back to Haiku for
+        // a tighter rewrite, repeating until the message fits or we hit
+        // a small iteration cap. Shortening necessarily breaks the
+        // substring contract a `strip` carries, so the result is folded
+        // to `Rewrite` semantically — the audit log records the original
+        // verdict above and a separate `reasoning_filter_shorten` record
+        // per loop iteration.
+        let action = match action {
+            reasoning_filter::FilterAction::Strip(m)
+            | reasoning_filter::FilterAction::Rewrite(m)
+                if m.chars().count() > reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT =>
+            {
+                const MAX_SHORTEN_ITERS: u32 = 3;
+                let mut m = m;
+                let mut iters: u32 = 0;
+                while m.chars().count() > reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT
+                    && iters < MAX_SHORTEN_ITERS
+                {
+                    let shorten_started = Instant::now();
+                    let shorten_req = reasoning_filter::build_shorten_request(
+                        &config.reasoning_filter_model,
+                        &m,
+                        config.reasoning_filter_temperature,
+                    );
+                    let shorten_in_est = ((shorten_req
+                        .system
+                        .iter()
+                        .map(|b| match b {
+                            client::SystemBlock::Text { text, .. } => text.len() as u64,
+                        })
+                        .sum::<u64>()
+                        + shorten_req
+                            .messages
+                            .iter()
+                            .flat_map(|msg| msg.content.iter())
+                            .map(|cb| match cb {
+                                client::ContentBlock::Text { text, .. } => text.len() as u64,
+                                _ => 0,
+                            })
+                            .sum::<u64>())
+                        / 4)
+                        .max(1) as u32;
+                    let s_cap_in = shorten_in_est as u64;
+                    let s_cap_out = 64u64;
+                    let s_cap_usd = pricing_table.usd_for_tokens(
+                        &config.reasoning_filter_model,
+                        s_cap_in,
+                        s_cap_out,
+                    );
+                    let s_cap_v = runtime_state.would_exceed_caps_classifier(
+                        s_cap_in,
+                        s_cap_out,
+                        s_cap_usd,
+                        config,
+                    );
+                    if !matches!(s_cap_v, state::CapVerdict::Ok) {
+                        decisions::write(
+                            &decisions::DecisionRecord::new("cap_tripped")
+                                .with_sender(&event.sender)
+                                .with_event_ts(event.recv_at)
+                                .with_reason(format!(
+                                    "reasoning_filter_shorten {s_cap_v:?}"
+                                ))
+                                .extra(
+                                    "source",
+                                    serde_json::Value::from("reasoning_filter_shorten"),
+                                ),
+                        );
+                        break;
+                    }
+                    if classifier_limiter
+                        .acquire(shorten_in_est)
+                        .await
+                        .is_err()
+                    {
+                        decisions::write(
+                            &decisions::DecisionRecord::new("reasoning_filter_skip")
+                                .with_sender(&event.sender)
+                                .with_event_ts(event.recv_at)
+                                .with_reason("local_rate_limit")
+                                .extra(
+                                    "source",
+                                    serde_json::Value::from("reasoning_filter_shorten"),
+                                ),
+                        );
+                        break;
+                    }
+                    match client::call_with_retry(api_key, &shorten_req, true).await {
+                        Ok(resp) => {
+                            let usd = pricing_table.usd_for_call(
+                                &config.reasoning_filter_model,
+                                resp.usage.input_tokens,
+                                resp.usage.output_tokens,
+                                resp.usage.cache_creation_input_tokens,
+                                resp.usage.cache_read_input_tokens,
+                            );
+                            runtime_state.record_classifier(
+                                &started_day,
+                                resp.usage.input_tokens,
+                                resp.usage.output_tokens,
+                                usd,
+                            );
+                            let mut text_buf = String::new();
+                            for b in &resp.content {
+                                if let client::ContentBlock::Text { text, .. } = b {
+                                    text_buf.push_str(text);
+                                }
+                            }
+                            match reasoning_filter::parse_verdict(&text_buf) {
+                                Ok(verdict) => {
+                                    let new_m = verdict.message.trim().to_string();
+                                    let before = m.chars().count() as u64;
+                                    let after = new_m.chars().count() as u64;
+                                    decisions::write(
+                                        &decisions::DecisionRecord::new(
+                                            "reasoning_filter_shorten",
+                                        )
+                                        .with_sender(&event.sender)
+                                        .with_event_ts(event.recv_at)
+                                        .with_latency(
+                                            shorten_started.elapsed().as_millis() as u64,
+                                        )
+                                        .with_tokens(
+                                            resp.usage.input_tokens,
+                                            resp.usage.output_tokens,
+                                            usd,
+                                        )
+                                        .with_cache_tokens(
+                                            resp.usage.cache_creation_input_tokens,
+                                            resp.usage.cache_read_input_tokens,
+                                        )
+                                        .extra("iter", serde_json::Value::from(iters))
+                                        .extra(
+                                            "before_chars",
+                                            serde_json::Value::from(before),
+                                        )
+                                        .extra(
+                                            "after_chars",
+                                            serde_json::Value::from(after),
+                                        )
+                                        .extra(
+                                            "reason",
+                                            serde_json::Value::from(verdict.reason),
+                                        ),
+                                    );
+                                    if new_m.is_empty() {
+                                        // Empty rewrite means the model
+                                        // gave up; keep the prior message
+                                        // and let downstream truncate cap
+                                        // it as a last resort.
+                                        break;
+                                    }
+                                    m = new_m;
+                                }
+                                Err(e) => {
+                                    decisions::write(
+                                        &decisions::DecisionRecord::new(
+                                            "reasoning_filter_decode_error",
+                                        )
+                                        .with_sender(&event.sender)
+                                        .with_event_ts(event.recv_at)
+                                        .with_reason(e)
+                                        .extra(
+                                            "source",
+                                            serde_json::Value::from(
+                                                "reasoning_filter_shorten",
+                                            ),
+                                        ),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            decisions::write(
+                                &decisions::DecisionRecord::new("reasoning_filter_error")
+                                    .with_sender(&event.sender)
+                                    .with_event_ts(event.recv_at)
+                                    .with_reason(e.to_string())
+                                    .extra(
+                                        "source",
+                                        serde_json::Value::from(
+                                            "reasoning_filter_shorten",
+                                        ),
+                                    ),
+                            );
+                            break;
+                        }
+                    }
+                    iters += 1;
+                }
+                reasoning_filter::FilterAction::Rewrite(m)
+            }
+            other => other,
         };
         match action {
             reasoning_filter::FilterAction::Send => reply,

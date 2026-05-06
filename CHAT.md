@@ -284,6 +284,15 @@ chat_task (subscriber):
     │               web_search / web_fetch
     ├── max iterations: composer_max_tool_iterations (default 5)
     ▼
+  reasoning_filter.rs (Haiku post-processor; opt-in)
+    ├── chat.reasoning_filter_enabled = false                    ── bypass
+    ├── classifier daily cap pre-flight                          ── send
+    ├── local rate-limit (shared classifier bucket)              ── send
+    ├── Haiku call → verdict {send, strip, rewrite, reject}
+    ├── strip non-substring → rewrite (audit-honest demotion)
+    ├── strip/rewrite message > 256 chars → shorten loop (≤3)
+    └── reject                                                   ── drop
+    ▼
   pacing.rs
     ├── strip_ai_tells + truncate to composer_max_chars
     ├── compute_typing_delay (base + per_char + Gaussian jitter)
@@ -459,6 +468,70 @@ Trigger conditions (any one fires; once per
 
 Operator-triggered runs use a permissive validator (`min_distinct_*= 1`,
 all senders treated as Trust 3) — the operator decides.
+
+### Reasoning-leak filter
+
+Optional Haiku post-processor that runs AFTER the composer returns and
+BEFORE pacing
+([reasoning_filter.rs](src/chat/reasoning_filter.rs)). Gated behind
+`chat.reasoning_filter_enabled`; disabled → composer reply flows straight
+into pacing. The pattern-based `pacing::strip_reasoning` (below) catches
+tagged leaks (`<thinking>` / `Reasoning:` preamble); the worst leaks are
+the ones that *don't* wear those tags — the model just narrates its plan
+in plain prose. Haiku reads the candidate and emits one of:
+
+- `send` — clean line, ship verbatim;
+- `strip` — reasoning preamble + real chat-line tail; emit ONLY the
+  trailing chat-line portion. The substring contract is enforced: a
+  `strip` whose `message` is not a contiguous substring of the original
+  candidate is downgraded to `rewrite` so a paraphrasing model can't
+  claim verbatim provenance in the audit log;
+- `rewrite` — leak and message mangled together; emit a fresh in-voice
+  line conveying the salvageable intent;
+- `reject` — pure deliberation with nothing to send; bot stays silent.
+
+Best-effort: any error / decode failure / cap-trip / rate-limit-skip
+short-circuits to `send` so a Haiku outage doesn't black-hole the bot.
+Filter calls record into the same daily classifier bucket as
+`classifier.rs` and respect the same daily-cap pre-flight before
+dispatch. The candidate text is hard-capped at `MAX_CANDIDATE_CHARS`
+(4000 chars) before escaping and is wrapped in a `<candidate>` tag the
+candidate cannot forge (angle-brackets in the candidate are escaped via
+`persona::escape_for_trusted_block` so `</candidate>` substrings cannot
+synthetically close the data block).
+
+#### Chat-line cap and shorten loop
+
+A `strip` / `rewrite` whose `message` exceeds
+`reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT` (256 chars) is fed back to
+Haiku via [`build_shorten_request`](src/chat/reasoning_filter.rs) for a
+tighter rewrite. The loop runs until the message fits or
+`MAX_SHORTEN_ITERS` (3) is reached, whichever comes first. Each iteration
+records a `reasoning_filter_shorten` decision with extras `iter`,
+`before_chars`, `after_chars`, `reason`. Shortening collapses `strip`
+semantics to `rewrite` (the substring contract no longer holds). If
+shortening hits the iter cap or the model gives up (empty response), the
+last `m` carries forward and the downstream
+`pacing::truncate_to_chat_limit` does the final hard cut.
+
+#### Decision-log records
+
+The filter writes one of these `kind` values to today's
+`decisions/<date>.jsonl`:
+
+- `reasoning_filter` — successful verdict; `extra.action` is one of
+  `send`/`strip`/`rewrite`/`reject`.
+- `reasoning_filter_shorten` — one record per shorten loop iteration;
+  see extras above.
+- `reasoning_filter_skip` — local rate-limit denied dispatch;
+  `extra.source` is `reasoning_filter` or `reasoning_filter_shorten` so
+  operators can grep by phase.
+- `reasoning_filter_decode_error` — JSON parse failed; same `source`
+  extra.
+- `reasoning_filter_error` — Anthropic call failed; same `source` extra.
+- `cap_tripped` — daily classifier-bucket cap pre-flight failed; the
+  `reason` field names which phase (`reasoning_filter` vs
+  `reasoning_filter_shorten`), `extra.source` mirrors it.
 
 ### Pacing post-process
 

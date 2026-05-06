@@ -1168,4 +1168,60 @@ mod tests {
         }"#;
         assert!(serde_json::from_str::<Config>(json).is_err());
     }
+
+    #[test]
+    fn temperature_above_one_is_rejected() {
+        let mut c = valid_config();
+        c.chat.reasoning_filter_temperature = Some(1.5);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.contains("reasoning_filter_temperature"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn temperature_below_zero_is_rejected() {
+        let mut c = valid_config();
+        c.chat.reasoning_filter_temperature = Some(-0.1);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.contains("reasoning_filter_temperature"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn temperature_nan_is_rejected() {
+        let mut c = valid_config();
+        c.chat.reasoning_filter_temperature = Some(f32::NAN);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.contains("reasoning_filter_temperature"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn temperature_none_is_accepted() {
+        let mut c = valid_config();
+        c.chat.reasoning_filter_temperature = None;
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn composer_temperature_out_of_range_names_field() {
+        let mut c = valid_config();
+        c.chat.composer_temperature = Some(2.0);
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("composer_temperature"), "got: {err}");
+    }
+
+    #[test]
+    fn classifier_temperature_out_of_range_names_field() {
+        let mut c = valid_config();
+        c.chat.classifier_temperature = Some(2.0);
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("classifier_temperature"), "got: {err}");
+    }
 }

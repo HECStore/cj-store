@@ -1364,37 +1364,47 @@ fn parse_chat_line(
 
 /// Try to extract the joining player's name from a server-side join
 /// broadcast. Returns `Some(name)` when the content carries a join cue
-/// (`joined`, `connected`, `logged in`, etc.) AND a single Mojang-shaped
-/// username can be picked out unambiguously. Best-effort and forgiving:
-/// false positives are tolerable because the chat-AI gets the final say
-/// on whether to greet.
+/// (`joined`, `joining`, `connected`, `risen`, etc.) AND a single
+/// Mojang-shaped username can be picked out unambiguously. Best-effort
+/// and forgiving: false positives are tolerable because the chat-AI
+/// gets the final say on whether to greet.
 ///
 /// Recognized shapes (case-insensitive on cues, exact on the username):
 /// - `Foo joined the game`, `Foo has joined`, `Foo connected`
+/// - `Foo joined the journey`, `Foo first time joining the journey`
+///   (CoreJourney / similar journey-themed servers — empirically the
+///   bulk of the chat-history corpus)
+/// - `Foo has risen to continue the journey` (post-death-ban respawn)
 /// - `+ Foo`, `[+] Foo` (proxy/2b2t-style join markers)
 /// - `Welcome Foo` / `Welcome, Foo` (server-driven greeter plugins)
 fn parse_join_broadcast(content: &str) -> Option<String> {
     let lc = content.to_lowercase();
     let has_cue = lc.contains("joined")
+        || lc.contains("joining")
         || lc.contains("connected")
         || lc.contains("logged in")
         || lc.contains("welcome")
+        || lc.contains("has risen")
+        || lc.contains("continue the journey")
         || lc.starts_with("+ ")
         || lc.starts_with("[+]");
     if !has_cue {
         return None;
     }
     // Walk the content collecting Mojang-shaped tokens. Stop words
-    // ("welcome", "joined", "the", etc.) get filtered so we don't
-    // accidentally pick a verb when no real username is present. We
-    // accept the FIRST username-shaped token that isn't a stop word —
-    // every recognized shape above places the joiner at the front of
-    // the cue, so first-match is the right heuristic.
+    // ("welcome", "joined", "first", "journey", etc.) get filtered so
+    // we don't accidentally pick a verb / connector word when no real
+    // username is present. We accept the FIRST username-shaped token
+    // that isn't a stop word — every recognized shape above places the
+    // joiner at the front of the cue, so first-match is the right
+    // heuristic.
     const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "joined", "join", "joins", "connected",
-        "connect", "connects", "logged", "log", "logs", "welcome",
-        "welcomes", "welcomed", "back", "in", "to", "game", "server",
-        "player", "newbie",
+        "the", "a", "an", "joined", "join", "joins", "joining",
+        "connected", "connect", "connects", "logged", "log", "logs",
+        "welcome", "welcomes", "welcomed", "back", "in", "to", "game",
+        "server", "player", "newbie", "first", "time", "journey",
+        "journeys", "has", "have", "risen", "rises", "rose",
+        "continue", "continues", "continued",
     ];
     for raw in content.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         if raw.len() < 3 || raw.len() > 16 {
@@ -1614,6 +1624,81 @@ mod tests {
                 "input: {line}"
             );
         }
+    }
+
+    #[test]
+    fn parse_join_broadcast_handles_corejourney_server_patterns() {
+        // Drawn from real `data/chat/history/*.jsonl` corpus on the
+        // CoreJourney server: vanilla "joined the game" is replaced by
+        // "joined the journey", new players get "first time joining",
+        // and post-death-ban respawns emit "has risen to continue the
+        // journey". All three must be salvaged or the bot's online
+        // roster goes stale.
+        for (line, expected) in &[
+            ("HECStore joined the journey", "HECStore"),
+            ("_itzn7r first time joining the journey", "_itzn7r"),
+            ("SnubMantis82722 has risen to continue the journey", "SnubMantis82722"),
+            ("bob4666631 has risen to continue the journey", "bob4666631"),
+            ("Alex124323423234 left the game", "Alex124323423234"),
+        ] {
+            // The leave line is in this batch on purpose: confirms that
+            // the join parser does NOT swallow it (it should fall to
+            // the leave parser instead).
+            if line.contains("left") {
+                assert_eq!(parse_join_broadcast(line), None, "leave line should not match join: {line}");
+                assert_eq!(
+                    parse_leave_broadcast(line).as_deref(),
+                    Some(*expected),
+                    "leave line: {line}"
+                );
+            } else {
+                assert_eq!(
+                    parse_join_broadcast(line).as_deref(),
+                    Some(*expected),
+                    "input: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_death_broadcast_handles_corejourney_corpus() {
+        // From the real history: every distinct death template that
+        // appears in `data/chat/history/*.jsonl`. Sanity-check that the
+        // current cue list covers all of them.
+        let cases: &[(&str, &str)] = &[
+            ("Furrgit was slain by Zombie", "Furrgit"),
+            ("Skyzlmt was shot by Skeleton", "Skyzlmt"),
+            ("SnubMantis82722 fell from a high place", "SnubMantis82722"),
+            ("_itzn7r withered away while fighting Wither", "_itzn7r"),
+            ("icrimexgg was slain by Spider", "icrimexgg"),
+            ("Foo was slain by Iron Golem", "Foo"),
+            ("Bar was blown up by Creeper", "Bar"),
+            ("Baz tried to swim in lava", "Baz"),
+            ("Qux was doomed to fall", "Qux"),
+        ];
+        for (line, expected) in cases {
+            let got = parse_death_broadcast(line);
+            let (name, _detail) = got.as_ref().unwrap_or_else(|| {
+                panic!("expected death match for: {line}");
+            });
+            assert_eq!(name, expected, "name for {line}");
+        }
+    }
+
+    #[test]
+    fn parse_join_broadcast_ignores_death_ban_followup() {
+        // "Foo 24 hour death ban starts now" is a follow-up emitted
+        // immediately after a death; it must not be misclassified as a
+        // join (would re-add a banned player to the online roster).
+        assert_eq!(
+            parse_join_broadcast("Foo 24 hour death ban starts now"),
+            None
+        );
+        assert_eq!(
+            parse_leave_broadcast("Foo 24 hour death ban starts now"),
+            None
+        );
     }
 
     #[test]

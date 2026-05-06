@@ -1081,16 +1081,25 @@ pub async fn chat_task(
                         classifier_counter.prune(now_prune);
                         spam_guard.prune(now_prune);
                         // Belt-and-braces against missed leave broadcasts
-                        // on flaky servers: drop roster entries we
-                        // haven't observed in `proactive_max_secs_since_partner`
-                        // seconds (the same staleness threshold the
-                        // proactive picker uses to consider a partner
-                        // "still in conversation"). Without this, the
-                        // roster could grow stale after an extended
-                        // quiet period.
-                        online_roster.prune_stale(Duration::from_secs(
-                            config.proactive_max_secs_since_partner.max(60) as u64 * 4,
-                        ));
+                        // on flaky servers — but ONLY as a last-resort
+                        // fallback. Authoritative removal happens on
+                        // explicit leave/death markers via `mark_left`;
+                        // this sweep just catches the rare case where
+                        // the leave packet was eaten by the network.
+                        //
+                        // Use a deliberately generous 6-hour window: a
+                        // survival player can be AFK farming, building
+                        // off-screen, or just exploring quietly for
+                        // hours without speaking, and dropping them
+                        // from the roster prematurely makes the bot
+                        // think the server is empty when it isn't. The
+                        // proactive picker has its own per-tick freshness
+                        // gate (`proactive_max_secs_since_partner`) so
+                        // a stale roster entry can't cause a misfired
+                        // proactive turn.
+                        const ROSTER_STALE_FALLBACK_SECS: u64 = 6 * 60 * 60;
+                        online_roster
+                            .prune_stale(Duration::from_secs(ROSTER_STALE_FALLBACK_SECS));
 
                         // Persist runtime state after each event so token
                         // counters survive a crash.

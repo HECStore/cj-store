@@ -101,9 +101,12 @@ impl Pair {
     /// Returns an error if the item name is empty/sentinel or `stack_size` is
     /// not one of Minecraft's three legal values (1, 16, 64).
     ///
-    /// Thin wrapper over `save_in_dir` rooted at `PAIRS_DIR`; production
-    /// callsites use this form, while the in-dir variant lets `save_all_in_dir`
-    /// (and its tests) target a caller-supplied directory.
+    /// Thin wrapper over `save_in_dir` rooted at `PAIRS_DIR`. Production
+    /// callsites today reach the disk through `Pair::save_all` /
+    /// `save_all_in_dir`, so the per-pair entry point is exercised only by
+    /// tests — `#[allow(dead_code)]` keeps the symbol available for any
+    /// future single-pair write path without spamming the warning channel.
+    #[allow(dead_code)]
     pub fn save(&self) -> io::Result<()> {
         self.save_in_dir(Path::new(Self::PAIRS_DIR))
     }

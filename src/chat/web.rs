@@ -729,7 +729,13 @@ fn port_for(safe: &SafeUrl) -> u16 {
         Scheme::Https => 8,
     };
     let after_scheme = &url[scheme_len..];
-    let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
+    // Authority terminates at `/`, `?`, or `#` — must match
+    // `validate_url`'s delimiter set, otherwise an accepted URL like
+    // `http://example.com:443?x=1` leaves `443?x=1` in the port slot,
+    // u16 parsing fails, and we silently fall back to the scheme default.
+    let path_start = after_scheme
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..path_start];
     // Strip IPv6 brackets if present.
     let port_part = if let Some(rest) = authority.strip_prefix('[') {
@@ -1706,5 +1712,42 @@ mod tests {
             url: "http://example.com:8080/path".to_string(),
         };
         assert_eq!(port_for(&safe), 8080);
+    }
+
+    #[test]
+    fn port_for_extracts_explicit_port_when_authority_terminated_by_query() {
+        // Regression: authority can end at `?` (no path). Without the
+        // multi-delimiter split, `port_for` would see `443?x=1` in the
+        // port slot, fail to parse, and fall back to scheme default 80.
+        let safe = SafeUrl {
+            scheme: Scheme::Http,
+            host: Host::Name("example.com".to_string()),
+            url: "http://example.com:443?x=1".to_string(),
+        };
+        assert_eq!(port_for(&safe), 443);
+    }
+
+    #[test]
+    fn port_for_extracts_explicit_port_when_authority_terminated_by_fragment() {
+        // Regression: authority can end at `#` (no path).
+        let safe = SafeUrl {
+            scheme: Scheme::Http,
+            host: Host::Name("example.com".to_string()),
+            url: "http://example.com:443#frag".to_string(),
+        };
+        assert_eq!(port_for(&safe), 443);
+    }
+
+    #[test]
+    fn port_for_extracts_explicit_port_ipv6_when_authority_terminated_by_query() {
+        // Regression: same bug shape for IPv6 authority — `after_close`
+        // would otherwise carry `:443?x=1` and `strip_prefix(':').parse()`
+        // would fail, masking the explicit port.
+        let safe = SafeUrl {
+            scheme: Scheme::Http,
+            host: Host::Ip(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap())),
+            url: "http://[2001:db8::1]:443?x=1".to_string(),
+        };
+        assert_eq!(port_for(&safe), 443);
     }
 }

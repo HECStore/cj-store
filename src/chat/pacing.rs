@@ -190,29 +190,72 @@ pub fn strip_reasoning(reply: &str) -> String {
         let fences = code_fence_ranges(&lower);
 
         // Find the earliest non-fenced opening tag across all reasoning
-        // tag names. Track the close tag alongside so we can excise
-        // open..close in one shot below.
-        let mut earliest: Option<(usize, String, String)> = None;
+        // tag names. The open-tag prefix is `<{tag}` followed by exactly
+        // one of `>`, ASCII whitespace, or `/` — NOT a name continuation
+        // char (alphanumeric / `-` / `_`), so e.g. `<thinking-cap>` does
+        // NOT match `thinking`. Track the body-start offset (just past
+        // the closing `>` of the open tag, which may carry attributes)
+        // alongside the tag name so we can excise open..close in one
+        // shot below.
+        let mut earliest: Option<(usize, usize, String)> = None;
         for tag in REASONING_TAGS {
-            let open = format!("<{tag}>");
+            let prefix = format!("<{tag}");
             let mut search_from = 0usize;
-            while let Some(rel) = lower[search_from..].find(&open) {
+            while let Some(rel) = lower[search_from..].find(&prefix) {
                 let pos = search_from + rel;
-                if range_contains(&fences, pos) {
-                    search_from = pos + open.len();
+                let after = pos + prefix.len();
+                let next = lower.as_bytes().get(after).copied();
+                let shape_ok = matches!(
+                    next,
+                    Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'/')
+                );
+                if !shape_ok {
+                    search_from = after;
                     continue;
                 }
+                if range_contains(&fences, pos) {
+                    search_from = after;
+                    continue;
+                }
+                // Walk forward to the first `>` to find body start. If
+                // the open tag is unterminated (no `>`), treat it like
+                // an unclosed block below by signaling body_start = EOS.
+                let body_start = match lower[after..].find('>') {
+                    Some(off) => after + off + 1,
+                    None => lower.len(),
+                };
                 if earliest.as_ref().map_or(true, |(s, _, _)| pos < *s) {
-                    earliest = Some((pos, open.clone(), format!("</{tag}>")));
+                    earliest = Some((pos, body_start, (*tag).to_string()));
                 }
                 break;
             }
         }
 
-        let Some((start, open, close)) = earliest else { break };
-        match lower[start + open.len()..].find(&close) {
-            Some(rel) => {
-                let end = start + open.len() + rel + close.len();
+        let Some((start, body_start, tag)) = earliest else { break };
+        // Close-tag detection: `</{tag}` followed by optional ASCII
+        // whitespace and then `>`. Scan from body_start forward.
+        let close_prefix = format!("</{tag}");
+        let mut close_match: Option<(usize, usize)> = None;
+        let mut search_from = body_start;
+        while let Some(rel) = lower[search_from..].find(&close_prefix) {
+            let cpos = search_from + rel;
+            let mut after = cpos + close_prefix.len();
+            // Skip optional ASCII whitespace before the `>`.
+            while let Some(&b) = lower.as_bytes().get(after) {
+                if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                    after += 1;
+                } else {
+                    break;
+                }
+            }
+            if lower.as_bytes().get(after) == Some(&b'>') {
+                close_match = Some((cpos, after + 1));
+                break;
+            }
+            search_from = cpos + close_prefix.len();
+        }
+        match close_match {
+            Some((_cpos, end)) => {
                 out.replace_range(start..end, "");
                 // `lower` is rebuilt at the top of the next iteration
                 // from the freshly-edited `out`.
@@ -393,14 +436,16 @@ pub fn strip_ai_tells(reply: &str) -> String {
     // and non-ASCII chars are passed through unchanged), so byte indices
     // in the lowered view map straight back into `out` without re-encoding.
     // This is the same invariant `strip_reasoning` relies on for its tag
-    // scan above.
+    // scan above. Build `lowered` once and drain it in lock-step with `out`
+    // so the inner loop doesn't rebuild a full lowercase copy per match.
+    let mut lowered: String = out.to_ascii_lowercase();
     for tell in BUILT_IN_AI_TELLS {
         let needle = tell.to_ascii_lowercase();
         loop {
-            let haystack = out.to_ascii_lowercase();
-            match haystack.find(&needle) {
+            match lowered.find(&needle) {
                 Some(idx) => {
                     out.drain(idx..idx + needle.len());
+                    lowered.drain(idx..idx + needle.len());
                 }
                 None => break,
             }
@@ -916,6 +961,47 @@ mod tests {
         // form is.
         let s = strip_reasoning("i was thinking maybe we trade");
         assert_eq!(s, "i was thinking maybe we trade");
+    }
+
+    #[test]
+    fn strip_reasoning_strips_thinking_with_attributes() {
+        // Attribute-bearing open tag must still trigger the strip — the
+        // tag-shape gate must scan up to the closing `>` rather than
+        // requiring the literal `<thinking>` byte sequence.
+        let s = strip_reasoning("<thinking type=\"cot\">leak text</thinking>more");
+        assert_eq!(s, "more");
+    }
+
+    #[test]
+    fn strip_reasoning_strips_thinking_with_whitespace_before_gt() {
+        // `<thinking >...</thinking>` — a stray space before the `>` on
+        // either tag must not defeat the strip.
+        let s = strip_reasoning("<thinking >leak</thinking>more");
+        assert_eq!(s, "more");
+    }
+
+    #[test]
+    fn strip_reasoning_strips_thinking_with_newlines_in_tags() {
+        // Newline between the tag name and the `>` (and inside the
+        // close tag) must still be recognized.
+        let s = strip_reasoning("<thinking\n>leak\n</thinking>more");
+        assert_eq!(s, "more");
+    }
+
+    #[test]
+    fn strip_reasoning_strips_uppercase_thinking_with_attributes() {
+        // Case-insensitive plus attribute-bearing close tag.
+        let s = strip_reasoning("<THINKING TYPE=\"COT\">leak</THINKING>more");
+        assert_eq!(s, "more");
+    }
+
+    #[test]
+    fn strip_reasoning_does_not_strip_thinking_cap() {
+        // Negative test: `<thinking-cap>` must NOT match the `thinking`
+        // tag — the byte after `<thinking` is `-`, a name continuation
+        // char, so the open-tag detector must reject this shape.
+        let input = "<thinking-cap>not a leak</thinking-cap>after";
+        assert_eq!(strip_reasoning(input), input);
     }
 
     // ---- truncate_to_chat_limit ----------------------------------------

@@ -1311,6 +1311,52 @@ mod tests {
     }
 
     #[test]
+    fn extract_text_reply_returns_none_for_empty_content() {
+        // Pins the "model produced an empty terminal turn" branch — the
+        // root cause behind every `had_text_reply=false` decisions-log
+        // entry. `is_terminal_turn` returns true (no ToolUse) and
+        // `extract_text_reply` must surface None so the orchestrator
+        // routes through `composer_silent`, not through the send pipeline.
+        let blocks: Vec<ContentBlock> = Vec::new();
+        assert!(is_terminal_turn(&blocks));
+        assert_eq!(extract_text_reply(&blocks), None);
+    }
+
+    #[test]
+    fn extract_text_reply_returns_none_for_only_server_tools() {
+        // Server-tool-only terminal turn (web_search invoked + result
+        // block, but the model emitted no follow-up text). Composer
+        // returns reply=None and the orchestrator must log
+        // `composer_silent` rather than silently dropping.
+        let blocks = vec![
+            ContentBlock::ServerToolUse {
+                id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::Value::Null,
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id: "srv_1".to_string(),
+                content: serde_json::Value::Null,
+            },
+        ];
+        assert!(is_terminal_turn(&blocks));
+        assert_eq!(extract_text_reply(&blocks), None);
+    }
+
+    #[test]
+    fn extract_text_reply_returns_none_for_whitespace_only_text() {
+        // A Text block containing only whitespace must collapse to None
+        // so the orchestrator-side empty-reply guard fires consistently
+        // (the proactive path's `reply.trim().is_empty()` check matches
+        // the reactive path's `reply_blocked: empty_after_sanitize`).
+        let blocks = vec![ContentBlock::Text {
+            text: "   \n\t  ".to_string(),
+            cache_control: None,
+        }];
+        assert_eq!(extract_text_reply(&blocks), None);
+    }
+
+    #[test]
     fn extract_text_reply_returns_text_when_mixed_with_tool_use() {
         // CHAT.md best-effort recovery: when the tool-use loop hits
         // the cap, take any text alongside tool calls.

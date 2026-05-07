@@ -9,11 +9,18 @@ see [ARCHITECTURE.md](ARCHITECTURE.md); for on-disk formats see
 
 - **Rust edition 2024** (stabilized in Rust 1.85, Feb 2025). The **nightly
   toolchain** is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
-  The pin is required because [`.cargo/config.toml`](.cargo/config.toml)
-  sets `-Zshare-generics=y`, a nightly-only flag. Azalea's transitive
-  dependency graph may also require nightly features. To drop the nightly
-  requirement, remove the `-Z...` flags from `.cargo/config.toml` before
-  attempting a stable build.
+  The binding constraint is Azalea: its transitive dependency graph
+  consumes nightly-only features (and Azalea itself pins
+  `channel = "nightly"` in its own `rust-toolchain.toml`), so the project
+  cannot build on stable regardless of local flags. As a secondary
+  per-target reason, [`.cargo/config.toml`](.cargo/config.toml) sets
+  `-Zshare-generics=y` on the Linux and macOS stanzas (the
+  `x86_64-pc-windows-msvc` stanza leaves both `linker` and `rustflags`
+  commented out, so the flag is **not** applied on Windows MSVC — the
+  project's primary tested target). Dropping the nightly requirement
+  would therefore need both removing the `-Z...` flags from the
+  Linux/macOS stanzas of `.cargo/config.toml` AND replacing or vendoring
+  Azalea to a stable-compatible cut.
 - Tested on Windows; Linux and macOS should work unchanged.
 - Logs go **only** to `data/logs/store.log`. `stdout` gets a handful of
   startup lines telling the operator how to tail the log (the exact
@@ -100,6 +107,17 @@ recovered). The usual async discipline — never hold the guard across
   `TransitionError` returns), UUID cache TTL, trade-GUI slot math, and the order-handler
   integration suite including `sell`/`deposit`/`withdraw` rejection paths.
   For exact counts at HEAD, see `cargo test --no-run` output.
+- **Chat subsystem coverage** (~half the project's tests): classifier
+  prompt-shape and decision parsing
+  ([src/chat/classifier.rs](src/chat/classifier.rs),
+  [decisions.rs](src/chat/decisions.rs)); composer cancel/path accounting
+  ([composer.rs](src/chat/composer.rs)); conversation/state/memory/retention
+  lifecycle ([conversation.rs](src/chat/conversation.rs),
+  [state.rs](src/chat/state.rs), [memory.rs](src/chat/memory.rs),
+  [retention.rs](src/chat/retention.rs)); reasoning-filter leak detection
+  ([reasoning_filter.rs](src/chat/reasoning_filter.rs)); pacing, jsonl,
+  history, web (SSRF + parsing), tools, online_players, persona, reflection,
+  pricing, and the `store_view` projections.
 - **Property-based AMM tests** via `proptest` assert: `k` never decreases,
   buy cost > sell payout (positive spread), per-item price rises with trade
   size, sell payout bounded by reserve, reserves stay strictly positive and

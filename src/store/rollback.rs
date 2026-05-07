@@ -403,6 +403,37 @@ mod tests {
         });
     }
 
+    /// Auto-ack every `InteractWithChestAndSync` with a sync report whose
+    /// `chest_id` is hard-coded to `bogus_chest_id` — i.e. not present in the
+    /// store's storage — so `apply_chest_sync` will return `Err` while the bot
+    /// itself confirms the physical deposit succeeded. Drives the rare
+    /// `Ok(Ok(Ok(report)))`-but-`apply_chest_sync`-fails branch in
+    /// `deposit_transfers`, where the items are physically returned but the
+    /// in-memory chest view has drifted.
+    fn spawn_sync_failing_bot(mut rx: mpsc::Receiver<BotInstruction>, bogus_chest_id: i32) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let BotInstruction::InteractWithChestAndSync {
+                    action,
+                    respond_to,
+                    ..
+                } = msg
+                {
+                    let item = match action {
+                        ChestAction::Deposit { item, .. } => item,
+                        ChestAction::Withdraw { item, .. } => item,
+                    };
+                    let amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                    let _ = respond_to.send(Ok(ChestSyncReport {
+                        chest_id: bogus_chest_id,
+                        item,
+                        amounts,
+                    }));
+                }
+            }
+        });
+    }
+
     fn transfer(chest_id: i32, item: &str, amount: i32) -> ChestTransfer {
         ChestTransfer {
             chest_id,
@@ -455,6 +486,29 @@ mod tests {
     #[test]
     fn default_rollback_result_reports_no_failures() {
         assert!(!RollbackResult::default().has_failures());
+    }
+
+    #[test]
+    fn has_failures_returns_true_when_only_items_unplanned_set() {
+        // Locks in the second disjunct of `has_failures()`: a planning
+        // shortfall alone (no per-step failures) must still surface as a
+        // failure so handlers escalate to operator-action wording.
+        let r = RollbackResult {
+            items_unplanned: 3,
+            ..Default::default()
+        };
+        assert_eq!(r.operations_failed, 0);
+        assert!(r.has_failures());
+    }
+
+    #[test]
+    fn has_failures_ignores_items_returned() {
+        // Locks in: physical successes alone don't constitute a failure.
+        let r = RollbackResult {
+            items_returned: 1000,
+            ..Default::default()
+        };
+        assert!(!r.has_failures());
     }
 
     // --- deposit_transfers -----------------------------------------------
@@ -586,6 +640,46 @@ mod tests {
         assert_eq!(result.items_returned, 10);
     }
 
+    #[tokio::test]
+    async fn deposit_transfers_credits_items_returned_even_when_apply_chest_sync_fails() {
+        // Pins the docstring contract on `RollbackResult::items_returned`:
+        // when the bot confirms the physical deposit (`Ok(Ok(Ok(report)))`)
+        // but `apply_chest_sync` errors — the chest holds the items, but the
+        // in-memory view has drifted — `items_returned` MUST still be credited
+        // for the physical transfer, while `operations_failed` flips so
+        // `has_failures()` surfaces the divergence to the operator.
+        //
+        // The mock bot replies with a `ChestSyncReport` whose `chest_id`
+        // (`9999`) is NOT present in storage, so `apply_chest_sync` returns
+        // `Err("Chest 9999 not found in storage")` while the deposit-confirm
+        // ack itself is `Ok`.
+        const BOGUS_CHEST_ID: i32 = 9999;
+        let (tx, rx) = mpsc::channel(4);
+        spawn_sync_failing_bot(rx, BOGUS_CHEST_ID);
+        let mut store = make_store(tx, single_node_storage("cobblestone"));
+
+        let amount = 17;
+        let plan = vec![transfer(2, "cobblestone", amount)];
+        let result = deposit_transfers(&mut store, &plan, "cobblestone", 64, "[Test]").await;
+
+        assert_eq!(
+            result.items_returned, amount,
+            "items must be credited per the docstring: physical deposit succeeded"
+        );
+        assert_eq!(
+            result.operations_failed, 1,
+            "apply_chest_sync failure must flip operations_failed so has_failures() escalates"
+        );
+        assert_eq!(
+            result.operations_succeeded, 0,
+            "the step did NOT succeed end-to-end: in-memory view diverged"
+        );
+        assert!(
+            result.has_failures(),
+            "in-memory drift must surface as a failure for operator escalation"
+        );
+    }
+
     // --- rollback_amount_to_storage --------------------------------------
 
     #[tokio::test]
@@ -658,6 +752,76 @@ mod tests {
         assert!(
             result.partial_message().is_some(),
             "partial_message() must yield a string when items remain on the bot"
+        );
+    }
+
+    // --- partial_message wording / format --------------------------------
+
+    #[test]
+    fn partial_message_returns_none_on_clean_rollback() {
+        // A result with successful operations and items returned but no
+        // failures and no unplanned items must produce no partial-message
+        // suffix — callers fall back to the "(items rolled back to storage)"
+        // wording instead.
+        let r = RollbackResult {
+            items_returned: 5,
+            operations_succeeded: 2,
+            ..Default::default()
+        };
+        assert!(r.partial_message().is_none());
+    }
+
+    #[test]
+    fn partial_message_only_reports_returned_when_no_failures() {
+        // Locks in: returned-only != failure. Even though `items_returned`
+        // is non-zero, `has_failures()` is false (no operations_failed and
+        // no items_unplanned), so `partial_message()` short-circuits to None.
+        let r = RollbackResult {
+            items_returned: 7,
+            ..Default::default()
+        };
+        assert!(r.partial_message().is_none());
+    }
+
+    #[test]
+    fn partial_message_combines_returned_failed_and_stuck() {
+        let r = RollbackResult {
+            items_returned: 5,
+            operations_failed: 2,
+            items_unplanned: 3,
+            ..Default::default()
+        };
+        let msg = r.partial_message().expect("has failures => Some");
+        assert!(msg.contains("5 returned to storage"), "msg was: {msg}");
+        assert!(msg.contains("2 chest operation(s) failed"), "msg was: {msg}");
+        assert!(
+            msg.contains("3 item(s) could not be placed"),
+            "msg was: {msg}"
+        );
+        assert!(msg.contains("; "), "clauses must be joined by '; ' (msg was: {msg})");
+        // Order is fixed in the function: returned, failed, stuck.
+        let returned_idx = msg.find("5 returned to storage").unwrap();
+        let failed_idx = msg.find("2 chest operation(s) failed").unwrap();
+        let stuck_idx = msg.find("3 item(s) could not be placed").unwrap();
+        assert!(
+            returned_idx < failed_idx && failed_idx < stuck_idx,
+            "clauses must appear in order returned, failed, stuck (msg was: {msg})"
+        );
+    }
+
+    #[test]
+    fn partial_message_omits_zero_counters() {
+        // Only items_unplanned is non-zero — the "returned" and "failed"
+        // clauses must be omitted entirely (no leading separator, no
+        // zero-padded clauses). Uses the literal em-dash (U+2014).
+        let r = RollbackResult {
+            items_unplanned: 4,
+            ..Default::default()
+        };
+        let msg = r.partial_message().expect("has failures => Some");
+        assert_eq!(
+            msg,
+            "4 item(s) could not be placed and remain on the bot — investigate manually"
         );
     }
 }

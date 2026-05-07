@@ -2082,7 +2082,24 @@ async fn process_event(
             .extra("had_text_reply", serde_json::Value::from(run.reply.is_some())),
     );
 
+    // Composer ran but emitted no text — model declined to speak (only
+    // tool_use turns followed by an empty terminal turn, or `hit_cap` with
+    // no text alongside). The proactive path logs `proactive_silent`; the
+    // reactive path needs the symmetric record so audit-tools can see why
+    // a `respond=true` classifier verdict produced no `sent`.
     let Some(reply) = run.reply else {
+        decisions::write(
+            &decisions::DecisionRecord::new("composer_silent")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason(if run.hit_cap {
+                    "hit_cap_no_text"
+                } else {
+                    "model_declined"
+                })
+                .extra("iterations", serde_json::Value::from(run.iterations))
+                .extra("hit_cap", serde_json::Value::from(run.hit_cap)),
+        );
         return Ok(());
     };
 
@@ -2524,6 +2541,17 @@ async fn process_event(
     let reply = pacing::sanitize_outbound_chat(&reply);
     let reply = pacing::truncate_to_chat_limit(&reply, config.composer_max_chars as usize);
     if reply.trim().is_empty() {
+        // Outbound shaping (strip_reasoning / strip_ai_tells / sanitize)
+        // ate the entire reply. Mirrors the proactive path's
+        // `proactive_silent: empty_after_sanitize` audit record so the
+        // operator can distinguish a model-silent from a sanitizer-ate-it
+        // outcome when grepping decisions.
+        decisions::write(
+            &decisions::DecisionRecord::new("reply_blocked")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason("empty_after_sanitize"),
+        );
         return Ok(());
     }
 
@@ -2560,6 +2588,12 @@ async fn process_event(
     // after the bot already left the server.
     tokio::select! {
         _ = composer_cancel.cancelled() => {
+            decisions::write(
+                &decisions::DecisionRecord::new("composer_cancelled")
+                    .with_sender(&event.sender)
+                    .with_event_ts(event.recv_at)
+                    .with_reason("cancelled_during_typing_delay"),
+            );
             return Ok(());
         }
         _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
@@ -2649,6 +2683,12 @@ async fn process_event(
     };
     if bot_tx.send(send_msg).await.is_err() {
         warn!("[Chat] bot channel closed before send");
+        decisions::write(
+            &decisions::DecisionRecord::new("send_error")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason("bot_channel_closed"),
+        );
         return Ok(());
     }
     match resp_rx.await {
@@ -2675,6 +2715,12 @@ async fn process_event(
         }
         Err(_) => {
             warn!("[Chat] send response channel dropped");
+            decisions::write(
+                &decisions::DecisionRecord::new("send_error")
+                    .with_sender(&event.sender)
+                    .with_event_ts(event.recv_at)
+                    .with_reason("response_channel_dropped"),
+            );
         }
     }
     Ok(())
@@ -2983,6 +3029,12 @@ async fn process_proactive_tick(
     );
     tokio::select! {
         _ = composer_cancel.cancelled() => {
+            decisions::write(
+                &decisions::DecisionRecord::new("composer_cancelled")
+                    .with_sender(&partner.username)
+                    .with_reason("cancelled_during_typing_delay")
+                    .extra("source", serde_json::Value::from("proactive")),
+            );
             return Ok(());
         }
         _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {}
@@ -3048,6 +3100,12 @@ async fn process_proactive_tick(
         .is_err()
     {
         warn!("[Chat] bot channel closed before proactive send");
+        decisions::write(
+            &decisions::DecisionRecord::new("send_error")
+                .with_sender(&partner.username)
+                .with_reason("bot_channel_closed")
+                .extra("source", serde_json::Value::from("proactive")),
+        );
         return Ok(());
     }
     match resp_rx.await {
@@ -3073,6 +3131,12 @@ async fn process_proactive_tick(
         }
         Err(_) => {
             warn!("[Chat] proactive send response channel dropped");
+            decisions::write(
+                &decisions::DecisionRecord::new("send_error")
+                    .with_sender(&partner.username)
+                    .with_reason("response_channel_dropped")
+                    .extra("source", serde_json::Value::from("proactive")),
+            );
         }
     }
     Ok(())

@@ -81,6 +81,13 @@ impl Trade {
 
     // Colons are reserved on Windows (NTFS), so RFC3339 timestamps must have
     // them replaced before use as a filename.
+    //
+    // Production code threads through `get_trade_file_path_in_dir` so the
+    // trades directory is parameterizable from `save_all_in_dir`; this
+    // `TRADES_DIR`-rooted form is exercised only by tests pinning the
+    // path-derivation contract. `#[allow(dead_code)]` keeps the symbol
+    // available for any future single-trade write path.
+    #[allow(dead_code)]
     fn get_trade_file_path(timestamp: &DateTime<Utc>) -> PathBuf {
         Self::get_trade_file_path_in_dir(Path::new(Self::TRADES_DIR), timestamp)
     }

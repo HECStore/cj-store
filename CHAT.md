@@ -283,6 +283,9 @@ chat_task (subscriber):
     │               read_today_history / search_history /
     │               web_search / web_fetch
     ├── max iterations: composer_max_tool_iterations (default 5)
+    ├── reply=None (had_text_reply=false on the `composer` record)
+    │   → `composer_silent` decision, reason `model_declined`
+    │     (or `hit_cap_no_text`); no `sent` ever follows.
     ▼
   reasoning_filter.rs (Haiku post-processor; opt-in)
     ├── chat.reasoning_filter_enabled = false                    ── bypass
@@ -418,7 +421,7 @@ addressed to the bot. Patterns are operator-configurable in
 When a pattern matches an inbound line addressing the bot, the chat
 module enters **long backoff** (default 24 h, `chat.moderation_backoff_secs`)
 — it observes and logs but does not classify or compose. Cleared by the
-`Chat: resume after moderation backoff` CLI command.
+`Chat: clear moderation backoff` CLI command.
 
 System-pseudo events are still written to history JSONL — they are
 useful context for the composer when it does decide to act — but never
@@ -491,10 +494,20 @@ in plain prose. Haiku reads the candidate and emits one of:
   `message` are reversed before being stored (Haiku saw the escaped
   candidate, so its faithful output may carry entity form), so chat
   output never ships HTML-escaped angle brackets;
-- `rewrite` — leak and message mangled together; emit a fresh in-voice
-  line conveying the salvageable intent. Same `&lt;`/`&gt;` reversal as
-  `strip` so the rewrite never ships HTML entities either;
-- `reject` — pure deliberation with nothing to send; bot stays silent.
+- `rewrite` — pure reasoning narration with ANY discernible actionable
+  intent (greet / react / answer / comment / joke / commiserate / ask /
+  redirect to shop). Haiku extracts that intent and writes a fresh
+  ≤120-char chat line in the bot's casual lowercase voice — even when
+  the candidate is "should I speak" deliberation rather than a mangled
+  half-formed reply. Example: `i should probably greet this new player`
+  → `hi, you new here?`. The prompt now defaults to `rewrite` over
+  `reject` whenever an intent can be named, on the philosophy that a
+  slightly-fabricated friendly line in voice is better than silence in
+  an active conversation. Same `&lt;`/`&gt;` reversal as `strip` so the
+  rewrite never ships HTML entities either;
+- `reject` — reasoning that EXPLICITLY concludes the bot should stay
+  silent ("i'll stay out of this", "don't think i should respond") with
+  no actionable intent to extract. Bot stays silent.
 
 Best-effort: any error / decode failure / cap-trip / rate-limit-skip
 short-circuits to `send` so a Haiku outage doesn't black-hole the bot.
@@ -584,7 +597,11 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
      `"-"`.
 3. Truncate at `composer_max_chars` (default 240; Minecraft chat allows
    256 with margin for the username prefix).
-4. If empty after stripping → silent.
+4. If empty after stripping → silent. Logged as
+   `kind: "reply_blocked"`, `reason: "empty_after_sanitize"`
+   (proactive: `proactive_silent` / `empty_after_sanitize`) so an
+   operator can distinguish a model-silent run from a sanitizer-ate-it
+   run when grepping decisions.
 5. **Leading-slash guard.** If the trimmed reply begins with `/` it is
    dropped unconditionally with `decisions.jsonl` reason
    `leading_slash`. The chat module is not a command surface — all
@@ -596,7 +613,11 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
                   typing_delay_floor_ms, typing_delay_max_ms)`. The
    Gaussian can yield negative values; the floor (default 400 ms)
    keeps replies from arriving instantly.
-7. `tokio::time::sleep(delay)`.
+7. `tokio::time::sleep(delay)`, raced against `composer_cancel`. A
+   BotDisconnected/Shutdown firing during the wait writes
+   `kind: "composer_cancelled"`, `reason: "cancelled_during_typing_delay"`
+   and aborts the send so a stale reply doesn't drip after the bot
+   already left the server.
 8. **Post-sleep recheck** (the slept reply might be stale by the time
    it would send):
    - `max_replies_per_minute` — always applied.
@@ -1310,7 +1331,7 @@ start on unknown versions. Operator playbook entries:
 - **Reset daily caps** (e.g. for testing): set `tokens_today` fields
   to 0 and `last_meter_day_utc` to today.
 - **Clear moderation backoff**: set `moderation_backoff_until` to null,
-  or use `Chat: resume after moderation backoff`.
+  or use `Chat: clear moderation backoff`.
 - **Clear composer-throttle backoff**: set `composer_throttle_backoff_until`
   to null. The chat task auto-clears it on the next event whose timestamp
   is past the recorded value, so manual edits are only needed when an
@@ -1377,7 +1398,8 @@ Gated on `config.chat.enabled`. Send via `chat_cmd_tx` from
 | `Chat: regenerate persona`                       | One-shot; requires confirmation + 24 h cooldown. Archives prior persona to `persona.md.<UTC>`.                                         |
 | `Chat: run reflection now`                       | Consumes `pending_adjustments.jsonl` immediately. Permissive validator (operator decides).                                             |
 | `Chat: forget player <username>`                 | GDPR: purges per-player file + history JSONL records + decisions JSONL records + overlay sidecars + `pending_adjustments.jsonl` (live + rotated archives) + rotated `pending_self_memory` archives + `_index.json` entries. Confirmation prompt; logged to operator audit. |
-| `Chat: resume after moderation backoff`          | Clears `state.moderation_backoff_until`.                                                                                               |
+| `Chat: clear moderation backoff`                 | Clears `state.moderation_backoff_until`.                                                                                               |
+| `Chat: run retention sweep`                      | Manual trigger of the daily retention sweep (also runs automatically at midnight UTC). Prints a per-bucket deletion count for `history`, `decisions`, `overlays`, `pending_adjustments`, `pending_self_memory`, `persona_archives`, `markdown_archives`, plus the total. |
 | `Chat: pause` / `Chat: resume`                   | Toggles `state.paused`, observed at the top of the chat decision pipeline.                                                              |
 
 ## Behavior guards and threat mitigations

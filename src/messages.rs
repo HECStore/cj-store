@@ -67,7 +67,7 @@ pub enum ChatCommand {
         respond_to: oneshot::Sender<()>,
     },
     /// Clear moderation backoff (CHAT.md
-    /// `Chat: resume after moderation backoff`).
+    /// `Chat: clear moderation backoff`).
     ClearModerationBackoff {
         respond_to: oneshot::Sender<()>,
     },

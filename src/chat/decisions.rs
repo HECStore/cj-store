@@ -315,6 +315,64 @@ mod tests {
     }
 
     #[test]
+    fn composer_silent_record_carries_diagnostic_fields() {
+        // Pin the shape of the `composer_silent` audit record. Operators
+        // grep for this kind whenever a `respond=true` classifier verdict
+        // produced no `sent` event; the `iterations` and `hit_cap` extras
+        // distinguish "model emitted no text after a tool turn" from
+        // "tool loop exhausted its iteration budget without producing a
+        // text reply".
+        let r = DecisionRecord::new("composer_silent")
+            .with_sender("Bob")
+            .with_event_ts(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_705_314_600))
+            .with_reason("model_declined")
+            .extra("iterations", serde_json::Value::from(2u32))
+            .extra("hit_cap", serde_json::Value::from(false));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["kind"], "composer_silent");
+        assert_eq!(json["sender"], "Bob");
+        assert_eq!(json["reason"], "model_declined");
+        assert_eq!(json["iterations"], 2);
+        assert_eq!(json["hit_cap"], false);
+        assert!(json.get("event_ts").is_some());
+    }
+
+    #[test]
+    fn reply_blocked_empty_after_sanitize_record_is_terse() {
+        // The reactive process_event path emits this when the outbound
+        // sanitize pipeline (strip_reasoning + strip_ai_tells +
+        // sanitize_outbound_chat + truncate) eats the whole reply. Mirror
+        // of the proactive path's `proactive_silent: empty_after_sanitize`
+        // — keep both audit shapes greppable by a single `reason` string.
+        let r = DecisionRecord::new("reply_blocked")
+            .with_sender("Bob")
+            .with_reason("empty_after_sanitize");
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["kind"], "reply_blocked");
+        assert_eq!(json["reason"], "empty_after_sanitize");
+        // No tokens / latency on reply_blocked: the call already paid
+        // upstream and was logged in the `composer` record. Keep this
+        // record terse.
+        assert!(json.get("input_tokens").is_none());
+        assert!(json.get("latency_ms").is_none());
+    }
+
+    #[test]
+    fn composer_cancelled_during_typing_delay_record_shape() {
+        // The reactive and proactive paths both race the typing-delay
+        // sleep against `composer_cancel`; on cancel they must emit a
+        // `composer_cancelled: cancelled_during_typing_delay` audit
+        // record so an operator can distinguish a Shutdown-killed reply
+        // from an upstream API failure.
+        let r = DecisionRecord::new("composer_cancelled")
+            .with_sender("Bob")
+            .with_reason("cancelled_during_typing_delay");
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["kind"], "composer_cancelled");
+        assert_eq!(json["reason"], "cancelled_during_typing_delay");
+    }
+
+    #[test]
     fn file_for_uses_date_under_decisions_dir() {
         use std::time::Duration;
         let t = std::time::UNIX_EPOCH + Duration::from_secs(1_705_314_600);

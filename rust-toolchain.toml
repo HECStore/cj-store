@@ -1,8 +1,9 @@
 [toolchain]
 # This project uses Azalea, which may require nightly depending on its
-# transitive dependencies (SIMD crates / feature gates). Nightly is also
-# required because `.cargo/config.toml` sets `-Zshare-generics=y`, which
-# is a nightly-only flag.
+# transitive dependencies (SIMD crates / feature gates). Nightly is
+# additionally enabled by `-Zshare-generics=y` on the Linux and macOS
+# stanzas of `.cargo/config.toml` (the Windows MSVC stanza leaves it
+# commented out), which is a nightly-only flag.
 #
 # The channel is pinned to a specific dated nightly so CI, contributors,
 # and the maintainer all build against the same toolchain. Bump the date

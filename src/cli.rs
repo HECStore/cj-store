@@ -604,14 +604,26 @@ fn chat_toggle_dry_run(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
         println!("Chat task is not running.");
         return;
     }
-    let now = match q_rx.blocking_recv() {
-        Ok(s) => s.dry_run_effective,
+    let status = match q_rx.blocking_recv() {
+        Ok(s) => s,
         Err(_) => {
             println!("Chat task did not respond.");
             return;
         }
     };
-    let want = !now;
+    // `dry_run_effective = config.dry_run || runtime_state.dry_run_runtime_override`,
+    // so when `config.dry_run = true` the runtime toggle is a silent no-op:
+    // the SetDryRun handler writes `runtime_state.dry_run_runtime_override`
+    // but the effective composition stays `true`. Refuse the toggle so the
+    // CLI doesn't print "OFF" while live mode never actually engages — the
+    // operator must edit `config.toml` and restart to truly disable dry-run.
+    if status.dry_run_config_pinned {
+        println!(
+            "Chat dry-run is pinned ON by `config.dry_run = true` and cannot be toggled at runtime. Edit your config and restart to disable.",
+        );
+        return;
+    }
+    let want = !status.dry_run_effective;
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
         .blocking_send(ChatCommand::SetDryRun {

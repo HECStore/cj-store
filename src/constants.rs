@@ -182,14 +182,31 @@ pub const RATE_LIMIT_RESET_AFTER_MS: u64 = 90_000;
 const _: () = assert!(RATE_LIMIT_RESET_AFTER_MS >= RATE_LIMIT_MAX_COOLDOWN_MS);
 
 /// Interval between periodic maintenance sweeps (seconds).
-/// Hourly is frequent enough to keep caches bounded under normal load
-/// without adding noticeable overhead on an otherwise idle store.
-pub const CLEANUP_INTERVAL_SECS: u64 = 3_600;
+/// Tied to the staleness budget of the two caches it sweeps
+/// (`RATE_LIMIT_STALE_AFTER_SECS` and `UUID_CACHE_TTL_SECS`, both 300):
+/// running the sweep at least as often as the staleness budget keeps the
+/// rate-limit map bounded by `attacker_rate * STALE_AFTER` (instead of by
+/// `attacker_rate * INTERVAL` when INTERVAL > STALE_AFTER). Both retain
+/// passes are O(n) on inner HashMaps and dominate nothing on an idle store.
+pub const CLEANUP_INTERVAL_SECS: u64 = 300;
 
 /// Rate-limiter entries older than this are dropped by the periodic sweep (seconds).
 /// Five minutes is well past any legitimate cooldown window, so the entry
 /// cannot still be throttling a user when it is removed.
 pub const RATE_LIMIT_STALE_AFTER_SECS: u64 = 300;
+
+// Invariant: the cleanup cadence cannot exceed the staleness budget, or
+// stale entries pile up between sweeps and the bound on the rate-limit map
+// degrades from `attacker_rate * STALE_AFTER` to `attacker_rate * INTERVAL`.
+const _: () = assert!(CLEANUP_INTERVAL_SECS <= RATE_LIMIT_STALE_AFTER_SECS);
+// Invariant: cleanup must not evict users still inside the violation-reset
+// window — otherwise an actively-throttled spammer gets a free escalation
+// reset when their entry is freed before `RATE_LIMIT_RESET_AFTER_MS` has
+// elapsed. The runtime `clamp_stale_threshold` (rate_limit.rs) handles
+// misconfiguration with a one-shot warn; this catches it at build time.
+const _: () = assert!(
+    RATE_LIMIT_STALE_AFTER_SECS.saturating_mul(1_000) >= RATE_LIMIT_RESET_AFTER_MS,
+);
 
 /// Outer watchdog on `Store::process_next_order` (seconds).
 /// Individual bot operations have their own timeouts (`TRADE_TIMEOUT_MS`,

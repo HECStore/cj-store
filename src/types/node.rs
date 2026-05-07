@@ -119,6 +119,20 @@ impl Node {
         }
 
         // Recompute positions from the current storage origin (see doc comment).
+        // Validate `chest.index` BEFORE computing positions: `Chest::calc_position`
+        // panics on out-of-range indices, and panics propagate past the
+        // skip-on-Err handler in `Storage::load`, taking down the bot at
+        // startup. A hand-edited or corrupted file with `index: 7` is just a
+        // bad node — we want to skip it, not crash.
+        for chest in &node.chests {
+            if !(0..CHESTS_PER_NODE as i32).contains(&chest.index) {
+                return Err(StoreError::InvariantViolation(format!(
+                    "Node {} has chest with invalid index {} (must be 0..{})",
+                    id, chest.index, CHESTS_PER_NODE
+                )));
+            }
+        }
+
         node.position = Self::calc_position(id, storage_position);
         for chest in &mut node.chests {
             chest.position = Chest::calc_position(&node.position, chest.index);
@@ -134,6 +148,35 @@ impl Node {
         }
 
         node.chests.sort_by_key(|chest| chest.index);
+
+        // After sort, indices must be exactly [0, 1, 2, 3] with no duplicates,
+        // and the redundant id fields (`chest.id`, `chest.node_id`, `chest.index`)
+        // must all agree — otherwise `Storage::get_chest_mut` and
+        // `apply_chest_sync` (which look up by id) silently return the wrong
+        // chest, and a chest with id=0 sitting in a non-zero node would be
+        // force-relabeled to "diamond" by the bot's first sync.
+        for (expected_idx, chest) in node.chests.iter().enumerate() {
+            let expected_idx = expected_idx as i32;
+            if chest.index != expected_idx {
+                return Err(StoreError::InvariantViolation(format!(
+                    "Node {} chest at slot {} has index {} (duplicate or missing)",
+                    id, expected_idx, chest.index
+                )));
+            }
+            if chest.node_id != id {
+                return Err(StoreError::InvariantViolation(format!(
+                    "Node {} chest {} has node_id {} (expected {})",
+                    id, chest.index, chest.node_id, id
+                )));
+            }
+            let expected_id = id * CHESTS_PER_NODE as i32 + chest.index;
+            if chest.id != expected_id {
+                return Err(StoreError::InvariantViolation(format!(
+                    "Node {} chest at index {} has id {} (expected {})",
+                    id, chest.index, chest.id, expected_id
+                )));
+            }
+        }
 
         // Re-enforce node 0's reserved chest invariants in case the JSON was
         // hand-edited. Persist the correction so later loads see the fix.
@@ -212,6 +255,17 @@ impl Node {
     /// . 4 3 2 .
     /// ```
     pub fn calc_position(id: i32, storage_position: &Position) -> Position {
+        // Negative IDs would silently produce garbage coordinates: the ring
+        // loop never iterates, `pos_in_ring / side` truncates toward zero
+        // through a `_` arm, and the function returns Position(-12, -1) ×
+        // NODE_SPACING with no error. Filenames are validated at the
+        // `Storage::load` boundary, so this should be unreachable; the
+        // assert documents the invariant.
+        debug_assert!(
+            id >= 0,
+            "Node::calc_position requires id >= 0, got {id}",
+        );
+
         if id == 0 {
             return Position {
                 x: storage_position.x,

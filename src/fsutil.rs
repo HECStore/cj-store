@@ -2,8 +2,14 @@
 //!
 //! Provides atomic file write operations to prevent torn writes during crashes.
 //!
-//! **Strategy**: Write to `*.tmp`, then rename to final file.
-//! On Windows, rename won't overwrite, so we remove destination first.
+//! **Strategy**: Write to `*.tmp`, then `fs::rename` it into place. Rust's
+//! `fs::rename` uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows,
+//! so the replace is atomic on both platforms — no manual remove-first dance.
+//! On rename failure (sharing violation, cross-volume, transient AV/indexer
+//! lock) we fall through to a recovery path that copies the new bytes to a
+//! `*.recovery.tmp` sibling, aside-renames the live file to `{path}.bak`, and
+//! then atomically renames the recovery-temp into place — so a mid-stream
+//! `fs::copy` failure can never truncate the prior good bytes at `path`.
 //!
 //! **Note on directory durability**: On Unix the parent directory is fsynced
 //! after the rename so the directory entry itself survives a crash. On Windows
@@ -88,12 +94,18 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
 }
 
 /// Recovery path when the atomic rename fails (sharing violation, cross-volume
-/// move, UNC quirk, long path, transient Windows lock). On Windows we first
-/// aside-rename the prior file to `{path}.bak` so the destructive `fs::copy`
-/// fallback can't destroy the prior good bytes if it itself fails midway. On
-/// Unix `fs::rename` would have left `path` untouched, so the prior file is
-/// already safe and no aside-rename is needed.
-#[cfg_attr(not(windows), allow(unused_variables))]
+/// move, UNC quirk, long path, transient Windows lock).
+///
+/// **Crash-safety:** the prior good bytes at `path` must survive any single
+/// failure here. The earlier implementation used a bare `fs::copy(tmp, path)`,
+/// which on Unix opens `path` with O_TRUNC (and on Windows uses CopyFileExW's
+/// overwrite mode) — both truncate the destination at the moment of open, so
+/// a mid-stream ENOSPC/EIO/sharing-violation left the destination empty or
+/// partial. We now copy `tmp_path` to a sibling **recovery-temp** first,
+/// `sync_all` it, optionally aside-rename the live `path` to `{path}.bak`
+/// (so even a failure of the second rename leaves a recoverable copy at
+/// `.bak`), then `fs::rename` the recovery-temp into `path`. The destination
+/// is only ever flipped in one atomic step.
 fn rename_failed_fallback_copy(
     path: &Path,
     parent: &Path,
@@ -101,12 +113,30 @@ fn rename_failed_fallback_copy(
     tmp_path: &Path,
     rename_err: io::Error,
 ) -> io::Result<()> {
-    tracing::warn!("[File] rename {tmp_path:?} -> {path:?} failed: {rename_err} — moving prior file aside and falling back to copy");
+    tracing::warn!("[File] rename {tmp_path:?} -> {path:?} failed: {rename_err} — moving prior file aside and falling back to copy-then-rename");
 
-    // 5 attempts × exponential backoff (10/20/40/80ms = ~150ms total) is
-    // enough for transient AV scans / indexer handles to release the file
-    // without making the UI feel unresponsive. Only runs in the failure path.
-    #[cfg(windows)]
+    // 1. Copy tmp_path to a sibling recovery-temp and fsync. The recovery-temp
+    //    is a distinct path so that `fs::copy` cannot truncate the live `path`
+    //    even if it fails midway.
+    let recovery_tmp = parent.join(format!("{file_name}.recovery.tmp"));
+    // Stale recovery-temp from an earlier failed run must not block this attempt.
+    let _ = fs::remove_file(&recovery_tmp);
+    if let Err(copy_err) = fs::copy(tmp_path, &recovery_tmp) {
+        tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy-to-recovery-temp={copy_err}; prior bytes at {path:?} are still intact (untouched by this branch)");
+        return Err(io::Error::other(format!(
+            "Failed to save file: rename error: {rename_err}, copy-to-recovery-temp error: {copy_err} (path: {path:?}, prior file preserved at: {path:?})"
+        )));
+    }
+    if let Ok(file) = fs::File::open(&recovery_tmp)
+        && let Err(sync_err) = file.sync_all() {
+            tracing::warn!("[File] sync_all on recovery-temp {recovery_tmp:?} failed: {sync_err} — continuing; rename remains atomic");
+        }
+
+    // 2. On both platforms, aside-rename the live `path` to `{path}.bak` so
+    //    that the final atomic rename below has a known-empty target slot.
+    //    Even if that final rename fails, the prior good bytes are at .bak
+    //    for an operator to recover. Five attempts on Windows for transient
+    //    AV/indexer locks; one attempt on Unix where rename is reliable.
     let bak_path: Option<std::path::PathBuf> = {
         let mut bak: Option<std::path::PathBuf> = None;
         if path.exists() {
@@ -114,18 +144,32 @@ fn rename_failed_fallback_copy(
             // A stale .bak from a prior failed write must not block the
             // aside-rename; remove it before moving the current good file aside.
             let _ = fs::remove_file(&candidate);
-            for attempt in 0..5 {
+            #[cfg(windows)]
+            {
+                for attempt in 0..5 {
+                    match fs::rename(path, &candidate) {
+                        Ok(_) => {
+                            bak = Some(candidate.clone());
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt == 4 {
+                                tracing::debug!("[File] {path:?}: aside-rename to .bak failed after 5 attempts: {e} — final rename below will overwrite path directly");
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10 * (1 << attempt)));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
                 match fs::rename(path, &candidate) {
                     Ok(_) => {
                         bak = Some(candidate.clone());
-                        break;
                     }
                     Err(e) => {
-                        if attempt == 4 {
-                            tracing::debug!("[File] {path:?}: aside-rename to .bak failed after 5 attempts: {e} — proceeding with copy anyway");
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10 * (1 << attempt)));
+                        tracing::debug!("[File] {path:?}: aside-rename to .bak failed: {e} — final rename below will overwrite path directly");
                     }
                 }
             }
@@ -133,43 +177,37 @@ fn rename_failed_fallback_copy(
         bak
     };
 
-    match fs::copy(tmp_path, path) {
+    // 3. Atomically rename the recovery-temp into the destination. This is
+    //    a clean swap: either the new bytes are at `path`, or the old bytes
+    //    are at `.bak`. No torn-state intermediate is observable.
+    match fs::rename(&recovery_tmp, path) {
         Ok(_) => {
+            #[cfg(unix)]
+            {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+            // Live path is fresh; clean up the bookkeeping siblings.
             let _ = fs::remove_file(tmp_path);
-            #[cfg(windows)]
             if let Some(ref bak) = bak_path {
                 let _ = fs::remove_file(bak);
             }
             Ok(())
         }
-        Err(copy_err) => {
-            // Copy failed. The prior good file is preserved — on Windows
-            // it lives at `.bak` (if the aside-rename succeeded) or still
-            // at `path` (if it didn't); on Unix `fs::rename` would have
-            // left `path` untouched. Do NOT attempt a second copy that
-            // requires removing the destination first — that path is what
-            // silently destroys ledgered state on multi-failure.
-            let _ = fs::remove_file(tmp_path);
-            #[cfg(windows)]
-            {
-                if let Some(ref bak) = bak_path {
-                    tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy={copy_err}; prior file preserved at {bak:?}");
-                    return Err(io::Error::other(
-                        format!("Failed to save file: rename error: {rename_err}, copy error: {copy_err} (path: {path:?}, prior file preserved at: {bak:?})")
-                    ));
-                }
-                tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy={copy_err}; destination preserved");
-                Err(io::Error::other(
-                    format!("Failed to save file: rename error: {rename_err}, copy error: {copy_err} (path: {path:?}, destination preserved)")
-                ))
-            }
-            #[cfg(not(windows))]
-            {
-                tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy={copy_err}; destination preserved");
-                Err(io::Error::other(
-                    format!("Failed to save file: rename error: {rename_err}, copy error: {copy_err} (path: {path:?}, destination preserved)")
-                ))
-            }
+        Err(final_err) => {
+            // Final rename failed. The prior good bytes are at `.bak`
+            // (if the aside-rename succeeded) or still at `path` (if it
+            // didn't — Windows-only fallthrough). Leave the recovery-temp
+            // and tmp_path on disk so an operator can recover by hand.
+            let preserved = bak_path.as_ref().map(|p| format!("{p:?}"))
+                .unwrap_or_else(|| format!("{path:?}"));
+            tracing::error!(
+                "[File] cannot save {path:?}: rename={rename_err}, recovery-rename={final_err}; new bytes preserved at {recovery_tmp:?} for manual recovery; prior file preserved at {preserved}"
+            );
+            Err(io::Error::other(format!(
+                "Failed to save file: rename error: {rename_err}, recovery-rename error: {final_err} (path: {path:?}, new bytes at: {recovery_tmp:?}, prior file preserved at: {preserved})"
+            )))
         }
     }
 }
@@ -290,8 +328,10 @@ mod tests {
     #[test]
     fn temp_file_cleaned_up_on_success() {
         // Regression guard: a successful write must not leave a .tmp sibling
-        // and must not leave a .bak sibling (Windows aside-rename should be
-        // cleaned up after the destination rename succeeds).
+        // and must not leave a .bak sibling. The happy path goes straight
+        // through `fs::rename` (atomic replace on both platforms) and never
+        // creates a `.bak` — that artefact is reserved for the rename-failure
+        // recovery path in `rename_failed_fallback_copy`.
         let dir = TmpDir::new("cleanup");
         let target = dir.path("foo.json");
         write_atomic(&target, "data").unwrap();
@@ -312,10 +352,10 @@ mod tests {
 
     #[test]
     fn two_sequential_writes_clean_up_bak() {
-        // The aside-rename creates `{path}.bak` on Windows when the destination
-        // already exists; after a successful rename, the .bak must be removed.
-        // This applies to overwrite cases — verify across two sequential writes
-        // that no .bak (or .tmp) sibling lingers.
+        // The recovery path (only) aside-renames the prior file to `{path}.bak`
+        // on both platforms before its final atomic rename, and cleans it up on
+        // success. The happy path does not touch `.bak` at all. Either way, two
+        // sequential successful writes must leave no `.bak` (or `.tmp`) sibling.
         let dir = TmpDir::new("seq-bak-cleanup");
         let target = dir.path("ledger.json");
         write_atomic(&target, "v1").unwrap();
@@ -345,23 +385,21 @@ mod tests {
         assert_eq!(read_to_string(&target), "fresh");
     }
 
-    /// On Windows, when the destination rename + copy both fail, the prior
-    /// good file's bytes must be preserved either at the live path or at
-    /// `{path}.bak`. We can't reliably force a rename failure in a unit test
-    /// without unsafe FFI or external locking tools, so this test simulates
-    /// the recovery contract: write a good file, then verify the contract
-    /// holds for the happy path (the only path testable in CI), and document
-    /// the .bak invariant via the aside-rename machinery exercised by the
-    /// other tests above.
+    /// When the destination rename and the recovery rename both fail, the
+    /// prior good file's bytes must be preserved either at the live path or
+    /// at `{path}.bak`. We can't reliably force a rename failure in a unit
+    /// test without unsafe FFI or external locking tools, so this test pins
+    /// the contract on the happy path (the only path testable in CI) — the
+    /// failure-path .bak invariant is documented in
+    /// `rename_failed_fallback_copy`.
     #[test]
     fn good_file_bytes_preserved_across_overwrite() {
         let dir = TmpDir::new("preserve-bytes");
         let target = dir.path("ledger.json");
         write_atomic(&target, "ledgered economic data").unwrap();
-        // Overwrite — the aside-rename moves the prior file to .bak, the new
-        // rename succeeds, and then .bak is cleaned up. At every observable
-        // moment after this call, either the live path or the .bak must hold
-        // a complete file (never both empty).
+        // Overwrite — the happy path goes straight through `fs::rename`
+        // (atomic replace on both platforms), so no `.bak` is ever created.
+        // The test below asserts no `.bak` remains after success.
         write_atomic(&target, "v2").unwrap();
         assert_eq!(read_to_string(&target), "v2");
         // No .bak should remain after success.

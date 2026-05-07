@@ -45,6 +45,12 @@ pub struct ChatStatusReport {
     pub enabled: bool,
     pub paused: bool,
     pub dry_run_effective: bool,
+    /// `true` iff `config.dry_run = true` is pinning dry-run on regardless
+    /// of the runtime override. Operator UI uses this to refuse a
+    /// runtime-override toggle that the config layer would silently
+    /// override (otherwise the CLI would print "Chat dry-run is now OFF"
+    /// while `dry_run_effective` stays `true`).
+    pub dry_run_config_pinned: bool,
     pub bot_username: Option<String>,
     pub composer_input_today: u64,
     pub composer_output_today: u64,
@@ -357,6 +363,7 @@ pub async fn chat_task(
                             enabled: config.enabled,
                             paused: runtime_state.paused,
                             dry_run_effective: config.dry_run || runtime_state.dry_run_runtime_override,
+                            dry_run_config_pinned: config.dry_run,
                             bot_username: bot_username.read().await.clone(),
                             composer_input_today: runtime_state.tokens_today.composer_input,
                             composer_output_today: runtime_state.tokens_today.composer_output,

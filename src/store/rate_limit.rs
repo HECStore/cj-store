@@ -600,13 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_stale_preserves_user_at_floor_boundary() {
-        // Boundary regression: backdate exactly the minimum legal threshold
-        // and call `cleanup_stale` with that same value. The retain check is
-        // strict-`<`, so an entry whose elapsed equals the threshold would
-        // be dropped — UNLESS the floor is set high enough that violations
-        // would have reset on the next check anyway. Using `last_attempt_time`
-        // for the retain key (bumped by `check` above) keeps the entry alive.
+    fn cleanup_stale_evicts_at_exact_floor_boundary() {
+        // The retain predicate is strict-`<`: an entry whose elapsed equals
+        // the threshold IS dropped. This test pins that contract so a future
+        // maintainer who flips it to `<=` (a plausible "preserve at boundary"
+        // tweak) gets a test failure instead of silently changing eviction
+        // semantics. Eviction at exactly the floor is harmless in production
+        // because the floor is the natural-reset window — violations would
+        // have reset on the next check anyway — but the predicate still has
+        // to be the one we ship.
         let mut limiter = RateLimiter::new();
         let _ = limiter.check("spammer");
         for _ in 0..20 {
@@ -616,29 +618,36 @@ mod tests {
         assert!(v_before >= 20, "precondition: saturation reached");
 
         let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
-        // `backdate` shifts both fields uniformly; with the retain predicate
-        // keyed on `last_attempt_time`, this places the entry exactly at the
-        // boundary and exercises the strict-`<` check.
+        // `backdate` shifts both fields uniformly; the retain predicate is
+        // keyed on `last_attempt_time`, so this places the entry exactly at
+        // the boundary and exercises the strict-`<` check.
         assert!(limiter.backdate("spammer", floor));
         limiter.cleanup_stale(floor);
-        // Note: at exactly the boundary `elapsed == floor` so strict-`<`
-        // evicts. The intent of this regression is that anything *less* than
-        // the floor preserves the user — and that the floor itself is the
-        // natural-reset window, so eviction at exactly that point is harmless
-        // (violations would have reset on the next check anyway).
-        // Verify by inspecting after a sub-floor backdate-and-cleanup:
-        let mut limiter2 = RateLimiter::new();
-        let _ = limiter2.check("spammer2");
-        for _ in 0..20 {
-            let _ = limiter2.check("spammer2");
-        }
-        let v_before2 = limiter2.violations_for("spammer2").unwrap();
-        assert!(limiter2.backdate("spammer2", floor - Duration::from_millis(1)));
-        limiter2.cleanup_stale(floor);
         assert_eq!(
-            limiter2.violations_for("spammer2"),
-            Some(v_before2),
-            "user just inside the floor must keep their violation count"
+            limiter.violations_for("spammer"),
+            None,
+            "exact-floor entries must be evicted under strict-`<` retain",
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_preserves_user_just_inside_floor() {
+        // Companion to the boundary test: an entry whose elapsed is one
+        // millisecond LESS than the threshold survives. The two tests
+        // together pin both sides of the strict-`<` predicate.
+        let mut limiter = RateLimiter::new();
+        let _ = limiter.check("spammer2");
+        for _ in 0..20 {
+            let _ = limiter.check("spammer2");
+        }
+        let v_before = limiter.violations_for("spammer2").unwrap();
+        let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
+        assert!(limiter.backdate("spammer2", floor - Duration::from_millis(1)));
+        limiter.cleanup_stale(floor);
+        assert_eq!(
+            limiter.violations_for("spammer2"),
+            Some(v_before),
+            "user just inside the floor must keep their violation count",
         );
     }
 

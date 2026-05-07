@@ -139,6 +139,7 @@ impl Storage {
                 && let Some(file_name) = path.file_stem()
                 && let Some(file_str) = file_name.to_str()
                 && let Ok(node_id) = file_str.parse::<i32>()
+                && node_id >= 0
             {
                 match Node::load(node_id, storage_position) {
                     Ok(node) => nodes.push(node),
@@ -152,6 +153,26 @@ impl Storage {
                     }
                 }
             }
+        }
+
+        // `read_dir` returns entries in filesystem-defined order
+        // (lexicographic on most ext4 mounts, arbitrary elsewhere). Several
+        // call sites (`simulate_deposit_plan`, `find_empty_chest_index`,
+        // `get_overflow_chest`, `get_overflow_chest_mut`, the auto-create
+        // guard in `store/mod.rs`) assume `nodes[0]` is node id 0; without
+        // a sort, a missing or hand-removed `0.json` silently routes those
+        // reserved-chest lookups to a different node and corrupts every
+        // invariant the reserved-chest assignment underwrites. Sort to make
+        // the assumption load-bearing rather than coincidental.
+        nodes.sort_by_key(|n| n.id);
+        if let Some(first) = nodes.first()
+            && first.id != 0
+        {
+            tracing::error!(
+                first_node_id = first.id,
+                "[Storage] node 0 is missing from disk — `nodes[0]` invariant violated; reserved-chest lookups will route to node {} instead",
+                first.id,
+            );
         }
 
         tracing::info!(
@@ -265,15 +286,24 @@ impl Storage {
 
     /// Plans a deposit of `qty` items **without mutating** storage state.
     ///
-    /// Read-only counterpart to `deposit_plan`. Mirrors the exact placement
-    /// rules (reserved chests on node 0, prefer partial shulkers, spill into
-    /// empty chests, grow by one node when nothing else is available). Because
-    /// this method never mutates, "growing by one node" is represented as a
-    /// synthetic extra chest allocation in the returned plan — good enough
-    /// for the plan-then-commit pattern used by order handlers, where the
-    /// real `deposit_plan` will allocate the node during execution.
+    /// Read-only counterpart to `deposit_plan`. Walks the EXISTING chests
+    /// in the same priority order (reserved chests on node 0, then partial
+    /// shulkers of the same item, then empty chests). **Does NOT model node
+    /// growth** — when every existing chest is full, this returns a plan
+    /// covering whatever fits and `planned < qty`; the caller decides what
+    /// to do with the shortfall:
     ///
-    /// Returns the plan plus the total amount that could actually be planned.
+    /// * Order pre-flight callers (`orders.rs`, `handlers/operator.rs`)
+    ///   surface the shortfall as a user-facing rejection — node growth
+    ///   should be an operator decision, not a side-effect of every passing
+    ///   buy/sell.
+    /// * Recovery / rollback callers (`rollback.rs::rollback_amount_to_storage`)
+    ///   fall back to the mutating `deposit_plan` for the unplanned remainder
+    ///   so items already on the bot reach storage even if it costs a node
+    ///   allocation — the alternative is stranded inventory.
+    ///
+    /// Returns the plan plus the total amount that could actually be planned
+    /// against existing chests.
     pub fn simulate_deposit_plan(&self, item: &str, qty: i32, stack_size: i32) -> (Vec<ChestTransfer>, i32) {
         if qty <= 0 {
             return (Vec::new(), 0);

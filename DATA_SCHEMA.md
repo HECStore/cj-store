@@ -239,9 +239,11 @@ One file per physical node (cluster of 4 chests). Filename is the numeric
 
 Invariants (checked by CLI option 12 "Audit state" where noted):
 
-- Exactly 4 chests per node, indices 0..=3. *Enforced at load time.*
-- `chest.id = node.id * 4 + chest.index`. *Convention followed by every
-  writer; not verified on load.*
+- Exactly 4 chests per node, indices 0..=3 with no duplicates or gaps.
+  *Enforced at load time, before and after sort.*
+- `chest.node_id == node.id` and `chest.id == node.id * 4 + chest.index`
+  for every chest. *Enforced at load time; a node whose chests disagree
+  is rejected and skipped by `Storage::load`.*
 - `amounts.len() == 54` (one entry per shulker-box slot in the double
   chest). *Normalized at load time: a vector of the wrong length is
   silently resized to 54 (padded with zeros or truncated).*

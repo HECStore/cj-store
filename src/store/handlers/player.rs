@@ -73,9 +73,24 @@ pub async fn handle_player_command(
         return utils::send_message_to_player(store, player_name, &msg).await;
     }
 
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
+    let user_uuid = match crate::mojang::resolve_user_uuid(player_name).await {
+        Ok(uuid) => uuid,
+        Err(reason) => {
+            // Don't propagate the error past this point: doing so reaches
+            // `mod.rs::handle_bot_message` which only `error!`-logs and never
+            // tells the player anything. The player has already consumed
+            // their `n:` rate-limit slot above, so silence here looks like
+            // "the bot ignored me". Whisper a sanitized notice and stop.
+            tracing::warn!(
+                player = player_name,
+                command = command,
+                reason = %reason,
+                "Mojang UUID lookup failed; whispering player-facing notice"
+            );
+            let err = StoreError::ValidationError(reason);
+            return utils::whisper_error_to_player(store, player_name, &err).await;
+        }
+    };
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     // Rate-limit check precedes parsing so malformed spam still counts

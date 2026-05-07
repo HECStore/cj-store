@@ -41,12 +41,16 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                     }
                     chest.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                 } else {
-                    // Fall back to EMPTY so an invalid id from the bot marks the
-                    // chest unassigned rather than poisoning it with a partial string.
-                    // Surface the parse error so a malformed report doesn't
-                    // silently unassign a chest while still overwriting its slot
-                    // counts — the audit's item_stock repair would otherwise mask
-                    // the resulting accounting drift on the next pass.
+                    // Refuse a malformed item ID instead of falling back to
+                    // EMPTY. Setting `chest.item = EMPTY` while the per-slot
+                    // loop below leaves prior `amounts` in place creates an
+                    // **orphan chest** — held items become invisible to
+                    // `Storage::total_item_amount` (which filters by
+                    // `c.item == item`) and the next `audit_state(repair=true)`
+                    // recomputes `pair.item_stock` from physical=0, silently
+                    // destroying the only remaining record those items
+                    // existed. Returning Err here keeps `chest.item` /
+                    // `chest.amounts` / `store.dirty` untouched.
                     chest.item = match ItemId::new(&report.item) {
                         Ok(id) => id,
                         Err(e) => {
@@ -54,9 +58,12 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                                 chest_id = report.chest_id,
                                 reported_item = %report.item,
                                 reason = %e,
-                                "chest sync: invalid item ID, marking chest unassigned"
+                                "chest sync rejected: invalid item ID, leaving chest assignment and amounts untouched"
                             );
-                            ItemId::EMPTY
+                            return Err(StoreError::ChestOp(format!(
+                                "Chest {} sync rejected: invalid item ID '{}': {}",
+                                report.chest_id, report.item, e
+                            )));
                         }
                     };
                 }
@@ -498,25 +505,53 @@ mod tests {
     }
 
     #[test]
-    fn apply_chest_sync_invalid_item_id_becomes_empty() {
+    fn apply_chest_sync_invalid_item_id_returns_err_and_preserves_state() {
+        // Pins the orphan-chest hazard fix: a malformed item ID from the bot
+        // must NOT silently unassign the chest (item = EMPTY) while leaving
+        // its prior `amounts` in place — that combination renders the held
+        // items invisible to `Storage::total_item_amount` and the next
+        // `audit_state(repair=true)` would zero out the cached pair stock,
+        // destroying the only remaining record those items existed.
         let mut store = build_store(HashMap::new(), HashMap::new(), test_storage());
+        // Pre-seed chest 2 with a known assignment + slot count so we can
+        // verify the report DID NOT mutate them.
+        let prior_item = ItemId::new("iron_ingot").unwrap();
+        let prior_amount = 100;
+        store.storage.nodes[0].chests[2].item = prior_item.clone();
+        store.storage.nodes[0].chests[2].amounts[0] = prior_amount;
         let chest_id = store.storage.nodes[0].chests[2].id;
+        store.dirty = false;
+
         let report = ChestSyncReport {
             chest_id,
-            // Bare "minecraft:" normalizes to empty and fails ItemId::new;
-            // apply_chest_sync should substitute EMPTY rather than panicking.
+            // Bare "minecraft:" normalizes to empty and fails ItemId::new.
             item: "minecraft:".to_string(),
             amounts: [-1i32; crate::constants::DOUBLE_CHEST_SLOTS],
         };
         let cap = test_capture::CaptureSubscriber::default();
         let messages = cap.messages.clone();
-        tracing::subscriber::with_default(cap, || {
-            apply_chest_sync(&mut store, report).expect("sync should succeed");
+        let result = tracing::subscriber::with_default(cap, || {
+            apply_chest_sync(&mut store, report)
         });
-        assert!(store.storage.nodes[0].chests[2].item.is_empty());
-        // The fallback must be operator-visible: silent unassign of a
-        // non-reserved chest is a stock-accounting hazard the audit's
-        // item_stock repair will quietly mask.
+        assert!(
+            matches!(result, Err(StoreError::ChestOp(_))),
+            "invalid item ID must return ChestOp Err, got {:?}",
+            result
+        );
+        // Prior assignment AND amounts survive the rejected report.
+        assert_eq!(
+            store.storage.nodes[0].chests[2].item.as_str(),
+            prior_item.as_str(),
+            "rejected sync must not mutate chest.item",
+        );
+        assert_eq!(
+            store.storage.nodes[0].chests[2].amounts[0], prior_amount,
+            "rejected sync must not mutate chest.amounts",
+        );
+        assert!(
+            !store.dirty,
+            "rejected sync must not flip store.dirty",
+        );
         let msgs = messages.lock().unwrap();
         assert!(
             msgs.iter().any(|m| m.contains("invalid item ID")),

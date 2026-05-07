@@ -61,12 +61,39 @@ pub async fn connect(
         // client instances alive simultaneously and inflate RSS by tens of MB
         // per cycle. The disconnect path achieves the same effect via a
         // post-abort sleep; the reconnect path previously did neither.
-        let _ = tokio::time::timeout(
+        match tokio::time::timeout(
             tokio::time::Duration::from_millis(crate::constants::DELAY_DISCONNECT_MS),
             old_task,
         )
-        .await;
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => {
+                // Timeout: dropping the JoinHandle here would DETACH the old
+                // task (drop != abort + join), so spawning a new client now
+                // would race two Azalea/Bevy worlds — exactly the leak the
+                // bound was supposed to prevent. Bail; the reconnect-tick at
+                // mod.rs:540 will double the backoff and try again next
+                // interval, by which time the old task should have settled.
+                warn!(
+                    "[Connection] Previous client task did not finish within {}ms after abort; declining to spawn fresh client to avoid double-spawn (caller will retry on next reconnect tick)",
+                    crate::constants::DELAY_DISCONNECT_MS
+                );
+                bot.connecting.store(false, Ordering::SeqCst);
+                return Err("Previous client task did not finish in time".into());
+            }
+        }
     }
+
+    // After aborting an in-progress old task, Azalea's `Event::Disconnect`
+    // for the old session does NOT fire — task.abort() cancels the future at
+    // its next await before the handler reaches `state.client.write() = None`.
+    // Any stale `Some(Client)` left over from the previous session would be
+    // carried into the new session window: the reconnect-tick's Init poll at
+    // mod.rs:551-557 sees `bot.client.is_some()` against the dead handle and
+    // returns ok=true on the first iteration, then bot_rx instructions
+    // dispatch against a Bevy world the aborted task already tore down.
+    bot.client.write().await.take();
 
     // Create initial state with our communication channels
     let initial_state = BotState {

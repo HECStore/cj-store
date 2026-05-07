@@ -37,8 +37,17 @@ pub struct RollbackResult {
     /// Items the planner could NOT place anywhere — storage is full, the item
     /// has no reserved chests, or there are zero growable nodes. These items
     /// remain physically on the bot; no chest step was even attempted for them.
-    /// Distinct from `operations_failed`, which counts per-step bot errors.
+    /// Distinct from `operations_failed`, which counts per-step bot errors,
+    /// and from `items_stuck_on_bot`, which counts items in *attempted* steps
+    /// that failed at execution time.
     pub items_unplanned: i32,
+    /// Items in chest-op steps that the planner placed but execution did not
+    /// confirm: send-error tail, bot-reported error, channel drop, timeout.
+    /// Note: the `apply_chest_sync`-fail sub-branch is NOT counted here —
+    /// items there are physically deposited, only the in-memory view drifted
+    /// (already credited via `items_returned`). Together with `items_unplanned`
+    /// this is the total inventory the bot may still be holding.
+    pub items_stuck_on_bot: i32,
     /// Number of per-chest deposit steps that completed cleanly.
     pub operations_succeeded: usize,
     /// Number of per-chest deposit steps that failed (send error, timeout,
@@ -51,7 +60,7 @@ impl RollbackResult {
     /// could not place every item. Both conditions mean items may still be in
     /// the bot's inventory and operator attention may be required.
     pub fn has_failures(&self) -> bool {
-        self.operations_failed > 0 || self.items_unplanned > 0
+        self.operations_failed > 0 || self.items_unplanned > 0 || self.items_stuck_on_bot > 0
     }
 
     /// If the rollback ended with items still on the bot (per-step failures
@@ -65,7 +74,8 @@ impl RollbackResult {
         if !self.has_failures() {
             return None;
         }
-        let stuck = self.items_unplanned;
+        let unplanned = self.items_unplanned;
+        let stuck_on_bot = self.items_stuck_on_bot;
         let failed = self.operations_failed;
         let returned = self.items_returned;
         let mut parts: Vec<String> = Vec::new();
@@ -75,10 +85,16 @@ impl RollbackResult {
         if failed > 0 {
             parts.push(format!("{} chest operation(s) failed", failed));
         }
-        if stuck > 0 {
+        if stuck_on_bot > 0 {
+            parts.push(format!(
+                "{} item(s) stuck on the bot from failed chest op(s) — recover manually",
+                stuck_on_bot
+            ));
+        }
+        if unplanned > 0 {
             parts.push(format!(
                 "{} item(s) could not be placed and remain on the bot — investigate manually",
-                stuck
+                unplanned
             ));
         }
         Some(parts.join("; "))
@@ -168,12 +184,20 @@ pub async fn deposit_transfers(
                 context, step_num, total_steps, chest_id, t.amount, item, e
             );
             result.operations_failed += 1;
+            result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             // mpsc Sender::send returning Err is permanent (receiver dropped).
             // Short-circuit: every remaining step would log the same error for
-            // one root cause. Mark the truly-not-yet-attempted tail as failed.
+            // one root cause. Mark the truly-not-yet-attempted tail as failed
+            // and credit each tail entry's amount to items_stuck_on_bot — the
+            // bot is holding all of them since no deposit was ever attempted.
             let skipped = transfers.len().saturating_sub(step_num);
             if skipped > 0 {
                 result.operations_failed += skipped;
+                let tail_amount: i32 = transfers[step_num..]
+                    .iter()
+                    .map(|tail| tail.amount.max(0))
+                    .sum();
+                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(tail_amount);
             }
             error!(
                 "{} Rollback step {}/{} chest {} bot channel closed; aborting after this step, {} subsequent step(s) marked failed: {}",
@@ -215,6 +239,7 @@ pub async fn deposit_transfers(
                     context, step_num, total_steps, chest_id, t.amount, item, e
                 );
                 result.operations_failed += 1;
+                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             }
             Ok(Err(e)) => {
                 error!(
@@ -222,6 +247,7 @@ pub async fn deposit_transfers(
                     context, step_num, total_steps, chest_id, t.amount, item, e
                 );
                 result.operations_failed += 1;
+                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             }
             Err(_) => {
                 error!(
@@ -229,6 +255,7 @@ pub async fn deposit_transfers(
                     context, step_num, total_steps, chest_id, CHEST_OP_TIMEOUT_SECS, t.amount, item
                 );
                 result.operations_failed += 1;
+                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             }
         }
     }
@@ -281,17 +308,34 @@ pub async fn rollback_amount_to_storage(
     }
     // Non-mutating planner: avoids cloning storage; `apply_chest_sync` re-syncs
     // the authoritative state per successful step in `deposit_transfers`.
-    let (plan, planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
-    let unplanned = (amount - planned).max(0);
+    let (mut plan, planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
+    let mut unplanned = (amount - planned).max(0);
     if unplanned > 0 {
-        // Deposit plan could not accommodate every item (storage is full or
-        // `item` has no reserved chests left). Items for which no slot was
-        // planned will remain in the bot's inventory — flag this so an operator
-        // can free space or manually reconcile.
-        warn!(
-            "{} Rollback under-planned: only {} of {} x {} will be deposited (remaining {} stay in bot inventory)",
-            context, planned, amount, item, unplanned
+        // `simulate_deposit_plan` only walks existing chests — it does NOT
+        // model node growth. Order pre-flight callers WANT this so growth
+        // becomes an operator decision; rollback is the safety net and must
+        // accept growth rather than strand items already in the bot's
+        // inventory. Fall back to the mutating `deposit_plan` for the
+        // remainder, which allocates a new node if needed.
+        info!(
+            "{} Rollback simulate under-planned by {}/{}; falling back to mutating deposit_plan to absorb remainder",
+            context, unplanned, amount
         );
+        let extra = store.storage.deposit_plan(item, unplanned, stack_size);
+        let extra_total: i32 = extra.iter().map(|t| t.amount).sum();
+        if extra_total < unplanned {
+            // `deposit_plan` is unconditional grow-on-shortfall, so this is
+            // unreachable in practice — but if it ever short-falls, the
+            // remainder really is stranded and we should report it.
+            warn!(
+                "{} Rollback grow-fallback still under-planned: deposit_plan absorbed {}/{}; {} item(s) will remain in bot inventory",
+                context, extra_total, unplanned, unplanned - extra_total
+            );
+            unplanned -= extra_total;
+        } else {
+            unplanned = 0;
+        }
+        plan.extend(extra);
     }
     // Populate `items_unplanned` here, BEFORE delegating: `deposit_transfers`
     // is also called by buy/operator handlers with caller-supplied plans where

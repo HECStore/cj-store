@@ -120,7 +120,7 @@ Tick cadence:
 | Tick         | Interval                            | Effect                                    |
 | ------------ | ----------------------------------- | ----------------------------------------- |
 | autosave     | `autosave_interval_secs` (cfg, 2 s) | saves only when `dirty`                   |
-| cleanup      | `CLEANUP_INTERVAL_SECS` (1 h)       | prunes UUID cache + stale rate-limit ents |
+| cleanup      | `CLEANUP_INTERVAL_SECS` (5 min)     | prunes UUID cache + stale rate-limit ents |
 | post-trade   | after each commit                   | unconditional non-debounced save          |
 | shutdown     | once                                | final save, then channel close            |
 
@@ -530,7 +530,7 @@ resets on bot restart.
 - **Exponential backoff** on violations: 2 s → 4 s → 8 s → 16 s → 32 s, capped
   at 60 s.
 - **Reset after 90 s idle** — violation count returns to 0.
-- Periodic cleanup (`CLEANUP_INTERVAL_SECS`, 1 h) prunes stale per-user state.
+- Periodic cleanup (`CLEANUP_INTERVAL_SECS`, 5 min, matched to `RATE_LIMIT_STALE_AFTER_SECS`) prunes stale per-user state.
 - **Two-stage gating with key namespacing**: the dispatcher checks a cheap
   per-name gate (`n:<lowercased-username>`) BEFORE the Mojang UUID lookup
   so a spammer cannot bypass the cooldown by inventing many distinct

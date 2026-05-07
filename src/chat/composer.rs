@@ -563,6 +563,12 @@ pub struct ComposerRun {
     pub iterations: u32,
     /// Whether the tool loop hit its iteration cap.
     pub hit_cap: bool,
+    /// Whether the empty-terminal-turn nudge fired during this run.
+    /// Surfaced so the orchestrator can attach the flag to the
+    /// `composer` decision record — distinguishes "nudge recovered the
+    /// reply" from "nudge attempted, still empty" when grepping
+    /// composer_silent fallouts.
+    pub nudged_for_silence: bool,
     /// Total input + output tokens across all iterations.
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -626,6 +632,15 @@ pub async fn run_loop(
     // model is nudged to use them eagerly; without an in-run cap, a
     // confused turn could fan out into N back-to-back queries.
     let mut store_tool_calls_this_turn = 0u32;
+    // One-shot retry flag for empty-terminal-turn recovery. Sonnet
+    // often "finishes" the turn after a tool round-trip without
+    // realizing it still owes a chat line — ~6 % of `respond=true`
+    // classifier verdicts on 2026-05-07 ended this way, with classifier
+    // confidence ≥ 0.8 and a clear conversational hook. When detected,
+    // we push a synthetic user-turn that demands a real chat line and
+    // re-run ONE more iteration; the bound prevents infinite loops
+    // against a stubbornly-silent model.
+    let mut nudged_for_silence = false;
 
     loop {
         // CHAT.md "between iterations" cancellation checkpoint. Sampling
@@ -640,6 +655,7 @@ pub async fn run_loop(
                 reply: None,
                 iterations,
                 hit_cap: false,
+                nudged_for_silence,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
@@ -671,10 +687,62 @@ pub async fn run_loop(
 
         if is_terminal_turn(&resp.content) {
             let reply = extract_text_reply(&resp.content);
+
+            // Empty-terminal-turn recovery: if the model emitted a
+            // terminal (no client `ToolUse`) turn but produced no text,
+            // the classifier's `respond=true` verdict is about to land
+            // as a `composer_silent` audit record and the player gets
+            // ignored. Push a single synthetic user-turn that demands a
+            // real chat line and run ONE more iteration. Bounded by
+            // `nudged_for_silence` so a stubbornly-silent model can't
+            // loop the budget away. The previous assistant turn (which
+            // may carry `ServerToolUse` / `WebSearchToolResult` blocks
+            // or be entirely empty) is replayed with a single-space
+            // text-block placeholder substituted when empty, since
+            // Anthropic rejects empty assistant content arrays.
+            if reply.is_none() && !nudged_for_silence {
+                nudged_for_silence = true;
+                let assistant_content = if resp.content.is_empty() {
+                    vec![crate::chat::client::ContentBlock::Text {
+                        text: " ".to_string(),
+                        cache_control: None,
+                    }]
+                } else {
+                    std::mem::take(&mut resp.content)
+                };
+                req.messages.push(crate::chat::client::Message {
+                    role: crate::chat::client::Role::Assistant,
+                    content: assistant_content,
+                });
+                req.messages.push(crate::chat::client::Message {
+                    role: crate::chat::client::Role::User,
+                    content: vec![crate::chat::client::ContentBlock::Text {
+                        text: "Your previous turn produced no chat \
+                               line, but a player is waiting on a \
+                               reply right now. Send the chat line in \
+                               your normal voice — one short message \
+                               (≤120 chars) responding to the player. \
+                               Do NOT call any more tools, do NOT \
+                               narrate your reasoning, do NOT explain \
+                               what you're about to say. Output the \
+                               chat line and nothing else."
+                            .to_string(),
+                        cache_control: None,
+                    }],
+                });
+                crate::chat::decisions::write(
+                    &crate::chat::decisions::DecisionRecord::new("composer_nudge")
+                        .with_reason("empty_terminal_turn")
+                        .extra("iterations", serde_json::Value::from(iterations)),
+                );
+                continue;
+            }
+
             return Ok(ComposerRun {
                 reply,
                 iterations,
                 hit_cap: false,
+                nudged_for_silence,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
@@ -706,6 +774,7 @@ pub async fn run_loop(
                 reply,
                 iterations,
                 hit_cap: true,
+                nudged_for_silence,
                 input_tokens,
                 output_tokens,
                 cache_creation_input_tokens,
@@ -1354,6 +1423,36 @@ mod tests {
             cache_control: None,
         }];
         assert_eq!(extract_text_reply(&blocks), None);
+    }
+
+    #[test]
+    fn empty_terminal_turn_is_target_of_run_loop_nudge() {
+        // Pins the precondition for the empty-terminal-turn nudge in
+        // `run_loop`: the recovery is triggered ONLY when both
+        // `is_terminal_turn` returns true AND `extract_text_reply`
+        // returns None. Three real-world shapes hit this branch — the
+        // empty content array (model returned nothing), the
+        // server-tool-only trailer (web_search ran but no follow-up
+        // text), and the whitespace-only text block. All three must
+        // route through the nudge in real prod traffic.
+        let empty: Vec<ContentBlock> = Vec::new();
+        assert!(is_terminal_turn(&empty));
+        assert_eq!(extract_text_reply(&empty), None);
+
+        let server_tool_only = vec![ContentBlock::ServerToolUse {
+            id: "srv_1".to_string(),
+            name: "web_search".to_string(),
+            input: serde_json::Value::Null,
+        }];
+        assert!(is_terminal_turn(&server_tool_only));
+        assert_eq!(extract_text_reply(&server_tool_only), None);
+
+        let whitespace_only = vec![ContentBlock::Text {
+            text: "  \n  ".to_string(),
+            cache_control: None,
+        }];
+        assert!(is_terminal_turn(&whitespace_only));
+        assert_eq!(extract_text_reply(&whitespace_only), None);
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub(super) async fn handle_pay(
                 error = %e,
                 "Payment failed"
             );
-            utils::send_message_to_player(store, player_name, &e.user_message()).await
+            utils::whisper_error_to_player(store, player_name, &e).await
         }
     }
 }

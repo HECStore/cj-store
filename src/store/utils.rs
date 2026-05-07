@@ -125,6 +125,28 @@ pub async fn send_message_to_player(
     }
 }
 
+/// Whisper a sanitized rendering of `err` to the player.
+///
+/// Canonical "tell the player about a [`StoreError`]" path: every handler
+/// that wants to surface a typed error to a player must go through this
+/// helper rather than constructing a `format!("{err}")` whisper directly.
+/// The helper routes through [`StoreError::user_message`], which collapses
+/// internal-detail variants (transport errors, invariant violations,
+/// call-site tags like `"pay/payer-balance"`) to a generic message and
+/// only passes through the variants whose inner text is author-controlled
+/// and known safe (`ValidationError`, `TradeRejected`, `ChestOp`).
+///
+/// Use this in any `Err(e: StoreError) =>` branch where the player should
+/// be notified. `grep`-ing for callers gives a complete view of which
+/// handlers have wired up the sanitization layer.
+pub async fn whisper_error_to_player(
+    store: &Store,
+    player_name: &str,
+    err: &crate::error::StoreError,
+) -> Result<(), crate::error::StoreError> {
+    send_message_to_player(store, player_name, &err.user_message()).await
+}
+
 /// Helper to format transfer summaries (excludes coordinates for security).
 ///
 /// Player-facing output must NEVER leak chest coordinates: exposing them would

@@ -2079,7 +2079,11 @@ async fn process_event(
             .with_cache_tokens(run.cache_creation_input_tokens, run.cache_read_input_tokens)
             .extra("iterations", serde_json::Value::from(run.iterations))
             .extra("hit_cap", serde_json::Value::from(run.hit_cap))
-            .extra("had_text_reply", serde_json::Value::from(run.reply.is_some())),
+            .extra("had_text_reply", serde_json::Value::from(run.reply.is_some()))
+            .extra(
+                "nudged_for_silence",
+                serde_json::Value::from(run.nudged_for_silence),
+            ),
     );
 
     // Composer ran but emitted no text — model declined to speak (only
@@ -2094,11 +2098,17 @@ async fn process_event(
                 .with_event_ts(event.recv_at)
                 .with_reason(if run.hit_cap {
                     "hit_cap_no_text"
+                } else if run.nudged_for_silence {
+                    "model_declined_after_nudge"
                 } else {
                     "model_declined"
                 })
                 .extra("iterations", serde_json::Value::from(run.iterations))
-                .extra("hit_cap", serde_json::Value::from(run.hit_cap)),
+                .extra("hit_cap", serde_json::Value::from(run.hit_cap))
+                .extra(
+                    "nudged_for_silence",
+                    serde_json::Value::from(run.nudged_for_silence),
+                ),
         );
         return Ok(());
     };
@@ -2965,6 +2975,10 @@ async fn process_proactive_tick(
             .extra("iterations", serde_json::Value::from(run.iterations))
             .extra("hit_cap", serde_json::Value::from(run.hit_cap))
             .extra("had_text_reply", serde_json::Value::from(run.reply.is_some()))
+            .extra(
+                "nudged_for_silence",
+                serde_json::Value::from(run.nudged_for_silence),
+            )
             .extra("source", serde_json::Value::from("proactive")),
     );
 

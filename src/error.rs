@@ -102,6 +102,11 @@ impl StoreError {
     /// collapses to a generic message so internal call-site identifiers
     /// (e.g. `"pay/payer-balance"`) and transport-level details never leak
     /// to players.
+    ///
+    /// **Prefer [`crate::store::utils::whisper_error_to_player`] over
+    /// calling this directly.** The helper is the canonical "tell the player
+    /// about a `StoreError`" path; routing every player notification through
+    /// it makes the sanitization discipline grep-able from a single name.
     pub fn user_message(&self) -> Cow<'static, str> {
         const GENERIC: &str = "Internal error. Please retry; the operator has been notified.";
         match self {

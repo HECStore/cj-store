@@ -373,6 +373,44 @@ mod tests {
     }
 
     #[test]
+    fn composer_nudge_record_carries_iterations_field() {
+        // Pin the wire shape of the nudge audit record. `run_loop`
+        // emits this whenever the empty-terminal-turn recovery fires
+        // — a respond=true classifier verdict that would otherwise
+        // route to `composer_silent`. Operators grep this kind to
+        // measure how often Sonnet's "tool turn → empty terminal"
+        // pattern actually triggers; if it spikes, the prompt may need
+        // a stronger emit-text-after-tools nudge.
+        let r = DecisionRecord::new("composer_nudge")
+            .with_reason("empty_terminal_turn")
+            .extra("iterations", serde_json::Value::from(2u32));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["kind"], "composer_nudge");
+        assert_eq!(json["reason"], "empty_terminal_turn");
+        assert_eq!(json["iterations"], 2);
+    }
+
+    #[test]
+    fn composer_silent_after_nudge_distinguishes_reason() {
+        // When the nudge fired but the model STILL emitted no text on
+        // the retry, the reactive path's `composer_silent` record
+        // carries `model_declined_after_nudge` rather than the bare
+        // `model_declined` — so an operator can see at a glance whether
+        // the recovery branch was tried. Pin both the reason string
+        // and the structured `nudged_for_silence` extra so a future
+        // edit can't silently collapse the two cases.
+        let r = DecisionRecord::new("composer_silent")
+            .with_sender("Bob")
+            .with_reason("model_declined_after_nudge")
+            .extra("iterations", serde_json::Value::from(3u32))
+            .extra("nudged_for_silence", serde_json::Value::from(true));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["kind"], "composer_silent");
+        assert_eq!(json["reason"], "model_declined_after_nudge");
+        assert_eq!(json["nudged_for_silence"], true);
+    }
+
+    #[test]
     fn file_for_uses_date_under_decisions_dir() {
         use std::time::Duration;
         let t = std::time::UNIX_EPOCH + Duration::from_secs(1_705_314_600);

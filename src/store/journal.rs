@@ -184,7 +184,18 @@ impl Journal {
                 Vec::new()
             }
         };
-        let leftover = entries.into_iter().last();
+        // The file format is forward-compatible to multiple entries, but the
+        // current writer emits at most one. If we ever see >1 entry on disk
+        // we still take only the last (existing semantics) but surface the
+        // discarded count so an operator notices instead of silently losing
+        // forensic state.
+        if entries.len() > 1 {
+            tracing::warn!(
+                "[Journal] file {:?} contains {} entries; only the most recent is used (forward-compat slot for multi-entry tracking, not yet implemented) - earlier entries discarded",
+                path, entries.len()
+            );
+        }
+        let leftover = entries.into_iter().next_back();
         if let Some(entry) = &leftover {
             tracing::info!(
                 "[Journal] loaded leftover entry: op_id={} type={:?} chest_id={} slot={} state={:?}",
@@ -359,11 +370,16 @@ impl Journal {
     }
 
     fn persist(&self) -> io::Result<()> {
-        let entries: Vec<&JournalEntry> = self.entry.iter().collect();
         // Compact JSON: the file is machine-only and rewritten on every
         // shulker-state transition, so pretty-printing is wasted bytes and
         // CPU on the hot path. `write_atomic` handles parent-dir creation.
-        let json = serde_json::to_string(&entries).map_err(io::Error::other)?;
+        // Serialize `[entry]` / `[]` directly via a stack-allocated array so
+        // the hot path doesn't pay for a fresh `Vec<&JournalEntry>` on every
+        // shulker-state transition (six per round-trip).
+        let json = match &self.entry {
+            Some(entry) => serde_json::to_string(&[entry]).map_err(io::Error::other)?,
+            None => String::from("[]"),
+        };
         write_atomic(&self.path, &json)?;
         Ok(())
     }

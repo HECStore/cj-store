@@ -959,4 +959,78 @@ mod tests {
         };
         assert!(user_text.contains(&FILTER_MESSAGE_CHAR_LIMIT.to_string()));
     }
+
+    #[test]
+    fn sanitize_reason_collapses_ascii_control_chars_to_spaces() {
+        // Defense-in-depth against JSONL log injection: a model that smuggles
+        // a literal newline into `reason` could otherwise terminate a record
+        // in the audit log and inject a fabricated row on the next line.
+        // Every ASCII control char (NL, CR, TAB, ESC, BEL, ...) must collapse
+        // to a single space so the rendered line stays one record.
+        let dirty = "line1\nline2\rline3\tline4\x07line5";
+        let cleaned = sanitize_reason(dirty);
+        assert!(!cleaned.contains('\n'), "newline must not survive sanitize");
+        assert!(!cleaned.contains('\r'), "carriage return must not survive sanitize");
+        assert!(!cleaned.contains('\t'), "tab must not survive sanitize");
+        assert!(!cleaned.contains('\x07'), "BEL must not survive sanitize");
+        assert_eq!(cleaned, "line1 line2 line3 line4 line5");
+    }
+
+    #[test]
+    fn sanitize_reason_truncates_to_max_chars() {
+        // Audit-log bloat defense: a misbehaving model that returned a 10KB
+        // reason would otherwise expand every JSONL record by that much. The
+        // cap is character-based, not byte-based, so this also exercises the
+        // char-iterator path via `chars().take(MAX_REASON_CHARS)`.
+        let oversized = "a".repeat(MAX_REASON_CHARS + 100);
+        let cleaned = sanitize_reason(&oversized);
+        assert_eq!(
+            cleaned.chars().count(),
+            MAX_REASON_CHARS,
+            "sanitized reason must be capped at MAX_REASON_CHARS"
+        );
+    }
+
+    #[test]
+    fn sanitize_reason_preserves_short_input() {
+        // Boundary check: input <= cap must pass through unchanged (modulo
+        // trim and control-char sanitization). A regression that always
+        // truncated would silently lose the tail of every short reason.
+        let normal = "short clean reason";
+        assert_eq!(sanitize_reason(normal), normal);
+    }
+
+    #[test]
+    fn sanitize_reason_truncates_at_exact_boundary() {
+        // Exactly MAX_REASON_CHARS in length must pass through (the comparison
+        // is `<=`); an off-by-one regression flipping that to `<` would chop
+        // a single char off every maximum-length reason.
+        let exact = "b".repeat(MAX_REASON_CHARS);
+        let cleaned = sanitize_reason(&exact);
+        assert_eq!(cleaned.chars().count(), MAX_REASON_CHARS);
+        assert_eq!(cleaned, exact);
+    }
+
+    #[test]
+    fn sanitize_reason_trims_surrounding_whitespace() {
+        // Leading/trailing whitespace would inflate the audit-log line for
+        // no signal; trim() before length-check also keeps the cap honest
+        // (a 200-char reason of mostly spaces shouldn't fill the budget).
+        assert_eq!(sanitize_reason("  hello  "), "hello");
+        assert_eq!(sanitize_reason("\n\thello\r\n"), "hello");
+    }
+
+    #[test]
+    fn sanitize_reason_handles_multibyte_chars_at_truncation() {
+        // Char-based truncation must not split a multi-byte UTF-8 sequence:
+        // `chars().take(N)` operates on Unicode scalar values, so a reason
+        // that mixes ASCII and multi-byte chars should still produce valid
+        // UTF-8 output capped at MAX_REASON_CHARS scalar values.
+        let mixed = "é".repeat(MAX_REASON_CHARS + 10);
+        let cleaned = sanitize_reason(&mixed);
+        assert_eq!(cleaned.chars().count(), MAX_REASON_CHARS);
+        // Output must still be valid UTF-8 (implicit — String guarantees it,
+        // but assert via reconstruction that no byte sequence was split).
+        assert_eq!(cleaned, "é".repeat(MAX_REASON_CHARS));
+    }
 }

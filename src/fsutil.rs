@@ -93,6 +93,7 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
 /// fallback can't destroy the prior good bytes if it itself fails midway. On
 /// Unix `fs::rename` would have left `path` untouched, so the prior file is
 /// already safe and no aside-rename is needed.
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn rename_failed_fallback_copy(
     path: &Path,
     parent: &Path,
@@ -100,7 +101,6 @@ fn rename_failed_fallback_copy(
     tmp_path: &Path,
     rename_err: io::Error,
 ) -> io::Result<()> {
-    let _ = (parent, file_name); // unused on non-Windows
     tracing::warn!("[File] rename {tmp_path:?} -> {path:?} failed: {rename_err} — moving prior file aside and falling back to copy");
 
     // 5 attempts × exponential backoff (10/20/40/80ms = ~150ms total) is

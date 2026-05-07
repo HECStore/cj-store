@@ -283,9 +283,18 @@ chat_task (subscriber):
     │               read_today_history / search_history /
     │               web_search / web_fetch
     ├── max iterations: composer_max_tool_iterations (default 5)
-    ├── reply=None (had_text_reply=false on the `composer` record)
-    │   → `composer_silent` decision, reason `model_declined`
-    │     (or `hit_cap_no_text`); no `sent` ever follows.
+    ├── empty-terminal-turn recovery: when the model emits a terminal
+    │   turn (no client `ToolUse`) with no text after at least one tool
+    │   round-trip — Sonnet's "I tool-called, my job is done" failure
+    │   mode — `run_loop` pushes one synthetic user-turn nudge demanding
+    │   a chat line and runs ONE more iteration. Bounded to a single
+    │   retry per run via `nudged_for_silence`. Each nudge writes a
+    │   `composer_nudge` decision record (reason `empty_terminal_turn`).
+    ├── reply=None even after the nudge → `composer_silent` decision,
+    │   reason `model_declined_after_nudge` (or `hit_cap_no_text` /
+    │   bare `model_declined` when the nudge wasn't fired); no `sent`
+    │   ever follows. The `nudged_for_silence` extra on the `composer`
+    │   record distinguishes the two retried-vs-not branches.
     ▼
   reasoning_filter.rs (Haiku post-processor; opt-in)
     ├── chat.reasoning_filter_enabled = false                    ── bypass

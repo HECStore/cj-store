@@ -79,16 +79,40 @@ impl Pair {
     /// Builds the on-disk path for a pair file, applying filename sanitization
     /// so the same item name always maps to the same path regardless of whether
     /// the caller passes "minecraft:gunpowder" or "gunpowder".
+    ///
+    /// Thin wrapper over `get_pair_file_path_in_dir` rooted at `PAIRS_DIR`;
+    /// production callsites use this form, while the in-dir variant lets
+    /// the `save_all_in_dir` test path target a `tempfile::tempdir()`.
     pub(crate) fn get_pair_file_path(item_name: &str) -> PathBuf {
+        Self::get_pair_file_path_in_dir(Path::new(Self::PAIRS_DIR), item_name)
+    }
+
+    /// Directory-parameterized form of `get_pair_file_path`. Same sanitization
+    /// rule, parameterized on `dir_path` so `save_all_in_dir` (and its tests)
+    /// can route writes to a caller-supplied directory rather than the real
+    /// `data/pairs/`.
+    fn get_pair_file_path_in_dir(dir_path: &Path, item_name: &str) -> PathBuf {
         let sanitized_name = Self::sanitize_item_name_for_filename(item_name);
-        PathBuf::from(Self::PAIRS_DIR).join(format!("{sanitized_name}.json"))
+        dir_path.join(format!("{sanitized_name}.json"))
     }
 
     /// Saves this single `Pair` instance to `data/pairs/{self.item}.json`.
     /// Creates the 'data/pairs' directory if it doesn't exist.
     /// Returns an error if the item name is empty/sentinel or `stack_size` is
     /// not one of Minecraft's three legal values (1, 16, 64).
+    ///
+    /// Thin wrapper over `save_in_dir` rooted at `PAIRS_DIR`; production
+    /// callsites use this form, while the in-dir variant lets `save_all_in_dir`
+    /// (and its tests) target a caller-supplied directory.
     pub fn save(&self) -> io::Result<()> {
+        self.save_in_dir(Path::new(Self::PAIRS_DIR))
+    }
+
+    /// Directory-parameterized form of `save`. Same validation rules, just
+    /// parameterized on `dir_path` so `save_all_in_dir` can thread its
+    /// argument all the way through the per-pair write loop instead of
+    /// silently bouncing back to `PAIRS_DIR` on every iteration.
+    fn save_in_dir(&self, dir_path: &Path) -> io::Result<()> {
         // Guard against writing a pair with an unusable identifier: the
         // EMPTY sentinel sanitizes to ".json" and would silently collide or
         // corrupt storage. `ItemId::new` strips the "minecraft:" prefix and
@@ -115,7 +139,7 @@ impl Pair {
             ));
         }
 
-        let path = Self::get_pair_file_path(&self.item);
+        let path = Self::get_pair_file_path_in_dir(dir_path, &self.item);
 
         if let Some(parent_dir) = path.parent()
             && !parent_dir.exists() {
@@ -241,20 +265,45 @@ impl Pair {
     }
 
     /// Saves a HashMap of `Pair`s, where each `Pair` is saved to its own file
-    /// in the `data/pairs/` directory using the `pair.save()` method.
+    /// in the `data/pairs/` directory using the `pair.save_in_dir()` method.
     /// This method overwrites existing files and then removes any orphaned files.
     pub fn save_all(pairs: &HashMap<String, Self>) -> io::Result<()> {
-        // Refuse to proceed with an empty map — the orphan-cleanup loop below
-        // would otherwise wipe every pair file. The base-currency `diamond`
-        // pair is invariantly retained, so an empty `pairs` is never legitimate.
-        if pairs.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "save_all called with an empty pairs map; refusing to wipe the pairs directory",
-            ));
-        }
+        Self::save_all_in_dir(pairs, Path::new(Self::PAIRS_DIR))
+    }
 
-        let dir_path = Path::new(Self::PAIRS_DIR);
+    /// Directory-parameterized form of `save_all`. The empty-map guard lives
+    /// here (not just in the public wrapper) so tests can exercise the
+    /// wipe-refusal invariant directly against a temp dir; the public
+    /// `save_all` is a thin one-liner over this helper.
+    fn save_all_in_dir(pairs: &HashMap<String, Self>, dir_path: &Path) -> io::Result<()> {
+        // Refuse an empty map only when there are real `.json` files on disk
+        // that the orphan sweep below would actually wipe. A fresh install
+        // (no pairs dir, or an empty/stub pairs dir) is a legitimate no-op:
+        // the setup-phase autosave runs before the operator has created the
+        // first pair, and erroring here would block the entire dirty-flag
+        // chain (`state::save` propagates via `?`, the autosave loop never
+        // clears `self.dirty`, and a shutdown then loses every staged
+        // mutation). Once any pair exists on disk, an empty in-memory map
+        // is still treated as "refuse to wipe".
+        if pairs.is_empty() {
+            let dir_has_pair_files = match fs::read_dir(dir_path) {
+                Ok(read_dir) => read_dir
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| {
+                        let path = entry.path();
+                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                    }),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            };
+            if dir_has_pair_files {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "save_all called with an empty pairs map but on-disk pair files exist; refusing to wipe the pairs directory",
+                ));
+            }
+            return Ok(());
+        }
 
         if !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
@@ -278,7 +327,7 @@ impl Pair {
             // `write_atomic` is independent, so one transient hiccup must
             // not silently drop later pairs' updates. Capture only the
             // first error to surface to the caller.
-            if let Err(e) = pair.save() {
+            if let Err(e) = pair.save_in_dir(dir_path) {
                 warn!("[Pair] save failed for {}: {e}", pair.item.as_str());
                 first_save_err.get_or_insert(e);
             } else {
@@ -410,8 +459,118 @@ mod tests {
 
     #[test]
     fn save_all_refuses_empty_map_to_prevent_accidental_wipe() {
-        let err = Pair::save_all(&HashMap::new()).unwrap_err();
+        // Pre-populate a `*.json` file; an empty `pairs` map paired with
+        // on-disk pair files must NOT trigger the orphan sweep that would
+        // wipe them.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("cobblestone.json");
+        fs::write(&f, "{}").unwrap();
+
+        let err = Pair::save_all_in_dir(&HashMap::new(), dir.path())
+            .expect_err("empty map paired with on-disk pair file must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("empty pairs map"));
+        assert!(f.exists(), "pre-existing pair file must survive");
+    }
+
+    #[test]
+    fn save_all_with_empty_map_and_empty_dir_is_noop() {
+        // Fresh install: no pairs dir / empty pairs dir + empty in-memory
+        // map must be a no-op `Ok(())`, not an `InvalidInput` error. Erring
+        // here would block the setup-phase autosave (the dirty flag never
+        // clears, and a shutdown drops every staged mutation).
+        let parent = tempfile::tempdir().unwrap();
+
+        // (i) Missing directory: an empty map must succeed without creating
+        //     the directory (the no-op path returns before `create_dir_all`).
+        let missing = parent.path().join("does_not_exist");
+        Pair::save_all_in_dir(&HashMap::new(), &missing)
+            .expect("empty map + missing dir must be a no-op");
+        assert!(!missing.exists(), "no-op must not create the dir");
+
+        // (ii) Existing but empty directory: also a no-op.
+        let empty = parent.path().join("empty_pairs");
+        fs::create_dir_all(&empty).unwrap();
+        Pair::save_all_in_dir(&HashMap::new(), &empty)
+            .expect("empty map + empty dir must be a no-op");
+
+        // (iii) Existing dir with only non-`.json` siblings: still a no-op
+        //       (the guard only fires on real `.json` files the sweep would wipe).
+        let with_sibling = parent.path().join("with_sibling");
+        fs::create_dir_all(&with_sibling).unwrap();
+        fs::write(with_sibling.join("README.txt"), "not a pair file").unwrap();
+        Pair::save_all_in_dir(&HashMap::new(), &with_sibling)
+            .expect("empty map + non-json siblings must be a no-op");
+        assert!(with_sibling.join("README.txt").exists(), "non-json sibling must survive");
+    }
+
+    #[test]
+    fn save_all_in_dir_threads_dir_through_writes_and_orphan_sweep() {
+        // End-to-end check that `dir_path` is honored everywhere — both the
+        // per-pair write loop and the orphan sweep. Before the in-dir thread
+        // landed, the per-pair `pair.save()` call routed through `PAIRS_DIR`
+        // regardless of the threaded argument, so a non-empty in-memory map
+        // would leak writes into the real `data/pairs/` directory and the
+        // orphan sweep would wipe unrelated files there.
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) Pre-existing stale `.json` in the temp dir — the orphan sweep
+        //     must remove it because no in-memory pair matches its name.
+        let stale = dir.path().join("stale_orphan.json");
+        fs::write(&stale, "{}").unwrap();
+
+        // (b) Pre-existing stale `.json` in the REAL `data/pairs/` dir — the
+        //     sweep must NOT touch it; otherwise the threaded `dir_path` is
+        //     a lie. Only seed this guard if the production dir already
+        //     exists, so a clean checkout running tests doesn't suddenly
+        //     manifest a `data/pairs/` directory just to satisfy this test.
+        let real_pairs = Path::new(Pair::PAIRS_DIR);
+        let real_pairs_existed = real_pairs.exists();
+        let real_guard = real_pairs.join(".pair_threading_test_guard.json");
+        let mut real_guard_seeded = false;
+        if real_pairs_existed {
+            // Skip seeding if the guard somehow already exists from a prior
+            // crashed run — leave it alone rather than racing.
+            if !real_guard.exists()
+                && fs::write(&real_guard, "{}").is_ok()
+            {
+                real_guard_seeded = true;
+            }
+        }
+
+        // (c) One legitimate pair in the in-memory map — must land in
+        //     `dir_path`, not in `data/pairs/`.
+        let mut pairs = HashMap::new();
+        let item = ItemId::new("cobblestone").expect("valid item id");
+        pairs.insert(
+            item.to_string(),
+            Pair { item: item.clone(), stack_size: 64, item_stock: 1, currency_stock: 0.0 },
+        );
+
+        Pair::save_all_in_dir(&pairs, dir.path()).expect("save_all_in_dir must succeed");
+
+        // The pair file landed in the threaded dir, not in `data/pairs/`.
+        let written = dir.path().join("cobblestone.json");
+        assert!(written.exists(), "pair file must land in the threaded dir");
+        let leaked = real_pairs.join("cobblestone.json");
+        // If `data/pairs/cobblestone.json` already existed before the test
+        // (a real running shop), we can't make a strong assertion. Otherwise
+        // it must not have been created here.
+        if !real_pairs_existed {
+            assert!(!leaked.exists(), "pair file must not leak into data/pairs/");
+        }
+
+        // The orphan sweep removed the temp-dir stale file …
+        assert!(!stale.exists(), "orphan sweep must remove stale .json from threaded dir");
+
+        // … but did NOT touch the real `data/pairs/` guard file.
+        if real_guard_seeded {
+            assert!(
+                real_guard.exists(),
+                "orphan sweep must not touch files in data/pairs/ when threaded to a temp dir"
+            );
+            // Cleanup so subsequent runs / unrelated tests aren't affected.
+            let _ = fs::remove_file(&real_guard);
+        }
     }
 }

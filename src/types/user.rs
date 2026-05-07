@@ -390,11 +390,13 @@ impl User {
     /// Skips persisting users that are in `dirty` but no longer present in
     /// `users` — they'll be removed by the orphan sweep below.
     ///
-    /// Refuses to operate on an empty `users` map, mirroring `Pair::save_all`
-    /// and `Trade::save_all`. An empty map would produce an empty
-    /// `expected_files` set and the orphan sweep would then wipe every
-    /// persisted user. A bug that empties the in-memory map should fail loud
-    /// rather than silently zap balances and operator flags.
+    /// Refuses to operate on an empty `users` map *only when the on-disk users
+    /// directory still has `.json` files that the orphan sweep would wipe* —
+    /// mirroring `Pair::save_all` and `Trade::save_all`. Empty-map + empty/
+    /// missing dir is a no-op `Ok(())` so fresh-install autosaves are not
+    /// blocked before the first user lands. A bug that empties the in-memory
+    /// map AFTER users have been persisted still fails loud rather than
+    /// silently zapping balances and operator flags.
     ///
     /// On a write failure, still completes population of `expected_files` for
     /// the remaining shape-valid users and runs the orphan sweep before
@@ -414,11 +416,34 @@ impl User {
         dirty: &HashSet<String>,
         dir_path: &Path,
     ) -> io::Result<()> {
+        // Refuse an empty map only when there are real `.json` files on disk
+        // that the orphan sweep below would actually wipe. A fresh install
+        // (no users dir, or an empty/stub users dir) is a legitimate no-op:
+        // the setup-phase autosave runs before any user has been seen
+        // (operator-only flows like `addnode`/`addpair` set `store.dirty`
+        // without populating `store.users`), and erroring here would block
+        // the entire dirty-flag chain (`state::save` propagates via `?`,
+        // the autosave loop never clears `self.dirty`, and a shutdown then
+        // loses every staged mutation). Once any user file exists on disk,
+        // an empty in-memory map is still treated as "refuse to wipe".
         if users.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "save_dirty called with an empty users map; refusing to wipe the users directory",
-            ));
+            let dir_has_user_files = match fs::read_dir(dir_path) {
+                Ok(read_dir) => read_dir
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| {
+                        let path = entry.path();
+                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                    }),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            };
+            if dir_has_user_files {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "save_dirty called with an empty users map but on-disk user files exist; refusing to wipe the users directory",
+                ));
+            }
+            return Ok(());
         }
 
         if !dir_path.exists() {
@@ -467,12 +492,28 @@ impl User {
 
         // Wipe-refusal: if every user in the map failed the shape gate,
         // `expected_files` is empty and the orphan sweep below would delete
-        // every legitimate `.json`. Match the explicit empty-map guard above.
+        // every legitimate `.json`. Match the explicit empty-map guard above:
+        // only refuse when there are real `.json` files on disk to wipe; a
+        // fresh / empty users dir is a legitimate no-op so the autosave
+        // chain isn't broken by an all-shape-invalid in-memory map.
         if expected_files.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "save_dirty: no shape-valid users to mirror; refusing to wipe the users directory",
-            ));
+            let dir_has_user_files = match fs::read_dir(dir_path) {
+                Ok(read_dir) => read_dir
+                    .filter_map(|entry| entry.ok())
+                    .any(|entry| {
+                        let path = entry.path();
+                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                    }),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            };
+            if dir_has_user_files {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "save_dirty: no shape-valid users to mirror but on-disk user files exist; refusing to wipe the users directory",
+                ));
+            }
+            return Ok(());
         }
 
         // Orphan sweep: warn-and-continue on per-entry IO errors so a single
@@ -601,6 +642,32 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(f1.exists(), "pre-existing file 1 must survive");
         assert!(f2.exists(), "pre-existing file 2 must survive");
+    }
+
+    #[test]
+    fn save_dirty_empty_map_with_empty_dir_is_ok() {
+        // Setup-phase autosave: operator-only flows (addnode/addpair/...) flip
+        // `store.dirty` without populating `store.users`. With no user files
+        // on disk yet, the empty-map guard must return Ok(()) so the dirty
+        // flag can clear and the autosave chain isn't broken.
+
+        // Case 1: dir exists but is empty.
+        let dir = tempfile::tempdir().unwrap();
+        User::save_dirty_in_dir(&HashMap::new(), &HashSet::new(), dir.path())
+            .expect("empty map + empty dir must be Ok");
+
+        // Case 2: dir is missing entirely (fresh install).
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("nonexistent-users");
+        assert!(!missing.exists());
+        User::save_dirty_in_dir(&HashMap::new(), &HashSet::new(), &missing)
+            .expect("empty map + missing dir must be Ok");
+
+        // Case 3: dir has only a non-`.json` sibling file — still no wipe risk.
+        let dir3 = tempfile::tempdir().unwrap();
+        fs::write(dir3.path().join("README.txt"), "ignore me").unwrap();
+        User::save_dirty_in_dir(&HashMap::new(), &HashSet::new(), dir3.path())
+            .expect("empty map + dir with no .json files must be Ok");
     }
 
     #[test]

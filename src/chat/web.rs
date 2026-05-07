@@ -203,7 +203,10 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
     // If the host LOOKS like a numeric IP address in any obfuscated
     // form (single integer in decimal/octal/hex; or dotted-quad with
     // leading-zero octets), it must NOT be re-treated as a hostname.
-    if looks_numeric_hostname(host_str) || looks_obfuscated_dotted_quad(host_str) {
+    if looks_numeric_hostname(host_str)
+        || looks_obfuscated_dotted_quad(host_str)
+        || looks_short_numeric_hostname(host_str)
+    {
         return Err(UrlError::NumericHostname);
     }
     // Otherwise it's a textual hostname.
@@ -255,6 +258,24 @@ fn parse_strict_dotted_quad(s: &str) -> Option<Ipv4Addr> {
         octets[i] = val as u8;
     }
     Some(Ipv4Addr::from(octets))
+}
+
+/// Detect short numeric forms with 2-3 dot-separated all-digit labels — e.g.
+/// `127.1`, `1.2`, `1.2.3`. POSIX `inet_aton` and Windows `GetAddrInfoW`
+/// expand these to full dotted-quads, so a hostile resolver could otherwise
+/// land us on `127.0.0.1` despite our explicit numeric-hostname guard.
+/// 4-part forms are handled by `looks_obfuscated_dotted_quad` /
+/// `parse_strict_dotted_quad`. RFC 3696 §2 also forbids all-numeric TLDs,
+/// so a final all-digit label is sufficient signal on its own for 2-3-part
+/// hostnames.
+fn looks_short_numeric_hostname(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn looks_numeric_hostname(s: &str) -> bool {
@@ -345,6 +366,21 @@ fn is_denied_ipv4(ip: Ipv4Addr) -> bool {
     }
     // 255.255.255.255 — broadcast (covered by /4 above but explicit).
     if o == [255, 255, 255, 255] {
+        return true;
+    }
+    // 192.0.0.0/24 — IETF Protocol Assignments (incl. 192.0.0.170 NAT64
+    // well-known). RFC 6890; never a legitimate fetch target.
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return true;
+    }
+    // 192.88.99.0/24 — deprecated 6to4 anycast (RFC 7526). Still occasionally
+    // routed by misconfigured edge gear; deny defensively.
+    if o[0] == 192 && o[1] == 88 && o[2] == 99 {
+        return true;
+    }
+    // 198.18.0.0/15 — RFC 2544 benchmarking. Routinely live on internal lab
+    // networks (Cisco inter-VRF benchmarking, F5 BIG-IP defaults).
+    if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
         return true;
     }
     false
@@ -1144,6 +1180,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_short_numeric_hostnames() {
+        // POSIX inet_aton and Windows GetAddrInfoW expand these to full
+        // dotted-quads (e.g. `127.1` → 127.0.0.1), so the dual hostname/IP
+        // gate must reject them at the parser layer rather than relying on
+        // the resolver-side IP deny-list.
+        for s in [
+            "http://127.1/",
+            "http://0.1/",
+            "http://1.2/",
+            "http://1.2.3/",
+        ] {
+            assert_eq!(
+                validate_url(s).unwrap_err(),
+                UrlError::NumericHostname,
+                "should be rejected: {s}"
+            );
+        }
+        // Mixed digit/text labels with a non-numeric final label (legitimate
+        // hostnames per RFC 3696 §2) must still validate.
+        assert!(validate_url("http://1.example.com/").is_ok());
+    }
+
+    #[test]
     fn rejects_hex_numeric_hostname() {
         assert_eq!(
             validate_url("http://0x7f000001/").unwrap_err(),
@@ -1342,6 +1401,39 @@ mod tests {
         // Public address embedded in the same prefix should still be
         // allowed — the wrapper itself is not a deny criterion.
         assert!(!is_denied_ip("::8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn ietf_protocol_assignments_denied() {
+        // 192.0.0.0/24 — RFC 6890 IETF Protocol Assignments. Includes the
+        // 192.0.0.170 NAT64 well-known prefix which a hostile resolver
+        // could otherwise return as a public-looking address.
+        assert!(is_denied_ip("192.0.0.0".parse().unwrap()));
+        assert!(is_denied_ip("192.0.0.170".parse().unwrap()));
+        assert!(is_denied_ip("192.0.0.255".parse().unwrap()));
+        // Adjacent /24 outside the range should still be allowed.
+        assert!(!is_denied_ip("192.0.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn deprecated_6to4_anycast_denied() {
+        // 192.88.99.0/24 — RFC 7526 deprecated 6to4 anycast.
+        assert!(is_denied_ip("192.88.99.1".parse().unwrap()));
+        assert!(is_denied_ip("192.88.99.254".parse().unwrap()));
+        assert!(!is_denied_ip("192.88.100.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn benchmarking_range_denied() {
+        // 198.18.0.0/15 — RFC 2544. Cisco inter-VRF benchmarking and F5
+        // BIG-IP defaults route this internally; a hostile resolver could
+        // land on it to reach lab/internal infrastructure.
+        assert!(is_denied_ip("198.18.0.0".parse().unwrap()));
+        assert!(is_denied_ip("198.18.0.1".parse().unwrap()));
+        assert!(is_denied_ip("198.19.255.254".parse().unwrap()));
+        // Just outside the /15 should still be allowed.
+        assert!(!is_denied_ip("198.17.255.254".parse().unwrap()));
+        assert!(!is_denied_ip("198.20.0.1".parse().unwrap()));
     }
 
     #[test]

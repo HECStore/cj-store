@@ -554,7 +554,7 @@ After the composer returns a string ([pacing.rs](src/chat/pacing.rs)):
    for chain-of-thought leaks: the composer system prompt forbids
    `<thinking>...</thinking>` / `<reasoning>...</reasoning>` blocks and
    `Thinking:` / `Reasoning:` preamble lines, but a thinking-capable
-   model (currently `claude-sonnet-4-6`) occasionally emits them anyway,
+   model (currently `claude-haiku-4-5-20251001`) occasionally emits them anyway,
    in full or partially mixed with the real reply. This pass excises
    them before any later step runs:
    - Recognized container tags (case-insensitive): `thinking`, `think`,
@@ -1013,9 +1013,14 @@ incomplete; defenses cover:
 - **IP deny-list**: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`,
   `192.168.0.0/16`, `169.254.0.0/16` (link-local + cloud metadata
   `169.254.169.254`), `100.64.0.0/10`, `224.0.0.0/4`, `0.0.0.0/8`,
+  `192.0.0.0/24` (IETF Protocol Assignments), `192.88.99.0/24`
+  (deprecated 6to4 anycast), `198.18.0.0/15` (RFC 2544 benchmarking),
   `::1/128`, `::/128`, `fc00::/7`, `fe80::/10`, `ff00::/8`,
   `64:ff9b::/96`, IPv4-mapped IPv6, and the GCP DNS name
-  `metadata.google.internal`.
+  `metadata.google.internal`. URL parsing additionally rejects
+  short all-digit-label hostnames like `127.1`, `1.2`, or `1.2.3`
+  (`looks_short_numeric_hostname`), which the OS resolver would
+  otherwise pad into a loopback/private address.
 - **Redirects disabled**: `redirect::Policy::none()`. 3xx responses
   are followed manually after re-running the parse + resolve +
   deny-list path; capped at 3 hops.

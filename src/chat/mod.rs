@@ -1080,9 +1080,11 @@ pub async fn chat_task(
                         // Belt-and-braces against missed leave broadcasts
                         // on flaky servers — but ONLY as a last-resort
                         // fallback. Authoritative removal happens on
-                        // explicit leave/death markers via `mark_left`;
-                        // this sweep just catches the rare case where
-                        // the leave packet was eaten by the network.
+                        // explicit leave markers via `mark_left` (death
+                        // markers refresh `last_seen` instead, since a
+                        // dier is still on the server); this sweep just
+                        // catches the rare case where the leave packet
+                        // was eaten by the network.
                         //
                         // Use a deliberately generous 6-hour window: a
                         // survival player can be AFK farming, building
@@ -1507,10 +1509,13 @@ async fn process_event(
         );
         return Ok(());
     } else if is_death_marker {
-        // Death is a soft signal. Per the user-stated requirement, we
-        // remove the dier from the roster: if they respawn and speak
-        // again, `mark_seen` re-admits them on the next inbound event.
-        online_players.mark_left(&event.sender);
+        // Death proves liveness — the dier is still on the server (death
+        // is not a disconnect). Refreshing `last_seen` keeps them on the
+        // roster so the classifier's "never address an absent player"
+        // rule doesn't suppress a documented "f"/"oof" death reaction.
+        // Real removal happens via explicit leave broadcasts or
+        // `prune_stale`.
+        online_players.mark_seen(&event.sender);
         // Fall through — the classifier may still decide to react with
         // a one-word reaction ("f", "oof"). The classifier's prompt
         // guidance treats death-marker content conservatively.

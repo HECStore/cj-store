@@ -148,8 +148,16 @@ One file per trading pair. Filename is the canonical item id (no
   quarantine rename itself fails the entry is just skipped this cycle
   (the bad file stays in place, no insert into the in-memory map).
   `Pair::save_all` refuses to run with an empty in-memory `pairs` map
-  (returns `InvalidInput`) so the orphan-cleanup pass cannot wipe the
-  pairs directory; on a per-pair write failure it still completes the
+  **only when on-disk `.json` pair files exist that the orphan-cleanup
+  pass would actually wipe** (returns `InvalidInput`); when the pairs
+  directory is missing or contains no `.json` files the empty-map call
+  is a no-op `Ok(())`. This carve-out keeps the setup-phase autosave
+  unblocked on a fresh install (where `addnode`/`addpair` set
+  `store.dirty = true` before any tradeable pair has been added — the
+  base-currency `diamond` is rejected by `AddPair` — so an unconditional
+  error here would propagate via `?` in `state::save`, the dirty flag
+  would never clear, and a shutdown would drop every staged mutation).
+  On a per-pair write failure `save_all` still completes the
   `expected_files` set and runs the orphan sweep before surfacing the
   captured error so the on-disk directory keeps mirroring the in-memory
   map. The orphan sweep itself is also warn-and-continue, and a
@@ -189,12 +197,18 @@ One file per known player. Filename is the hyphenated Mojang UUID. See
   lowercase hex) before building the file path; out-of-shape uuids fail
   with `InvalidInput` (and a shape-failing user is skipped, not aborted,
   so one bad entry doesn't block the rest of the dirty set).
-  `save_dirty` also refuses an empty `users` map (so a bug that empties
-  the in-memory map can't trigger the orphan sweep that would wipe every
-  persisted user), and on a write failure still completes the
-  `expected_files` set and runs the orphan sweep before surfacing the
-  captured error so the on-disk directory keeps mirroring the in-memory
-  map. `User::load_all` additionally requires that the embedded `uuid`
+  `save_dirty` refuses an empty `users` map only when on-disk `.json`
+  files exist that the orphan sweep would actually wipe (so a bug that
+  empties the in-memory map can't blow away every persisted user), but
+  treats empty-map + empty/missing dir as a legitimate no-op — the
+  setup-phase autosave runs before any user has been seen (operator-only
+  flows like `addnode`/`addpair` flip `store.dirty` without populating
+  `store.users`), and erroring there would block the entire dirty-flag
+  chain. The same softening applies to the secondary
+  "all-shape-invalid" guard. On a write failure `save_dirty` still
+  completes the `expected_files` set and runs the orphan sweep before
+  surfacing the captured error so the on-disk directory keeps mirroring
+  the in-memory map. `User::load_all` additionally requires that the embedded `uuid`
   field equals the filename stem and skips files where it doesn't, so a
   hand-renamed or tampered user file can't smuggle a mismatched identity
   into the store.
@@ -467,11 +481,15 @@ quarantine pattern — a quarantine rename failure is warn-and-continue
 `quarantine_failed` counter in the load summary log) so a single
 permission/lock issue can't block loading tens of thousands of history
 files at startup. `Trade::save_all` refuses to run with an empty
-in-memory `trades` vec (would otherwise wipe the trades directory via
-the orphan sweep); on a per-trade write failure it still completes the
-`expected_files` set and runs the orphan sweep before surfacing the
-captured error, and the orphan sweep is warn-and-continue with a
-captured save error winning over any sweep-only error.
+in-memory `trades` vec **only when on-disk `*.json` trade files exist
+that the orphan sweep would wipe** — an empty vec against a missing or
+`.json`-empty trades directory is a legitimate no-op `Ok(())`, so
+setup-phase autosaves and post-prune-to-empty edge cases don't block
+the dirty-flag chain in `state::save`. On a per-trade write failure it
+still completes the `expected_files` set and runs the orphan sweep
+before surfacing the captured error, and the orphan sweep is
+warn-and-continue with a captured save error winning over any
+sweep-only error.
 
 ## Versioning policy
 

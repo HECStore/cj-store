@@ -613,4 +613,30 @@ mod tests {
         let back: ChatState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
     }
+
+    // ---- iso_utc format contract -----------------------------------------
+    // The seconds-precision shape is what gets written into state.json's
+    // `at_utc` / `last_user_message_utc` / `since_utc` fields. Daily-cap
+    // accounting and external replay tooling string-match against this
+    // shape, so widening it (e.g. by collapsing onto `jsonl::iso_utc_millis`)
+    // would silently break readers. The doc comment forbids unification;
+    // these tests pin the contract so the prohibition isn't doc-only.
+
+    #[test]
+    fn iso_utc_emits_seconds_precision_not_millis() {
+        use chrono::TimeZone;
+        let dt = Utc.timestamp_millis_opt(1_705_314_600_123).unwrap();
+        assert_eq!(iso_utc(dt), "2024-01-15T10:30:00Z");
+    }
+
+    #[test]
+    fn iso_utc_diverges_from_jsonl_millis() {
+        use chrono::TimeZone;
+        let dt = Utc.timestamp_millis_opt(1_705_314_600_123).unwrap();
+        let secs = iso_utc(dt);
+        let millis = crate::chat::jsonl::iso_utc_millis_dt(dt);
+        assert_ne!(secs, millis);
+        assert!(!secs.contains('.'), "seconds form must not include fractional component: {secs}");
+        assert!(millis.contains(".123"), "millis form must include .123: {millis}");
+    }
 }

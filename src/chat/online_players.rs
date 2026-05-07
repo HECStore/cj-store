@@ -19,6 +19,7 @@
 //! it via `mark_seen`.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::time::{Duration, Instant};
 
 /// One entry in the online roster.
@@ -53,22 +54,26 @@ impl OnlinePlayers {
     /// but preserve `first_seen`. Empty / non-Mojang-shaped names are
     /// rejected to keep system-sender shrapnel out of the roster.
     pub fn mark_joined(&mut self, username: &str) -> bool {
-        if !is_mojang_shaped(username) {
+        let mut buf = [0u8; 16];
+        let Some(lc_str) = ascii_lc_buf(username, &mut buf) else {
             return false;
-        }
+        };
         let now = Instant::now();
-        let key = username.to_lowercase();
-        self.by_lc
-            .entry(key)
-            .and_modify(|e| {
-                e.last_seen = now;
+        if let Some(e) = self.by_lc.get_mut(lc_str) {
+            e.last_seen = now;
+            if e.username != username {
                 e.username = username.to_string();
-            })
-            .or_insert_with(|| OnlinePlayerInfo {
-                username: username.to_string(),
-                first_seen: now,
-                last_seen: now,
-            });
+            }
+        } else {
+            self.by_lc.insert(
+                String::from(lc_str),
+                OnlinePlayerInfo {
+                    username: username.to_string(),
+                    first_seen: now,
+                    last_seen: now,
+                },
+            );
+        }
         true
     }
 
@@ -77,29 +82,36 @@ impl OnlinePlayers {
     /// chat is to be on the server, so a chat event proves liveness even
     /// when we missed the join broadcast (e.g. bot connected mid-session).
     pub fn mark_seen(&mut self, username: &str) {
-        if !is_mojang_shaped(username) {
+        let mut buf = [0u8; 16];
+        let Some(lc_str) = ascii_lc_buf(username, &mut buf) else {
             return;
-        }
+        };
         let now = Instant::now();
-        let key = username.to_lowercase();
-        self.by_lc
-            .entry(key)
-            .and_modify(|e| {
-                e.last_seen = now;
+        if let Some(e) = self.by_lc.get_mut(lc_str) {
+            e.last_seen = now;
+            if e.username != username {
                 e.username = username.to_string();
-            })
-            .or_insert_with(|| OnlinePlayerInfo {
-                username: username.to_string(),
-                first_seen: now,
-                last_seen: now,
-            });
+            }
+        } else {
+            self.by_lc.insert(
+                String::from(lc_str),
+                OnlinePlayerInfo {
+                    username: username.to_string(),
+                    first_seen: now,
+                    last_seen: now,
+                },
+            );
+        }
     }
 
     /// Drop a player from the roster. Returns true if the player was
     /// present. Idempotent on a missing key.
     pub fn mark_left(&mut self, username: &str) -> bool {
-        let key = username.to_lowercase();
-        self.by_lc.remove(&key).is_some()
+        let mut buf = [0u8; 16];
+        let Some(key) = ascii_lc_buf(username, &mut buf) else {
+            return false;
+        };
+        self.by_lc.remove(key).is_some()
     }
 
     /// Wipe the roster. Called on `BotDisconnected` so the next session
@@ -117,7 +129,11 @@ impl OnlinePlayers {
     }
 
     pub fn contains(&self, username: &str) -> bool {
-        self.by_lc.contains_key(&username.to_lowercase())
+        let mut buf = [0u8; 16];
+        let Some(key) = ascii_lc_buf(username, &mut buf) else {
+            return false;
+        };
+        self.by_lc.contains_key(key)
     }
 
     /// Iterate over (canonical_username, info) sorted by most-recently-seen
@@ -172,7 +188,7 @@ impl OnlinePlayers {
         for e in entries {
             let secs_seen =
                 now.saturating_duration_since(e.last_seen).as_secs();
-            out.push_str(&format!("- {} (seen {}s ago", e.username, secs_seen));
+            let _ = write!(out, "- {} (seen {}s ago", e.username, secs_seen);
             if let Some(note) = note_for(&e.username) {
                 let trimmed = note.trim();
                 if !trimmed.is_empty() {
@@ -198,15 +214,27 @@ impl OnlinePlayers {
     }
 }
 
-/// Mojang-shaped username gate: 3-16 chars, ASCII alphanumeric + underscore.
-/// Mirrors `bot::parse_join_broadcast`'s acceptance rule so we don't admit
-/// system shrapnel like `[Server]` or `+` into the roster.
-fn is_mojang_shaped(s: &str) -> bool {
-    let len = s.len();
+/// ASCII-lowercase a Mojang-shaped name into a stack buffer and return it as
+/// `&str`, or `None` if the input is not Mojang-shaped (length out of 3..=16
+/// or any non-alphanumeric/underscore byte). Acts as both the gate (mirrors
+/// `bot::parse_join_broadcast`'s acceptance rule so we don't admit system
+/// shrapnel like `[Server]` or `+` into the roster) and the lowercase
+/// projection used as the map key — letting `mark_*` and `contains` probe
+/// the lowercase-keyed map without allocating a `String` per call.
+fn ascii_lc_buf<'a>(s: &str, buf: &'a mut [u8; 16]) -> Option<&'a str> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
     if !(3..=16).contains(&len) {
-        return false;
+        return None;
     }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    for (i, &b) in bytes.iter().enumerate() {
+        if !b.is_ascii_alphanumeric() && b != b'_' {
+            return None;
+        }
+        buf[i] = b.to_ascii_lowercase();
+    }
+    // SAFETY: every byte verified ASCII above; ASCII is valid UTF-8.
+    std::str::from_utf8(&buf[..len]).ok()
 }
 
 #[cfg(test)]

@@ -20,19 +20,45 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
         for chest in &mut node.chests {
             if chest.id == report.chest_id {
                 if chest.id == crate::constants::DIAMOND_CHEST_ID {
-                    if chest.item != "diamond" {
+                    // Compare the bot-reported item (normalized to strip any
+                    // `minecraft:` prefix) against the reserved value, so the
+                    // warning fires on a misreport instead of only when local
+                    // state has already drifted. An invalid id is treated as
+                    // "not the reserved item" and warns.
+                    let reported_matches = ItemId::new(&report.item)
+                        .map(|id| id.as_str() == "diamond")
+                        .unwrap_or(false);
+                    if !reported_matches {
                         warn!("Attempted to change node 0 chest 0 item from diamond to {}, enforcing diamond", report.item);
                     }
                     chest.item = ItemId::new("diamond").expect("diamond is a valid item ID");
                 } else if chest.id == crate::constants::OVERFLOW_CHEST_ID {
-                    if chest.item != crate::constants::OVERFLOW_CHEST_ITEM {
+                    let reported_matches = ItemId::new(&report.item)
+                        .map(|id| id.as_str() == crate::constants::OVERFLOW_CHEST_ITEM)
+                        .unwrap_or(false);
+                    if !reported_matches {
                         warn!("Attempted to change node 0 chest 1 item from overflow to {}, enforcing overflow", report.item);
                     }
                     chest.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                 } else {
                     // Fall back to EMPTY so an invalid id from the bot marks the
                     // chest unassigned rather than poisoning it with a partial string.
-                    chest.item = ItemId::new(&report.item).unwrap_or(ItemId::EMPTY);
+                    // Surface the parse error so a malformed report doesn't
+                    // silently unassign a chest while still overwriting its slot
+                    // counts — the audit's item_stock repair would otherwise mask
+                    // the resulting accounting drift on the next pass.
+                    chest.item = match ItemId::new(&report.item) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            warn!(
+                                chest_id = report.chest_id,
+                                reported_item = %report.item,
+                                reason = %e,
+                                "chest sync: invalid item ID, marking chest unassigned"
+                            );
+                            ItemId::EMPTY
+                        }
+                    };
                 }
 
                 // Bounds check guards against a report whose slot array is
@@ -345,6 +371,50 @@ mod tests {
         assert!(store.dirty);
     }
 
+    /// In-test [`tracing::Subscriber`] that records every event's `message`
+    /// field into a shared `Vec<String>`. Used to assert that
+    /// `apply_chest_sync` actually fires the reserved-chest warning when the
+    /// bot misreports the item — otherwise the warning is silent in the very
+    /// scenario it was designed to surface.
+    mod test_capture {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Record};
+        use tracing::{Event, Id, Metadata, Subscriber};
+
+        #[derive(Clone, Default)]
+        pub struct CaptureSubscriber {
+            pub messages: Arc<Mutex<Vec<String>>>,
+        }
+
+        struct MessageVisitor<'a> {
+            buf: &'a mut String,
+        }
+
+        impl<'a> Visit for MessageVisitor<'a> {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write;
+                    let _ = write!(self.buf, "{:?}", value);
+                }
+            }
+        }
+
+        impl Subscriber for CaptureSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut buf = String::new();
+                event.record(&mut MessageVisitor { buf: &mut buf });
+                self.messages.lock().unwrap().push(buf);
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+    }
+
     #[test]
     fn apply_chest_sync_forces_diamond_item_on_reserved_chest() {
         let mut store = build_store(HashMap::new(), HashMap::new(), test_storage());
@@ -354,12 +424,49 @@ mod tests {
             item: "iron_ingot".to_string(),
             amounts: [-1i32; crate::constants::DOUBLE_CHEST_SLOTS],
         };
-        apply_chest_sync(&mut store, report).expect("sync should succeed");
+        let cap = test_capture::CaptureSubscriber::default();
+        let messages = cap.messages.clone();
+        tracing::subscriber::with_default(cap, || {
+            apply_chest_sync(&mut store, report).expect("sync should succeed");
+        });
         assert_eq!(
             store.storage.nodes[0].chests[crate::constants::DIAMOND_CHEST_ID as usize]
                 .item
                 .as_str(),
             "diamond"
+        );
+        // The bot reported a non-diamond item, so the reserved-chest warning
+        // must fire — that's the only operator-visible signal of a misreport.
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("enforcing diamond") && m.contains("iron_ingot")),
+            "expected reserved-chest warning to fire; got {:?}",
+            *msgs
+        );
+    }
+
+    #[test]
+    fn apply_chest_sync_diamond_prefixed_report_does_not_warn() {
+        // Bot reports "minecraft:diamond" (with the namespace prefix). After
+        // normalization this matches the reserved item, so the warning must
+        // NOT fire — otherwise every legitimate prefixed report is a false
+        // positive.
+        let mut store = build_store(HashMap::new(), HashMap::new(), test_storage());
+        let report = ChestSyncReport {
+            chest_id: crate::constants::DIAMOND_CHEST_ID,
+            item: "minecraft:diamond".to_string(),
+            amounts: [-1i32; crate::constants::DOUBLE_CHEST_SLOTS],
+        };
+        let cap = test_capture::CaptureSubscriber::default();
+        let messages = cap.messages.clone();
+        tracing::subscriber::with_default(cap, || {
+            apply_chest_sync(&mut store, report).expect("sync should succeed");
+        });
+        let msgs = messages.lock().unwrap();
+        assert!(
+            !msgs.iter().any(|m| m.contains("enforcing diamond")),
+            "prefixed report should normalize and not trip the warning; got {:?}",
+            *msgs
         );
     }
 
@@ -371,12 +478,22 @@ mod tests {
             item: "diamond".to_string(),
             amounts: [-1i32; crate::constants::DOUBLE_CHEST_SLOTS],
         };
-        apply_chest_sync(&mut store, report).expect("sync should succeed");
+        let cap = test_capture::CaptureSubscriber::default();
+        let messages = cap.messages.clone();
+        tracing::subscriber::with_default(cap, || {
+            apply_chest_sync(&mut store, report).expect("sync should succeed");
+        });
         assert_eq!(
             store.storage.nodes[0].chests[crate::constants::OVERFLOW_CHEST_ID as usize]
                 .item
                 .as_str(),
             crate::constants::OVERFLOW_CHEST_ITEM
+        );
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("enforcing overflow") && m.contains("diamond")),
+            "expected reserved-chest warning to fire; got {:?}",
+            *msgs
         );
     }
 
@@ -391,8 +508,21 @@ mod tests {
             item: "minecraft:".to_string(),
             amounts: [-1i32; crate::constants::DOUBLE_CHEST_SLOTS],
         };
-        apply_chest_sync(&mut store, report).expect("sync should succeed");
+        let cap = test_capture::CaptureSubscriber::default();
+        let messages = cap.messages.clone();
+        tracing::subscriber::with_default(cap, || {
+            apply_chest_sync(&mut store, report).expect("sync should succeed");
+        });
         assert!(store.storage.nodes[0].chests[2].item.is_empty());
+        // The fallback must be operator-visible: silent unassign of a
+        // non-reserved chest is a stock-accounting hazard the audit's
+        // item_stock repair will quietly mask.
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("invalid item ID")),
+            "expected invalid-item-ID warning to fire; got {:?}",
+            *msgs
+        );
     }
 
     #[test]

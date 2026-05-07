@@ -417,7 +417,7 @@ impl Default for ChatConfig {
 fn default_chat_enabled() -> bool { false }
 fn default_chat_dry_run() -> bool { false }
 fn default_chat_api_key_env() -> String { "ANTHROPIC_API_KEY".to_string() }
-fn default_chat_composer_model() -> String { "claude-sonnet-4-6".to_string() }
+fn default_chat_composer_model() -> String { "claude-haiku-4-5-20251001".to_string() }
 fn default_chat_classifier_model() -> String { "claude-haiku-4-5-20251001".to_string() }
 fn default_chat_composer_temperature() -> Option<f32> { Some(0.8) }
 fn default_chat_classifier_temperature() -> Option<f32> { Some(0.0) }

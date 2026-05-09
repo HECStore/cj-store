@@ -67,6 +67,14 @@ pub(crate) fn validate_quantity(quantity_str: &str, operation: &str) -> Result<u
 
 /// Validate that `username` matches Minecraft's 3-16 character ASCII
 /// alphanumeric (plus underscore) convention.
+///
+/// The per-rule error messages stay split (length vs charset) because
+/// operators see them verbatim and benefit from the precise diagnostic.
+/// The terminal `is_valid_username_shape` call is a defense-in-depth
+/// belt-and-braces check that the friendly per-rule branches above already
+/// cover the full predicate; if the rules ever drift, this gate ensures
+/// `validate_username` cannot accept anything the single-source-of-truth
+/// predicate rejects.
 pub(crate) fn validate_username(username: &str) -> Result<(), String> {
     if username.len() < 3 || username.len() > 16 {
         return Err(format!(
@@ -82,6 +90,16 @@ pub(crate) fn validate_username(username: &str) -> Result<(), String> {
                 username
             ));
         }
+    }
+
+    // Defense-in-depth: agree with the single-source-of-truth predicate.
+    // Any disagreement here indicates a drift bug; surface it with the
+    // generic charset error to match the legacy reject path.
+    if !crate::types::user::is_valid_username_shape(username) {
+        return Err(format!(
+            "Invalid username '{}'. Usernames contain only ASCII letters, numbers, and underscores.",
+            username
+        ));
     }
 
     Ok(())
@@ -307,5 +325,57 @@ mod tests {
         // The 's' is Cyrillic U+0441, which `is_alphanumeric` would accept
         // but `is_ascii_alphanumeric` correctly rejects.
         assert!(validate_username("Notсh_99").is_err());
+    }
+
+    #[test]
+    fn username_validators_agree_on_edge_corpus() {
+        // Pin agreement between the operator-friendly `validate_username`
+        // and the single-source-of-truth `is_valid_username_shape`. If a
+        // future drift puts them out of sync, this test fails before any
+        // user-visible inconsistency reaches production.
+        use crate::types::user::is_valid_username_shape;
+
+        let corpus: &[&str] = &[
+            // Boundary lengths.
+            "ab",                  // 2 — reject
+            "abc",                 // 3 — accept
+            "abcdefghijklmnop",    // 16 — accept
+            "abcdefghijklmnopq",   // 17 — reject
+            "",                    // empty — reject
+            // Underscore positions.
+            "_user_1",             // leading underscore — accept
+            "user_1_",             // trailing underscore — accept
+            // Digit-only.
+            "1234",                // all-digit — accept
+            // Hyphen — reject.
+            "foo-bar",
+            // Single non-ASCII codepoint inside a 3-16-byte string.
+            "abç",                 // multi-byte — reject
+            // 4-byte / 2-char multi-byte — reject (byte-vs-char asymmetry).
+            "éé",
+            // Whitespace, colon, dot, NUL.
+            "foo bar",
+            "foo:bar",
+            "foo.bar",
+            "foo\0bar",
+        ];
+
+        for u in corpus {
+            let predicate = is_valid_username_shape(u);
+            let validator = validate_username(u).is_ok();
+            assert_eq!(
+                predicate, validator,
+                "drift on {u:?}: is_valid_username_shape={predicate}, validate_username.is_ok={validator}",
+            );
+        }
+    }
+
+    #[test]
+    fn username_rejects_multibyte_input() {
+        // Direct rejection pin: a 4-byte / 2-char string with byte length
+        // in [3,16] must be rejected on the byte-class check.
+        let s = "éé";
+        assert_eq!(s.len(), 4);
+        assert!(validate_username(s).is_err(), "multi-byte must be rejected");
     }
 }

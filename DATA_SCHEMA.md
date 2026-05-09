@@ -155,8 +155,10 @@ One file per trading pair. Filename is the canonical item id (no
   unblocked on a fresh install (where `addnode`/`addpair` set
   `store.dirty = true` before any tradeable pair has been added — the
   base-currency `diamond` is rejected by `AddPair` — so an unconditional
-  error here would propagate via `?` in `state::save`, the dirty flag
-  would never clear, and a shutdown would drop every staged mutation).
+  error here would be aggregated and surfaced by `state::save` (which
+  attempts every sub-save first-error-keep-going then returns the first
+  error), the dirty flag would never clear, and a shutdown would drop
+  every staged mutation).
   On a per-pair write failure `save_all` still completes the
   `expected_files` set and runs the orphan sweep before surfacing the
   captured error so the on-disk directory keeps mirroring the in-memory

@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 static ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::constants::{MAX_ORDERS_PER_USER, MAX_QUEUE_SIZE, QUEUE_FILE};
-use crate::fsutil::write_atomic;
+use crate::fsutil::{archive_aside, write_atomic};
 use crate::messages::QueuedOrderType;
 
 /// An order waiting to be processed.
@@ -204,19 +204,8 @@ impl OrderQueue {
             Some(parent) => parent.join(archived_name),
             None => PathBuf::from(archived_name),
         };
-        match fs::rename(path, &archived) {
-            Ok(()) => Ok(archived),
-            Err(_) => {
-                fs::copy(path, &archived)?;
-                if let Err(remove_err) = fs::remove_file(path) {
-                    warn!(
-                        "[Queue] archived queue file to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                        archived, path
-                    );
-                }
-                Ok(archived)
-            }
-        }
+        archive_aside(path, &archived)?;
+        Ok(archived)
     }
 
     /// Path-parameterized save, separated so tests can round-trip without

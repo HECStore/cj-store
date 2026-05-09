@@ -428,7 +428,7 @@ pub async fn handle_buy_order(
         return utils::send_message_to_player(
             store,
             player_name,
-            &format!("Buy aborted: bot failed chest withdrawal step: {}", e),
+            &format!("Buy aborted: bot failed chest withdrawal step: {}", e.user_message()),
         )
         .await;
     }
@@ -494,9 +494,9 @@ pub async fn handle_buy_order(
             let rollback_msg = match rb.partial_message() {
                 Some(detail) => format!(
                     "Buy aborted: trade failed: {}. Rollback partial: {}.",
-                    err, detail
+                    err.user_message(), detail
                 ),
-                None => format!("Buy aborted: trade failed: {} (items rolled back to storage)", err),
+                None => format!("Buy aborted: trade failed: {} (items rolled back to storage)", err.user_message()),
             };
             return utils::send_message_to_player(store, player_name, &rollback_msg).await;
         }
@@ -682,13 +682,12 @@ pub async fn handle_buy_order(
         plan.total_cost,
         plan.user_uuid.clone(),
     ));
-    store.orders.push_back(Order {
-        order_type: crate::types::order::OrderType::Buy,
-        item: ItemId::from_normalized(item.to_string()),
-        amount: plan.qty_i32,
-        currency_amount: 0.0,
-        user_uuid: plan.user_uuid.clone(),
-    });
+    store.orders.push_back(Order::buy(
+        ItemId::from_normalized(item.to_string()),
+        plan.qty_i32,
+        plan.total_cost,
+        plan.user_uuid.clone(),
+    ));
 
     // Advance: Trading -> Committed
     store.advance_trade(|s| s.commit(item.to_string(), plan.qty_i32, plan.total_cost));
@@ -705,8 +704,9 @@ pub async fn handle_buy_order(
         "Buy order completed"
     );
 
-    if let Err(e) = state::assert_invariants(store, "post-buy", true) {
-        error!(phase = "buy.invariant", player = %player_name, item = %item, "Invariant violation after buy: {}", e);
+    let invariant_ok = state::assert_invariants(store, "post-buy", true).is_ok();
+    if !invariant_ok {
+        error!(phase = "buy.invariant", player = %player_name, item = %item, "Invariant violation after buy — operator must audit store state");
         let _ = state::save(store);
     }
 
@@ -719,12 +719,17 @@ pub async fn handle_buy_order(
     } else {
         String::new()
     };
+    let alert_suffix = if invariant_ok {
+        String::new()
+    } else {
+        " (Note: store self-check flagged an inconsistency; operator notified.)".to_string()
+    };
     utils::send_message_to_player(
         store,
         player_name,
         &format!(
-            "Bought {} {} for {:.2} diamonds (fee {:.2}).{} Trade complete. Storage: {}",
-            quantity, item, plan.total_cost, fee_amount, payment_msg, pickup_summary
+            "Bought {} {} for {:.2} diamonds (fee {:.2}).{} Trade complete. Storage: {}{}",
+            quantity, item, plan.total_cost, fee_amount, payment_msg, pickup_summary, alert_suffix
         ),
     )
     .await
@@ -918,7 +923,7 @@ pub async fn handle_sell_order(
             return utils::send_message_to_player(
                 store,
                 player_name,
-                &format!("Sell aborted: failed to get diamonds from storage: {}", e),
+                &format!("Sell aborted: failed to get diamonds from storage: {}", e.user_message()),
             )
             .await;
         }
@@ -971,11 +976,11 @@ pub async fn handle_sell_order(
             let msg = match rb.partial_message() {
                 Some(detail) => format!(
                     "Sell aborted: trade failed: {}. Rollback partial: {}.",
-                    err, detail
+                    err.user_message(), detail
                 ),
                 None => format!(
                     "Sell aborted: trade failed: {}. Diamonds returned to storage.",
-                    err
+                    err.user_message()
                 ),
             };
             return utils::send_message_to_player(store, player_name, &msg).await;
@@ -1064,7 +1069,7 @@ pub async fn handle_sell_order(
     {
         // Best-effort return of the ORIGINAL qty via trade - partial deposits can't be
         // cleanly unwound because the bot has already committed earlier steps.
-        let _ = perform_trade(
+        let return_trade_result = perform_trade(
             store,
             player_name,
             vec![TradeItem {
@@ -1077,15 +1082,17 @@ pub async fn handle_sell_order(
             "[Sell] deposit-failed",
         )
         .await;
-        return utils::send_message_to_player(
-            store,
-            player_name,
-            &format!(
-                "Sell aborted: failed to deposit into storage: {}. You were NOT paid. I attempted to return items via trade; if you did not receive them, contact an operator.",
-                err
+        let msg = match return_trade_result {
+            Ok(_) => format!(
+                "Sell aborted: failed to deposit into storage: {}. You were NOT paid. Items have been returned via trade.",
+                err.user_message()
             ),
-        )
-        .await;
+            Err(rerr) => format!(
+                "Sell aborted: failed to deposit into storage: {}. You were NOT paid. Return-trade ALSO failed: {}. Contact an operator.",
+                err.user_message(), rerr.user_message()
+            ),
+        };
+        return utils::send_message_to_player(store, player_name, &msg).await;
     }
 
     // Commit ledgers.
@@ -1112,13 +1119,12 @@ pub async fn handle_sell_order(
         plan.total_payout,
         plan.user_uuid.clone(),
     ));
-    store.orders.push_back(Order {
-        order_type: crate::types::order::OrderType::Sell,
-        item: ItemId::from_normalized(item.to_string()),
-        amount: plan.qty_i32,
-        currency_amount: 0.0,
-        user_uuid: plan.user_uuid.clone(),
-    });
+    store.orders.push_back(Order::sell(
+        ItemId::from_normalized(item.to_string()),
+        plan.qty_i32,
+        plan.total_payout,
+        plan.user_uuid.clone(),
+    ));
 
     // Advance: Depositing -> Committed
     store.advance_trade(|s| s.commit(item.to_string(), plan.qty_i32, plan.total_payout));
@@ -1134,19 +1140,25 @@ pub async fn handle_sell_order(
         "Sell order completed"
     );
 
-    if let Err(e) = state::assert_invariants(store, "post-sell", true) {
-        error!(phase = "sell.invariant", player = %player_name, item = %item, "Invariant violation after sell: {}", e);
+    let invariant_ok = state::assert_invariants(store, "post-sell", true).is_ok();
+    if !invariant_ok {
+        error!(phase = "sell.invariant", player = %player_name, item = %item, "Invariant violation after sell — operator must audit store state");
         let _ = state::save(store);
     }
 
     let deposit_summary = utils::summarize_transfers(&plan.deposit_plan, 3);
     let fee_amount = plan.total_payout / (1.0 - store.config.fee) - plan.total_payout;
+    let alert_suffix = if invariant_ok {
+        String::new()
+    } else {
+        " (Note: store self-check flagged an inconsistency; operator notified.)".to_string()
+    };
     utils::send_message_to_player(
         store,
         player_name,
         &format!(
-            "Sold {} {} for {:.2} diamonds (fee {:.2}). Trade complete. Storage: {}",
-            quantity, item, plan.total_payout, fee_amount, deposit_summary
+            "Sold {} {} for {:.2} diamonds (fee {:.2}). Trade complete. Storage: {}{}",
+            quantity, item, plan.total_payout, fee_amount, deposit_summary, alert_suffix
         ),
     )
     .await

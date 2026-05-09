@@ -273,7 +273,7 @@ impl Journal {
             "journal",
             "leftover",
             &ARCHIVE_SEQ,
-        );
+        )?;
         match fs::rename(&self.path, &archived) {
             Ok(()) => Ok(archived),
             Err(_) => {
@@ -304,7 +304,7 @@ impl Journal {
             "journal",
             "unreadable",
             &ARCHIVE_SEQ,
-        );
+        )?;
         match fs::rename(path, &archived) {
             Ok(()) => Ok(archived),
             Err(_) => {
@@ -340,18 +340,27 @@ impl Journal {
             );
         }
         let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
-        self.entry = Some(JournalEntry {
+        let new_entry = JournalEntry {
             operation_id,
             operation_type,
             chest_id,
             slot_index,
             state: JournalState::ShulkerTaken,
-        });
-        self.persist().inspect_err(|e| {
+        };
+        // Persist-before-mutate: swap the new entry in tentatively, then
+        // rollback to the old one on failure so the in-memory state stays
+        // consistent with what is on disk. Without this, a failed persist
+        // leaves `self.entry = Some(new_entry)` in memory while the disk
+        // still has the old (or empty) state, causing a false
+        // "overwriting stale entry" warning on the next `begin()`.
+        let old_entry = self.entry.replace(new_entry);
+        if let Err(e) = self.persist() {
             tracing::error!(
                 "[Journal] failed to persist begin: op_id={operation_id} type={operation_type:?} chest_id={chest_id} slot={slot_index}: {e}"
             );
-        })?;
+            self.entry = old_entry;
+            return Err(e);
+        }
         Ok(operation_id)
     }
 
@@ -370,15 +379,29 @@ impl Journal {
         let op_id = entry.operation_id;
         let chest_id = entry.chest_id;
         let slot_index = entry.slot_index;
+        let old_state = entry.state;
         entry.state = state;
-        self.persist().inspect_err(|e| {
+        if let Err(e) = self.persist() {
             tracing::error!(
                 "[Journal] failed to persist advance to {state:?}: op_id={op_id} chest_id={chest_id} slot={slot_index}: {e}"
             );
-        })
+            if let Some(entry) = self.entry.as_mut() {
+                entry.state = old_state;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Mark the active operation complete and clear the journal.
+    ///
+    /// Production callers should prefer
+    /// [`complete_with_state`](Self::complete_with_state) so the final state
+    /// is recorded for log correlation and the advance+complete pair becomes
+    /// a single atomic write. This bare form is retained for explicit
+    /// clear-without-state-update use and for tests that exercise the cleared
+    /// in-memory invariant directly.
+    #[allow(dead_code)]
     pub fn complete(&mut self) -> io::Result<()> {
         let op_id = self.entry.as_ref().map(|e| e.operation_id);
         self.entry = None;
@@ -387,6 +410,47 @@ impl Journal {
                 "[Journal] failed to persist complete: op_id={op_id:?}: {e}"
             );
         })
+    }
+
+    /// Atomic equivalent of `advance(state)` immediately followed by `complete()`.
+    ///
+    /// The two-call sequence persists twice; a crash between the two
+    /// `write_atomic` calls would leave the intermediate state on disk —
+    /// violating the docstring promise at the top of this module that "only
+    /// truly in-flight entries remain". This collapses both writes into a
+    /// single `persist()` so on disk we either still see the prior state (no
+    /// progress) or an empty journal (complete), never the intermediate.
+    ///
+    /// `state` is recorded on the in-memory entry first purely for log
+    /// correlation in the persist error path; the entry is then cleared and
+    /// the empty form (`[]`) is written exactly once.
+    pub fn complete_with_state(&mut self, state: JournalState) -> io::Result<()> {
+        if let Some(entry) = self.entry.as_mut() {
+            entry.state = state;
+        }
+        let op_id = self.entry.as_ref().map(|e| e.operation_id);
+        let old_entry = self.entry.take();
+        if let Err(e) = self.persist() {
+            tracing::error!(
+                "[Journal] failed to persist complete_with_state({state:?}): op_id={op_id:?}: {e}"
+            );
+            self.entry = old_entry;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Re-attach a leftover entry to the in-memory journal.
+    ///
+    /// Used by the bot startup path when [`archive_leftover`](Self::archive_leftover)
+    /// fails: the loader unconditionally clears `self.entry`, so without this
+    /// the next `begin()` would silently overwrite the on-disk forensic record
+    /// (the empty in-memory entry → empty `[]` persist → operator evidence
+    /// gone). Restoring the entry means the next `begin()` instead triggers
+    /// the existing "overwriting stale entry" warning and re-persists the
+    /// same single-entry payload, preserving the operation_id/state.
+    pub(crate) fn restore_leftover(&mut self, e: JournalEntry) {
+        self.entry = Some(e);
     }
 
     /// View the currently-active entry, if any.

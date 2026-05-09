@@ -245,10 +245,11 @@ impl Trade {
         // (no trades dir, or an empty/stub trades dir) is a legitimate no-op:
         // the setup-phase autosave runs before the operator has committed the
         // first Buy/Sell/Deposit/Withdraw, and erroring here would block the
-        // entire dirty-flag chain (`state::save` propagates via `?`, the
-        // autosave loop never clears `self.dirty`, and a shutdown then loses
-        // every staged mutation). Once any trade exists on disk, an empty
-        // in-memory vec is still treated as "refuse to wipe".
+        // entire dirty-flag chain (`state::save` aggregates sub-save errors
+        // first-error-keep-going and surfaces the first to the caller; the
+        // autosave loop therefore never clears `self.dirty`, and a shutdown
+        // then loses every staged mutation). Once any trade exists on disk,
+        // an empty in-memory vec is still treated as "refuse to wipe".
         if trades.is_empty() {
             let dir_has_trade_files = match fs::read_dir(dir_path) {
                 Ok(read_dir) => read_dir

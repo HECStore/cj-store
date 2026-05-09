@@ -14,6 +14,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::fsutil::write_atomic;
+use crate::types::ItemId;
 
 /// The kind of transaction recorded in the audit log.
 ///
@@ -23,10 +24,11 @@ use crate::fsutil::write_atomic;
 /// adjustments (`AddCurrency`/`RemoveCurrency`). Serialized variant names
 /// are part of the on-disk format in `data/orders.json`, so renaming them
 /// is a breaking change.
-#[derive(Debug, PartialEq, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub enum OrderType {
     /// User purchased an item from the store.
-    #[default]
+    #[cfg_attr(test, default)]
     Buy,
     /// User sold an item to the store.
     Sell,
@@ -45,7 +47,12 @@ pub enum OrderType {
 }
 
 /// A single entry in the audit log.
-#[derive(Debug, PartialEq, Serialize, Deserialize, Default, Clone)]
+///
+/// `currency_amount` is the diamond magnitude for every value-bearing variant
+/// (Buy/Sell/Deposit/Withdraw/AddCurrency/RemoveCurrency); 0.0 only for
+/// AddItem/RemoveItem which move items without a currency leg.
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct Order {
     pub order_type: OrderType,
     pub item: crate::types::ItemId,
@@ -63,6 +70,96 @@ pub struct Order {
 pub const ORDERS_FILE: &str = "data/orders.json";
 
 impl Order {
+    /// User purchased `qty` of `item` for `price` total diamonds.
+    pub fn buy(item: ItemId, qty: i32, price: f64, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::Buy,
+            item,
+            amount: qty,
+            currency_amount: price,
+            user_uuid: uuid,
+        }
+    }
+
+    /// User sold `qty` of `item` for `payout` total diamonds.
+    pub fn sell(item: ItemId, qty: i32, payout: f64, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::Sell,
+            item,
+            amount: qty,
+            currency_amount: payout,
+            user_uuid: uuid,
+        }
+    }
+
+    /// User deposited `amount` diamonds into their store balance. `amount`
+    /// is the diamond magnitude credited; `Order::amount` carries the whole
+    /// diamond count.
+    pub fn deposit_balance(amount: f64, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::DepositBalance,
+            item: ItemId::from_normalized("diamond".to_string()),
+            amount: amount as i32,
+            currency_amount: amount,
+            user_uuid: uuid,
+        }
+    }
+
+    /// User withdrew `amount` diamonds from their store balance.
+    pub fn withdraw_balance(amount: f64, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::WithdrawBalance,
+            item: ItemId::from_normalized("diamond".to_string()),
+            amount: amount as i32,
+            currency_amount: amount,
+            user_uuid: uuid,
+        }
+    }
+
+    /// Operator credited `amount` of currency to the reserve for `item`.
+    pub fn add_currency(item: ItemId, amount: f64, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::AddCurrency,
+            item,
+            amount: 0,
+            currency_amount: amount,
+            user_uuid: uuid,
+        }
+    }
+
+    /// Operator debited `amount` of currency from the reserve for `item`.
+    pub fn remove_currency(item: ItemId, amount: f64, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::RemoveCurrency,
+            item,
+            amount: 0,
+            currency_amount: amount,
+            user_uuid: uuid,
+        }
+    }
+
+    /// Operator added `qty` of `item` to storage (no currency leg).
+    pub fn add_item(item: ItemId, qty: i32, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::AddItem,
+            item,
+            amount: qty,
+            currency_amount: 0.0,
+            user_uuid: uuid,
+        }
+    }
+
+    /// Operator removed `qty` of `item` from storage (no currency leg).
+    pub fn remove_item(item: ItemId, qty: i32, uuid: String) -> Self {
+        Self {
+            order_type: OrderType::RemoveItem,
+            item,
+            amount: qty,
+            currency_amount: 0.0,
+            user_uuid: uuid,
+        }
+    }
+
     /// Saves a VecDeque of Orders to `ORDERS_FILE`, keeping only the most
     /// recent `max_orders` entries.
     pub fn save_all_with_limit(orders: &VecDeque<Self>, max_orders: usize) -> io::Result<()> {

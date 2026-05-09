@@ -37,8 +37,16 @@ pub struct UserView {
 /// Mirrors `crate::chat::tools::is_canonical_hyphen_uuid` and
 /// `crate::types::user::is_valid_uuid_shape` — duplicated inline by the
 /// same chat-independence rationale used elsewhere in this module.
+///
+/// Defense-in-depth against T15P1: the all-zeros sentinel is the
+/// "no sender resolved" marker chat/mod.rs historically substituted on
+/// Mojang failure. Reject it here so a stale tool-arg carrying it can
+/// never resolve to a real on-disk user file.
 fn is_canonical_hyphen_uuid(s: &str) -> bool {
     if s.len() != 36 {
+        return false;
+    }
+    if s == "00000000-0000-0000-0000-000000000000" {
         return false;
     }
     s.bytes().enumerate().all(|(i, b)| match i {

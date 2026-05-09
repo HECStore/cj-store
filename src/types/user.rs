@@ -18,6 +18,7 @@ use std::{
     fmt, fs, io,
     path::Path,
     sync::OnceLock,
+    time::Duration,
 };
 #[cfg(test)]
 use std::path::PathBuf;
@@ -114,12 +115,22 @@ pub enum MojangResolveError {
     /// `reqwest::Error::is_connect()`. Same operator-only sanitization rule.
     NetworkError,
     /// Non-success HTTP status (`is_status()`) other than the 204 mapped
-    /// to `NotFound`. Generic-message at the player; full status logged.
+    /// to `NotFound` and the 429 mapped to `RateLimited`. Generic-message
+    /// at the player; full status logged.
     UpstreamError,
     /// Mojang returned 2xx but the body was undecodable JSON, or the
     /// `id` field failed the 32-char lowercase-hex shape check. Same
     /// generic player whisper.
     MalformedResponse,
+    /// HTTP 429 Too Many Requests. `retry_after` is `Some(Duration)` if
+    /// Mojang sent a parseable `Retry-After` header (integer-seconds or
+    /// RFC 2822 absolute date), `None` otherwise. Distinct from
+    /// `UpstreamError` so callers can route "rate-limited, retry later"
+    /// differently from "upstream broken" (e.g. exponential backoff and
+    /// quiet whisper vs. operator alert). The retry-budget logic in
+    /// `User::get_uuid_async` deliberately does NOT auto-retry this
+    /// variant — repeating the call would only deepen the throttle.
+    RateLimited { retry_after: Option<Duration> },
 }
 
 impl fmt::Display for MojangResolveError {
@@ -137,6 +148,10 @@ impl fmt::Display for MojangResolveError {
             MojangResolveError::MalformedResponse => {
                 write!(f, "Mojang API returned malformed response")
             }
+            MojangResolveError::RateLimited { retry_after } => match retry_after {
+                Some(d) => write!(f, "Mojang API rate-limited (retry after {}s)", d.as_secs()),
+                None => write!(f, "Mojang API rate-limited"),
+            },
         }
     }
 }
@@ -144,14 +159,85 @@ impl fmt::Display for MojangResolveError {
 impl std::error::Error for MojangResolveError {}
 
 /// Mojang-shape username validator (3-16 chars, ASCII alphanumeric + `_`).
-/// Mirrors `crate::chat::tools::validate_username_shape`; intentionally
-/// duplicated here so this module has no dependency on `chat::*`. The two
-/// must stay in sync — both enforce the in-game protocol's username rules.
-fn is_valid_username_shape(username: &str) -> bool {
+///
+/// Single source of truth for the username byte/charset gate — every other
+/// caller in the crate (`chat::tools::validate_username_shape`,
+/// `mojang::resolve_user_uuid`, `store::handlers::validation::validate_username`)
+/// delegates here so a tweak to the rule (e.g. a future Mojang shape change)
+/// applies uniformly.
+///
+/// The byte-length check `(3..=16).contains(&username.len())` is correct
+/// even for multi-byte UTF-8 inputs: a 4-byte string like `"ää"` (2 chars,
+/// 4 bytes) is rejected on TWO independent grounds — the byte-length is in
+/// `[3,16]` so the length gate alone would not save us, but the per-byte
+/// `is_ascii_alphanumeric() || b == b'_'` check rejects every high-bit
+/// continuation byte. See `is_valid_username_shape_rejects_multibyte_byte_vs_char`.
+pub(crate) fn is_valid_username_shape(username: &str) -> bool {
     (3..=16).contains(&username.len())
         && username
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Parse an HTTP `Retry-After` header value into a `Duration`.
+///
+/// RFC 7231 §7.1.3 permits two encodings:
+/// 1. **delta-seconds** — a non-negative integer number of seconds
+///    (`"120"`).
+/// 2. **HTTP-date** — an absolute timestamp in one of three formats
+///    (RFC 1123, RFC 850, asctime). We accept the modern RFC 2822 form
+///    (RFC 1123 is a subset of RFC 2822 for the date portion) via
+///    `chrono::DateTime::parse_from_rfc2822`, which covers what every
+///    real-world server emits in 2026.
+///
+/// On parse failure (malformed header, negative skew, garbage), returns
+/// `None` — the caller treats absence the same as "no hint, fall back to
+/// generic backoff". Negative deltas (date already in the past) clamp to
+/// `Duration::ZERO` rather than wrapping or producing a sentinel error,
+/// because a server that says "retry after a moment ago" is effectively
+/// saying "retry immediately".
+#[cfg_attr(test, allow(dead_code))]
+fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
+    let s = value.to_str().ok()?.trim();
+    // Form 1: integer-seconds.
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // Form 2: HTTP-date (RFC 2822 / RFC 1123).
+    let target = chrono::DateTime::parse_from_rfc2822(s).ok()?;
+    let now = chrono::Utc::now();
+    let delta = target.signed_duration_since(now);
+    if delta <= chrono::Duration::zero() {
+        return Some(Duration::ZERO);
+    }
+    delta.to_std().ok()
+}
+
+/// Canonicalize a Mojang-API `id` field (bare 32-char hex, any case) into
+/// the canonical hyphenated lowercase form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+///
+/// Owns BOTH the lowercase step AND the shape gate so the slice into the
+/// 5-segment hyphenation cannot panic on adversarial input:
+/// - `is_ascii_hexdigit` on every byte ensures all bytes are ASCII (so the
+///   `&id[0..8]…&id[20..32]` byte slices land on valid UTF-8 char boundaries),
+/// - and the length-32 check ensures the indices are in range.
+///
+/// Extracted from `User::get_uuid_async` so the panic-guard is directly
+/// unit-testable. Returns `MojangResolveError::MalformedResponse` on any
+/// shape failure (length, non-hex byte, multi-byte non-ASCII, etc).
+fn canonicalize_mojang_id(raw: &str) -> Result<String, MojangResolveError> {
+    let id = raw.to_ascii_lowercase();
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(MojangResolveError::MalformedResponse);
+    }
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &id[0..8],
+        &id[8..12],
+        &id[12..16],
+        &id[16..20],
+        &id[20..32]
+    ))
 }
 
 /// UUID-shape validator: canonical 36-char hyphenated lowercase hex
@@ -163,7 +249,19 @@ fn is_valid_username_shape(username: &str) -> bool {
 /// arm because Mojang's API returns the bare form and existing on-disk
 /// user files were historically written with it. Intentionally
 /// duplicated to keep `types::user` chat-independent.
+///
+/// Defense-in-depth against T15P1: the all-zeros sentinel (in either
+/// hyphenated or bare-hex form) is the reserved "no sender resolved"
+/// marker chat/mod.rs historically substituted on Mojang failure. It
+/// must never reach a storage-path constructor here either, since the
+/// chat tool layer is the first perimeter but the storage boundary is
+/// the last one.
 pub(crate) fn is_valid_uuid_shape(uuid: &str) -> bool {
+    if uuid == "00000000-0000-0000-0000-000000000000"
+        || uuid == "00000000000000000000000000000000"
+    {
+        return false;
+    }
     let bytes = uuid.as_bytes();
     match bytes.len() {
         32 => bytes
@@ -193,22 +291,61 @@ impl User {
 
     /// Resolves a Minecraft username to a hyphenated Mojang UUID via
     /// `https://api.mojang.com/users/profiles/minecraft/{username}`.
-    /// HTTP 204 → `NotFound`; other non-2xx or network errors → typed
-    /// [`MojangResolveError`]. Rejects out-of-shape usernames before
-    /// constructing the URL so a malformed name (slash, query, fragment,
-    /// control char) cannot escape the path component into an
-    /// attacker-chosen Mojang endpoint.
+    /// HTTP 204 → `NotFound`; HTTP 429 → `RateLimited`; other non-2xx or
+    /// network errors → typed [`MojangResolveError`]. Rejects out-of-shape
+    /// usernames before constructing the URL so a malformed name (slash,
+    /// query, fragment, control char) cannot escape the path component
+    /// into an attacker-chosen Mojang endpoint.
     ///
     /// Returns a typed error rather than a stringified `reqwest::Error` so
     /// nothing from the underlying HTTP client (URLs, header dumps, TLS
     /// errors) can reach a player whisper. Operator-visible detail is
     /// emitted via the `warn!`/`debug!` log lines below.
+    ///
+    /// Retries ONCE after a ~500ms jittered backoff on `NetworkError` /
+    /// `NetworkTimeout` (transient). `NotFound`, `InvalidShape`,
+    /// `UpstreamError`, `MalformedResponse`, and `RateLimited` are
+    /// single-shot — the first four are not transient, and re-issuing on
+    /// 429 would only deepen the throttle. Total wall time stays within
+    /// the existing ~10s `MOJANG_TIMEOUT_SECS` budget per attempt plus
+    /// the sub-second jittered sleep.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn get_uuid_async(username: &str) -> Result<String, MojangResolveError> {
         if !is_valid_username_shape(username) {
             warn!("[Mojang] rejecting out-of-shape username '{username}' before URL build");
             return Err(MojangResolveError::InvalidShape);
         }
+
+        match Self::get_uuid_async_once(username).await {
+            Ok(uuid) => Ok(uuid),
+            Err(e @ (MojangResolveError::NetworkError | MojangResolveError::NetworkTimeout)) => {
+                // Single jittered retry on transient transport errors.
+                // Bound the sleep tight (300-700ms) so the total wall
+                // time stays well under the 10s timeout invariant — the
+                // first attempt either errored quickly (DNS/connect) or
+                // hit the per-request timeout, and the second attempt
+                // gets the same 10s budget.
+                let mut buf = [0u8; 1];
+                let jitter_ms: u64 = match getrandom::fill(&mut buf) {
+                    Ok(()) => 300 + (buf[0] as u64 * 400 / 255), // 300..=700
+                    Err(_) => 500, // RNG failure: fall back to fixed midpoint.
+                };
+                debug!(
+                    "[Mojang] transient error for '{username}' ({e}); retrying once in {jitter_ms}ms"
+                );
+                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                Self::get_uuid_async_once(username).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Single-shot Mojang lookup: one HTTPS round-trip, no retry. Lifted
+    /// out of [`User::get_uuid_async`] so the retry envelope above can
+    /// invoke it twice for transient-transport failures without
+    /// duplicating the request/parse logic.
+    #[cfg_attr(test, allow(dead_code))]
+    async fn get_uuid_async_once(username: &str) -> Result<String, MojangResolveError> {
         let url = format!("https://api.mojang.com/users/profiles/minecraft/{username}");
 
         let client = get_http_client();
@@ -232,6 +369,22 @@ impl User {
             });
         }
 
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Parse Retry-After before consuming `response` (the body is
+            // typically empty on 429 and irrelevant either way). Mojang's
+            // rate-limit semantics aren't well documented, so accept both
+            // formats RFC 7231 permits: integer seconds and HTTP-date.
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(parse_retry_after);
+            warn!(
+                "[Mojang] rate-limited resolving '{username}' (retry_after={:?})",
+                retry_after
+            );
+            return Err(MojangResolveError::RateLimited { retry_after });
+        }
+
         if !response.status().is_success() {
             let status = response.status();
             warn!("[Mojang] non-success resolving '{username}': HTTP {status}");
@@ -243,34 +396,20 @@ impl User {
             MojangResolveError::MalformedResponse
         })?;
 
-        // Mojang returns a bare-hex UUID; hyphenate to the canonical
-        // xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. Both guards are needed:
-        // length alone counts BYTES, not chars, so a 32-byte response with
-        // any non-ASCII multi-byte char would slice on a non-char-boundary
-        // and panic. Requiring every byte to be ASCII hex makes the slice
-        // offsets land on valid char boundaries AND prevents non-hex content
-        // (which would later become a filename component) from propagating.
-        // The persistence layer's `is_valid_uuid_shape` is lowercase-only,
-        // so canonicalize here — Mojang doesn't contractually guarantee a
-        // case, and an uppercase response would otherwise survive this guard
-        // (`is_ascii_hexdigit` accepts A-F) and then be silently rejected by
-        // `save_in_dir`/`load_all_in_dir`, dropping the user on next start.
-        let id = mojang_response.id.to_ascii_lowercase();
-        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Mojang returns a bare-hex UUID; canonicalize to the hyphenated
+        // lowercase xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. The helper
+        // owns BOTH the lowercase step AND the shape gate so the slicing
+        // there cannot panic on adversarial input. The persistence layer's
+        // `is_valid_uuid_shape` is lowercase-only — canonicalizing here
+        // means an uppercase Mojang reply does not survive into a filename
+        // that `save_in_dir`/`load_all_in_dir` would silently reject.
+        let formatted = canonicalize_mojang_id(&mojang_response.id).map_err(|e| {
             warn!(
                 "[Mojang] invalid UUID shape for '{username}': got {:?}",
-                id
+                mojang_response.id
             );
-            return Err(MojangResolveError::MalformedResponse);
-        }
-        let formatted = format!(
-            "{}-{}-{}-{}-{}",
-            &id[0..8],
-            &id[8..12],
-            &id[12..16],
-            &id[16..20],
-            &id[20..32]
-        );
+            e
+        })?;
 
         debug!("[Mojang] resolved '{username}' -> {formatted}");
         Ok(formatted)
@@ -481,10 +620,12 @@ impl User {
         // the setup-phase autosave runs before any user has been seen
         // (operator-only flows like `addnode`/`addpair` set `store.dirty`
         // without populating `store.users`), and erroring here would block
-        // the entire dirty-flag chain (`state::save` propagates via `?`,
-        // the autosave loop never clears `self.dirty`, and a shutdown then
-        // loses every staged mutation). Once any user file exists on disk,
-        // an empty in-memory map is still treated as "refuse to wipe".
+        // the entire dirty-flag chain (`state::save` aggregates sub-save
+        // errors first-error-keep-going and surfaces the first to the
+        // caller; the autosave loop therefore never clears `self.dirty`,
+        // and a shutdown then loses every staged mutation). Once any user
+        // file exists on disk, an empty in-memory map is still treated as
+        // "refuse to wipe".
         if users.is_empty() {
             let dir_has_user_files = match fs::read_dir(dir_path) {
                 Ok(read_dir) => read_dir
@@ -822,5 +963,339 @@ mod tests {
             !parent.path().join("etc/passwd.json").exists(),
             "no escape file outside dir"
         );
+    }
+
+    // ---- canonicalize_mojang_id (panic-guard for the Mojang slice) --------
+
+    #[test]
+    fn canonicalize_mojang_id_lowercase_32hex_ok_hyphenated() {
+        assert_eq!(
+            canonicalize_mojang_id("550e8400e29b41d4a716446655440000").unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_uppercase_canonicalized_to_lowercase() {
+        assert_eq!(
+            canonicalize_mojang_id("550E8400E29B41D4A716446655440000").unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_mixed_case_canonicalized() {
+        assert_eq!(
+            canonicalize_mojang_id("550E8400e29B41d4A716446655440000").unwrap(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_31_char_err() {
+        // 31 chars (one short).
+        assert_eq!(
+            canonicalize_mojang_id("550e8400e29b41d4a71644665544000"),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_33_char_err() {
+        // 33 chars (one too long).
+        assert_eq!(
+            canonicalize_mojang_id("550e8400e29b41d4a7164466554400000"),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_empty_err() {
+        assert_eq!(
+            canonicalize_mojang_id(""),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_non_hex_char_err() {
+        // 'g' is not hex.
+        assert_eq!(
+            canonicalize_mojang_id("550e8400e29b41d4a71644665544000g"),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_embedded_nul_err() {
+        let mut s = String::from("550e8400e29b41d4a716446655440000");
+        // Replace the last byte with a NUL.
+        s.pop();
+        s.push('\0');
+        assert_eq!(s.len(), 32);
+        assert_eq!(
+            canonicalize_mojang_id(&s),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_multibyte_non_ascii_err_no_panic() {
+        // 30 ASCII hex bytes + one 2-byte UTF-8 codepoint = 32 BYTES, 31 chars.
+        // This is the panic-surface case: a naive byte-slice into [0..8] etc.
+        // could land on a non-char-boundary if the byte gate were missing.
+        // The function MUST return Err and MUST NOT panic.
+        let ascii_30 = "550e8400e29b41d4a71644665544"; // 28 chars
+        let s = format!("{ascii_30}aaé"); // 28 + 2 + 2 = 32 bytes
+        assert_eq!(s.len(), 32);
+        assert_eq!(
+            canonicalize_mojang_id(&s),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn canonicalize_mojang_id_already_hyphenated_36_err() {
+        // Helper requires bare 32-char form; hyphenated is 36 chars and rejected.
+        assert_eq!(
+            canonicalize_mojang_id("550e8400-e29b-41d4-a716-446655440000"),
+            Err(MojangResolveError::MalformedResponse)
+        );
+    }
+
+    // ---- is_valid_uuid_shape ----------------------------------------------
+
+    #[test]
+    fn is_valid_uuid_shape_accepts_canonical_and_bare_hex() {
+        assert!(is_valid_uuid_shape("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_uuid_shape("550e8400e29b41d4a716446655440000"));
+    }
+
+    #[test]
+    fn is_valid_uuid_shape_rejects_path_traversal() {
+        for bad in [
+            "../foo",
+            "..\\foo",
+            "foo/bar",
+            "foo\\bar",
+            ".",
+            "..",
+        ] {
+            assert!(!is_valid_uuid_shape(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_valid_uuid_shape_rejects_uppercase_and_mixed_case() {
+        // Uppercase canonical hyphenated.
+        assert!(!is_valid_uuid_shape("550E8400-E29B-41D4-A716-446655440000"));
+        // Uppercase bare hex.
+        assert!(!is_valid_uuid_shape("550E8400E29B41D4A716446655440000"));
+        // Mixed-case bare hex.
+        assert!(!is_valid_uuid_shape("550E8400e29b41d4A716446655440000"));
+    }
+
+    #[test]
+    fn is_valid_uuid_shape_rejects_wrong_hyphen_positions() {
+        // Hyphen one position too early at index 7.
+        assert!(!is_valid_uuid_shape("550e840-0e29b-41d4-a716-446655440000"));
+        // Missing one hyphen (length 35).
+        assert!(!is_valid_uuid_shape("550e8400e29b-41d4-a716-446655440000"));
+        // Extra hyphen makes length 37.
+        assert!(!is_valid_uuid_shape("550e8400--e29b-41d4-a716-446655440000"));
+        // All-hyphen length 36.
+        assert!(!is_valid_uuid_shape(&"-".repeat(36)));
+    }
+
+    #[test]
+    fn is_valid_uuid_shape_rejects_wrong_lengths() {
+        for n in [0usize, 31, 33, 35, 37, 200] {
+            let s = "a".repeat(n);
+            assert!(!is_valid_uuid_shape(&s), "must reject length {n}");
+        }
+    }
+
+    #[test]
+    fn is_valid_uuid_shape_rejects_embedded_nul() {
+        let mut s = String::from("550e8400e29b41d4a716446655440000");
+        s.pop();
+        s.push('\0');
+        assert_eq!(s.len(), 32);
+        assert!(!is_valid_uuid_shape(&s));
+    }
+
+    #[test]
+    fn is_valid_uuid_shape_rejects_multibyte_non_ascii() {
+        // 32-byte string with multi-byte non-ASCII char — must reject without panic.
+        let ascii_28 = "550e8400e29b41d4a71644665544";
+        let s = format!("{ascii_28}aaé");
+        assert_eq!(s.len(), 32);
+        assert!(!is_valid_uuid_shape(&s));
+    }
+
+    // ---- is_valid_username_shape ------------------------------------------
+
+    #[test]
+    fn is_valid_username_shape_accepts_at_boundaries() {
+        // 3-char minimum.
+        assert!(is_valid_username_shape("abc"));
+        // 16-char maximum.
+        assert!(is_valid_username_shape("abcdefghijklmnop"));
+        // Mixed alphanumeric with underscore.
+        assert!(is_valid_username_shape("Steve_99"));
+        assert!(is_valid_username_shape("_user_1"));
+    }
+
+    #[test]
+    fn is_valid_username_shape_rejects_at_boundaries() {
+        // 2-char (one short).
+        assert!(!is_valid_username_shape("ab"));
+        // 17-char (one over).
+        assert!(!is_valid_username_shape("abcdefghijklmnopq"));
+        // Empty.
+        assert!(!is_valid_username_shape(""));
+    }
+
+    #[test]
+    fn is_valid_username_shape_rejects_multibyte_byte_vs_char() {
+        // 4 bytes / 2 chars (2-byte codepoint x 2). Length-in-bytes is in
+        // (3..=16) but the byte-class check rejects each non-ASCII byte.
+        let s = "éé";
+        assert_eq!(s.len(), 4);
+        assert!(!is_valid_username_shape(s));
+    }
+
+    #[test]
+    fn is_valid_username_shape_rejects_disallowed_bytes() {
+        for bad in [
+            "ab-cd",
+            "ab cd",
+            "ab.cd",
+            "ab:cd",
+            "ab\0cd",
+        ] {
+            assert!(!is_valid_username_shape(bad), "must reject {bad:?}");
+        }
+    }
+
+    // ---- save_dirty_in_dir wipe-refusal & orphan sweep --------------------
+
+    #[test]
+    fn save_dirty_in_dir_refuses_to_wipe_when_all_in_memory_uuids_invalid() {
+        // Pre-write 2 valid `.json` files.
+        let dir = tempfile::tempdir().unwrap();
+        let f1 = dir.path().join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json");
+        let f2 = dir.path().join("11111111-2222-3333-4444-555555555555.json");
+        fs::write(&f1, "{}").unwrap();
+        fs::write(&f2, "{}").unwrap();
+
+        // All-shape-invalid in-memory map.
+        let mut users = HashMap::new();
+        users.insert(
+            "k1".to_string(),
+            User {
+                uuid: "../etc/passwd".to_string(),
+                username: "a".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+        users.insert(
+            "k2".to_string(),
+            User {
+                uuid: "".to_string(),
+                username: "b".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+        users.insert(
+            "k3".to_string(),
+            User {
+                uuid: "UPPERCASE-IS-INVALID".to_string(),
+                username: "c".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+
+        let dirty: HashSet<String> = users.keys().cloned().collect();
+        let err = User::save_dirty_in_dir(&users, &dirty, dir.path())
+            .expect_err("all-invalid map with on-disk files must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(f1.exists(), "pre-existing file 1 must survive wipe-refusal");
+        assert!(f2.exists(), "pre-existing file 2 must survive wipe-refusal");
+    }
+
+    #[test]
+    fn save_dirty_in_dir_all_invalid_uuids_with_empty_dir_is_ok() {
+        // Symmetric positive case for the lines 558-576 fresh-install carve-out:
+        // same all-invalid map but EMPTY users dir → returns Ok(()).
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut users = HashMap::new();
+        users.insert(
+            "k1".to_string(),
+            User {
+                uuid: "../etc/passwd".to_string(),
+                username: "a".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+        users.insert(
+            "k2".to_string(),
+            User {
+                uuid: "".to_string(),
+                username: "b".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+        users.insert(
+            "k3".to_string(),
+            User {
+                uuid: "UPPERCASE-IS-INVALID".to_string(),
+                username: "c".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
+
+        let dirty: HashSet<String> = users.keys().cloned().collect();
+        User::save_dirty_in_dir(&users, &dirty, dir.path())
+            .expect("all-invalid map + empty dir is a fresh-install no-op");
+    }
+
+    #[test]
+    fn save_dirty_in_dir_orphan_sweep_removes_unmapped_json_files() {
+        // Pre-write 2 valid-named `.json` files.
+        let dir = tempfile::tempdir().unwrap();
+        let uuid1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid2 = "11111111-2222-3333-4444-555555555555";
+        let f1 = dir.path().join(format!("{uuid1}.json"));
+        let f2 = dir.path().join(format!("{uuid2}.json"));
+        fs::write(&f1, "{}").unwrap();
+        fs::write(&f2, "{}").unwrap();
+
+        // HashMap contains only the FIRST as a valid User.
+        let mut users = HashMap::new();
+        users.insert(
+            uuid1.to_string(),
+            User {
+                uuid: uuid1.to_string(),
+                username: "alice".to_string(),
+                balance: 1.0,
+                operator: false,
+            },
+        );
+
+        let mut dirty = HashSet::new();
+        dirty.insert(uuid1.to_string());
+
+        User::save_dirty_in_dir(&users, &dirty, dir.path()).expect("save_dirty must succeed");
+
+        assert!(f1.exists(), "mapped user file must remain");
+        assert!(!f2.exists(), "unmapped user file must be swept");
     }
 }

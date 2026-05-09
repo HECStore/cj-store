@@ -103,6 +103,10 @@ pub struct ChatState {
     /// Bounded by `chat.update_self_memory_max_per_day`.
     #[serde(default)]
     pub update_self_memory_today: u32,
+    /// CHAT.md — `update_player_memory` calls made today.
+    /// Bounded by `chat.update_player_memory_max_per_day`.
+    #[serde(default)]
+    pub update_player_memory_today: u32,
     /// Snapshot of the last composer call — `Chat: status` displays
     /// this so operators can see the latest cost without grepping
     /// the decision log.
@@ -149,6 +153,7 @@ impl Default for ChatState {
             last_sweep_day: None,
             last_reflection_at: None,
             update_self_memory_today: 0,
+            update_player_memory_today: 0,
             last_composer_call: None,
             last_persona_regenerated_at: None,
             last_saved_json: None,
@@ -273,6 +278,7 @@ impl ChatState {
             self.history_drops_today = 0;
             self.web_fetches_today = 0;
             self.update_self_memory_today = 0;
+            self.update_player_memory_today = 0;
             self.last_meter_day_utc = today.to_string();
         }
     }

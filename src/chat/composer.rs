@@ -580,6 +580,10 @@ pub struct ComposerRun {
     /// The orchestrator increments `state.update_self_memory_today`
     /// by this amount on success.
     pub update_self_memory_calls: u32,
+    /// Number of `update_player_memory` tool calls dispatched in this run.
+    /// The orchestrator increments `state.update_player_memory_today`
+    /// by this amount on success.
+    pub update_player_memory_calls: u32,
     /// Number of `web_fetch` tool calls dispatched in this run.
     /// The orchestrator increments `state.web_fetches_today` by this
     /// amount on success.
@@ -627,6 +631,7 @@ pub async fn run_loop(
     let mut cache_read_input_tokens = 0u64;
     let mut iterations = 0u32;
     let mut update_self_memory_calls = 0u32;
+    let mut update_player_memory_calls = 0u32;
     let mut web_fetch_calls = 0u32;
     // Combined per-turn budget for the three store-read tools. The
     // model is nudged to use them eagerly; without an in-run cap, a
@@ -661,6 +666,7 @@ pub async fn run_loop(
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 update_self_memory_calls,
+                update_player_memory_calls,
                 web_fetch_calls,
             });
         }
@@ -748,6 +754,7 @@ pub async fn run_loop(
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 update_self_memory_calls,
+                update_player_memory_calls,
                 web_fetch_calls,
             });
         }
@@ -780,6 +787,7 @@ pub async fn run_loop(
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 update_self_memory_calls,
+                update_player_memory_calls,
                 web_fetch_calls,
             });
         }
@@ -810,6 +818,12 @@ pub async fn run_loop(
                             .update_self_memory_today
                             .saturating_add(update_self_memory_calls),
                         tool_ctx.update_self_memory_max_per_day,
+                    )),
+                    "update_player_memory" => Some((
+                        tool_ctx
+                            .update_player_memory_today
+                            .saturating_add(update_player_memory_calls),
+                        tool_ctx.update_player_memory_max_per_day,
                     )),
                     "web_fetch" => Some((
                         tool_ctx
@@ -850,6 +864,7 @@ pub async fn run_loop(
                 if !is_err {
                     match name.as_str() {
                         "update_self_memory" => update_self_memory_calls += 1,
+                        "update_player_memory" => update_player_memory_calls += 1,
                         "web_fetch" => web_fetch_calls += 1,
                         "query_trades" | "get_pair" | "get_user_balance" => {
                             store_tool_calls_this_turn += 1

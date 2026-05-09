@@ -284,10 +284,11 @@ impl Pair {
         // (no pairs dir, or an empty/stub pairs dir) is a legitimate no-op:
         // the setup-phase autosave runs before the operator has created the
         // first pair, and erroring here would block the entire dirty-flag
-        // chain (`state::save` propagates via `?`, the autosave loop never
-        // clears `self.dirty`, and a shutdown then loses every staged
-        // mutation). Once any pair exists on disk, an empty in-memory map
-        // is still treated as "refuse to wipe".
+        // chain (`state::save` aggregates sub-save errors first-error-keep-
+        // going and surfaces the first to the caller; the autosave loop
+        // therefore never clears `self.dirty`, and a shutdown then loses
+        // every staged mutation). Once any pair exists on disk, an empty
+        // in-memory map is still treated as "refuse to wipe".
         if pairs.is_empty() {
             let dir_has_pair_files = match fs::read_dir(dir_path) {
                 Ok(read_dir) => read_dir

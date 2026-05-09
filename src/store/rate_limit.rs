@@ -134,6 +134,20 @@ pub struct RateLimiter {
     /// previous implementation used a `static AtomicBool`, which made the
     /// warning effectively single-fire across all instances and tests).
     clamp_warned: AtomicBool,
+    /// Last time the cap-overflow path emitted a player-facing whisper.
+    /// Without this gate, the cap-refusal branch had no per-user entry to
+    /// throttle against and would whisper on every fresh-name attempt at
+    /// cap — turning inbound junk into outbound chat amplification, the
+    /// exact failure the per-user `last_whisper_time` was designed to
+    /// prevent. Throttled to one whisper per `RATE_LIMIT_RESET_AFTER_MS`.
+    cap_refusal_last_whisper: Option<Instant>,
+    /// Last time the cap-overflow path actually ran an inline `cleanup_stale`.
+    /// At cap, a Sybil-style new-key flood would otherwise re-run the full
+    /// O(MAX_RATE_LIMIT_ENTRIES) `HashMap::retain` on every check — a CPU
+    /// amplification primitive on the hot message path. Throttled to once
+    /// per `RATE_LIMIT_BASE_COOLDOWN_MS`; the periodic `cleanup_stale`
+    /// (300s loop) still preserves correctness.
+    last_inline_sweep: Option<Instant>,
 }
 
 impl Default for RateLimiter {
@@ -162,6 +176,8 @@ impl RateLimiter {
         Self {
             limits: HashMap::with_capacity(INITIAL_LIMITS_CAPACITY),
             clamp_warned: AtomicBool::new(false),
+            cap_refusal_last_whisper: None,
+            last_inline_sweep: None,
         }
     }
 
@@ -217,16 +233,34 @@ impl RateLimiter {
         // guaranteed to survive. If the sweep frees no slots, refuse the
         // new attempt with the base cooldown so still-throttled users are
         // never silently reset by cap pressure.
+        //
+        // Sweep itself is throttled to once per RATE_LIMIT_BASE_COOLDOWN_MS:
+        // without that, a sustained Sybil flood would force a 10k-element
+        // `HashMap::retain` on every check (CPU amplification). The periodic
+        // `cleanup_stale` (300s loop) still preserves correctness; the
+        // throttle just bounds adversarial worst-case inline work.
         if !self.limits.contains_key(user_uuid) && self.limits.len() >= MAX_RATE_LIMIT_ENTRIES {
-            self.cleanup_stale(Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS));
+            let sweep_due = self
+                .last_inline_sweep
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS));
+            if sweep_due {
+                self.cleanup_stale(Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS));
+                self.last_inline_sweep = Some(now);
+            }
             if self.limits.len() >= MAX_RATE_LIMIT_ENTRIES {
-                // No tracked entry to gate the whisper against, so emit
-                // one rather than silently dropping it — same policy as
-                // the missing-entry branch in the prior
-                // `should_whisper_rejection`.
+                // No tracked entry to gate the whisper against — gate
+                // globally instead so a Sybil-style flood at cap cannot
+                // turn each inbound junk message into an outbound whisper.
+                // One whisper per RATE_LIMIT_RESET_AFTER_MS window.
+                let should_whisper = self
+                    .cap_refusal_last_whisper
+                    .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS));
+                if should_whisper {
+                    self.cap_refusal_last_whisper = Some(now);
+                }
                 return Err(Throttled {
                     wait: calculate_cooldown(0),
-                    should_whisper: true,
+                    should_whisper,
                 });
             }
         }
@@ -255,12 +289,12 @@ impl RateLimiter {
                     let mut limit = UserRateLimit::new();
                     let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
                     limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
-                    // `last_attempt_time` stays at `now` (NOT backdated): a brand
-                    // new user has just attempted their first message, so they
-                    // are not idle. Backdating this would let the very first
-                    // rejected attempt also clear violations on a phantom "idle"
-                    // window that never actually occurred.
-                    limit.last_attempt_time = now;
+                    // `last_attempt_time` is initialized to `now` by
+                    // `UserRateLimit::new`. The post-insert block below
+                    // (`user_limit.last_attempt_time = now;`) is the canonical
+                    // site that stamps every call's attempt timestamp; do not
+                    // re-assign here. Avoiding the double-write makes it
+                    // unambiguous which write a future test would pin.
                     limit
                 }),
         };

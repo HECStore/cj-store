@@ -11,7 +11,7 @@ use crate::error::StoreError;
 use crate::messages::{BotInstruction, CliMessage};
 use crate::types::ItemId;
 use crate::types::User;
-use super::super::{Store, state, utils};
+use super::super::{Store, state, trade_state, utils};
 
 /// Handle messages from the CLI
 pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Result<(), StoreError> {
@@ -392,7 +392,7 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             // resolved issue or a remaining one surfaced for the operator).
             // State divergence is rare enough that over-persisting costs
             // nothing, while under-persisting would lose the fix on crash.
-            if repair && report.repair_applied {
+            if report.repair_applied {
                 store.dirty = true;
             }
             let _ = respond_to.send(report.to_lines());
@@ -507,6 +507,15 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
             store.processing_order = false;
             store.current_trade = None;
             store.dirty = true;
+
+            // The on-disk trade-state mirror was the previous run's evidence
+            // of an in-flight trade. The operator's explicit "clear" decision
+            // means that evidence should not survive a subsequent crash —
+            // otherwise next startup mis-detects the cleared trade as a fresh
+            // interrupted-trade and emits a misleading alert.
+            if let Err(e) = trade_state::clear_persisted() {
+                warn!("[CLI-Store] Failed to clear persisted trade state after clearing stuck order: {}", e);
+            }
 
             // Persist the queue immediately (in addition to the dirty flag)
             // so a crash before the next periodic save doesn't re-strand the

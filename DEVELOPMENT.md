@@ -199,13 +199,14 @@ recovered). The usual async discipline — never hold the guard across
 - **High disk I/O every ~2 s** — the autosave debounce. Tune
   `autosave_interval_secs` if it's thrashing, but remember that raising
   it widens the crash-loss window. Per-user saves are also bounded by the
-  `Store.dirty_users` set: only UUIDs whose balance or operator flag
-  changed since the last successful save are rewritten via
-  `User::save_dirty`, so a one-player order does not rewrite every user
-  file. If you add a new code path that mutates `User.balance` or
-  `User.operator`, you must insert that UUID into `store.dirty_users`
-  right next to the mutation or the change will be dropped on the next
-  save cycle. Shutdown force-populates the set with every UUID before the
+  `Store.dirty_users` set: only UUIDs whose balance, operator flag, or
+  last-seen username changed since the last successful save are rewritten
+  via `User::save_dirty`, so a one-player order does not rewrite every
+  user file. If you add a new code path that mutates `User.balance`,
+  `User.operator`, or `User.username`, you must insert that UUID into
+  `store.dirty_users` right next to the mutation or the change will be
+  dropped on the next save cycle. (`store::utils::ensure_user_exists`
+  already does this on both the create and the username-update branches.) Shutdown force-populates the set with every UUID before the
   final flush, so terminal saves still mirror the full in-memory map.
 - **Queue stalling during bursts** — orders process one at a time. There is
   no parallelism here, intentionally.

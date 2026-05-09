@@ -42,6 +42,11 @@ pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
             },
         );
         store.dirty = true;
+        // dirty_users is the source of truth for save_dirty_in_dir — without
+        // this insert the brand-new user is silently skipped by every save
+        // until shutdown's force-extend (and is lost entirely on a crash
+        // before shutdown).
+        store.dirty_users.insert(uuid.to_string());
         debug!(uuid = uuid, username = username, "Created new user record");
     } else if let Some(user) = store.users.get_mut(uuid)
         && user.username != username {
@@ -62,6 +67,9 @@ pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
             }
             let old = std::mem::replace(&mut user.username, username.to_string());
             store.dirty = true;
+            // Same dirty-tracking obligation as the create branch: the username
+            // mutation must reach disk on the next save.
+            store.dirty_users.insert(uuid.to_string());
             debug!(
                 uuid = uuid,
                 old_username = %old,

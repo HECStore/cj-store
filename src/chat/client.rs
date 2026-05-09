@@ -535,6 +535,31 @@ pub async fn send_one(
 /// retry attempt within budget.
 const RETRY_AFTER_HINT_MAX_MS: u64 = 8_000;
 
+/// Cross-call transport-failure cooldown window. If the last observed
+/// `ClientError::Transport(_)` was within this many milliseconds, the
+/// retry layer short-circuits to `Stop` instead of burning the full
+/// per-call 30 s budget on transport-503 retries. Sustained DNS
+/// failures or connect-refused storms therefore fail fast on the second
+/// (and subsequent) caller until one call completes successfully and
+/// resets the stamp.
+const TRANSPORT_COOLDOWN_MS: u64 = 5_000;
+
+/// Wall-clock millis (since UNIX epoch) at which the most recent
+/// transport-layer failure was observed across the entire process. `0`
+/// means "no recent failure" — reset on every successful `send_one`
+/// return. Read by `call_with_retry` to decide whether to short-circuit
+/// a fresh transport error rather than re-running the exponential.
+static LAST_TRANSPORT_FAILURE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Current wall-clock millis since UNIX epoch, saturating to 0 if the
+/// system clock is before the epoch (impossible in practice).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Extract a retry-after hint (in milliseconds) from response headers.
 /// Inspects `retry-after` (decimal seconds; HTTP-date per RFC 7231
 /// §7.1.3 also accepted via `httpdate`-style parsing if present) and
@@ -564,14 +589,29 @@ fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         } else if let Ok(secs_f) = trimmed.parse::<f64>() {
             if secs_f.is_finite() && secs_f >= 0.0 {
                 let ms = (secs_f * 1_000.0) as u64;
-                bump(&mut candidate_ms, ms);
+                // Treat sub-50ms hints as "no hint" — a near-zero
+                // retry-after is indistinguishable from a clock-skew
+                // race and would cause the same 429 spiral the hint
+                // exists to prevent. Fall through to exponential.
+                if ms >= 50 {
+                    bump(&mut candidate_ms, ms);
+                }
             }
         } else if let Ok(when) = chrono::DateTime::parse_from_rfc2822(trimmed) {
             // RFC 7231 §7.1.3 HTTP-date: prefer chrono's RFC 2822
             // parser (HTTP-date is a constrained subset).
+            //
+            // Clock-skew guard: if our local clock is ahead of
+            // Anthropic's, `delta.num_seconds()` goes negative. Treat
+            // <= 0 as "no hint" so the caller falls back to the
+            // exponential schedule rather than firing immediately and
+            // re-tripping the same 429.
             let now = chrono::Utc::now();
             let delta = when.with_timezone(&chrono::Utc) - now;
-            if let Ok(secs) = u64::try_from(delta.num_seconds().max(0)) {
+            let secs_i = delta.num_seconds();
+            if secs_i > 0
+                && let Ok(secs) = u64::try_from(secs_i)
+            {
                 bump(&mut candidate_ms, secs.saturating_mul(1_000));
             }
         }
@@ -584,9 +624,16 @@ fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         if let Some(v) = headers.get(header_name).and_then(|v| v.to_str().ok())
             && let Ok(when) = chrono::DateTime::parse_from_rfc3339(v.trim())
         {
+            // Same clock-skew guard as the RFC 2822 branch: a reset
+            // timestamp in the past (or exactly now) means our clock is
+            // ahead — falling back to exponential is safer than firing
+            // a "retry now" that the server is still rate-limiting.
             let now = chrono::Utc::now();
             let delta = when.with_timezone(&chrono::Utc) - now;
-            if let Ok(secs) = u64::try_from(delta.num_seconds().max(0)) {
+            let secs_i = delta.num_seconds();
+            if secs_i > 0
+                && let Ok(secs) = u64::try_from(secs_i)
+            {
                 bump(&mut candidate_ms, secs.saturating_mul(1_000));
             }
         }
@@ -709,9 +756,40 @@ pub async fn call_with_retry(
     let mut beta_retry_used = false;
     loop {
         let beta_was_on = EXTENDED_CACHE_AVAILABLE.load(Ordering::Relaxed);
-        let res = send_one(api_key, request, use_extended_cache).await;
+        // Wrap each attempt in the remaining wall-clock budget so a stuck
+        // HTTP call (its own 15s per-attempt timeout) cannot push the
+        // total beyond the documented 30s ceiling. On outer-timeout we
+        // synthesize a transport-style error and stop — the budget is
+        // already exhausted, so further retries cannot help.
+        let remaining_for_attempt = budget.saturating_sub(started.elapsed());
+        if remaining_for_attempt.is_zero() {
+            return Err(ClientError::Transport(
+                "retry budget exhausted before next attempt".to_string(),
+            ));
+        }
+        let res = match tokio::time::timeout(
+            remaining_for_attempt,
+            send_one(api_key, request, use_extended_cache),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_) => {
+                return Err(ClientError::Transport(format!(
+                    "retry budget of {}s exhausted during attempt {}",
+                    budget.as_secs(),
+                    attempt
+                )));
+            }
+        };
         match res {
-            Ok(r) => return Ok(r),
+            Ok(r) => {
+                // Successful round-trip — clear the cross-call
+                // transport-cooldown stamp so the next caller doesn't
+                // fail-fast on a stale failure.
+                LAST_TRANSPORT_FAILURE_MS.store(0, Ordering::Relaxed);
+                return Ok(r);
+            }
             Err(e) => {
                 // One-shot beta demotion retry: if the call failed AND
                 // the beta flag was just flipped off by `send_one`, the
@@ -736,6 +814,26 @@ pub async fn call_with_retry(
                     ClientError::ModelNotFound { .. } => (404, None),
                     ClientError::BadRequest { status, .. } => (*status, None),
                     ClientError::Transport(_) => {
+                        // Cross-call cooldown: if another caller in
+                        // this process recently observed a transport
+                        // failure too, the underlying issue (DNS down,
+                        // connect refused) is sustained and running
+                        // this call's exponential schedule would just
+                        // burn ~30s before failing identically. Short-
+                        // circuit to Stop so the failure surfaces
+                        // quickly. Always record the current failure
+                        // so the *next* caller within the cooldown
+                        // window short-circuits too.
+                        let prev = LAST_TRANSPORT_FAILURE_MS.load(Ordering::Relaxed);
+                        let now_ms = now_unix_ms();
+                        LAST_TRANSPORT_FAILURE_MS.store(now_ms, Ordering::Relaxed);
+                        if prev != 0 && now_ms.saturating_sub(prev) <= TRANSPORT_COOLDOWN_MS {
+                            tracing::warn!(
+                                error = %e,
+                                "[Chat] transport-failure cooldown active — failing fast"
+                            );
+                            return Err(e);
+                        }
                         tracing::debug!(error = %e, "[Chat] treating transport error as retryable");
                         (503, None) // retryable transient
                     }
@@ -900,6 +998,12 @@ struct RateLimiterInner {
     /// One entry per accepted request, with the estimated input-token
     /// weight that was charged. Same length as `requests`.
     tokens: std::collections::VecDeque<(std::time::Instant, u32)>,
+    /// Running sum of the `u32` weights in `tokens`. Maintained
+    /// incrementally on every `push_back` (saturating add) and on every
+    /// `pop_front` during the prune loop (saturating sub) so the
+    /// `acquire` hot path doesn't have to re-sum the whole deque each
+    /// iteration. Canonical value — do NOT recompute by iterating.
+    cur_itpm: u32,
 }
 
 impl RateLimiter {
@@ -915,6 +1019,7 @@ impl RateLimiter {
                 wait_max_secs,
                 requests: std::collections::VecDeque::new(),
                 tokens: std::collections::VecDeque::new(),
+                cur_itpm: 0,
             })),
         }
     }
@@ -928,10 +1033,14 @@ impl RateLimiter {
         let started = std::time::Instant::now();
         let window = std::time::Duration::from_secs(60);
         loop {
-            let wait_max_secs;
+            // Computed wakeup target — the next moment at which the
+            // limiter state could plausibly change in our favor. Set
+            // inside the lock; awaited outside it so we don't hold the
+            // mutex across a potentially long sleep.
+            let next_event: tokio::time::Instant;
             {
                 let mut g = self.inner.lock().await;
-                wait_max_secs = g.wait_max_secs;
+                let wait_max_secs = g.wait_max_secs;
                 let now = std::time::Instant::now();
                 // Prune entries older than 60 s.
                 while let Some(&t) = g.requests.front() {
@@ -941,23 +1050,26 @@ impl RateLimiter {
                         break;
                     }
                 }
-                while let Some(&(t, _)) = g.tokens.front() {
+                while let Some(&(t, n)) = g.tokens.front() {
                     if now.duration_since(t) >= window {
                         g.tokens.pop_front();
+                        g.cur_itpm = g.cur_itpm.saturating_sub(n);
                     } else {
                         break;
                     }
                 }
                 let cur_rpm = g.requests.len() as u32;
-                let cur_itpm: u32 = g.tokens.iter().map(|(_, n)| *n).sum();
+                let cur_itpm = g.cur_itpm;
                 let rpm_ok = cur_rpm < g.rpm_max;
                 let itpm_ok = cur_itpm.saturating_add(estimated_input_tokens) <= g.itpm_max;
                 if rpm_ok && itpm_ok {
                     g.requests.push_back(now);
                     g.tokens.push_back((now, estimated_input_tokens));
+                    g.cur_itpm = g.cur_itpm.saturating_add(estimated_input_tokens);
                     return Ok(());
                 }
-                if started.elapsed() >= std::time::Duration::from_secs(wait_max_secs as u64) {
+                let wait_max = std::time::Duration::from_secs(wait_max_secs as u64);
+                if started.elapsed() >= wait_max {
                     return Err(ClientError::RateLimited {
                         reason: format!(
                             "waited {}s; rpm={}/{}, itpm={}/{} (need +{} tokens)",
@@ -970,8 +1082,34 @@ impl RateLimiter {
                         ),
                     });
                 }
+                // Compute the soonest moment the limiter might admit
+                // us: the oldest request entry's 60s anniversary, the
+                // oldest token entry's 60s anniversary, or the budget
+                // deadline — whichever comes first. This replaces the
+                // 50ms spin so the task sleeps until something actually
+                // changes (or the budget runs out).
+                let deadline = started + wait_max;
+                let mut wakeup = deadline;
+                if let Some(&t) = g.requests.front() {
+                    let exp = t + window;
+                    if exp < wakeup {
+                        wakeup = exp;
+                    }
+                }
+                if let Some(&(t, _)) = g.tokens.front() {
+                    let exp = t + window;
+                    if exp < wakeup {
+                        wakeup = exp;
+                    }
+                }
+                // Floor to "now + 1ms" so we always make forward
+                // progress even if the front entry already expired
+                // (shouldn't happen post-prune, but defensive).
+                let target = wakeup.max(now + std::time::Duration::from_millis(1));
+                next_event = tokio::time::Instant::now()
+                    + target.saturating_duration_since(now);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep_until(next_event).await;
         }
     }
 }
@@ -1918,6 +2056,9 @@ mod tests {
             g.requests.push_back(aged);
             g.tokens.clear();
             g.tokens.push_back((aged, 10));
+            // Keep the running counter in sync with the manual edit
+            // above — the prune loop will subtract on pop_front.
+            g.cur_itpm = 10;
         }
 
         // The aged entry must be pruned and the next acquire succeed.

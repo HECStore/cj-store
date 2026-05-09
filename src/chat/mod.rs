@@ -432,15 +432,18 @@ pub async fn chat_task(
                         let _ = respond_to.send(());
                     }
                     Some(ChatCommand::RunRetentionSweep { respond_to }) => {
+                        let now = chrono::Utc::now();
                         let cfg = retention::SweepConfig {
                             chat_dir: PathBuf::from(memory::CHAT_DIR),
-                            history_retention_days: 30,
-                            decisions_retention_days: 30,
-                            persona_archive_max: 10,
-                            today: chrono::Utc::now(),
+                            history_retention_days: config.history_retention_days,
+                            decisions_retention_days: config.decisions_retention_days,
+                            persona_archive_max: config.persona_archive_max,
+                            today: now,
                         };
                         let report = retention::run_sweep(&cfg);
                         info!(deleted = report.total(), "[Chat] on-demand retention sweep complete");
+                        // Record so the same-day daily sweep doesn't re-run idempotently.
+                        runtime_state.last_sweep_day = Some(now.format("%Y-%m-%d").to_string());
                         let _ = respond_to.send(report);
                     }
                     Some(ChatCommand::RunReflection { respond_to }) => {
@@ -799,8 +802,7 @@ pub async fn chat_task(
 
                         // CHAT.md — fire the retention sweep on the first
                         // event of each new UTC day, in addition to startup.
-                        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                        if retention::should_run_today(runtime_state.last_sweep_day.as_deref()) {
+                        if let Some(today) = retention::sweep_due_today(runtime_state.last_sweep_day.as_deref()) {
                             let cfg = retention::SweepConfig {
                                 chat_dir: PathBuf::from(memory::CHAT_DIR),
                                 history_retention_days: config.history_retention_days,
@@ -810,7 +812,7 @@ pub async fn chat_task(
                             };
                             let report = retention::run_sweep(&cfg);
                             info!(today = %today, deleted = report.total(), "[Chat] daily retention sweep complete");
-                            runtime_state.last_sweep_day = Some(today.clone());
+                            runtime_state.last_sweep_day = Some(today);
                         }
 
                         // CHAT.md — auto-trigger reflection when the
@@ -1996,15 +1998,25 @@ async fn process_event(
 
     // Tool context — drives every per-tool gate (sender binding, USD
     // budgets, daily caps). The sender UUID was resolved above; if
-    // resolution failed we fall back to a sentinel that no real UUID
-    // ever matches, so update_player_memory's sender-binding check
-    // fails closed (the model gets `Err("sender binding violated")`
-    // and re-plans).
-    let sender_uuid = resolved_sender_uuid
-        .clone()
-        .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
+    // resolution failed we MUST NOT dispatch the composer at all.
+    // Substituting a sentinel here would silently route per-player
+    // memory writes for every distinct unresolvable sender into the
+    // same `data/chat/players/<sentinel>.md` file (T15P1
+    // confused-deputy: every shape gate accepted the all-zeros UUID,
+    // so the sender-binding check did NOT fail closed). Bail with an
+    // auditable decisions record instead.
+    let Some(sender_uuid) = resolved_sender_uuid.clone() else {
+        decisions::write(
+            &decisions::DecisionRecord::new("uuid_unresolved")
+                .with_sender(&event.sender)
+                .with_event_ts(event.recv_at)
+                .with_reason("composer_skip: sender mojang lookup failed"),
+        );
+        return Ok(());
+    };
     let tool_ctx = tools::ToolContext {
         sender_uuid: &sender_uuid,
+        sender_username: &event.sender,
         cross_player_reads: config.cross_player_reads,
         history_max_bytes: config.tools_history_max_bytes as usize,
         update_bullet_max_chars: config.update_bullet_max_chars as usize,
@@ -2015,6 +2027,8 @@ async fn process_event(
         player_memory_max_bytes: config.player_memory_max_bytes,
         update_self_memory_today: runtime_state.update_self_memory_today,
         update_self_memory_max_per_day: config.update_self_memory_max_per_day,
+        update_player_memory_today: runtime_state.update_player_memory_today,
+        update_player_memory_max_per_day: config.update_player_memory_max_per_day,
         memory_max_inferred_bullets: config.memory_max_inferred_bullets,
         web_fetches_today: runtime_state.web_fetches_today,
         web_fetch_daily_max: config.web_fetch_daily_max,
@@ -2106,12 +2120,17 @@ async fn process_event(
     });
 
     // Tool-call counter increments. The composer's tool-use loop ran
-    // some number of `update_self_memory` and `web_fetch` calls; the
-    // tool layer doesn't mutate state.json directly so the orchestrator
-    // sums them after the fact. `run` carries the counts.
+    // some number of `update_self_memory`, `update_player_memory`, and
+    // `web_fetch` calls; the tool layer doesn't mutate state.json
+    // directly so the orchestrator sums them after the fact. `run`
+    // carries the counts.
     if run.update_self_memory_calls > 0 {
         runtime_state.update_self_memory_today =
             runtime_state.update_self_memory_today.saturating_add(run.update_self_memory_calls);
+    }
+    if run.update_player_memory_calls > 0 {
+        runtime_state.update_player_memory_today =
+            runtime_state.update_player_memory_today.saturating_add(run.update_player_memory_calls);
     }
     if run.web_fetch_calls > 0 {
         runtime_state.web_fetches_today =
@@ -2873,9 +2892,17 @@ async fn process_proactive_tick(
         return Ok(());
     }
 
-    // Resolve partner UUID for player-memory loading (best-effort: fall
-    // back to the sentinel UUID so update_player_memory's sender-binding
-    // check fails closed if the partner isn't yet known to Mojang).
+    // Resolve partner UUID for player-memory loading (best-effort: if
+    // Mojang lookup fails we substitute the all-zeros sentinel below.
+    // The sentinel UUID is rejected at every chat tool-layer shape gate
+    // (`validate_uuid`, `is_valid_uuid_shape`, the duplicated local
+    // gates in `chat::memory` / `chat::store_view::user`), so any tool
+    // call carrying it will be denied at the perimeter — including
+    // `update_player_memory`'s sender binding, which compares against
+    // `ctx.sender_uuid`. This is the proactive code path; it differs
+    // from the reactive event path (where we bail before composer
+    // dispatch on sender-uuid-unresolved) because there is no incoming
+    // sender event to drop here.
     let resolved_partner_uuid = crate::mojang::resolve_user_uuid(&partner.username)
         .await
         .ok();
@@ -2935,11 +2962,17 @@ async fn process_proactive_tick(
         cache_ttl,
     );
 
+    // Sentinel substitution: if Mojang lookup of the partner failed,
+    // we still let the proactive composer turn run (no real sender to
+    // drop here), but the sentinel UUID is rejected at every chat
+    // tool-layer shape gate so any tool dispatch carrying it is denied
+    // at the perimeter — see PART B of T15P1.
     let sender_uuid = resolved_partner_uuid
         .clone()
         .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".to_string());
     let tool_ctx = tools::ToolContext {
         sender_uuid: &sender_uuid,
+        sender_username: &partner.username,
         cross_player_reads: config.cross_player_reads,
         history_max_bytes: config.tools_history_max_bytes as usize,
         update_bullet_max_chars: config.update_bullet_max_chars as usize,
@@ -2950,6 +2983,8 @@ async fn process_proactive_tick(
         player_memory_max_bytes: config.player_memory_max_bytes,
         update_self_memory_today: runtime_state.update_self_memory_today,
         update_self_memory_max_per_day: config.update_self_memory_max_per_day,
+        update_player_memory_today: runtime_state.update_player_memory_today,
+        update_player_memory_max_per_day: config.update_player_memory_max_per_day,
         memory_max_inferred_bullets: config.memory_max_inferred_bullets,
         web_fetches_today: runtime_state.web_fetches_today,
         web_fetch_daily_max: config.web_fetch_daily_max,
@@ -3016,6 +3051,10 @@ async fn process_proactive_tick(
     if run.update_self_memory_calls > 0 {
         runtime_state.update_self_memory_today =
             runtime_state.update_self_memory_today.saturating_add(run.update_self_memory_calls);
+    }
+    if run.update_player_memory_calls > 0 {
+        runtime_state.update_player_memory_today =
+            runtime_state.update_player_memory_today.saturating_add(run.update_player_memory_calls);
     }
     if run.web_fetch_calls > 0 {
         runtime_state.web_fetches_today =

@@ -1,11 +1,58 @@
 //! Inventory management operations
 
 use azalea::BlockPos;
+use azalea::inventory::ItemStack;
 use azalea::inventory::operations::PickupClick;
 use tracing::{debug, error, info, warn};
 
 use crate::constants::HOTBAR_SLOT_0;
 use super::{Bot, shulker};
+
+/// Container slot range for the player's main inventory rows (rows 1-3).
+/// Slots 0-8 are crafting/armor; 9-35 are the main 3x9 inventory grid.
+pub const INVENTORY_RANGE: std::ops::Range<usize> = 9..36;
+
+/// Container slot range for the player's hotbar (the bottom row in the GUI).
+/// `HOTBAR_RANGE.start == HOTBAR_SLOT_0` and ends one past hotbar slot 8.
+pub const HOTBAR_RANGE: std::ops::Range<usize> = 36..45;
+
+/// Classify a container slot index into a coarse human-readable kind.
+/// Used by debug/info logging so we don't repeat the if-ladder.
+pub fn slot_kind(idx: usize) -> &'static str {
+    if idx < 9 {
+        "crafting/armor"
+    } else if idx < 36 {
+        "inventory"
+    } else if idx < 45 {
+        "hotbar"
+    } else {
+        "unknown"
+    }
+}
+
+/// Find the first empty slot in the main inventory range (9..36).
+/// Returns `None` if every inventory slot is occupied. Slots outside the
+/// snapshot length count as "empty" (treated the same as the original
+/// duplicated loops which used `unwrap_or(true)`).
+pub fn find_empty_inventory_slot(slots: &[ItemStack]) -> Option<usize> {
+    for i in INVENTORY_RANGE {
+        if slots.get(i).map(|s| s.count() == 0).unwrap_or(true) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Find the first slot anywhere in the snapshot whose item is a shulker box.
+/// Short-circuits on the first match. Returns `None` if no shulker is present.
+pub fn find_shulker_slot(slots: &[ItemStack]) -> Option<usize> {
+    for (i, slot_item) in slots.iter().enumerate() {
+        if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
+            return Some(i);
+        }
+    }
+    None
+}
 
 /// Ensure inventory is empty by dumping items to buffer chest if configured.
 ///
@@ -41,20 +88,23 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
         let slots = inv_handle
             .slots()
             .ok_or_else(|| "Inventory closed while searching for empty slot to stash cursor".to_string())?;
-        let mut placed = false;
-        for i in 9..45 {
-            if i < slots.len() && slots[i].count() == 0 {
-                inv_handle.click(azalea::inventory::operations::PickupClick::Left {
-                    slot: Some(i as u16),
-                });
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                placed = true;
-                debug!("ensure_inventory_empty: Placed cursor items in slot {}", i);
-                break;
-            }
-        }
+        // Search inventory rows first (the canonical stash location); fall back
+        // to hotbar slots if none are free, mirroring the original 9..45 sweep.
+        let stash_slot = find_empty_inventory_slot(&slots).or_else(|| {
+            // Reborrow the const range into a fresh iterator (rustc warns
+            // against `.find()` directly on a `const` because each use is a
+            // new temporary, and `.find()` takes `&mut self`).
+            let mut iter = HOTBAR_RANGE;
+            iter.find(|&i| slots.get(i).map(|s| s.count() == 0).unwrap_or(false))
+        });
 
-        if !placed {
+        if let Some(i) = stash_slot {
+            inv_handle.click(azalea::inventory::operations::PickupClick::Left {
+                slot: Some(i as u16),
+            });
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            debug!("ensure_inventory_empty: Placed cursor items in slot {}", i);
+        } else {
             warn!("ensure_inventory_empty: No empty slot for cursor items, dropping outside");
             inv_handle.click(azalea::inventory::operations::PickupClick::LeftOutside);
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -65,6 +115,10 @@ pub async fn ensure_inventory_empty(bot: &Bot) -> Result<(), String> {
             error!(
                 "ensure_inventory_empty: Failed to clear cursor - still has {}x {}",
                 cursor_after.count(), cursor_after.kind()
+            );
+            drop(inv_handle);
+            return Err(
+                "ensure_inventory_empty: cursor still non-empty after place attempt — no honest path forward".to_string(),
             );
         }
 
@@ -173,61 +227,70 @@ pub async fn move_hotbar_to_inventory(bot: &Bot) -> Result<(), String> {
             "Failed to open inventory".to_string()
         })?;
 
-    let all_slots = inv_handle
-        .slots()
-        .ok_or_else(|| {
-            error!("move_hotbar_to_inventory: Inventory closed while reading hotbar state");
-            "Inventory closed while reading hotbar state".to_string()
-        })?;
-
-    debug!("move_hotbar_to_inventory: Current hotbar state:");
-    for hotbar_idx in 36..45 {
-        if let Some(stack) = all_slots.get(hotbar_idx)
-            && stack.count() > 0 {
-                debug!("  Hotbar slot {} (idx {}): {} x{}", hotbar_idx - 36, hotbar_idx, stack.kind(), stack.count());
-            }
+    {
+        let initial_slots = inv_handle
+            .slots()
+            .ok_or_else(|| {
+                error!("move_hotbar_to_inventory: Inventory closed while reading hotbar state");
+                "Inventory closed while reading hotbar state".to_string()
+            })?;
+        debug!("move_hotbar_to_inventory: Current hotbar state:");
+        for hotbar_idx in 36..45 {
+            if let Some(stack) = initial_slots.get(hotbar_idx)
+                && stack.count() > 0 {
+                    debug!("  Hotbar slot {} (idx {}): {} x{}", hotbar_idx - 36, hotbar_idx, stack.kind(), stack.count());
+                }
+        }
     }
 
     let mut moved_count = 0;
     for hotbar_idx in 36..45 {
+        // Re-fetch the slot snapshot at the top of every iteration. azalea's
+        // `slots()` returns a freshly cloned `Vec<ItemStack>` — a snapshot
+        // taken once before the loop becomes stale after the first move
+        // (the freshly-emptied hotbar slot AND the freshly-occupied
+        // inventory slot are invisible to subsequent iterations against the
+        // stale snapshot, so iteration N+1 may pick the SAME "first empty"
+        // slot as iteration N and silently swap-overwrite the just-placed
+        // stack). The previous `let _ = inv_handle.slots();` discard at
+        // end-of-iteration was a no-op against the outer `all_slots`.
+        let all_slots = match inv_handle.slots() {
+            Some(s) => s,
+            None => {
+                warn!("move_hotbar_to_inventory: inventory closed mid-loop at hotbar_idx={}", hotbar_idx);
+                break;
+            }
+        };
         let stack = all_slots.get(hotbar_idx);
         if stack.map(|s| s.count() > 0).unwrap_or(false) {
             let item_kind = stack.map(|s| s.kind().to_string()).unwrap_or_else(|| "unknown".to_string());
             let item_count = stack.map(|s| s.count()).unwrap_or(0);
-            
-            // Find an empty slot in inventory (9-35)
-            let mut empty_slot: Option<usize> = None;
-            for inv_idx in 9..36 {
-                if all_slots.get(inv_idx).map(|s| s.count() == 0).unwrap_or(true) {
-                    empty_slot = Some(inv_idx);
-                    break;
-                }
-            }
+
+            // Find an empty slot in inventory (9-35) using the FRESH snapshot.
+            let empty_slot = find_empty_inventory_slot(&all_slots);
 
             if let Some(empty) = empty_slot {
                 debug!(
-                    "move_hotbar_to_inventory: Moving {} x{} from hotbar slot {} to inventory slot {}", 
+                    "move_hotbar_to_inventory: Moving {} x{} from hotbar slot {} to inventory slot {}",
                     item_kind, item_count, hotbar_idx, empty
                 );
-                
+
                 // Pick up item from hotbar
                 inv_handle.click(PickupClick::Left {
                     slot: Some(hotbar_idx as u16),
                 });
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                
+
                 // Place in inventory slot
                 inv_handle.click(PickupClick::Left {
                     slot: Some(empty as u16),
                 });
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                
-                // Refresh slots for next iteration
-                let _ = inv_handle.slots();
+
                 moved_count += 1;
             } else {
                 warn!(
-                    "move_hotbar_to_inventory: No empty inventory slot found for {} x{} at hotbar slot {}", 
+                    "move_hotbar_to_inventory: No empty inventory slot found for {} x{} at hotbar slot {}",
                     item_kind, item_count, hotbar_idx
                 );
             }
@@ -279,17 +342,36 @@ pub async fn quick_move_from_container(
     let after_slot = after.get(slot_index);
     let after_count = after_slot.map(|s| s.count()).unwrap_or(0);
     let after_item = after_slot.map(|s| s.kind().to_string()).unwrap_or_else(|| "None".to_string());
-    
-    let moved = (before_count - after_count).max(0);
-    
+
+    // Detect a server-side change that would make `moved` meaningless. Both
+    // checks must run before the count subtraction: we don't want to silently
+    // collapse a "slot grew" or "slot kind changed" mid-window into a
+    // benign-looking nonnegative `moved`.
+    if after_count > before_count {
+        error!(
+            "quick_move_from_container: source slot {} GREW during click ({} x{} -> {} x{})",
+            slot_index, before_item, before_count, after_item, after_count
+        );
+        return Err("source slot grew during click".to_string());
+    }
+    if before_count > 0 && after_count > 0 && before_item != after_item {
+        error!(
+            "quick_move_from_container: source slot {} kind changed during click ({} x{} -> {} x{})",
+            slot_index, before_item, before_count, after_item, after_count
+        );
+        return Err("source slot kind changed during click".to_string());
+    }
+
+    let moved = before_count - after_count;
+
     debug!(
-        "quick_move_from_container: slot {} AFTER shift-click: {} x{} (moved: {})", 
+        "quick_move_from_container: slot {} AFTER shift-click: {} x{} (moved: {})",
         slot_index, after_item, after_count, moved
     );
-    
+
     if moved == 0 && before_count > 0 {
         warn!(
-            "quick_move_from_container: shift-click moved 0 items from slot {} (had {} x{})", 
+            "quick_move_from_container: shift-click moved 0 items from slot {} (had {} x{})",
             slot_index, before_item, before_count
         );
     }
@@ -297,22 +379,60 @@ pub async fn quick_move_from_container(
     Ok(moved)
 }
 
-/// Verify that bot is holding a shulker box before placing it.
-/// Returns true if holding shulker, false otherwise.
-pub fn verify_holding_shulker(client: &azalea::Client) -> bool {
+/// Result of inspecting the bot's cursor for a shulker box.
+///
+/// The previous bool return collapsed three semantically distinct conditions
+/// into one indistinguishable signal, so callers couldn't tell whether to
+/// retry, pick up the shulker, or clear the cursor first. Each variant maps
+/// to a specific recovery branch:
+///
+/// - `EntityNotReady` — Inventory ECS component not attached yet; caller should
+///   wait via `wait_for_entity_ready` and retry.
+/// - `Empty` — Cursor genuinely empty; caller should pick up the shulker.
+/// - `HoldingShulker(kind, count)` — Cursor already holds the right thing;
+///   caller may proceed straight to placement.
+/// - `HoldingOther(kind, count)` — Cursor holds something else; caller must
+///   stash/clear the cursor before picking up the shulker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorState {
+    EntityNotReady,
+    Empty,
+    HoldingShulker(String, i32),
+    HoldingOther(String, i32),
+}
+
+/// Inspect cursor state with full disambiguation between not-ready, empty,
+/// holding-shulker, and holding-something-else. Replaces the older bool-return
+/// `verify_holding_shulker`.
+pub fn verify_holding_shulker(client: &azalea::Client) -> CursorState {
+    if !is_entity_ready(client) {
+        debug!("verify_holding_shulker: entity not ready (no Inventory component yet)");
+        return CursorState::EntityNotReady;
+    }
+
     let carried = carried_item(client);
     let item_kind = carried.kind().to_string();
-    let is_shulker = carried.count() > 0 && shulker::is_shulker_box(&item_kind);
-    
-    if is_shulker {
-        debug!("verify_holding_shulker: YES - cursor holds {} (count: {})", item_kind, carried.count());
-    } else if carried.count() > 0 {
-        debug!("verify_holding_shulker: NO - cursor holds {} (count: {}) - NOT a shulker", item_kind, carried.count());
-    } else {
-        debug!("verify_holding_shulker: NO - cursor is EMPTY");
+
+    if carried.count() == 0 {
+        debug!("verify_holding_shulker: cursor is EMPTY");
+        return CursorState::Empty;
     }
-    
-    is_shulker
+
+    if shulker::is_shulker_box(&item_kind) {
+        debug!(
+            "verify_holding_shulker: HoldingShulker - cursor holds {} (count: {})",
+            item_kind,
+            carried.count()
+        );
+        CursorState::HoldingShulker(item_kind, carried.count())
+    } else {
+        debug!(
+            "verify_holding_shulker: HoldingOther - cursor holds {} (count: {}) - NOT a shulker",
+            item_kind,
+            carried.count()
+        );
+        CursorState::HoldingOther(item_kind, carried.count())
+    }
 }
 
 /// Check if the entity's Inventory component is available (entity fully initialized).
@@ -391,13 +511,7 @@ async fn place_shulker_in_hotbar_slot_0(
                     slot_item.kind(),
                     slot_item.count()
                 );
-                let mut empty_slot: Option<usize> = None;
-                for i in 9..36 {
-                    if all_slots.get(i).map(|s| s.count() == 0).unwrap_or(true) {
-                        empty_slot = Some(i);
-                        break;
-                    }
-                }
+                let empty_slot = find_empty_inventory_slot(&all_slots);
                 if let Some(_empty) = empty_slot {
                     debug!(
                         "place_shulker_in_hotbar_slot_0: Will shift-click hotbar slot 0 to clear it (empty slot {} available)",
@@ -435,18 +549,12 @@ async fn place_shulker_in_hotbar_slot_0(
                         let all_slots2 = inv_handle2
                             .slots()
                             .ok_or_else(|| "Inventory closed".to_string())?;
-                        let mut shulker_slot: Option<usize> = None;
-                        for (i, slot_item) in all_slots2.iter().enumerate() {
-                            if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
-                                shulker_slot = Some(i);
-                                info!(
-                                    "place_shulker_in_hotbar_slot_0: Found lost shulker in slot {} after cursor loss",
-                                    i
-                                );
-                                break;
-                            }
-                        }
+                        let shulker_slot = find_shulker_slot(&all_slots2);
                         if let Some(shulker_idx) = shulker_slot {
+                            info!(
+                                "place_shulker_in_hotbar_slot_0: Found lost shulker in slot {} after cursor loss",
+                                shulker_idx
+                            );
                             info!(
                                 "place_shulker_in_hotbar_slot_0: Recovering shulker from slot {} to hotbar slot 0",
                                 shulker_idx
@@ -526,13 +634,7 @@ async fn place_shulker_in_hotbar_slot_0(
                     slot_item.kind(),
                     slot_item.count()
                 );
-                let mut empty_slot: Option<usize> = None;
-                for i in 9..36 {
-                    if all_slots.get(i).map(|s| s.count() == 0).unwrap_or(true) {
-                        empty_slot = Some(i);
-                        break;
-                    }
-                }
+                let empty_slot = find_empty_inventory_slot(&all_slots);
                 if let Some(_empty) = empty_slot {
                     debug!("place_shulker_in_hotbar_slot_0: Moving hotbar slot 0 item to slot {}", _empty);
                     inv_handle.click(PickupClick::Left { slot: Some(HOTBAR_SLOT_0 as u16) });
@@ -669,18 +771,9 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
     debug!("ensure_shulker_in_hotbar_slot_0: Scanning all slots for shulkers:");
     for (i, slot_item) in all_slots.iter().enumerate() {
         if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
-            let slot_type = if i < 9 {
-                "crafting/armor"
-            } else if i < 36 {
-                "inventory"
-            } else if i < 45 {
-                "hotbar"
-            } else {
-                "unknown"
-            };
             info!(
                 "ensure_shulker_in_hotbar_slot_0: Found shulker in {} slot {} (idx {}): {}",
-                slot_type,
+                slot_kind(i),
                 if i >= 36 { i - 36 } else { i },
                 i,
                 slot_item.kind()
@@ -716,17 +809,15 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
 
     debug!("ensure_shulker_in_hotbar_slot_0: Shulker NOT in cursor, searching inventory/hotbar");
     let all_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
-    let mut shulker_slot: Option<usize> = None;
-    for (i, slot_item) in all_slots.iter().enumerate() {
-        if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
-            shulker_slot = Some(i);
-            info!(
-                "ensure_shulker_in_hotbar_slot_0: Found shulker in slot {} ({})",
-                i,
-                slot_item.kind()
-            );
-            break;
-        }
+    let shulker_slot = find_shulker_slot(&all_slots);
+    if let Some(idx) = shulker_slot
+        && let Some(slot_item) = all_slots.get(idx)
+    {
+        info!(
+            "ensure_shulker_in_hotbar_slot_0: Found shulker in slot {} ({})",
+            idx,
+            slot_item.kind()
+        );
     }
 
     if let Some(shulker_idx) = shulker_slot {
@@ -834,29 +925,66 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
         
         // Search for shulker in ALL slots (inventory + hotbar)
         debug!("recover_shulker_to_slot_0: Searching all inventory slots for shulker");
-        let mut shulker_slot: Option<usize> = None;
-        for (i, slot_item) in all_slots.iter().enumerate() {
-            if slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
-                shulker_slot = Some(i);
-                let slot_type = if i < 9 {
-                    "crafting/armor"
-                } else if i < 36 {
-                    "inventory"
-                } else if i < 45 {
-                    "hotbar"
-                } else {
-                    "unknown"
-                };
-                info!(
-                    "recover_shulker_to_slot_0: Found shulker in {} slot {} (idx {}): {}", 
-                    slot_type, if i >= 36 { i - 36 } else { i }, i, slot_item.kind()
-                );
-                break;
-            }
+        let shulker_slot = find_shulker_slot(&all_slots);
+        if let Some(i) = shulker_slot
+            && let Some(slot_item) = all_slots.get(i)
+        {
+            info!(
+                "recover_shulker_to_slot_0: Found shulker in {} slot {} (idx {}): {}",
+                slot_kind(i),
+                if i >= 36 { i - 36 } else { i },
+                i,
+                slot_item.kind()
+            );
         }
-        
+
         if let Some(shulker_idx) = shulker_slot {
             if shulker_idx == HOTBAR_SLOT_0 {
+                // FIX T12P3: cursor state was previously unverified at this
+                // early return — if the cursor still carried a stack, dropping
+                // `inv_handle` would silently abandon it. Stash it into an
+                // empty inventory slot first.
+                let cursor = carried_item(client);
+                if cursor.count() > 0 {
+                    warn!(
+                        "recover_shulker_to_slot_0: shulker already in slot 0 but cursor holds {} x{} - stashing before return",
+                        cursor.kind(),
+                        cursor.count()
+                    );
+                    let stash_slot = find_empty_inventory_slot(&all_slots);
+                    let Some(stash) = stash_slot else {
+                        error!(
+                            "recover_shulker_to_slot_0: no empty inventory slot to stash leftover cursor stack ({} x{}) - refusing to abandon",
+                            cursor.kind(),
+                            cursor.count()
+                        );
+                        drop(inv_handle);
+                        return Err(format!(
+                            "recover_shulker_to_slot_0: cursor still holds {} x{} and no empty inventory slot available to stash",
+                            cursor.kind(),
+                            cursor.count()
+                        ));
+                    };
+                    inv_handle.click(PickupClick::Left { slot: Some(stash as u16) });
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    let cursor_after = carried_item(client);
+                    if cursor_after.count() > 0 {
+                        error!(
+                            "recover_shulker_to_slot_0: failed to clear cursor after stash to slot {} - still holds {} x{}",
+                            stash,
+                            cursor_after.kind(),
+                            cursor_after.count()
+                        );
+                        drop(inv_handle);
+                        return Err(format!(
+                            "recover_shulker_to_slot_0: cursor still holds {} x{} after stash attempt to slot {}",
+                            cursor_after.kind(),
+                            cursor_after.count(),
+                            stash
+                        ));
+                    }
+                    debug!("recover_shulker_to_slot_0: cursor stashed into slot {}", stash);
+                }
                 debug!("recover_shulker_to_slot_0: SUCCESS - Shulker is already in hotbar slot 0");
                 drop(inv_handle);
                 return Ok(());
@@ -942,3 +1070,102 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
     Err("Failed to recover shulker to hotbar slot 0 after multiple attempts".to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use azalea::registry::builtin::ItemKind;
+
+    /// Build a 45-slot synthetic inventory: 0-8 crafting/armor, 9-35 main, 36-44 hotbar.
+    fn empty_inv() -> Vec<ItemStack> {
+        vec![ItemStack::Empty; 45]
+    }
+
+    fn put(slots: &mut [ItemStack], idx: usize, kind: ItemKind, count: i32) {
+        slots[idx] = ItemStack::new(kind, count);
+    }
+
+    #[test]
+    fn slot_kind_boundaries() {
+        // 0..9 crafting/armor
+        assert_eq!(slot_kind(0), "crafting/armor");
+        assert_eq!(slot_kind(8), "crafting/armor");
+        // 9..36 inventory
+        assert_eq!(slot_kind(9), "inventory");
+        assert_eq!(slot_kind(35), "inventory");
+        // 36..45 hotbar
+        assert_eq!(slot_kind(36), "hotbar");
+        assert_eq!(slot_kind(44), "hotbar");
+        // 45+ unknown
+        assert_eq!(slot_kind(45), "unknown");
+        assert_eq!(slot_kind(usize::MAX), "unknown");
+    }
+
+    #[test]
+    fn find_empty_inventory_slot_returns_first_match() {
+        let mut slots = empty_inv();
+        // Fill 9..15 to force the first empty match to be slot 15.
+        for i in 9..15 {
+            put(&mut slots, i, ItemKind::Stone, 1);
+        }
+        assert_eq!(find_empty_inventory_slot(&slots), Some(15));
+    }
+
+    #[test]
+    fn find_empty_inventory_slot_ignores_crafting_and_hotbar() {
+        let mut slots = empty_inv();
+        // Fill the entire main inventory but leave crafting + hotbar empty.
+        for i in INVENTORY_RANGE {
+            put(&mut slots, i, ItemKind::Stone, 1);
+        }
+        // Even though slots 0-8 and 36-44 are empty, they MUST NOT be returned.
+        assert_eq!(find_empty_inventory_slot(&slots), None);
+    }
+
+    #[test]
+    fn find_empty_inventory_slot_none_when_full() {
+        let mut slots = empty_inv();
+        for i in INVENTORY_RANGE {
+            put(&mut slots, i, ItemKind::Stone, 64);
+        }
+        assert_eq!(find_empty_inventory_slot(&slots), None);
+    }
+
+    #[test]
+    fn find_empty_inventory_slot_first_in_range() {
+        let slots = empty_inv();
+        // Brand-new inventory: first empty inventory slot is exactly INVENTORY_RANGE.start.
+        assert_eq!(find_empty_inventory_slot(&slots), Some(INVENTORY_RANGE.start));
+    }
+
+    #[test]
+    fn find_shulker_slot_short_circuits_at_first_match() {
+        let mut slots = empty_inv();
+        // Place two shulkers; the helper must return the lower index.
+        put(&mut slots, 12, ItemKind::ShulkerBox, 1);
+        put(&mut slots, 30, ItemKind::RedShulkerBox, 1);
+        assert_eq!(find_shulker_slot(&slots), Some(12));
+    }
+
+    #[test]
+    fn find_shulker_slot_none_when_absent() {
+        let mut slots = empty_inv();
+        // Items present but none are shulker boxes.
+        put(&mut slots, 9, ItemKind::Stone, 64);
+        put(&mut slots, 36, ItemKind::Diamond, 32);
+        assert_eq!(find_shulker_slot(&slots), None);
+    }
+
+    #[test]
+    fn find_shulker_slot_skips_zero_count_stacks() {
+        let slots = empty_inv();
+        // Empty inventory must produce None despite kind() returning a real ItemKind for ItemStack::Empty.
+        assert_eq!(find_shulker_slot(&slots), None);
+    }
+
+    #[test]
+    fn find_shulker_slot_finds_in_hotbar() {
+        let mut slots = empty_inv();
+        put(&mut slots, HOTBAR_SLOT_0, ItemKind::ShulkerBox, 1);
+        assert_eq!(find_shulker_slot(&slots), Some(HOTBAR_SLOT_0));
+    }
+}

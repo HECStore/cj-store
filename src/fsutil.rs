@@ -97,18 +97,37 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
 /// `unix_ms` falls back to 0 from a clock error AND the sibling counter is
 /// reset — without it, `fs::rename` would silently overwrite the prior
 /// archive, destroying exactly the crash evidence the helper preserves.
+///
+/// Returns `Err(AlreadyExists)` if the bump cap is exhausted and the final
+/// candidate still exists on disk: returning the colliding path would let
+/// callers `fs::rename` onto it and silently overwrite the prior archive,
+/// the worst-of-both-worlds outcome the cap was supposed to prevent.
+///
+/// Also `fs::create_dir_all`s `parent` if it doesn't yet exist, so archive
+/// paths don't degrade silently when `data/` is missing.
 pub(crate) fn pick_archive_path(
     parent: Option<&Path>,
     base: &str,
     kind: &str,
     seq: &AtomicU64,
-) -> PathBuf {
+) -> io::Result<PathBuf> {
+    if let Some(p) = parent {
+        if !p.exists() {
+            fs::create_dir_all(p)?;
+        }
+    }
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let n = seq.fetch_add(1, Ordering::Relaxed);
-    let primary = format!("{base}.{kind}-{unix_ms}-{n}.json");
+    let primary = match parent {
+        Some(_) => format!("{base}.{kind}-{unix_ms}-{n}.json"),
+        // No parent: two distinct processes both at CWD could otherwise
+        // collide on the same primary candidate. Append the PID to give each
+        // process its own namespace before the bump loop kicks in.
+        None => format!("{base}.{kind}-{unix_ms}-{n}-pid{}.json", std::process::id()),
+    };
     let mut candidate = match parent {
         Some(p) => p.join(&primary),
         None => PathBuf::from(&primary),
@@ -116,13 +135,25 @@ pub(crate) fn pick_archive_path(
     let mut bump: u32 = 0;
     while candidate.exists() && bump < 1000 {
         bump += 1;
-        let alt = format!("{base}.{kind}-{unix_ms}-{n}-{bump}.json");
+        let alt = match parent {
+            Some(_) => format!("{base}.{kind}-{unix_ms}-{n}-{bump}.json"),
+            None => format!(
+                "{base}.{kind}-{unix_ms}-{n}-pid{}-{bump}.json",
+                std::process::id()
+            ),
+        };
         candidate = match parent {
             Some(p) => p.join(&alt),
             None => PathBuf::from(&alt),
         };
     }
-    candidate
+    if candidate.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "pick_archive_path exhausted bump suffixes",
+        ));
+    }
+    Ok(candidate)
 }
 
 /// `sync_all` an archived file (best-effort) and its parent directory on Unix.
@@ -145,6 +176,33 @@ pub(crate) fn durably_sync_archive(archived: &Path) {
     #[cfg(unix)]
     if let Some(parent) = archived.parent() {
         sync_parent_dir(parent);
+    }
+}
+
+/// Move `src` to `dst`, falling back to copy + sync + remove when `fs::rename`
+/// fails. Centralizes the rename → copy + remove dance the archive helpers in
+/// `journal.rs`, `queue.rs`, and `trade_state.rs` previously inlined, including
+/// the durability `sync_all` of the archived sibling and a single warn log on
+/// remove failure.
+///
+/// Returns `Err` only when both `fs::rename` AND the fallback `fs::copy` fail
+/// (i.e. the archive could not be created at all). A failed `fs::remove_file`
+/// of the source after a successful copy is downgraded to a warn log: the
+/// archive itself is durable, but the active path may need manual cleanup
+/// (typically a held handle on Windows).
+pub(crate) fn archive_aside(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst)?;
+            durably_sync_archive(dst);
+            if let Err(remove_err) = fs::remove_file(src) {
+                tracing::warn!(
+                    "[File] archived {src:?} -> {dst:?} but failed to remove original: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)"
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -199,6 +257,13 @@ fn rename_failed_fallback_copy(
         } else {
             format!("no prior file existed at {path:?} — this was a first write")
         };
+        // A partial copy may have created a truncated `.recovery.tmp`; the
+        // pre-call `remove_file` only cleared a *prior* stale sibling. If we
+        // leave this partial behind, the next attempt's `remove_file` clears
+        // it too — but in the interim any operator inspecting the directory
+        // would see misleading evidence. Clear it now so the failure surface
+        // is exactly the failed-rename + failed-copy report.
+        let _ = fs::remove_file(&recovery_tmp);
         tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy-to-recovery-temp={copy_err}; {prior_state}");
         return Err(io::Error::other(format!(
             "Failed to save file: rename error: {rename_err}, copy-to-recovery-temp error: {copy_err} (path: {path:?}, {prior_state})"

@@ -174,9 +174,14 @@ impl StoreError {
 /// stay grep-able from one place:
 /// - `NotFound` → `UserNotFound` (player-safe whisper, name passed through)
 /// - `InvalidShape` → `ValidationError` (player typed garbage, tell them)
-/// - everything else (network / timeout / upstream / decode) →
+/// - everything else (network / timeout / upstream / decode / rate-limited) →
 ///   `MojangNetwork` (operator-visible Display only; player gets the
-///   generic sanitized whisper from `user_message()`)
+///   generic sanitized whisper from `user_message()`). The new
+///   `RateLimited` variant routes here too so callers that want to
+///   distinguish "retry later" from "upstream broken" can match on the
+///   typed `MojangResolveError` directly *before* the conversion; once
+///   collapsed into `StoreError::MojangNetwork`, the retry-after hint is
+///   only available through the inner `Display` text.
 impl From<MojangResolveError> for StoreError {
     fn from(err: MojangResolveError) -> Self {
         match err {
@@ -189,9 +194,11 @@ impl From<MojangResolveError> for StoreError {
             other @ (MojangResolveError::NetworkTimeout
             | MojangResolveError::NetworkError
             | MojangResolveError::UpstreamError
-            | MojangResolveError::MalformedResponse) => {
+            | MojangResolveError::MalformedResponse
+            | MojangResolveError::RateLimited { .. }) => {
                 StoreError::MojangNetwork(other.to_string())
             }
         }
     }
 }
+

@@ -244,13 +244,10 @@ pub async fn handle_deposit_balance_queued(
         "Deposit balance credited"
     );
 
-    store.orders.push_back(crate::types::Order {
-        order_type: crate::types::order::OrderType::DepositBalance,
-        item: ItemId::from_normalized("diamond".to_string()),
-        amount: credited_diamonds,
-        currency_amount: 0.0,
-        user_uuid: user_uuid.clone(),
-    });
+    store.orders.push_back(crate::types::Order::deposit_balance(
+        actual_amount,
+        user_uuid.clone(),
+    ));
 
     store.trades.push(crate::types::Trade::new(
         crate::types::TradeType::DepositBalance,

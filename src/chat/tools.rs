@@ -36,8 +36,22 @@ use std::path::{Path, PathBuf};
 
 /// Canonical hyphenated UUID regex shape (the Mojang-resolved form):
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+///
+/// Defense-in-depth: the all-zeros sentinel is rejected here even
+/// though it satisfies the hyphenated-hex grammar. T15P1 — chat/mod.rs
+/// historically substituted that sentinel when Mojang sender resolution
+/// failed, and accepting it at this gate let `update_player_memory`
+/// route every distinct unresolvable sender's bullets into a single
+/// shared `data/chat/players/00000000-...000.md` file (cross-player
+/// pollution). The reactive event path now bails before composer
+/// dispatch on unresolved sender, but this gate stays as the
+/// belt-and-braces perimeter for the proactive path and any future
+/// caller.
 fn is_canonical_hyphen_uuid(s: &str) -> bool {
     if s.len() != 36 {
+        return false;
+    }
+    if s == "00000000-0000-0000-0000-000000000000" {
         return false;
     }
     let bytes = s.as_bytes();
@@ -72,14 +86,18 @@ pub fn validate_uuid(uuid: &str) -> Result<(), &'static str> {
 }
 
 /// Validate a Mojang-shape username.
+///
+/// Thin wrapper over [`crate::types::user::is_valid_username_shape`] (the
+/// single source of truth) that preserves the existing chat-tool error
+/// message API — `Result<(), &'static str>` so callers can surface the
+/// reason to the model. The two-arm split below keeps the per-rule message
+/// (length vs charset) for diagnostic clarity even though both arms now
+/// consult the same predicate.
 pub fn validate_username_shape(username: &str) -> Result<(), &'static str> {
-    if username.len() < 3 || username.len() > 16 {
-        return Err("username must be 3-16 characters");
-    }
-    if !username
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if !crate::types::user::is_valid_username_shape(username) {
+        if !(3..=16).contains(&username.len()) {
+            return Err("username must be 3-16 characters");
+        }
         return Err("username may only contain ASCII alphanumerics and underscore");
     }
     Ok(())
@@ -481,6 +499,12 @@ pub fn tool_definitions(
 pub struct ToolContext<'a> {
     /// UUID of the current event's sender (for sender-binding checks).
     pub sender_uuid: &'a str,
+    /// Username of the current event's sender. Used as the fallback when
+    /// `update_player_memory` cannot find the sender in the player index
+    /// (new player whose file hasn't been created yet). Without this,
+    /// `ensure_player_file` would be called with `"unknown"`, which corrupts
+    /// the index when two different new players both lack index entries.
+    pub sender_username: &'a str,
     /// Operator opt-in: cross-player reads.
     pub cross_player_reads: bool,
     /// Tools-history byte cap.
@@ -506,6 +530,13 @@ pub struct ToolContext<'a> {
     pub update_self_memory_today: u32,
     /// CHAT.md — daily cap for `update_self_memory` invocations.
     pub update_self_memory_max_per_day: u32,
+    /// CHAT.md — `update_player_memory` calls already made today.
+    /// Read by the tool to enforce the daily cap; the orchestrator
+    /// increments the matching state.json counter after a successful
+    /// invocation.
+    pub update_player_memory_today: u32,
+    /// CHAT.md — daily cap for `update_player_memory` invocations.
+    pub update_player_memory_max_per_day: u32,
     /// CHAT.md — bullet cap on `## Inferred` in `memory.md`. When a
     /// commit pushes past the cap, the oldest bullet(s) are moved to
     /// `memory.archive.md`.
@@ -706,12 +737,28 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
     if !is_writable_section(section) {
         return Err(format!("section '{section}' is not writable"));
     }
+
+    // Daily cap — symmetric with `update_self_memory`. Player memory is
+    // legitimately written more often per session (many players), so the
+    // cap is more generous, but still bounded.
+    if ctx.update_player_memory_today >= ctx.update_player_memory_max_per_day {
+        return Err("daily player-memory write limit reached".to_string());
+    }
+
     let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
 
     // Bootstrap the file if needed BEFORE canonicalization so the
     // players dir is guaranteed to exist on disk. The index is keyed
     // username → UUID, so the reverse lookup is an iter-find: the index
     // is small (one entry per known player) so this is fine.
+    //
+    // Use `ctx.sender_username` as the fallback when the player is not
+    // yet in the index (new player whose file hasn't been created yet).
+    // Falling back to "unknown" would corrupt the index if two distinct
+    // new players were both missing: both would get `# unknown` as their
+    // heading and the index would map `unknown → <uuid2>` (overwriting
+    // the first). `ctx.sender_username` is the authoritative name from
+    // the inbound chat event, so it is always correct for the sender.
     let username = crate::chat::memory::load_or_rebuild_index()
         .ok()
         .and_then(|idx| {
@@ -720,7 +767,7 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
                 .find(|(_, v)| v.eq_ignore_ascii_case(uuid))
                 .map(|(k, _)| k.clone())
         })
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| ctx.sender_username.to_string());
     crate::chat::memory::ensure_player_file(uuid, &username)
         .map_err(|e| format!("ensure_player_file: {e}"))?;
 
@@ -1615,7 +1662,20 @@ mod tests {
     #[test]
     fn canonical_hyphenated_uuid_accepted() {
         assert!(validate_uuid("11111111-2222-3333-4444-555555555555").is_ok());
-        assert!(validate_uuid("00000000-0000-0000-0000-000000000000").is_ok());
+    }
+
+    #[test]
+    fn all_zeros_sentinel_uuid_rejected() {
+        // The all-zeros UUID is reserved as the "no sender resolved"
+        // sentinel that chat/mod.rs historically substituted when a
+        // Mojang lookup failed. It must NEVER reach the tool layer:
+        // accepting it would let `update_player_memory` route bullets
+        // for every distinct unresolvable sender into one shared
+        // `data/chat/players/00000000-...000.md` file (T15P1
+        // cross-player pollution / confused-deputy). Defense-in-depth
+        // against future regressions where another caller forgets the
+        // bail-before-dispatch contract on the reactive path.
+        assert!(validate_uuid("00000000-0000-0000-0000-000000000000").is_err());
     }
 
     #[test]
@@ -1875,6 +1935,7 @@ mod tests {
     fn test_ctx<'a>(sender_uuid: &'a str) -> ToolContext<'a> {
         ToolContext {
             sender_uuid,
+            sender_username: "TestPlayer",
             cross_player_reads: false,
             history_max_bytes: 32_768,
             update_bullet_max_chars: 280,
@@ -1885,6 +1946,8 @@ mod tests {
             player_memory_max_bytes: 4096,
             update_self_memory_today: 0,
             update_self_memory_max_per_day: 3,
+            update_player_memory_today: 0,
+            update_player_memory_max_per_day: 10,
             memory_max_inferred_bullets: 30,
             web_fetches_today: 0,
             web_fetch_daily_max: 50,
@@ -1950,6 +2013,34 @@ mod tests {
         assert!(
             msg.contains("at cap") && msg.contains("rate-limited"),
             "unexpected error: {msg}",
+        );
+    }
+
+    // ---- update_player_memory daily cap --------------------------------
+
+    #[test]
+    fn update_player_memory_daily_cap_enforced() {
+        // When the daily cap is reached, further writes are blocked.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let uuid = "00000000-0000-0000-0000-dddddddddddd";
+        let mut ctx = test_ctx(uuid);
+        // Simulate cap already reached.
+        ctx.update_player_memory_today = 10;
+        ctx.update_player_memory_max_per_day = 10;
+        let input = json!({
+            "uuid": uuid,
+            "section": "Inferred",
+            "bullet": "this should be blocked by daily cap",
+        });
+        let res = rt.block_on(update_player_memory_tool(&input, &ctx));
+        // The file should NOT have been touched; clean up just in case.
+        let _ = std::fs::remove_file(crate::chat::memory::player_file_path(uuid));
+        assert!(res.is_err(), "expected error from daily cap, got: {res:?}");
+        assert_eq!(
+            res.unwrap_err(),
+            "daily player-memory write limit reached",
         );
     }
 

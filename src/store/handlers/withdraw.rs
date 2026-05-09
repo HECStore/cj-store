@@ -314,7 +314,11 @@ pub async fn handle_withdraw_balance_queued(
             return utils::send_message_to_player(
                 store,
                 player_name,
-                &format!("Withdraw aborted: bot response dropped: {}.{}", e, suffix),
+                &format!(
+                    "Withdraw aborted: bot response dropped: {}.{}",
+                    StoreError::BotResponseDropped(e.to_string()).user_message(),
+                    suffix
+                ),
             )
             .await;
         }
@@ -364,14 +368,18 @@ pub async fn handle_withdraw_balance_queued(
             "[Withdraw] trade-failed",
         )
         .await;
+        // The bot's trade response carries an unstructured `String` error;
+        // route it through `BotReportedError::user_message()` so any transport
+        // detail it picked up never reaches the player.
+        let safe_err = StoreError::BotReportedError(err.clone()).user_message().into_owned();
         let msg = match rb.partial_message() {
             Some(detail) => format!(
                 "Withdraw aborted: trade failed: {}. Rollback partial: {}.",
-                err, detail
+                safe_err, detail
             ),
             None => format!(
                 "Withdraw aborted: trade failed: {}. Diamonds returned to storage.",
-                err
+                safe_err
             ),
         };
         store.advance_trade(|s| s.rollback("withdraw/trade-rejected".to_string()));
@@ -395,13 +403,10 @@ pub async fn handle_withdraw_balance_queued(
         "Withdraw: decremented user balance"
     );
 
-    store.orders.push_back(crate::types::Order {
-        order_type: crate::types::order::OrderType::WithdrawBalance,
-        item: ItemId::from_normalized("diamond".to_string()),
-        amount: whole_diamonds,
-        currency_amount: 0.0,
-        user_uuid: user_uuid.clone(),
-    });
+    store.orders.push_back(crate::types::Order::withdraw_balance(
+        amount,
+        user_uuid.clone(),
+    ));
 
     store.trades.push(crate::types::Trade::new(
         crate::types::TradeType::WithdrawBalance,

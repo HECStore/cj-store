@@ -107,6 +107,12 @@ fn parse_item_amount(parts: &[&str], verb: &str) -> Result<(String, f64), String
     if !amount.is_finite() {
         return Err("Amount must be a finite number.".to_string());
     }
+    if amount <= 0.0 {
+        return Err("Amount must be positive".to_string());
+    }
+    if amount > 1_000_000.0 {
+        return Err("Amount too large. Maximum is 1,000,000.".to_string());
+    }
     Ok((item, amount))
 }
 
@@ -762,6 +768,48 @@ mod tests {
             Command::RemoveCurrency {
                 item: "cobblestone".to_string(),
                 amount: 500.0
+            }
+        );
+    }
+
+    #[test]
+    fn addcurrency_rejects_zero_amount() {
+        let err = parse_command("addcurrency diamond 0").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn addcurrency_rejects_negative_amount() {
+        let err = parse_command("addcurrency diamond -5").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn removecurrency_rejects_zero_amount() {
+        let err = parse_command("removecurrency diamond 0").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn removecurrency_rejects_negative_amount() {
+        let err = parse_command("removecurrency diamond -5").unwrap_err();
+        assert!(err.contains("positive"));
+    }
+
+    #[test]
+    fn addcurrency_rejects_amount_above_cap() {
+        // Cap mirrors `parse_pay`: 1,000,000.
+        let err = parse_command("addcurrency diamond 2000000").unwrap_err();
+        assert!(err.contains("Maximum"));
+    }
+
+    #[test]
+    fn addcurrency_accepts_amount_at_cap() {
+        assert_eq!(
+            parse_command("addcurrency diamond 1000000").unwrap(),
+            Command::AddCurrency {
+                item: "diamond".to_string(),
+                amount: 1_000_000.0
             }
         );
     }

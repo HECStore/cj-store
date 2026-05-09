@@ -128,11 +128,36 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
         store.pairs.len(), store.users.len(), store.dirty_users.len(),
         store.orders.len(), store.trades.len(), store.storage.nodes.len());
 
-    Pair::save_all(&store.pairs)?;
-    User::save_dirty(&store.users, &store.dirty_users)?;
-    Order::save_all_with_limit(&store.orders, store.config.max_orders)?;
-    Trade::save_all(&store.trades)?;
-    store.storage.save().map_err(|e| Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>)?;
+    // First-error-keep-going: attempt all five sub-saves regardless of which
+    // one fails first, then surface the first error to the caller. The bare
+    // `?`-early-exit pattern stranded later sub-saves on an early failure
+    // (e.g. a Pair-side ENOSPC silently lost the User/Order/Trade/Storage
+    // updates from the same tick), and because the autosave loop keeps
+    // `dirty = true` on Err the same chain re-ran the same first slot
+    // forever — wasted work and biased recovery toward the first slot.
+    type DynErr = Box<dyn std::error::Error + Send + Sync>;
+    let mut first_err: Option<DynErr> = None;
+    let record = |label: &'static str, r: Result<(), DynErr>, sink: &mut Option<DynErr>| {
+        if let Err(e) = r {
+            tracing::error!(target_save = label, error = %e, "save sub-step failed; continuing with remaining sub-saves");
+            if sink.is_none() {
+                *sink = Some(e);
+            }
+        }
+    };
+    record("pairs", Pair::save_all(&store.pairs).map_err(|e| Box::new(e) as DynErr), &mut first_err);
+    record("users", User::save_dirty(&store.users, &store.dirty_users).map_err(|e| Box::new(e) as DynErr), &mut first_err);
+    record("orders", Order::save_all_with_limit(&store.orders, store.config.max_orders).map_err(|e| Box::new(e) as DynErr), &mut first_err);
+    record("trades", Trade::save_all(&store.trades).map_err(|e| Box::new(e) as DynErr), &mut first_err);
+    record(
+        "storage",
+        store.storage.save().map_err(|e| Box::new(std::io::Error::other(e.to_string())) as DynErr),
+        &mut first_err,
+    );
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
 
     tracing::info!(
         pairs = store.pairs.len(),
@@ -149,8 +174,9 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
 ///
 /// `issues` is the plain list of problems found (safe-to-repair issues are
 /// removed from this list when `repair=true` and the fix succeeded).
-/// `repair_applied` is `true` iff `audit_state` was called with `repair=true`;
-/// callers use it to decide whether to persist the store. Keeping the two
+/// `repair_applied` is `true` iff at least one repair was actually performed
+/// (not merely that `repair=true` was passed — a clean run with `repair=true`
+/// leaves it `false`). Callers use it to decide whether to persist the store. Keeping the two
 /// fields separate avoids the old fragile coupling where repair status was
 /// smuggled as a "Repair applied..." string at position 0 of the vec.
 #[derive(Debug, Clone, Default)]
@@ -277,7 +303,7 @@ pub fn audit_state(store: &mut Store, repair: bool) -> AuditReport {
         warn!(item = %item, before, after, "audit repaired pair item_stock drift");
     }
 
-    AuditReport { issues, repair_applied: repair }
+    AuditReport { issues, repair_applied: !repairs.is_empty() }
 }
 
 /// Assert store invariants, optionally repairing issues.

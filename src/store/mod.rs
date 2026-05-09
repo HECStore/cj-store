@@ -122,20 +122,35 @@ impl Store {
         // data/ don't mistake it for live state.
         let orders_file = std::path::Path::new(crate::types::order::ORDERS_FILE);
         if orders_file.exists() {
-            let count = std::fs::read_to_string(orders_file)
-                .ok()
-                .and_then(|s| serde_json::from_str::<std::collections::VecDeque<Order>>(&s).ok())
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let (count, was_corrupt) = match std::fs::read_to_string(orders_file) {
+                Ok(s) => match serde_json::from_str::<std::collections::VecDeque<Order>>(&s) {
+                    Ok(v) => (v.len(), false),
+                    Err(parse_err) => {
+                        warn!(
+                            "orders.json exists but could not be parsed ({}); treating as 0 orders before clearing",
+                            parse_err
+                        );
+                        (0, true)
+                    }
+                },
+                Err(_) => (0, false),
+            };
             let age_secs = std::fs::metadata(orders_file)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .map(|d| d.as_secs());
             match age_secs {
+                Some(secs) if was_corrupt => warn!(
+                    "Clearing corrupt orders.json from previous session (file last modified {}s ago)",
+                    secs
+                ),
                 Some(secs) => warn!(
                     "Clearing {} pending order(s) from previous session (file last modified {}s ago)",
                     count, secs
+                ),
+                None if was_corrupt => warn!(
+                    "Clearing corrupt orders.json from previous session"
                 ),
                 None => warn!(
                     "Clearing {} pending order(s) from previous session",
@@ -302,6 +317,12 @@ impl Store {
         info!("Store started (autosave every {}s)", self.config.autosave_interval_secs);
         let mut last_save = tokio::time::Instant::now();
         let mut last_cleanup = tokio::time::Instant::now();
+        // Throttle repeated autosave-failure log lines so a persistent ENOSPC
+        // or permissions issue doesn't flood the log at one error per
+        // autosave_interval_secs. We still retry every interval (to flush as
+        // soon as the condition clears), but only log once per 10 minutes.
+        let mut last_save_error_logged: Option<tokio::time::Instant> = None;
+        let save_error_log_interval = tokio::time::Duration::from_secs(600);
         let cleanup_interval = tokio::time::Duration::from_secs(crate::constants::CLEANUP_INTERVAL_SECS);
         let rate_limit_stale_after = std::time::Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS);
         // Re-read each iteration so hot-reload of `autosave_interval_secs`
@@ -344,9 +365,15 @@ impl Store {
             // cadence even with zero inbound traffic.
             if self.dirty && last_save.elapsed() >= min_save_interval {
                 if let Err(e) = state::save(&mut self) {
-                    error!("[Store] Autosave failed: {}", e);
+                    let should_log = last_save_error_logged
+                        .map_or(true, |t| t.elapsed() >= save_error_log_interval);
+                    if should_log {
+                        error!("[Store] Autosave failed (will retry every {}s, logging every 10min): {}", min_save_interval.as_secs(), e);
+                        last_save_error_logged = Some(tokio::time::Instant::now());
+                    }
                 } else {
                     last_save = tokio::time::Instant::now();
+                    last_save_error_logged = None;
                     self.dirty = false;
                     self.dirty_users.clear();
                 }
@@ -388,9 +415,15 @@ impl Store {
                 // cannot be lost to a crash before the next debounced autosave.
                 if self.dirty {
                     if let Err(e) = state::save(&mut self) {
-                        error!("[Store] Autosave failed: {}", e);
+                        let should_log = last_save_error_logged
+                            .map_or(true, |t| t.elapsed() >= save_error_log_interval);
+                        if should_log {
+                            error!("[Store] Post-order save failed (logging every 10min): {}", e);
+                            last_save_error_logged = Some(tokio::time::Instant::now());
+                        }
                     } else {
                         last_save = tokio::time::Instant::now();
+                        last_save_error_logged = None;
                         self.dirty = false;
                         self.dirty_users.clear();
                     }

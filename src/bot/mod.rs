@@ -423,8 +423,7 @@ pub async fn bot_task(
     // bot can proceed with fresh operations.
     let journal = match crate::store::journal::Journal::load() {
         Ok((journal, leftover)) => {
-            let had_leftover = leftover.is_some();
-            if let Some(entry) = leftover {
+            if let Some(entry) = &leftover {
                 error!(
                     "[Bot] Crash recovery: previous run left an in-flight shulker op: op_id={} type={:?} chest_id={} slot={} state={:?} — manual reconciliation recommended",
                     entry.operation_id,
@@ -435,16 +434,29 @@ pub async fn bot_task(
                 );
             }
             let shared = std::sync::Arc::new(parking_lot::Mutex::new(journal));
-            if had_leftover {
-                match shared.lock().archive_leftover() {
+            if let Some(entry) = leftover {
+                let mut guard = shared.lock();
+                match guard.archive_leftover() {
                     Ok(path) => error!(
                         "[Bot] Quarantined leftover journal to {:?} — preserve for operator review",
                         path
                     ),
-                    Err(e) => warn!(
-                        "[Bot] Failed to archive leftover journal: {} — entry remains on disk",
-                        e
-                    ),
+                    Err(e) => {
+                        // Both rename and copy+remove fallback failed. The loader
+                        // already cleared the in-memory entry, so without this
+                        // restore the next `begin()` would silently persist `[]`
+                        // and overwrite the on-disk forensic record we just
+                        // failed to move aside. Re-attaching the entry routes
+                        // the next `begin()` through the "overwriting stale
+                        // entry" warning path and re-persists the same single
+                        // entry, preserving the operation_id/state for an
+                        // operator.
+                        guard.restore_leftover(entry);
+                        warn!(
+                            "[Bot] Failed to archive leftover journal: {} — entry will be re-persisted on next begin()",
+                            e
+                        );
+                    }
                 }
             }
             shared
@@ -495,9 +507,14 @@ pub async fn bot_task(
 
     let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
     // Exponential backoff for reconnect attempts: starts at 2s, doubles on each failure,
-    // capped at 60s. Reset to 2s on successful reconnect.
+    // capped at 60s. Reset to 2s ONLY when the just-dropped connection had been alive
+    // for at least `MIN_STABLE_FOR_RESET` — a server that admits the bot at handshake
+    // but kicks it within seconds (premium-only check, region restriction, plugin
+    // grace period, kicked-on-join) would otherwise flap forever at the 2s floor.
     let mut backoff = tokio::time::Duration::from_secs(2);
     let max_backoff = tokio::time::Duration::from_secs(60);
+    let backoff_floor = tokio::time::Duration::from_secs(2);
+    let min_stable_for_reset = tokio::time::Duration::from_secs(60);
     // Initialize last_attempt in the past so the first reconnect check can fire immediately.
     let mut last_attempt = tokio::time::Instant::now() - backoff;
     // Edge-detect connect→disconnect transitions so we fire
@@ -507,6 +524,12 @@ pub async fn bot_task(
     // loop is the only place with both visibility into the transition
     // and the channel handle.
     let mut was_connected = false;
+    // Stamp set on the disconnect→connect rising edge (Event::Init has populated
+    // bot.client). Read on the connect→disconnect falling edge to decide whether
+    // the just-completed session was stable enough to warrant resetting backoff
+    // to its floor. `None` = we have not seen a connected state since the last
+    // backoff escalation.
+    let mut connected_since: Option<tokio::time::Instant> = None;
 
     // Main event loop (+ periodic reconnect checks)
     'outer: loop {
@@ -521,14 +544,42 @@ pub async fn bot_task(
                 // Fire BotDisconnected on the connect→disconnect edge,
                 // not every tick — chat would otherwise see the same
                 // signal once per second while we wait for reconnect.
-                if was_connected && disconnected
-                    && let Some(tx) = &bot.chat_cmd_tx
-                    && let Err(e) = tx.try_send(ChatCommand::BotDisconnected)
-                {
-                    debug!(
-                        "[Bot] BotDisconnected signal not delivered to chat: {} (chat task may be down)",
-                        e
-                    );
+                if was_connected && disconnected {
+                    if let Some(tx) = &bot.chat_cmd_tx
+                        && let Err(e) = tx.try_send(ChatCommand::BotDisconnected)
+                    {
+                        debug!(
+                            "[Bot] BotDisconnected signal not delivered to chat: {} (chat task may be down)",
+                            e
+                        );
+                    }
+                    // Falling edge: decide whether the just-ended session was
+                    // stable enough to forgive prior failures. A flap that
+                    // never crossed the stability threshold keeps the existing
+                    // (escalated) backoff so we don't hammer a server that
+                    // admits then immediately kicks us.
+                    if let Some(since) = connected_since.take() {
+                        let uptime = since.elapsed();
+                        if uptime >= min_stable_for_reset {
+                            backoff = backoff_floor;
+                            info!(
+                                uptime_secs = uptime.as_secs(),
+                                "[Bot] connection considered stable, backoff floor reset"
+                            );
+                        } else {
+                            warn!(
+                                uptime_secs = uptime.as_secs(),
+                                backoff_secs = backoff.as_secs(),
+                                "[Bot] connection dropped before stable threshold; keeping escalated backoff"
+                            );
+                        }
+                    }
+                }
+                // Rising edge: stamp the moment we first observe a live
+                // client handle (Event::Init has fired). Used by the next
+                // falling edge to gate the backoff reset above.
+                if !was_connected && !disconnected {
+                    connected_since = Some(tokio::time::Instant::now());
                 }
                 was_connected = !disconnected;
                 if disconnected && last_attempt.elapsed() >= backoff {
@@ -556,8 +607,13 @@ pub async fn bot_task(
                             tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS)).await;
                         }
                         if ok {
-                            // Successful reconnect: reset backoff to the initial floor.
-                            backoff = tokio::time::Duration::from_secs(2);
+                            // Successful handshake: do NOT reset backoff yet — a
+                            // server that kicks us within seconds (premium check,
+                            // region restriction, plugin grace period) would
+                            // otherwise flap forever at the floor. The reset
+                            // decision is deferred to the connect→disconnect
+                            // edge above, where `connected_since.elapsed()` is
+                            // compared against the stability threshold.
                             info!("Bot reconnected");
 
                             // CRITICAL: Wait for Azalea to fully initialize all entity components

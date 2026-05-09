@@ -16,9 +16,13 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+#[cfg(not(test))]
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+#[cfg(not(test))]
+use tokio::sync::Notify;
 use tracing::debug;
 
 use crate::constants::UUID_CACHE_TTL_SECS;
@@ -29,27 +33,72 @@ use crate::types::User;
 /// Map of lowercased username -> (uuid, lookup timestamp).
 type UuidCache = HashMap<String, (String, Instant)>;
 
-/// Global UUID cache for Mojang API lookups. TTL-expiry only — stale entries
-/// are rejected on read and pruned periodically by [`cleanup_uuid_cache`].
+/// Hard cap on `UUID_CACHE` entries. TTL-only eviction lets a long-running
+/// bot (weeks of uptime, hundreds of distinct interactors per day) grow the
+/// cache unbounded between `cleanup_uuid_cache` cycles. The cap forces a
+/// best-effort cleanup pass + oldest-entry eviction at insert time so the
+/// resident set stays bounded even if cleanup never runs.
+///
+/// 4096 entries × ~80 bytes each (key string + UUID + Instant) ≈ 320 KiB —
+/// orders of magnitude larger than any realistic active-player set on a
+/// single-server bot, but small enough that even adversarial username
+/// flooding can't OOM the process.
+#[cfg(not(test))]
+const MAX_UUID_CACHE_ENTRIES: usize = 4096;
+
+/// Global UUID cache for Mojang API lookups. TTL-expiry on read AND a
+/// hard size cap on insert — stale entries are rejected on read and pruned
+/// periodically by [`cleanup_uuid_cache`]; oversized maps trigger an
+/// opportunistic cleanup + oldest-entry eviction inline.
 static UUID_CACHE: OnceLock<Mutex<UuidCache>> = OnceLock::new();
 
 fn uuid_cache() -> &'static Mutex<UuidCache> {
     UUID_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Per-key in-flight coordinator for `resolve_user_uuid`.
+///
+/// Without this, N concurrent resolutions of the same uncached username each
+/// fire an independent HTTPS request to api.mojang.com (the cache-miss read
+/// at the top of the function and the network call further down are not
+/// atomic — every racing task observes the miss and proceeds). With it, the
+/// first task to miss inserts a `Notify` for that lowercased key, every
+/// subsequent task that misses with an existing `Notify` parks on
+/// `notified()`, and the leader broadcasts via `notify_waiters()` once it
+/// has populated the cache. Followers then re-check the cache and return
+/// the freshly-inserted entry.
+///
+/// Keyed off the lowercased ASCII username — same key as `UUID_CACHE` so a
+/// `Steve` / `steve` collision coalesces too.
+///
+/// `LazyLock` (not `OnceLock` + getter) because there are no cyclic init
+/// dependencies and the closure form is read-only after first access.
+#[cfg(not(test))]
+static IN_FLIGHT: LazyLock<Mutex<HashMap<String, Arc<Notify>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Resolve a Minecraft username to a canonical hyphenated Mojang UUID.
 ///
 /// Lookups are cached for `UUID_CACHE_TTL_SECS` (default 5 minutes). Repeated
 /// calls for the same player reuse the cached UUID instead of hitting the
 /// Mojang API on every interaction. Cache keys are lowercased so `Steve` and
-/// `steve` share an entry.
+/// `steve` share an entry. Concurrent calls for the same uncached username
+/// are coalesced via a per-key `Notify` so only one HTTPS round-trip ever
+/// fires per (lowercased) name even under thundering-herd load.
 ///
 /// Returns a typed [`MojangResolveError`] so call sites can route each
 /// failure mode to a sanitized `StoreError` (`UserNotFound` /
 /// `ValidationError` / `MojangNetwork`) without ever stringifying a
 /// `reqwest::Error` into a player-facing whisper. Chat-layer callers that
 /// still want a `String` should rely on the `Display` impl, which is short
-/// and entirely author-controlled — or call [`resolve_user_uuid_string`].
+/// and entirely author-controlled.
+///
+/// **Test-build behavior**: under `#[cfg(test)]` the `UUID_CACHE` is
+/// bypassed entirely and every call recomputes the deterministic fixture
+/// UUID from the username. Tests that need to observe cache behavior
+/// (insert/read, TTL expiry, cleanup) must operate on the cache directly
+/// via `uuid_cache()` / `clear_uuid_cache()`; calling this function from a
+/// test will neither populate nor consult the cache.
 pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveError> {
     #[cfg(test)]
     {
@@ -62,12 +111,8 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveEr
         // a non-ASCII or out-of-range username matches the production branch's
         // error path instead of silently producing a multi-byte trailing
         // segment that would violate the canonical 36-char UUID contract.
-        if username.len() < 3
-            || username.len() > 16
-            || !username
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
+        // Delegates to the single-source-of-truth predicate in `types::user`.
+        if !crate::types::user::is_valid_username_shape(username) {
             return Err(MojangResolveError::NotFound {
                 username: username.to_string(),
             });
@@ -96,12 +141,8 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveEr
         // username can't pollute the cache or burn a Mojang round-trip.
         // `User::get_uuid_async` runs the same check before URL construction;
         // doing it here too means even cache hits/misses see only valid keys.
-        if username.len() < 3
-            || username.len() > 16
-            || !username
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
+        // Delegates to the single-source-of-truth predicate in `types::user`.
+        if !crate::types::user::is_valid_username_shape(username) {
             return Err(MojangResolveError::InvalidShape);
         }
         // After the shape gate the username is ASCII, so `to_ascii_lowercase`
@@ -127,11 +168,106 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveEr
             }
         }
 
-        let uuid = User::get_uuid_async(username).await?;
+        // Single-flight coalescing: if another task is already resolving
+        // the same lowercased name, park on its `Notify` and re-check the
+        // cache when it broadcasts. Otherwise install our own `Notify`,
+        // do the fetch, then remove the entry and `notify_waiters()` so
+        // every parked follower wakes and re-reads the cache. Critically,
+        // the `IN_FLIGHT` lock is dropped BEFORE every `await` —
+        // `parking_lot::Mutex` is sync; holding it across an `.await`
+        // would deadlock the runtime if a follower were polled on the
+        // same worker thread that needs the same lock, AND the
+        // MutexGuard is not `Send` so the surrounding future would
+        // become non-`Send` (breaking `tokio::spawn`).
+        //
+        // The two arms are split into a leader path and a follower path.
+        // Each computes its `Notify` (or absence) inside a tight inner
+        // scope so the `MutexGuard` cannot be carried into the `.await`
+        // by NLL — even a "this binding might be used later" analysis is
+        // foreclosed by the early `return`/binding-out-of-scope.
+        enum SingleFlight {
+            Leader,
+            FollowerOf(Arc<Notify>),
+        }
+        let role = {
+            let mut inflight = IN_FLIGHT.lock();
+            if let Some(notify) = inflight.get(&key) {
+                SingleFlight::FollowerOf(Arc::clone(notify))
+            } else {
+                inflight.insert(key.clone(), Arc::new(Notify::new()));
+                SingleFlight::Leader
+            }
+        };
+
+        let leader = match role {
+            SingleFlight::FollowerOf(notify) => {
+                debug!(username = username, "UUID coalesced behind in-flight resolve");
+                notify.notified().await;
+                // Leader has populated the cache (or failed). Re-read
+                // the cache; on a leader-success we get a fresh hit,
+                // on a leader-failure we fall through and try ourselves
+                // — which is the right semantics: the leader's typed
+                // error is not stored in the cache, and the follower
+                // shouldn't synthesize a sibling's error.
+                let hit = {
+                    let cache = uuid_cache().lock();
+                    cache.get(&key).and_then(|(uuid, ts)| {
+                        if ts.elapsed() < ttl { Some(uuid.clone()) } else { None }
+                    })
+                };
+                if let Some(uuid) = hit {
+                    return Ok(uuid);
+                }
+                false
+            }
+            SingleFlight::Leader => true,
+        };
+
+        let result = User::get_uuid_async(username).await;
+
+        if leader {
+            // Remove our in-flight entry first, then notify, so any
+            // follower that wakes immediately and races to re-take the
+            // in-flight lock won't observe a stale `Notify` for a leader
+            // that already completed.
+            let notify = {
+                let mut inflight = IN_FLIGHT.lock();
+                inflight.remove(&key)
+            };
+            if let Some(notify) = notify {
+                notify.notify_waiters();
+            }
+        }
+
+        let uuid = result?;
         debug!(username = username, uuid = %uuid, "UUID fetched from Mojang");
 
         {
             let mut cache = uuid_cache().lock();
+            // Cap enforcement: if we're at the limit, run an
+            // opportunistic TTL sweep first; if still at the cap, evict
+            // the single oldest entry by `inserted_at`. Bounds the
+            // resident set to MAX_UUID_CACHE_ENTRIES even if
+            // `cleanup_uuid_cache` never runs. The min-by-key sweep is
+            // O(N) but only triggered at the cap (4096 entries), not on
+            // the hot path.
+            if cache.len() >= MAX_UUID_CACHE_ENTRIES {
+                let now = Instant::now();
+                cache.retain(|_, (_, inserted)| now.duration_since(*inserted) < ttl);
+                if cache.len() >= MAX_UUID_CACHE_ENTRIES
+                    && let Some(oldest_key) = cache
+                        .iter()
+                        .min_by_key(|(_, (_, inserted))| *inserted)
+                        .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                    debug!(
+                        evicted = %oldest_key,
+                        cap = MAX_UUID_CACHE_ENTRIES,
+                        "UUID cache at cap, evicted oldest entry"
+                    );
+                }
+            }
             cache.insert(key, (uuid.clone(), Instant::now()));
         }
 

@@ -1310,22 +1310,56 @@ async fn place_shulker_on_station(
 
     // Verify the bot is currently holding a shulker; fall back to an explicit
     // inventory-open click on hotbar slot 0 if the initial ensure didn't surface it.
-    if !super::inventory::verify_holding_shulker(&client) {
-        let inv_handle = client
-            .open_inventory()
-            .ok_or_else(|| "Failed to open inventory".to_string())?;
-        inv_handle.click(PickupClick::Left {
-            slot: Some(HOTBAR_SLOT_0 as u16),
-        });
-        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
-        drop(inv_handle);
-        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
+    use super::inventory::CursorState;
+    match super::inventory::verify_holding_shulker(&client) {
+        CursorState::HoldingShulker(_, _) => {
+            // Already holding the shulker, fall through to placement below.
+        }
+        initial_state => {
+            // Branch on the failure mode so we don't blindly click on top of
+            // a non-empty cursor (which would swap an unrelated stack into
+            // hotbar slot 0) or retry while the entity isn't even ready.
+            match &initial_state {
+                CursorState::EntityNotReady => {
+                    warn!(
+                        "place_shulker_on_station: entity not ready before pickup attempt; waiting"
+                    );
+                    super::inventory::wait_for_entity_ready(&client).await?;
+                }
+                CursorState::HoldingOther(kind, count) => {
+                    warn!(
+                        "place_shulker_on_station: cursor holds non-shulker {} x{} before pickup; clearing inventory first",
+                        kind, count
+                    );
+                    super::inventory::ensure_inventory_empty(bot).await?;
+                }
+                CursorState::Empty => {
+                    debug!(
+                        "place_shulker_on_station: cursor empty after ensure; will retry pickup from hotbar slot 0"
+                    );
+                }
+                CursorState::HoldingShulker(_, _) => unreachable!(),
+            }
 
-        if !super::inventory::verify_holding_shulker(&client) {
-            return Err(format!(
-                "Bot is not holding shulker before placing on station ({} slot {})",
-                context_label, slot_idx
-            ));
+            let inv_handle = client
+                .open_inventory()
+                .ok_or_else(|| "Failed to open inventory".to_string())?;
+            inv_handle.click(PickupClick::Left {
+                slot: Some(HOTBAR_SLOT_0 as u16),
+            });
+            tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
+            drop(inv_handle);
+            tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
+
+            match super::inventory::verify_holding_shulker(&client) {
+                CursorState::HoldingShulker(_, _) => {}
+                final_state => {
+                    return Err(format!(
+                        "Bot is not holding shulker before placing on station ({} slot {}): {:?}",
+                        context_label, slot_idx, final_state
+                    ));
+                }
+            }
         }
     }
 
@@ -1451,18 +1485,17 @@ async fn finish_shulker_round_trip(
     };
 
     // Journal: shulker is back in its chest slot; round-trip complete.
+    // Use the atomic `complete_with_state` so on disk we never see the
+    // intermediate `ShulkerReplaced` state — a crash between an `advance`
+    // and a `complete` would otherwise violate the journal's invariant
+    // that "only truly in-flight entries remain" on disk.
     {
-        let (advance_res, complete_res) = tokio::task::block_in_place(|| {
+        let res = tokio::task::block_in_place(|| {
             let mut j = bot.journal.lock();
-            let a = j.advance(JournalState::ShulkerReplaced);
-            let c = j.complete();
-            (a, c)
+            j.complete_with_state(JournalState::ShulkerReplaced)
         });
-        if let Err(e) = advance_res {
-            warn!("[Journal] advance(ShulkerReplaced) failed: {}", e);
-        }
-        if let Err(e) = complete_res {
-            warn!("[Journal] complete failed: {}", e);
+        if let Err(e) = res {
+            warn!("[Journal] complete_with_state(ShulkerReplaced) failed: {}", e);
         }
     }
 

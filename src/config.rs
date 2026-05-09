@@ -170,6 +170,8 @@ pub struct ChatConfig {
     pub update_bullet_max_chars: u32,
     #[serde(default = "default_chat_update_self_memory_max_per_day")]
     pub update_self_memory_max_per_day: u32,
+    #[serde(default = "default_chat_update_player_memory_max_per_day")]
+    pub update_player_memory_max_per_day: u32,
     #[serde(default = "default_chat_memory_max_inferred_bullets")]
     pub memory_max_inferred_bullets: u32,
 
@@ -364,6 +366,7 @@ impl Default for ChatConfig {
             player_memory_max_bytes: default_chat_player_memory_max_bytes(),
             update_bullet_max_chars: default_chat_update_bullet_max_chars(),
             update_self_memory_max_per_day: default_chat_update_self_memory_max_per_day(),
+            update_player_memory_max_per_day: default_chat_update_player_memory_max_per_day(),
             memory_max_inferred_bullets: default_chat_memory_max_inferred_bullets(),
             composer_rpm_max: default_chat_composer_rpm_max(),
             classifier_rpm_max: default_chat_classifier_rpm_max(),
@@ -445,6 +448,7 @@ fn default_chat_adjustments_max_bullets() -> u32 { 50 }
 fn default_chat_player_memory_max_bytes() -> u32 { 4096 }
 fn default_chat_update_bullet_max_chars() -> u32 { 280 }
 fn default_chat_update_self_memory_max_per_day() -> u32 { 3 }
+fn default_chat_update_player_memory_max_per_day() -> u32 { 10 }
 fn default_chat_memory_max_inferred_bullets() -> u32 { 30 }
 fn default_chat_composer_rpm_max() -> u32 { 20 }
 fn default_chat_classifier_rpm_max() -> u32 { 40 }

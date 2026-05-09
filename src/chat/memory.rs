@@ -53,8 +53,14 @@ pub fn player_file_path(uuid: &str) -> PathBuf {
 /// duplicated copies of this check (here, `chat::store_view::user`,
 /// `chat::tools`) per the chat-independence rationale documented at
 /// `chat/store_view/user.rs:40-48`. Do NOT factor this out.
+///
+/// The all-zeros sentinel is rejected here as defense-in-depth against
+/// T15P1 — see the parallel comment in `chat::tools::is_canonical_hyphen_uuid`.
 fn is_canonical_hyphen_uuid(s: &str) -> bool {
     if s.len() != 36 {
+        return false;
+    }
+    if s == "00000000-0000-0000-0000-000000000000" {
         return false;
     }
     let bytes = s.as_bytes();
@@ -337,18 +343,22 @@ pub fn operator_trust3_expired(player_md: &str) -> bool {
 /// derive Trust 1/2.
 ///
 /// `partner_username_lc` is the username the bot was talking WITH (the
-/// player whose trust we're computing) — callers pre-lowercase it so the
-/// inner comparator is case-insensitive against the original-case `target`
-/// field on disk.
+/// player whose trust we're computing) — used ONLY as a cheap byte
+/// prefilter to skip history lines that obviously aren't about this
+/// partner before paying the JSON parse cost. The authoritative match
+/// is UUID-only: a record counts iff its `target_uuid` field equals
+/// `target_uuid`. The username arm was deliberately removed (T15P1
+/// bonus tightening) because Mojang names are mutable — when player A
+/// adopts player B's old handle, every historical record targeted at
+/// "B" would silently roll into A's trust ladder. UUIDs are immutable,
+/// so UUID-only matching is the only stable identity boundary.
 ///
-/// Records are JSON lines under `<history_dir>/<YYYY-MM-DD>.jsonl`. A
-/// record matches if its `target_uuid` equals `target_uuid`, OR its
-/// `target` field equals `partner_username_lc` (case-insensitive). Any of
-/// `bot_out`, `bot_chat`, or `bot_whisper` count as a bot-output record
-/// — CHAT.md describes the conceptual kind as `bot_out`, but the writer
-/// emits the more specific `bot_chat`/`bot_whisper` labels for log
-/// readability. Treating all three uniformly here keeps the trust
-/// ladder from being silently pinned at 0.
+/// Records are JSON lines under `<history_dir>/<YYYY-MM-DD>.jsonl`.
+/// Any of `bot_out`, `bot_chat`, or `bot_whisper` count as a bot-output
+/// record — CHAT.md describes the conceptual kind as `bot_out`, but
+/// the writer emits the more specific `bot_chat`/`bot_whisper` labels
+/// for log readability. Treating all three uniformly here keeps the
+/// trust ladder from being silently pinned at 0.
 pub fn count_interactions_for_uuid(
     history_dir: &Path,
     target_uuid: &str,
@@ -379,7 +389,9 @@ pub fn count_interactions_for_uuid(
             // history lines that aren't bot output addressed to the
             // partner. The line must contain `"kind":"bot_` AND either
             // the lowercased partner username (case-insensitive) or the
-            // partner's UUID, before we pay the JSON parse cost.
+            // partner's UUID, before we pay the JSON parse cost. The
+            // username branch is a cheap PARSE-OPTIMIZATION ONLY — the
+            // authoritative match below is UUID-only.
             let bytes = line.as_bytes();
             if !contains_bytes(bytes, kind_marker) {
                 continue;
@@ -397,11 +409,10 @@ pub fn count_interactions_for_uuid(
             if !matches!(kind, "bot_out" | "bot_chat" | "bot_whisper") {
                 continue;
             }
-            let target = row.target.as_deref().unwrap_or("");
+            // UUID-only match (no username fallback): see fn doc above
+            // for the rename-vulnerability rationale.
             let target_uuid_field = row.target_uuid.as_deref().unwrap_or("");
-            if target_uuid_field == target_uuid
-                || target.eq_ignore_ascii_case(partner_username_lc)
-            {
+            if target_uuid_field == target_uuid {
                 interactions += 1;
                 matched_today = true;
             }
@@ -423,8 +434,6 @@ pub fn count_interactions_for_uuid(
 struct HistRow {
     #[serde(default)]
     kind: Option<String>,
-    #[serde(default)]
-    target: Option<String>,
     #[serde(default)]
     target_uuid: Option<String>,
 }
@@ -864,7 +873,14 @@ mod tests {
     }
 
     #[test]
-    fn count_interactions_matches_uuid_and_username_and_skips_other_kinds() {
+    fn count_interactions_matches_uuid_only_and_skips_other_kinds() {
+        // T15P1 bonus tightening: matching is UUID-only — the username
+        // fallback was removed because Mojang names are mutable, so a
+        // record targeted at the OLD owner of a name would otherwise
+        // silently roll into the NEW owner's trust ladder. This test
+        // pins that contract: a record whose target_uuid does NOT
+        // equal the partner's UUID is NOT counted, even if its `target`
+        // (username) matches.
         let scratch = Scratch::new("count-history");
         let history = scratch.0.join("history");
         fs::create_dir_all(&history).unwrap();
@@ -872,7 +888,8 @@ mod tests {
         let yesterday = today - chrono::Duration::days(1);
         let target_uuid = "11111111-2222-3333-4444-555555555555";
 
-        // Today's file: 2 matching bot_out + 1 non-matching kind.
+        // Today's file: 1 UUID-matching bot_out + 1 username-only
+        // (different UUID — must NOT count) + 1 non-matching kind.
         let today_path = crate::chat::jsonl::day_file_for_date(&history, today);
         let today_body = format!(
             "{}\n{}\n{}\n",
@@ -882,7 +899,8 @@ mod tests {
                 "target": "Other",
                 "target_uuid": target_uuid,
             }),
-            // Match by target username (case-insensitive).
+            // Username matches but UUID does NOT — must NOT count
+            // (rename-vulnerability guard).
             serde_json::json!({
                 "kind": "bot_out",
                 "target": "STEVE",
@@ -911,7 +929,7 @@ mod tests {
 
         let (i, d) =
             count_interactions_for_uuid(&history, target_uuid, "steve", 7);
-        assert_eq!(i, 3);
+        assert_eq!(i, 2);
         assert_eq!(d, 2);
     }
 
@@ -920,10 +938,20 @@ mod tests {
     #[test]
     fn is_canonical_hyphen_uuid_accepts_canonical_form() {
         assert!(is_canonical_hyphen_uuid(
-            "00000000-0000-0000-0000-000000000000"
-        ));
-        assert!(is_canonical_hyphen_uuid(
             "deadbeef-cafe-1234-5678-90abcdef0123"
+        ));
+    }
+
+    #[test]
+    fn is_canonical_hyphen_uuid_rejects_all_zeros_sentinel() {
+        // T15P1: the all-zeros UUID is the reserved "no sender resolved"
+        // sentinel chat/mod.rs historically substituted on Mojang
+        // failure. Accepting it here would let `update_player_memory`
+        // collapse every distinct unresolvable sender into one shared
+        // per-player file. Defense-in-depth even though the reactive
+        // path now bails before composer dispatch.
+        assert!(!is_canonical_hyphen_uuid(
+            "00000000-0000-0000-0000-000000000000"
         ));
     }
 

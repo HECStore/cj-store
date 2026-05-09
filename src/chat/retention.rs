@@ -241,9 +241,20 @@ fn sweep_rotated_pending(
 /// Persona archives are pruned by COUNT. Files are named
 /// `persona.md.<YYYYMMDDTHHMMSSZ>`. Keep the `max` newest.
 fn sweep_persona_archives(chat_dir: &Path, max: u32, out: &mut usize) {
+    // Defensive: a misconfigured `persona_archive_max = 0` would otherwise
+    // wipe every persona snapshot on first sweep (irrecoverable). Treat
+    // zero as "feature disabled" — the cap is meant to bound history, not
+    // serve as a delete-all toggle.
+    if max == 0 {
+        warn!("persona_archive_max is 0; refusing to wipe all archives, treating as disabled");
+        return;
+    }
     let entries = match fs::read_dir(chat_dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            warn!(dir = %chat_dir.display(), error = %e, "could not list chat dir for persona archive sweep");
+            return;
+        }
     };
     let mut archives: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries.flatten() {
@@ -265,7 +276,12 @@ fn sweep_persona_archives(chat_dir: &Path, max: u32, out: &mut usize) {
     if archives.len() <= max as usize {
         return;
     }
-    // Sort by stamp ascending → oldest first.
+    // Sort by stamp ascending → oldest first. Relies on parse_compact_utc_stamp's
+    // strict fixed-width `YYYYMMDDTHHMMSSZ` grammar, which makes lexicographic
+    // string ordering equal to chronological ordering. If that grammar is
+    // ever loosened (fractional seconds, non-zero-padded fields), this sort
+    // would silently invert delete order — start wiping the newest archives
+    // instead of the oldest. Re-pin in tests if the grammar ever changes.
     archives.sort_by(|a, b| a.1.cmp(&b.1));
     let to_delete = archives.len() - max as usize;
     for (path, _) in archives.into_iter().take(to_delete) {
@@ -286,7 +302,10 @@ fn sweep_rotated_archive(
 ) {
     let entries = match fs::read_dir(chat_dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            warn!(dir = %chat_dir.display(), error = %e, "could not list chat dir for rotated archive sweep");
+            return;
+        }
     };
     let p_prefix = format!("{prefix}.");
     let p_suffix = ".md";
@@ -356,19 +375,6 @@ pub fn sweep_due_today(last_sweep_day: Option<&str>) -> Option<String> {
     }
 }
 
-/// True iff the retention sweep has not yet run today (UTC). Used by
-/// the chat orchestrator to fire the sweep "first event each new UTC
-/// day". This is the boolean-shape sibling of
-/// [`sweep_due_today`]; callers that just need a yes/no gate prefer
-/// this, callers that also want the new "today" string prefer
-/// `sweep_due_today`.
-pub fn should_run_today(last_sweep_day: Option<&str>) -> bool {
-    let today = Utc::now().format("%Y-%m-%d").to_string();
-    match last_sweep_day {
-        None => true,
-        Some(d) => d != today,
-    }
-}
 
 // io::Result is referenced indirectly via error handling above; pull
 // the import into scope to satisfy unused-import lints in some build
@@ -620,28 +626,6 @@ mod tests {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         let v = sweep_due_today(Some(&today));
         assert!(v.is_none());
-    }
-
-    // ---- should_run_today ----------------------------------------------
-
-    #[test]
-    fn should_run_today_none_returns_true() {
-        // Never swept — must run.
-        assert!(should_run_today(None));
-    }
-
-    #[test]
-    fn should_run_today_today_returns_false() {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
-        assert!(!should_run_today(Some(&today)));
-    }
-
-    #[test]
-    fn should_run_today_yesterday_returns_true() {
-        let yesterday = (Utc::now() - chrono::Duration::days(1))
-            .format("%Y-%m-%d")
-            .to_string();
-        assert!(should_run_today(Some(&yesterday)));
     }
 
     // ---- sweep_rotated_archive counter ---------------------------------

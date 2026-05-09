@@ -432,21 +432,9 @@ fn quarantine_unreadable_to(path: &Path) -> io::Result<std::path::PathBuf> {
         "current_trade",
         "unreadable",
         &ARCHIVE_SEQ,
-    );
-    match std::fs::rename(path, &archived) {
-        Ok(()) => Ok(archived),
-        Err(_) => {
-            std::fs::copy(path, &archived)?;
-            crate::fsutil::durably_sync_archive(&archived);
-            if let Err(remove_err) = std::fs::remove_file(path) {
-                tracing::warn!(
-                    "[TradeState] quarantined unreadable trade-state to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                    archived, path
-                );
-            }
-            Ok(archived)
-        }
-    }
+    )?;
+    crate::fsutil::archive_aside(path, &archived)?;
+    Ok(archived)
 }
 
 /// Path-parameterized clear, separated so tests can round-trip without
@@ -468,21 +456,9 @@ pub fn archive_persisted_to(path: &Path) -> io::Result<std::path::PathBuf> {
         "current_trade",
         "leftover",
         &ARCHIVE_SEQ,
-    );
-    match std::fs::rename(path, &archived) {
-        Ok(()) => Ok(archived),
-        Err(_) => {
-            std::fs::copy(path, &archived)?;
-            crate::fsutil::durably_sync_archive(&archived);
-            if let Err(remove_err) = std::fs::remove_file(path) {
-                tracing::warn!(
-                    "[TradeState] archived persisted trade-state to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                    archived, path
-                );
-            }
-            Ok(archived)
-        }
-    }
+    )?;
+    crate::fsutil::archive_aside(path, &archived)?;
+    Ok(archived)
 }
 
 #[cfg(test)]

@@ -171,14 +171,17 @@ pub async fn handle_additem_order(
             error!("[Additem] deposit step {} failed to send: operator={} item={} chunk_amount={} err={}",
                 step + 1, player_name, item, t.amount, e);
             deposit_failed = true;
-            failed_reason = format!("Failed to send deposit instruction: {}", e);
+            // Sanitize for operator whisper: the raw mpsc SendError leaks
+            // transport detail. The operator-facing whisper splices
+            // `failed_reason` verbatim, so wrap through `user_message()`.
+            failed_reason = StoreError::BotSendFailed(e.to_string()).user_message().into_owned();
             break;
         }
 
         let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
             .await
-            .map_err(|_| "Bot timed out performing chest step".to_string())
-            .and_then(|r| r.map_err(|e| format!("Bot response dropped: {}", e)));
+            .map_err(|_| StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS * 1000 })
+            .and_then(|r| r.map_err(|e| StoreError::BotResponseDropped(e.to_string())));
 
         match bot_result {
             Ok(Ok(report)) => {
@@ -192,14 +195,16 @@ pub async fn handle_additem_order(
                 error!("[Additem] deposit step {} bot error: item={} chest_id={} chunk_amount={} err={}",
                     step + 1, item, t.chest_id, t.amount, err);
                 deposit_failed = true;
-                failed_reason = format!("Bot failed chest deposit: {}", err);
+                // Sanitize for operator whisper: bot-reported error text may
+                // include transport-layer detail. Wrap through `user_message()`.
+                failed_reason = StoreError::BotReportedError(err).user_message().into_owned();
                 break;
             }
             Err(err) => {
                 error!("[Additem] deposit step {} error: item={} chest_id={} chunk_amount={} err={}",
                     step + 1, item, t.chest_id, t.amount, err);
                 deposit_failed = true;
-                failed_reason = err;
+                failed_reason = err.user_message().into_owned();
                 break;
             }
         }
@@ -333,13 +338,11 @@ pub async fn handle_additem_order(
             user_uuid.clone(),
         ));
 
-        store.orders.push_back(Order {
-            order_type: crate::types::order::OrderType::AddItem,
-            item: ItemId::from_normalized(item.to_string()),
-            amount: qty_i32,
-            currency_amount: 0.0,
-            user_uuid: user_uuid.clone(),
-        });
+        store.orders.push_back(Order::add_item(
+            ItemId::from_normalized(item.to_string()),
+            qty_i32,
+            user_uuid.clone(),
+        ));
 
         info!(
             "[Additem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
@@ -592,13 +595,11 @@ pub async fn handle_removeitem_order(
             user_uuid.clone(),
         ));
 
-        store.orders.push_back(Order {
-            order_type: crate::types::order::OrderType::RemoveItem,
-            item: ItemId::from_normalized(item.to_string()),
-            amount: qty_i32,
-            currency_amount: 0.0,
-            user_uuid: user_uuid.clone(),
-        });
+        store.orders.push_back(Order::remove_item(
+            ItemId::from_normalized(item.to_string()),
+            qty_i32,
+            user_uuid.clone(),
+        ));
 
         info!(
             "[Removeitem] committed: operator={} uuid={} item={} qty={} stock_before={} stock_after={}",
@@ -683,13 +684,11 @@ pub async fn handle_add_currency(
         user_uuid.clone(),
     ));
 
-    store.orders.push_back(Order {
-        order_type: crate::types::order::OrderType::AddCurrency,
-        item: ItemId::from_normalized(item.to_string()),
-        amount: 0,
-        currency_amount: amount,
-        user_uuid: user_uuid.clone(),
-    });
+    store.orders.push_back(Order::add_currency(
+        ItemId::from_normalized(item.to_string()),
+        amount,
+        user_uuid.clone(),
+    ));
 
     info!(
         "[AddCurrency] committed: operator={} uuid={} item={} amount={:.2} reserve_before={:.2} reserve_after={:.2}",
@@ -780,13 +779,11 @@ pub async fn handle_remove_currency(
         user_uuid.clone(),
     ));
 
-    store.orders.push_back(Order {
-        order_type: crate::types::order::OrderType::RemoveCurrency,
-        item: ItemId::from_normalized(item.to_string()),
-        amount: 0,
-        currency_amount: amount,
-        user_uuid: user_uuid.clone(),
-    });
+    store.orders.push_back(Order::remove_currency(
+        ItemId::from_normalized(item.to_string()),
+        amount,
+        user_uuid.clone(),
+    ));
 
     info!(
         "[RemoveCurrency] committed: operator={} uuid={} item={} amount={:.2} reserve_before={:.2} reserve_after={:.2}",

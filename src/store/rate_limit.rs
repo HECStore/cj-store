@@ -13,13 +13,20 @@
 //! let mut limiter = RateLimiter::new();
 //! match limiter.check("player_uuid") {
 //!     Ok(()) => { /* process message */ }
-//!     Err(wait_duration) => { /* reject, tell player to wait */ }
+//!     Err(throttled) => { /* reject; whisper iff throttled.should_whisper */ }
 //! }
 //! ```
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Initial HashMap capacity for `RateLimiter::limits`. Sized to a small
+/// server's typical concurrent active-user count so the map doesn't rehash
+/// repeatedly through its growth from 0 toward `MAX_RATE_LIMIT_ENTRIES`
+/// during a spam burst. Steady-state idle bot allocates ~256 buckets — small
+/// in absolute terms relative to `MAX_RATE_LIMIT_ENTRIES = 10_000`.
+const INITIAL_LIMITS_CAPACITY: usize = 256;
 
 use tracing::{debug, warn};
 
@@ -71,9 +78,10 @@ struct UserRateLimit {
     /// When we last emitted a player-facing whisper for this user. Tracked
     /// independently of `last_warn_time` so the operator log gate and the
     /// outbound chat gate don't entangle — `check()` updates `last_warn_time`
-    /// on its way out, and a co-located `should_whisper_rejection()` call
-    /// must NOT see that update treated as "whisper just fired" or every
-    /// rejection after the first would be silently suppressed.
+    /// on its way out and computes the whisper-gate decision from THIS
+    /// field, so the warn-gate stamp must not be treated as "whisper just
+    /// fired" or every rejection after the first would be silently
+    /// suppressed.
     last_whisper_time: Option<Instant>,
 }
 
@@ -94,6 +102,20 @@ impl UserRateLimit {
     }
 }
 
+/// Outcome of a rejected `RateLimiter::check`. Combines the suggested
+/// wait duration with the whisper-throttling decision so callers
+/// cannot accidentally drop one or skip the second-phase call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Throttled {
+    /// Suggested wait before the next attempt.
+    pub wait: Duration,
+    /// Whether the caller should emit a player-facing whisper for
+    /// this rejection. False when the per-user whisper budget for
+    /// this cycle is exhausted (cap on chat amplification under
+    /// sustained spam).
+    pub should_whisper: bool,
+}
+
 /// Hard cap on entries in `RateLimiter::limits` between cleanup sweeps. The
 /// constants comment names `attacker_rate * STALE_AFTER_SECS` as the bound
 /// — that's an unbounded multiplication on attacker_rate. This cap turns the
@@ -106,6 +128,12 @@ const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 pub struct RateLimiter {
     /// Per-user rate limit tracking
     limits: HashMap<String, UserRateLimit>,
+    /// One-shot guard for the "cleanup_stale threshold below floor" warning.
+    /// Per-instance so a misconfiguration in one limiter doesn't silence the
+    /// warning forever in every other limiter sharing the process (the
+    /// previous implementation used a `static AtomicBool`, which made the
+    /// warning effectively single-fire across all instances and tests).
+    clamp_warned: AtomicBool,
 }
 
 impl Default for RateLimiter {
@@ -129,45 +157,35 @@ fn calculate_cooldown(violations: u32) -> Duration {
     Duration::from_millis(cooldown_ms.min(RATE_LIMIT_MAX_COOLDOWN_MS))
 }
 
-/// Clamp a `cleanup_stale` threshold to the `RATE_LIMIT_RESET_AFTER_MS` floor.
-///
-/// The floor is the violation-reset window, not the cooldown cap: an entry
-/// must survive long enough for `consecutive_violations` to clear naturally,
-/// otherwise eviction would silently strip the violation count from a user
-/// who is past their cooldown but still inside the reset window — granting a
-/// returning spammer a fresh `violations = 0` entry. The compile-time
-/// invariant `RATE_LIMIT_RESET_AFTER_MS >= RATE_LIMIT_MAX_COOLDOWN_MS`
-/// (constants.rs) keeps this floor at least as strong as the cooldown cap.
-///
-/// If the input is already `>= RESET_AFTER_MS`, it is returned unchanged.
-/// Otherwise it is raised to `RESET_AFTER_MS`, and a one-shot `warn!` is
-/// emitted so a misconfiguration surfaces in production logs without becoming
-/// a per-call spam source.
-///
-/// The `debug_assert!` for misuse lives in `cleanup_stale` itself; this helper
-/// implements only the release-build clamp+warn so it remains testable in
-/// both build modes.
-fn clamp_stale_threshold(stale_threshold: Duration) -> Duration {
-    let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
-    let clamped = stale_threshold.max(floor);
-    if stale_threshold < clamped {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self {
+            limits: HashMap::with_capacity(INITIAL_LIMITS_CAPACITY),
+            clamp_warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Clamp a `cleanup_stale` threshold to the `RATE_LIMIT_RESET_AFTER_MS`
+    /// floor. The floor is the violation-reset window, not the cooldown cap:
+    /// an entry must survive long enough for `consecutive_violations` to
+    /// clear naturally, otherwise eviction would silently strip the violation
+    /// count from a user who is past their cooldown but still inside the
+    /// reset window. If the input is already `>= RESET_AFTER_MS`, returned
+    /// unchanged. Otherwise raised to the floor, and a per-instance one-shot
+    /// `warn!` is emitted so misconfiguration surfaces without per-call spam.
+    fn clamp_stale_threshold(&self, stale_threshold: Duration) -> Duration {
+        let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
+        let clamped = stale_threshold.max(floor);
+        if stale_threshold < clamped
+            && !self.clamp_warned.swap(true, Ordering::Relaxed)
+        {
             warn!(
                 original_threshold_ms = stale_threshold.as_millis() as u64,
                 clamped_threshold_ms = clamped.as_millis() as u64,
                 "[RateLimit] cleanup_stale threshold below RATE_LIMIT_RESET_AFTER_MS; clamping to floor to preserve violation counts inside the reset window"
             );
         }
-    }
-    clamped
-}
-
-impl RateLimiter {
-    pub fn new() -> Self {
-        Self {
-            limits: HashMap::new(),
-        }
+        clamped
     }
 
     /// Check if a user can send a message.
@@ -177,60 +195,75 @@ impl RateLimiter {
     ///
     /// # Returns
     /// * `Ok(())` - User can proceed with their message
-    /// * `Err(Duration)` - User must wait this long before sending another message
+    /// * `Err(Throttled)` - User must wait `Throttled::wait` before sending
+    ///   another message; the caller should emit a player-facing whisper
+    ///   only if `Throttled::should_whisper` is true. The whisper decision
+    ///   is folded into the same return value so callers cannot
+    ///   accidentally drop it (a missed gate would silently flood chat
+    ///   under sustained spam).
     ///
     /// # Key namespacing
     /// Callers may use a `prefix:` namespacing convention on keys (e.g. `n:`
     /// for usernames, `u:` for UUIDs) to keep semantically distinct gates
     /// from sharing a slot in the limiter's map. The limiter itself treats
     /// the key as an opaque string.
-    pub fn check(&mut self, user_uuid: &str) -> Result<(), Duration> {
+    pub fn check(&mut self, user_uuid: &str) -> Result<(), Throttled> {
         let now = Instant::now();
 
         // Cold-path cap: an attacker cycling shape-valid usernames creates
-        // one fresh entry per name. Between cleanup sweeps that's bounded
-        // by `MAX_RATE_LIMIT_ENTRIES`; on overflow evict the entry with
-        // the oldest `last_attempt_time` so actively-throttled users are
-        // not preferentially evicted.
+        // one fresh entry per name. On overflow, run an inline
+        // cleanup_stale at the RATE_LIMIT_RESET_AFTER_MS floor —
+        // actively-throttled users (still inside the reset window) are
+        // guaranteed to survive. If the sweep frees no slots, refuse the
+        // new attempt with the base cooldown so still-throttled users are
+        // never silently reset by cap pressure.
         if !self.limits.contains_key(user_uuid) && self.limits.len() >= MAX_RATE_LIMIT_ENTRIES {
-            if let Some(victim) = self
-                .limits
-                .iter()
-                .min_by_key(|(_, l)| l.last_attempt_time)
-                .map(|(k, _)| k.clone())
-            {
-                self.limits.remove(&victim);
+            self.cleanup_stale(Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS));
+            if self.limits.len() >= MAX_RATE_LIMIT_ENTRIES {
+                // No tracked entry to gate the whisper against, so emit
+                // one rather than silently dropping it — same policy as
+                // the missing-entry branch in the prior
+                // `should_whisper_rejection`.
+                return Err(Throttled {
+                    wait: calculate_cooldown(0),
+                    should_whisper: true,
+                });
             }
         }
 
-        // `entry()` collapses the warm-path-vs-cold-path lookup into one
-        // hash and removes the `expect("just inserted")` panic site. The
-        // cold-path branch fires once per attacker-invented name, so the
-        // win matters under spam — exactly the regime the limiter exists
-        // to handle.
-        let user_limit = self
-            .limits
-            .entry(user_uuid.to_string())
-            .or_insert_with(|| {
-                // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
-                // so the `elapsed >= required_cooldown` check below always passes on
-                // the very first message; without this, a new user would be treated
-                // as having "just messaged" at entry creation and be rejected.
-                // `checked_sub` guards against the (Windows/Linux-impossible but
-                // platform-allowed) case of `Instant` subtraction underflowing near
-                // process start; falling back to `now` means the first message would
-                // be rejected, which is preferable to a panic.
-                let mut limit = UserRateLimit::new();
-                let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
-                limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
-                // `last_attempt_time` stays at `now` (NOT backdated): a brand
-                // new user has just attempted their first message, so they
-                // are not idle. Backdating this would let the very first
-                // rejected attempt also clear violations on a phantom "idle"
-                // window that never actually occurred.
-                limit.last_attempt_time = now;
-                limit
-            });
+        // Warm path: a single `get_mut` hash lookup, no `to_owned()`. The
+        // cold-path `entry()` only fires when the user has no entry yet,
+        // so the per-call `to_string()` allocation paid by the prior
+        // `entry(user_uuid.to_string())` is now scoped to first-attempt
+        // inserts. Keeping `entry()` (rather than a plain `insert`) on
+        // the cold path preserves the "fail-fast on duplicate insert"
+        // guarantee and the existing closure body unchanged.
+        let user_limit = match self.limits.get_mut(user_uuid) {
+            Some(e) => e,
+            None => self
+                .limits
+                .entry(user_uuid.to_owned())
+                .or_insert_with(|| {
+                    // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
+                    // so the `elapsed >= required_cooldown` check below always passes on
+                    // the very first message; without this, a new user would be treated
+                    // as having "just messaged" at entry creation and be rejected.
+                    // `checked_sub` guards against the (Windows/Linux-impossible but
+                    // platform-allowed) case of `Instant` subtraction underflowing near
+                    // process start; falling back to `now` means the first message would
+                    // be rejected, which is preferable to a panic.
+                    let mut limit = UserRateLimit::new();
+                    let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
+                    limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
+                    // `last_attempt_time` stays at `now` (NOT backdated): a brand
+                    // new user has just attempted their first message, so they
+                    // are not idle. Backdating this would let the very first
+                    // rejected attempt also clear violations on a phantom "idle"
+                    // window that never actually occurred.
+                    limit.last_attempt_time = now;
+                    limit
+                }),
+        };
 
         let elapsed = now.duration_since(user_limit.last_message_time);
 
@@ -241,6 +274,15 @@ impl RateLimiter {
         let attempt_elapsed = now.duration_since(user_limit.last_attempt_time);
         if attempt_elapsed >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) {
             user_limit.consecutive_violations = 0;
+            // Clear the warn/whisper gates so "first rejection in a new cycle"
+            // takes the explicit `None` arm regardless of how RESET_AFTER and
+            // the warn/whisper windows are tuned. Today they are all the same
+            // constant and the gates would reopen anyway, but coupling three
+            // independent windows by coincidence is brittle — making the
+            // invariant local prevents a future tuning change from silently
+            // suppressing the first warn/whisper after a natural reset.
+            user_limit.last_warn_time = None;
+            user_limit.last_whisper_time = None;
         }
         // Stamp the attempt now, AFTER reading the prior value, so this call
         // counts as "an attempt just happened" for the next call's idle check.
@@ -273,8 +315,8 @@ impl RateLimiter {
             // (the point at which `calculate_cooldown` is already pinned at
             // MAX). The stored counter is left unchanged — tests rely on it
             // accumulating — but readers of the log get a meaningful number
-            // plus a `saturated` flag indicating "the cooldown has been at
-            // MAX for at least one cycle", which is the operationally
+            // plus a `saturated` flag indicating "the cooldown is pinned at
+            // MAX from this rejection onward", which is the operationally
             // interesting signal.
             //
             // Gate the warn so a sustained DoS doesn't drown operators in
@@ -293,7 +335,7 @@ impl RateLimiter {
                 warn!(
                     gate_key = %user_uuid,
                     violations = user_limit.consecutive_violations.min(SATURATION_THRESHOLD),
-                    saturated = user_limit.consecutive_violations > SATURATION_THRESHOLD,
+                    saturated = user_limit.consecutive_violations >= SATURATION_THRESHOLD,
                     wait_ms = remaining.as_millis() as u64,
                     "[RateLimit] Violation recorded"
                 );
@@ -306,36 +348,29 @@ impl RateLimiter {
                     "[RateLimit] Violation (suppressed warn)"
                 );
             }
-            Err(remaining)
+            // Whisper-throttling, folded inline so callers can't skip it
+            // and silently flood chat. Returns true on the FIRST rejection
+            // in the current cycle, on the SATURATION transition, and at
+            // most once per RATE_LIMIT_RESET_AFTER_MS window thereafter.
+            // The whisper window happens to equal `warn_window` today, but
+            // the field is tracked independently of `last_warn_time` so a
+            // future tuning of either window doesn't entangle the two.
+            // `saturation_transition` is reused from the warn-gate logic
+            // above — both are post-increment by the time we get here.
+            let whisper_window = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
+            let should_whisper = match user_limit.last_whisper_time {
+                None => true,
+                Some(_) if saturation_transition => true,
+                Some(prev) => now.duration_since(prev) >= whisper_window,
+            };
+            if should_whisper {
+                user_limit.last_whisper_time = Some(now);
+            }
+            Err(Throttled {
+                wait: remaining,
+                should_whisper,
+            })
         }
-    }
-
-    /// Decide whether the caller should whisper a cooldown notice for the
-    /// most recent rejection on `user_uuid`, and update internal state to
-    /// throttle subsequent whispers. Returns true on the FIRST rejection in
-    /// the current cycle, on the SATURATION transition, and at most once
-    /// per `RATE_LIMIT_RESET_AFTER_MS` window thereafter. This caps the
-    /// outbound chat amplification when an attacker spams cycled distinct
-    /// usernames — without it, every rejected attempt forces the bot to
-    /// whisper a notice, turning the limiter into a chat-spam source.
-    /// Caller must invoke this only AFTER `check()` returned Err.
-    pub fn should_whisper_rejection(&mut self, user_uuid: &str) -> bool {
-        let now = Instant::now();
-        let window = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
-        let entry = match self.limits.get_mut(user_uuid) {
-            Some(e) => e,
-            None => return true,
-        };
-        let saturation_transition = entry.consecutive_violations == SATURATION_THRESHOLD;
-        let should = match entry.last_whisper_time {
-            None => true,
-            Some(_) if saturation_transition => true,
-            Some(prev) => now.duration_since(prev) >= window,
-        };
-        if should {
-            entry.last_whisper_time = Some(now);
-        }
-        should
     }
 
     /// Drop entries for users idle longer than `stale_threshold`. Call
@@ -361,12 +396,19 @@ impl RateLimiter {
             stale_threshold,
             RATE_LIMIT_RESET_AFTER_MS,
         );
-        // Defense-in-depth for release builds: clamp the threshold to the
-        // RESET_AFTER floor so a misconfigured caller can't silently strip
-        // violation counters from users still inside the reset window. The
-        // helper also emits a one-shot warning on the first observed
-        // violation so the misconfiguration surfaces in production logs.
-        let stale_threshold = clamp_stale_threshold(stale_threshold);
+        self.cleanup_stale_clamped(stale_threshold);
+    }
+
+    /// Release-mode core of [`Self::cleanup_stale`]: clamp the threshold to
+    /// the `RATE_LIMIT_RESET_AFTER_MS` floor (defense-in-depth against a
+    /// misconfigured caller that bypasses the `debug_assert!`), then evict
+    /// every entry whose `last_attempt_time` is older than the (clamped)
+    /// threshold. Factored out so a direct unit test can confirm the
+    /// release-mode safety net actually preserves actively-throttled users
+    /// when handed a sub-floor threshold, without relying on `cfg`-gated
+    /// test-build forks.
+    fn cleanup_stale_clamped(&mut self, stale_threshold: Duration) {
+        let stale_threshold = self.clamp_stale_threshold(stale_threshold);
         let now = Instant::now();
         let before = self.limits.len();
         // Key idleness off `last_attempt_time` (bumped on every check, accepted
@@ -388,18 +430,27 @@ impl RateLimiter {
         }
     }
 
-    /// Test-only: backdate a user's `last_message_time` AND `last_attempt_time`
-    /// by `by` so time-dependent paths (reset window, staleness) can be
-    /// exercised without real sleeps. Both fields shift in lockstep so the
-    /// synthetic "time travel" matches what would happen in real wall-clock
-    /// time — otherwise tests would be probing internal accounting rather
-    /// than externally observable behavior.
+    /// Test-only: backdate a user's `last_message_time`, `last_attempt_time`,
+    /// and (when present) `last_warn_time` / `last_whisper_time` by `by` so
+    /// time-dependent paths (reset window, staleness, warn/whisper gates) can
+    /// be exercised without real sleeps. All four fields shift in lockstep so
+    /// the synthetic "time travel" matches what would happen in real
+    /// wall-clock time — otherwise tests would be probing internal accounting
+    /// rather than externally observable behavior. The warn/whisper fields
+    /// are only shifted when `Some`, so a fresh entry whose gates have never
+    /// fired stays in the `None` state.
     /// Returns false if the user has no entry yet.
     #[cfg(test)]
     fn backdate(&mut self, user_uuid: &str, by: Duration) -> bool {
         if let Some(limit) = self.limits.get_mut(user_uuid) {
             limit.last_message_time -= by;
             limit.last_attempt_time -= by;
+            if let Some(t) = limit.last_warn_time.as_mut() {
+                *t -= by;
+            }
+            if let Some(t) = limit.last_whisper_time.as_mut() {
+                *t -= by;
+            }
             true
         } else {
             false
@@ -581,7 +632,7 @@ mod tests {
         // escalated cooldown rather than the base cooldown.
         let escalated = calculate_cooldown(1);
         match limiter.check("user1") {
-            Err(wait) => assert!(
+            Err(Throttled { wait, .. }) => assert!(
                 wait <= escalated,
                 "wait {wait:?} exceeds escalated cooldown {escalated:?}"
             ),
@@ -598,7 +649,7 @@ mod tests {
         let mut limiter = RateLimiter::new();
         let _ = limiter.check("user1");
         let wait = match limiter.check("user1") {
-            Err(w) => w,
+            Err(Throttled { wait, .. }) => wait,
             Ok(()) => panic!("expected rejection"),
         };
         assert!(limiter.backdate("user1", wait));
@@ -749,18 +800,19 @@ mod tests {
         // At-floor input: returned unchanged. The floor is RESET_AFTER_MS,
         // not MAX_COOLDOWN_MS, so an entry must survive long enough for
         // `consecutive_violations` to reset naturally.
+        let limiter = RateLimiter::new();
         let at_floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
-        assert_eq!(clamp_stale_threshold(at_floor), at_floor);
+        assert_eq!(limiter.clamp_stale_threshold(at_floor), at_floor);
 
         // Above-floor input: returned unchanged. Use a realistic production
         // threshold so the assertion ties to actual deployment configuration.
         let above_floor = Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS);
         assert!(above_floor >= at_floor, "test precondition");
-        assert_eq!(clamp_stale_threshold(above_floor), above_floor);
+        assert_eq!(limiter.clamp_stale_threshold(above_floor), above_floor);
 
         // Far-above-floor input: still unchanged.
         let way_above = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS * 100);
-        assert_eq!(clamp_stale_threshold(way_above), way_above);
+        assert_eq!(limiter.clamp_stale_threshold(way_above), way_above);
     }
 
     #[test]
@@ -769,20 +821,325 @@ mod tests {
         // assert `>= floor` rather than `== floor` so this test stays
         // resilient if the helper later switches to (e.g.) `RESET_AFTER * 2`
         // as the safety floor.
+        let limiter = RateLimiter::new();
         let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
 
         let zero = Duration::from_millis(0);
-        assert!(clamp_stale_threshold(zero) >= floor);
+        assert!(limiter.clamp_stale_threshold(zero) >= floor);
 
         // The old MAX_COOLDOWN-based floor used to admit this value
         // unchanged; the tightened floor now raises it.
         let at_old_floor = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS);
-        assert!(clamp_stale_threshold(at_old_floor) >= floor);
+        assert!(limiter.clamp_stale_threshold(at_old_floor) >= floor);
 
         let just_under = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS - 1);
-        assert!(clamp_stale_threshold(just_under) >= floor);
+        assert!(limiter.clamp_stale_threshold(just_under) >= floor);
 
         let way_under = Duration::from_millis(1);
-        assert!(clamp_stale_threshold(way_under) >= floor);
+        assert!(limiter.clamp_stale_threshold(way_under) >= floor);
+    }
+
+    #[test]
+    fn cleanup_stale_clamped_preserves_actively_throttled_user_under_subfloor_input() {
+        // Direct release-mode test of the safety net: even when handed a
+        // sub-floor threshold (which would `debug_assert!` in the public
+        // wrapper), the inner `cleanup_stale_clamped` raises it to the floor
+        // and an actively-throttled user inside the reset window survives.
+        let mut limiter = RateLimiter::new();
+        // Trigger a violation so the user has consecutive_violations > 0.
+        assert!(limiter.check("alice").is_ok());
+        assert!(limiter.check("alice").is_err());
+        let pre = limiter.violations_for("alice").unwrap();
+        assert!(pre > 0, "test precondition: alice has violations");
+
+        // Hand a deliberately-sub-floor threshold; clamp must rescue.
+        let too_small = Duration::from_millis(1);
+        limiter.cleanup_stale_clamped(too_small);
+
+        assert!(
+            limiter.violations_for("alice").is_some(),
+            "actively-throttled user inside reset window must survive sub-floor cleanup"
+        );
+    }
+
+    /// Helper for cap-overflow tests: pre-fill the limiter to
+    /// `MAX_RATE_LIMIT_ENTRIES` with synthetic distinct keys. Each entry is
+    /// inserted via the public `check()` path so the per-user accounting is
+    /// produced by real code, not hand-rolled struct literals — keeps the
+    /// test honest if `UserRateLimit::new` semantics change.
+    #[cfg(test)]
+    fn fill_to_cap(limiter: &mut RateLimiter) {
+        for i in 0..MAX_RATE_LIMIT_ENTRIES {
+            let key = format!("filler-{i}");
+            let _ = limiter.check(&key);
+        }
+        assert_eq!(limiter.len(), MAX_RATE_LIMIT_ENTRIES);
+    }
+
+    #[test]
+    fn cap_overflow_evicts_only_entries_past_reset_window() {
+        // When the map is at cap and a new key arrives, the inline
+        // cleanup_stale sweep must drop entries whose last_attempt_time is
+        // past RATE_LIMIT_RESET_AFTER_MS — and ONLY those entries. Entries
+        // still inside the reset window survive.
+        let mut limiter = RateLimiter::new();
+        fill_to_cap(&mut limiter);
+
+        // Backdate exactly one filler past the reset window so cleanup_stale
+        // has at least one eligible victim.
+        let stale_key = "filler-0";
+        assert!(limiter.backdate(
+            stale_key,
+            Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS + 1_000),
+        ));
+
+        // A representative still-fresh entry; it must survive the sweep.
+        let fresh_key = "filler-1";
+        let fresh_violations_before = limiter.violations_for(fresh_key);
+
+        assert!(limiter.check("newcomer").is_ok());
+
+        assert_eq!(
+            limiter.violations_for(stale_key),
+            None,
+            "entry past the reset window must be evicted by the inline sweep"
+        );
+        assert_eq!(
+            limiter.violations_for(fresh_key),
+            fresh_violations_before,
+            "entries inside the reset window must survive the inline sweep"
+        );
+    }
+
+    #[test]
+    fn cap_overflow_refuses_new_user_when_no_eligible_victim() {
+        // If every entry is still inside the reset window, the inline
+        // cleanup_stale cannot free any slots. The contract is to refuse
+        // the new attempt with a base cooldown rather than silently evict
+        // an actively-throttled or legitimate-but-idle user.
+        let mut limiter = RateLimiter::new();
+        fill_to_cap(&mut limiter);
+        let len_before = limiter.len();
+
+        match limiter.check("newcomer") {
+            Ok(()) => panic!("expected refusal when no entry is past the reset window"),
+            Err(Throttled { wait, .. }) => assert_eq!(
+                wait,
+                Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS),
+                "refusal must use the base cooldown"
+            ),
+        }
+        assert_eq!(
+            limiter.len(),
+            len_before,
+            "new key must NOT be inserted when the cap cannot be relieved"
+        );
+        assert!(
+            limiter.violations_for("newcomer").is_none(),
+            "new key must NOT have an entry after refusal"
+        );
+    }
+
+    #[test]
+    fn cap_overflow_preserves_actively_throttled_user() {
+        // Anchor the property the previous LRU policy violated: an
+        // actively-throttled user (saturated violations, recent
+        // last_attempt_time) must keep their violation count when the cap
+        // is hit by a new attacker name. The new policy refuses the
+        // newcomer rather than evicting any actively-tracked user.
+        let mut limiter = RateLimiter::new();
+
+        // Seed the throttled user FIRST so they get a deterministic key,
+        // then saturate their violations.
+        let throttled = "throttled_user";
+        let _ = limiter.check(throttled);
+        for _ in 0..(SATURATION_THRESHOLD + 2) {
+            let _ = limiter.check(throttled);
+        }
+        let throttled_violations = limiter
+            .violations_for(throttled)
+            .expect("throttled user has an entry");
+        assert!(
+            throttled_violations >= SATURATION_THRESHOLD,
+            "precondition: violations saturated"
+        );
+
+        // Fill the rest of the map. `fill_to_cap` would push us past cap
+        // because the throttled user already occupies a slot, so insert
+        // one fewer filler to land exactly at cap.
+        for i in 0..(MAX_RATE_LIMIT_ENTRIES - limiter.len()) {
+            let key = format!("filler-{i}");
+            let _ = limiter.check(&key);
+        }
+        assert_eq!(limiter.len(), MAX_RATE_LIMIT_ENTRIES);
+
+        // Newcomer arrival under no eligible-victim conditions: should
+        // refuse, leaving the throttled user untouched.
+        let _ = limiter.check("attacker_new_name");
+        assert_eq!(
+            limiter.violations_for(throttled),
+            Some(throttled_violations),
+            "actively-throttled user's violation count must be unchanged by cap pressure"
+        );
+    }
+
+    #[test]
+    fn throttled_first_rejection_returns_should_whisper_true() {
+        // The first rejection in a fresh cycle must surface
+        // `should_whisper: true` so the caller emits the player-facing
+        // notice. Anchors the missing-entry / first-cycle behavior the
+        // prior `should_whisper_rejection_returns_true_when_no_entry`
+        // and `..._emits_then_suppresses_within_window` covered.
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.check("user1").is_ok());
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => assert!(
+                should_whisper,
+                "first whisper after a rejection must fire"
+            ),
+            Ok(()) => panic!("precondition: second check must produce Err"),
+        }
+    }
+
+    #[test]
+    fn throttled_repeated_rejection_within_window_suppresses_whisper() {
+        // A second rejection inside the suppression window without any
+        // natural reset must report `should_whisper: false` so the bot
+        // doesn't spam whispers on every rejected attempt.
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.check("user1").is_ok());
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => {
+                assert!(should_whisper, "first whisper must fire")
+            }
+            Ok(()) => panic!("precondition: second check must produce Err"),
+        }
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => assert!(
+                !should_whisper,
+                "second whisper inside the suppression window must be suppressed"
+            ),
+            Ok(()) => panic!("third check must also be rejected"),
+        }
+    }
+
+    #[test]
+    fn throttled_re_emits_should_whisper_after_reset_window() {
+        // After RATE_LIMIT_RESET_AFTER_MS of synthetic time has elapsed
+        // since the last whisper, the gate must reopen so a returning
+        // spammer (or a legitimate lapsed user) gets a fresh whisper
+        // rather than being silently throttled forever by stale state.
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.check("user1").is_ok());
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => {
+                assert!(should_whisper, "first whisper must fire")
+            }
+            Ok(()) => panic!("precondition: second check must produce Err"),
+        }
+
+        // Push last_whisper_time past the suppression window. `backdate`
+        // shifts last_whisper_time alongside the message/attempt
+        // timestamps so this scenario is actually modelable.
+        let beyond_window =
+            Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) + Duration::from_secs(1);
+        assert!(limiter.backdate("user1", beyond_window));
+
+        // Note: the backdate also crosses the violation-reset window, so
+        // the next check sees `attempt_elapsed >= RESET_AFTER_MS` and
+        // clears violations — and clears `last_whisper_time` to None —
+        // making this look like the start of a fresh cycle. The "honest
+        // wait" invariant means that next check ALSO crosses the
+        // cooldown and is accepted, so we do one accept then trigger a
+        // new rejection to observe the whisper gate.
+        assert!(
+            limiter.check("user1").is_ok(),
+            "post-reset-window check must accept (full idle resets state)"
+        );
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => assert!(
+                should_whisper,
+                "whisper must re-emit on the first rejection after the suppression window elapses"
+            ),
+            Ok(()) => panic!("expected rejection within fresh cooldown"),
+        }
+    }
+
+    #[test]
+    fn throttled_emits_should_whisper_on_saturation_transition() {
+        // The saturation transition (consecutive_violations crossing
+        // SATURATION_THRESHOLD) is operationally interesting and the
+        // folded whisper gate explicitly bypasses the suppression window
+        // for that crossing. After the first rejection (which fires the
+        // whisper), accumulate further rejections inside the suppression
+        // window until violations hit SATURATION_THRESHOLD; on that
+        // crossing the whisper must fire again.
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.check("user1").is_ok());
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => assert!(
+                should_whisper,
+                "initial whisper after first rejection must fire"
+            ),
+            Ok(()) => panic!("precondition: second check must produce Err"),
+        }
+
+        let mut saw_saturation_whisper = false;
+        // Generous upper bound — SATURATION_THRESHOLD is small (5) and
+        // the saturation transition fires once consecutive_violations
+        // equals that constant (post-increment, inside check).
+        for _ in 0..50 {
+            let throttled = match limiter.check("user1") {
+                Err(t) => t,
+                Ok(()) => panic!("still within cooldown — every check must be rejected"),
+            };
+            let v = limiter.violations_for("user1").unwrap();
+            if v == SATURATION_THRESHOLD {
+                assert!(
+                    throttled.should_whisper,
+                    "saturation-transition rejection must fire a whisper \
+                     even within the suppression window"
+                );
+                saw_saturation_whisper = true;
+                break;
+            } else {
+                assert!(
+                    !throttled.should_whisper,
+                    "non-transition rejection inside the suppression window \
+                     must NOT fire a whisper (violations={v})"
+                );
+            }
+        }
+        assert!(
+            saw_saturation_whisper,
+            "loop must reach the SATURATION_THRESHOLD crossing"
+        );
+    }
+
+    #[test]
+    fn throttled_warn_gate_does_not_silently_suppress_whisper_gate() {
+        // Load-bearing invariant per the field doc-comments: `check()`
+        // updates `last_warn_time` on its way out, and the folded
+        // whisper-gate decision must NOT see that update treated as
+        // "whisper just fired". Otherwise every rejection after the
+        // first would be silently suppressed because the warn-gate stamp
+        // would gate the whisper too. The two gates share their window
+        // by coincidence today, but their stamps are tracked
+        // independently and the first rejection must always whisper.
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.check("user1").is_ok());
+        // First rejection — `check()` stamps last_warn_time AND fires
+        // the whisper gate. The whisper gate must still observe its own
+        // None state at decision time, not the freshly-stamped warn
+        // gate.
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => assert!(
+                should_whisper,
+                "first whisper after a rejection must fire even though \
+                 check() also stamps last_warn_time — the gates must \
+                 evolve independently"
+            ),
+            Ok(()) => panic!("precondition: second check must produce Err"),
+        }
     }
 }

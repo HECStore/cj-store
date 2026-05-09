@@ -133,6 +133,11 @@ impl Storage {
             let entry = entry?;
             let path = entry.path();
 
+            // Cap node_id so `node_id * CHESTS_PER_NODE + 3` (computed in
+            // `Chest::new` and `Node::load`) cannot overflow i32. Hand-edited
+            // filenames like `2147483647.json` would otherwise wrap to a
+            // negative chest id and silently collide with a real chest.
+            let max_node_id = i32::MAX / crate::constants::CHESTS_PER_NODE as i32 - 1;
             if path.is_file()
                 && let Some(extension) = path.extension()
                 && extension == "json"
@@ -140,6 +145,7 @@ impl Storage {
                 && let Some(file_str) = file_name.to_str()
                 && let Ok(node_id) = file_str.parse::<i32>()
                 && node_id >= 0
+                && node_id <= max_node_id
             {
                 match Node::load(node_id, storage_position) {
                     Ok(node) => nodes.push(node),

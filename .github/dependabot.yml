@@ -1,0 +1,30 @@
+# Dependabot configuration.
+#
+# NOTE: Dependabot will NOT bump the `azalea` git-rev pin in Cargo.toml —
+# that pin is deliberate (see Cargo.toml lines 8-41 + vendor/azalea-viaversion/
+# VENDOR_NOTES.md). The `azalea` upgrade path is manual; this file covers
+# the rest of the dependency surface (registry deps + Actions).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: master
+    open-pull-requests-limit: 5
+    # Bunch sub-dep churn into single PRs so the review queue stays
+    # tractable; security patches still come in dedicated PRs.
+    groups:
+      cargo-dev:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+          - minor
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: master
+    open-pull-requests-limit: 5

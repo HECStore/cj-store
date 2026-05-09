@@ -912,8 +912,6 @@ async fn validate_node_physically(
     node_id: i32,
     node_position: &Position,
 ) -> Result<(), String> {
-    use crate::types::Node;
-
     info!(
         "Validating node {} at ({}, {}, {})",
         node_id, node_position.x, node_position.y, node_position.z
@@ -944,7 +942,7 @@ async fn validate_node_physically(
             .await;
         }
 
-        let chest_pos = Node::calc_chest_position(chest_index, node_position);
+        let chest_pos = crate::types::chest::Chest::calc_position(node_position, chest_index);
         let block_pos = azalea::BlockPos::new(chest_pos.x, chest_pos.y, chest_pos.z);
 
         debug!(

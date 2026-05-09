@@ -110,7 +110,18 @@ impl Node {
     /// chest 1 = overflow) are re-enforced even on load in case the file was
     /// edited manually, and any correction is persisted back to disk.
     pub fn load(id: i32, storage_position: &Position) -> Result<Self, StoreError> {
-        let file_path = node_file_path(id);
+        Self::load_from_dir(id, storage_position, Path::new(STORAGE_DIR))
+    }
+
+    /// Same as [`Self::load`], but reads from `base/{id}.json` instead of the
+    /// hard-coded [`STORAGE_DIR`]. Exists so unit tests can exercise the JSON
+    /// invariant checks against a temp dir without polluting the real data dir.
+    fn load_from_dir(
+        id: i32,
+        storage_position: &Position,
+        base: &Path,
+    ) -> Result<Self, StoreError> {
+        let file_path = base.join(format!("{id}.json"));
 
         if !file_path.exists() {
             return Err(StoreError::InvariantViolation(format!(
@@ -127,6 +138,19 @@ impl Node {
             return Err(StoreError::InvariantViolation(format!(
                 "Node ID mismatch: expected {}, got {}",
                 id, node.id
+            )));
+        }
+
+        // Reject wrong chest counts up-front so the per-chest scan below isn't
+        // wasting cycles on a node that was always going to be rejected, and
+        // operators get a clearer error than whichever per-chest check would
+        // happen to fail first on a 5-chest hand-edited file.
+        if node.chests.len() != CHESTS_PER_NODE {
+            return Err(StoreError::InvariantViolation(format!(
+                "Node {} has {} chests, expected {}",
+                id,
+                node.chests.len(),
+                CHESTS_PER_NODE
             )));
         }
 
@@ -163,15 +187,6 @@ impl Node {
             chest.position = Chest::calc_position(&node.position, chest.index);
         }
 
-        if node.chests.len() != CHESTS_PER_NODE {
-            return Err(StoreError::InvariantViolation(format!(
-                "Node {} has {} chests, expected {}",
-                id,
-                node.chests.len(),
-                CHESTS_PER_NODE
-            )));
-        }
-
         node.chests.sort_by_key(|chest| chest.index);
 
         // After sort, indices must be exactly [0, 1, 2, 3] with no duplicates,
@@ -181,35 +196,31 @@ impl Node {
         // chest, and a chest with id=0 sitting in a non-zero node would be
         // force-relabeled to "diamond" by the bot's first sync.
         for (expected_idx, chest) in node.chests.iter().enumerate() {
-            let expected_idx = expected_idx as i32;
-            if chest.index != expected_idx {
-                return Err(StoreError::InvariantViolation(format!(
-                    "Node {} chest at slot {} has index {} (duplicate or missing)",
-                    id, expected_idx, chest.index
-                )));
-            }
-            if chest.node_id != id {
-                return Err(StoreError::InvariantViolation(format!(
-                    "Node {} chest {} has node_id {} (expected {})",
-                    id, chest.index, chest.node_id, id
-                )));
-            }
-            let expected_id = id * CHESTS_PER_NODE as i32 + chest.index;
-            if chest.id != expected_id {
-                return Err(StoreError::InvariantViolation(format!(
-                    "Node {} chest at index {} has id {} (expected {})",
-                    id, chest.index, chest.id, expected_id
-                )));
-            }
+            chest.check_invariants(id, expected_idx as i32)?;
         }
 
         // Re-enforce node 0's reserved chest invariants in case the JSON was
         // hand-edited. Persist the correction so later loads see the fix.
+        //
+        // Refuse the relabel if the existing chest holds a non-empty stockpile
+        // of the wrong item: silently relabeling would mint currency. The
+        // operator must reconcile manually. -1 is the wire-protocol unchecked
+        // sentinel (ChestSyncReport) and counts as "no stockpile".
         if id == 0 {
             let mut needs_save = false;
 
             if let Some(chest_0) = node.chests.get_mut(0)
                 && chest_0.item != crate::constants::BASE_CURRENCY_ITEM {
+                    let stockpile: i32 =
+                        chest_0.amounts.iter().filter(|&&a| a > 0).sum();
+                    if stockpile > 0 {
+                        return Err(StoreError::InvariantViolation(format!(
+                            "Node 0 chest 0 reserved for `{}` but on-disk item is `{}` with stockpile of {} units; refusing to relabel (would mint currency). Reconcile manually.",
+                            crate::constants::BASE_CURRENCY_ITEM,
+                            chest_0.item,
+                            stockpile
+                        )));
+                    }
                     chest_0.item = ItemId::from_normalized(
                         crate::constants::BASE_CURRENCY_ITEM.to_string(),
                     );
@@ -218,6 +229,16 @@ impl Node {
 
             if let Some(chest_1) = node.chests.get_mut(1)
                 && chest_1.item != crate::constants::OVERFLOW_CHEST_ITEM {
+                    let stockpile: i32 =
+                        chest_1.amounts.iter().filter(|&&a| a > 0).sum();
+                    if stockpile > 0 {
+                        return Err(StoreError::InvariantViolation(format!(
+                            "Node 0 chest 1 reserved for `{}` but on-disk item is `{}` with stockpile of {} units; refusing to relabel. Reconcile manually.",
+                            crate::constants::OVERFLOW_CHEST_ITEM,
+                            chest_1.item,
+                            stockpile
+                        )));
+                    }
                     chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                     needs_save = true;
                 }
@@ -227,7 +248,10 @@ impl Node {
                     node_id = 0,
                     "node 0 reserved chest assignments were wrong on disk; rewriting"
                 );
-                if let Err(e) = node.save() {
+                // Save back to the SAME base we loaded from — otherwise a
+                // test loading from a temp dir would silently rewrite the
+                // real `data/storage` dir on a node-0 fixup.
+                if let Err(e) = node.save_to_dir(base) {
                     tracing::error!(
                         node_id = 0,
                         error = %e,
@@ -246,6 +270,13 @@ impl Node {
     /// Uses [`write_atomic`] (write-to-temp + rename) so a crash mid-write
     /// cannot leave a partially-written node file on disk.
     pub fn save(&self) -> Result<(), StoreError> {
+        self.save_to_dir(Path::new(STORAGE_DIR))
+    }
+
+    /// Same as [`Self::save`], but writes to `base/{id}.json` instead of the
+    /// hard-coded [`STORAGE_DIR`]. Exists so unit tests can round-trip a node
+    /// through a temp dir without touching the real data dir.
+    fn save_to_dir(&self, base: &Path) -> Result<(), StoreError> {
         // Validate in-memory invariants before persisting so a mutation bug
         // (accidental Vec::push of a 5th chest, swapped indices, etc.) fails
         // at the save boundary rather than corrupting disk and surfacing only
@@ -259,28 +290,18 @@ impl Node {
             )));
         }
         for (expected_idx, chest) in self.chests.iter().enumerate() {
-            let expected_idx = expected_idx as i32;
-            if chest.index != expected_idx
-                || chest.node_id != self.id
-                || chest.id != self.id * CHESTS_PER_NODE as i32 + chest.index
-                || chest.amounts.len() != crate::constants::DOUBLE_CHEST_SLOTS
-            {
-                return Err(StoreError::InvariantViolation(format!(
-                    "Node {} chest at slot {} fails invariant: index={} node_id={} id={} amounts.len()={}",
-                    self.id,
-                    expected_idx,
-                    chest.index,
-                    chest.node_id,
-                    chest.id,
-                    chest.amounts.len()
-                )));
-            }
+            chest.check_invariants(self.id, expected_idx as i32)?;
         }
 
-        let file_path = node_file_path(self.id);
+        let file_path = base.join(format!("{}.json", self.id));
 
         if let Some(parent_dir) = file_path.parent()
-            && !parent_dir.exists() {
+            && !parent_dir.is_dir() {
+                // Use is_dir, not exists: if `data/storage` already exists as a
+                // regular file (operator mistake), `create_dir_all` returns a
+                // clear "Not a directory" error; `exists()` would short-circuit
+                // and let the downstream tempfile rename fail with a confusing
+                // path-error far from the cause.
                 fs::create_dir_all(parent_dir)?;
             }
 
@@ -373,17 +394,6 @@ impl Node {
         }
     }
 
-    /// Thin wrapper around [`Chest::calc_position`] kept for path/naming
-    /// stability with the bot validation call site.
-    ///
-    /// # Panics
-    /// Panics if `chest_index` is not in `0..=3`.
-    pub fn calc_chest_position(
-        chest_index: i32,
-        node_position: &Position,
-    ) -> Position {
-        Chest::calc_position(node_position, chest_index)
-    }
 }
 
 #[cfg(test)]
@@ -481,40 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn calc_chest_position_matches_chest_calc_position() {
-        // The wrapper must be an exact delegation for every valid index.
-        let node_pos = Position { x: 100, y: 64, z: 200 };
-        for idx in 0..CHESTS_PER_NODE as i32 {
-            let via_node = Node::calc_chest_position(idx, &node_pos);
-            let via_chest = Chest::calc_position(&node_pos, idx);
-            assert_eq!(
-                (via_node.x, via_node.y, via_node.z),
-                (via_chest.x, via_chest.y, via_chest.z),
-                "chest {idx} mismatch"
-            );
-        }
-    }
-
-    #[test]
-    fn calc_chest_position_matches_documented_2x2_layout() {
-        // Looking north (toward -z) from the bot position P:
-        //   01  <- y+1 (top row)
-        //   23  <- y (bottom row)
-        // Left column: x-2, right column: x-1, all on the z-1 face.
-        let p = Position { x: 100, y: 64, z: 200 };
-        let expect = [
-            (98, 65, 199),  // 0: left,  top
-            (99, 65, 199),  // 1: right, top
-            (98, 64, 199),  // 2: left,  bottom
-            (99, 64, 199),  // 3: right, bottom
-        ];
-        for (idx, (ex, ey, ez)) in expect.iter().enumerate() {
-            let c = Node::calc_chest_position(idx as i32, &p);
-            assert_eq!((c.x, c.y, c.z), (*ex, *ey, *ez), "chest {idx} offset wrong");
-        }
-    }
-
-    #[test]
     fn new_node_0_has_reserved_diamond_and_overflow_chests() {
         let node = Node::new(0, &Position { x: 50, y: 70, z: 100 });
         assert_eq!(node.id, 0);
@@ -551,5 +527,207 @@ mod tests {
                        (expected_chest.x, expected_chest.y, expected_chest.z),
                        "chest {} misplaced", c.index);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // save_to_dir / load_from_dir round-trip + on-disk invariant tests.
+    //
+    // These pin every JSON-shaped invariant in `Node::load`: chest count,
+    // duplicate / out-of-range indices, redundant-id agreement,
+    // amounts.len, and the node-0 reserved-chest fixup including the
+    // "refuse to relabel a non-empty reserved chest" guard. Without
+    // these, a regression that loosened any check would slip past CI.
+    // We use `tempfile::tempdir()` so the real `data/storage` is
+    // never touched.
+    // -----------------------------------------------------------------
+
+    fn write_node_json(dir: &Path, id: i32, json: &str) {
+        fs::write(dir.join(format!("{id}.json")), json).unwrap();
+    }
+
+    /// Build a minimal valid node-0 JSON with `chest_0_item` and
+    /// `chest_0_amounts` controllable for the reserved-chest tests.
+    fn node_0_json(chest_0_item: &str, chest_0_amounts: Vec<i32>) -> String {
+        // amounts arrays for the other chests are always 54 zeros.
+        let zeros: Vec<i32> = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        let zeros_json = serde_json::to_string(&zeros).unwrap();
+        let chest_0_amounts_json = serde_json::to_string(&chest_0_amounts).unwrap();
+        format!(
+            r#"{{
+              "id": 0,
+              "position": {{"x": 0, "y": 64, "z": 0}},
+              "chests": [
+                {{"id": 0, "node_id": 0, "index": 0, "position": {{"x":0,"y":0,"z":0}}, "item": "{chest_0_item}", "amounts": {chest_0_amounts_json}}},
+                {{"id": 1, "node_id": 0, "index": 1, "position": {{"x":0,"y":0,"z":0}}, "item": "overflow", "amounts": {zeros_json}}},
+                {{"id": 2, "node_id": 0, "index": 2, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 3, "node_id": 0, "index": 3, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}}
+              ]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn save_load_round_trip_preserves_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = Node::new(5, &origin());
+        // Plant some recognisable state we can assert survives the
+        // round-trip so the test doesn't accidentally pass on a default-
+        // valued node where every field is zero/empty.
+        node.chests[2].item = ItemId::from_normalized("cobblestone".to_string());
+        node.chests[2].amounts[0] = 17;
+        node.chests[2].amounts[53] = 99;
+        node.chests[3].item = ItemId::from_normalized("iron_ingot".to_string());
+        node.chests[3].amounts[10] = 42;
+
+        node.save_to_dir(dir.path()).unwrap();
+
+        let loaded = Node::load_from_dir(5, &origin(), dir.path()).unwrap();
+        assert_eq!(loaded.id, node.id);
+        assert_eq!(loaded.position, node.position);
+        assert_eq!(loaded.chests.len(), node.chests.len());
+        for (a, b) in loaded.chests.iter().zip(node.chests.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.node_id, b.node_id);
+            assert_eq!(a.index, b.index);
+            assert_eq!(a.position, b.position);
+            assert_eq!(a.item, b.item);
+            assert_eq!(a.amounts, b.amounts);
+        }
+    }
+
+    #[test]
+    fn load_rejects_chest_count_other_than_4() {
+        let dir = tempfile::tempdir().unwrap();
+        let zeros: Vec<i32> = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        let zeros_json = serde_json::to_string(&zeros).unwrap();
+        // Three chests instead of four.
+        let json = format!(
+            r#"{{
+              "id": 1,
+              "position": {{"x":0,"y":64,"z":0}},
+              "chests": [
+                {{"id": 4, "node_id": 1, "index": 0, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 5, "node_id": 1, "index": 1, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 6, "node_id": 1, "index": 2, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}}
+              ]
+            }}"#
+        );
+        write_node_json(dir.path(), 1, &json);
+        let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::InvariantViolation(_)),
+                "expected InvariantViolation, got {err:?}");
+    }
+
+    #[test]
+    fn load_rejects_duplicate_chest_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let zeros: Vec<i32> = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        let zeros_json = serde_json::to_string(&zeros).unwrap();
+        // Two chests with index=0 (and no index=3) — must be rejected.
+        let json = format!(
+            r#"{{
+              "id": 1,
+              "position": {{"x":0,"y":64,"z":0}},
+              "chests": [
+                {{"id": 4, "node_id": 1, "index": 0, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 4, "node_id": 1, "index": 0, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 5, "node_id": 1, "index": 1, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 6, "node_id": 1, "index": 2, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}}
+              ]
+            }}"#
+        );
+        write_node_json(dir.path(), 1, &json);
+        let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::InvariantViolation(_)),
+                "expected InvariantViolation, got {err:?}");
+    }
+
+    #[test]
+    fn load_rejects_chest_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let zeros: Vec<i32> = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        let zeros_json = serde_json::to_string(&zeros).unwrap();
+        // Node 1 chest at index 2 should have id = 1*4+2 = 6, but we lie
+        // and write id=99 — `check_invariants` must catch it.
+        let json = format!(
+            r#"{{
+              "id": 1,
+              "position": {{"x":0,"y":64,"z":0}},
+              "chests": [
+                {{"id": 4, "node_id": 1, "index": 0, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 5, "node_id": 1, "index": 1, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 99, "node_id": 1, "index": 2, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}},
+                {{"id": 7, "node_id": 1, "index": 3, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_json}}}
+              ]
+            }}"#
+        );
+        write_node_json(dir.path(), 1, &json);
+        let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::InvariantViolation(_)),
+                "expected InvariantViolation, got {err:?}");
+    }
+
+    #[test]
+    fn load_rejects_amounts_len_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let zeros_full: Vec<i32> = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        let zeros_full_json = serde_json::to_string(&zeros_full).unwrap();
+        // 53 entries — one short of DOUBLE_CHEST_SLOTS.
+        let zeros_short: Vec<i32> = vec![0; crate::constants::DOUBLE_CHEST_SLOTS - 1];
+        let zeros_short_json = serde_json::to_string(&zeros_short).unwrap();
+        let json = format!(
+            r#"{{
+              "id": 1,
+              "position": {{"x":0,"y":64,"z":0}},
+              "chests": [
+                {{"id": 4, "node_id": 1, "index": 0, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_full_json}}},
+                {{"id": 5, "node_id": 1, "index": 1, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_short_json}}},
+                {{"id": 6, "node_id": 1, "index": 2, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_full_json}}},
+                {{"id": 7, "node_id": 1, "index": 3, "position": {{"x":0,"y":0,"z":0}}, "item": "", "amounts": {zeros_full_json}}}
+              ]
+            }}"#
+        );
+        write_node_json(dir.path(), 1, &json);
+        let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
+        assert!(matches!(err, StoreError::InvariantViolation(_)),
+                "expected InvariantViolation, got {err:?}");
+    }
+
+    #[test]
+    fn load_refuses_relabel_on_node_0_chest_with_nonempty_stockpile() {
+        let dir = tempfile::tempdir().unwrap();
+        // Chest 0 mis-labelled as iron_ingot but holds 100 units of it —
+        // silently relabelling to diamond would mint currency, so load must
+        // refuse.
+        let mut amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        amounts[0] = 100;
+        let json = node_0_json("iron_ingot", amounts);
+        write_node_json(dir.path(), 0, &json);
+        let err = Node::load_from_dir(0, &origin(), dir.path()).unwrap_err();
+        match err {
+            StoreError::InvariantViolation(msg) => {
+                assert!(
+                    msg.contains("refusing to relabel"),
+                    "expected 'refusing to relabel' in error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_relabels_node_0_empty_reserved_chest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Wrong item but empty stockpile — load should silently relabel
+        // back to BASE_CURRENCY_ITEM (diamond) and persist the fix.
+        let amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        let json = node_0_json("wrong_item", amounts);
+        write_node_json(dir.path(), 0, &json);
+        let loaded = Node::load_from_dir(0, &origin(), dir.path()).unwrap();
+        assert_eq!(
+            loaded.chests[0].item,
+            crate::constants::BASE_CURRENCY_ITEM,
+            "empty reserved chest should be relabeled to base currency"
+        );
     }
 }

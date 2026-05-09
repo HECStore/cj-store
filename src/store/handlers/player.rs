@@ -30,6 +30,22 @@ pub use deposit::handle_deposit_balance_queued;
 pub use info::pay_async;
 pub use withdraw::handle_withdraw_balance_queued;
 
+/// Compose the `n:`-prefixed rate-limit key for a raw player name.
+///
+/// Centralized so the lowercase normalization is a single load-bearing site
+/// — without it, ALICE/Alice/alice would each consume a distinct slot in
+/// the limiter and a distinct whisper-gate, doubling (or worse) the spam
+/// amplification a single attacker can extract by case-cycling. The
+/// `to_lowercase()` allocation is skipped on already-lowercase input
+/// (the common case) since `validate_username` permits any ASCII case.
+fn name_rate_limit_key(player_name: &str) -> String {
+    if player_name.bytes().any(|b| b.is_ascii_uppercase()) {
+        format!("n:{}", player_name.to_lowercase())
+    } else {
+        format!("n:{player_name}")
+    }
+}
+
 pub async fn handle_player_command(
     store: &mut Store,
     player_name: &str,
@@ -56,21 +72,29 @@ pub async fn handle_player_command(
     // Mojang round-trip. Keyed by the lowercased raw name; since UUIDs are
     // 36-char dashed strings, they cannot collide with the 3-16 char
     // alphanumeric+underscore usernames that reach this point.
-    let name_key = format!("n:{}", player_name.to_lowercase());
-    if let Err(wait_duration) = store.rate_limiter.check(&name_key) {
-        let should_whisper = store.rate_limiter.should_whisper_rejection(&name_key);
-        if !should_whisper {
+    //
+    // The `n:` and `u:` gates each consume their own slot in the limiter:
+    // a single legitimate command therefore reserves two slots, halving the
+    // effective `MAX_RATE_LIMIT_ENTRIES` cap relative to user count. The
+    // `n:` gate is the primary anti-DoS surface (it fires before any Mojang
+    // I/O); the `u:` gate is a defense-in-depth check after a successful
+    // resolve. Don't remove either — together they cap both fake-name spam
+    // and resolved-user spam.
+    //
+    let name_key = name_rate_limit_key(player_name);
+    if let Err(throttled) = store.rate_limiter.check(&name_key) {
+        if !throttled.should_whisper {
             // Suppress the whisper to cap outbound chat amplification on
             // sustained spam (attacker cycling distinct usernames). The
             // rejection still lands; only the player-facing notice is
-            // throttled — see RateLimiter::should_whisper_rejection.
+            // throttled — see `RateLimiter::check` returning `Throttled`.
             return Ok(());
         }
         return whisper_rate_limit_notice(
             store,
             player_name,
             command,
-            wait_duration,
+            throttled.wait,
             None,
             "pre-resolve",
         )
@@ -107,16 +131,15 @@ pub async fn handle_player_command(
     // Rate-limit check precedes parsing so malformed spam still counts
     // toward the per-user cooldown.
     let uuid_key = format!("u:{}", user_uuid);
-    if let Err(wait_duration) = store.rate_limiter.check(&uuid_key) {
-        let should_whisper = store.rate_limiter.should_whisper_rejection(&uuid_key);
-        if !should_whisper {
+    if let Err(throttled) = store.rate_limiter.check(&uuid_key) {
+        if !throttled.should_whisper {
             return Ok(());
         }
         return whisper_rate_limit_notice(
             store,
             player_name,
             command,
-            wait_duration,
+            throttled.wait,
             Some(&user_uuid),
             "post-resolve",
         )
@@ -314,6 +337,33 @@ mod tests {
             max_trades_in_memory: 1000,
             autosave_interval_secs: 10,
             chat: crate::config::ChatConfig::default(),
+        }
+    }
+
+    #[test]
+    fn name_rate_limit_key_collapses_case_variants() {
+        // Pin the lowercase normalization: every case-variant of the same
+        // player name must produce the SAME `n:`-key so a single attacker
+        // cannot get one whisper-budget per case-variant by alternating
+        // ALICE/alice/Alice. If a future refactor of `name_rate_limit_key`
+        // drops or moves the lowercase step, this test must catch it.
+        for variant in &["alice", "Alice", "ALICE", "aLiCe", "AlIcE"] {
+            assert_eq!(
+                name_rate_limit_key(variant),
+                "n:alice",
+                "case-variant `{variant}` must collapse to the same n:-key as `alice`"
+            );
+        }
+    }
+
+    #[test]
+    fn name_rate_limit_key_skips_lowercase_path_for_already_lowercase() {
+        // The skip exists so the warm path (already-lowercase names — the
+        // common case for Minecraft players) does not pay a `to_lowercase()`
+        // allocation. Verify the output matches the slow path so the skip is
+        // observably equivalent.
+        for n in &["bob", "alice42", "snake_case_user"] {
+            assert_eq!(name_rate_limit_key(n), format!("n:{}", n.to_lowercase()));
         }
     }
 

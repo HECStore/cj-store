@@ -6,8 +6,12 @@
 linker = "clang"
 rustflags = ["-Clink-arg=-fuse-ld=lld", "-Zshare-generics=y"]
 
-# NOTE: you must install [Mach-O LLD Port](https://lld.llvm.org/MachO/index.html) on mac. you can easily do this by installing llvm which includes lld with the "brew" package manager:
-# `brew install llvm`
+# NOTE: both macOS stanzas below pin a brew-installed Mach-O LLD Port path
+# (https://lld.llvm.org/MachO/index.html). Install with `brew install llvm`.
+# The Intel and Apple-silicon stanzas hard-code different prefixes because
+# Homebrew installs to `/usr/local/opt` on Intel and `/opt/homebrew/opt` on
+# Apple silicon — both required for the linker pin to resolve.
+# macOS is not exercised by CI; see DEVELOPMENT.md.
 [target.x86_64-apple-darwin]
 rustflags = [
     "-C",

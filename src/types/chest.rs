@@ -18,6 +18,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{CHESTS_PER_NODE, DOUBLE_CHEST_SLOTS};
+use crate::error::StoreError;
 use crate::types::item_id::ItemId;
 use crate::types::position::Position;
 
@@ -31,7 +32,11 @@ use crate::types::position::Position;
 ///
 /// **Invariants**:
 /// - `amounts.len() == 54` (enforced by `Storage::normalize_amounts_len()`)
-/// - `amounts[i] >= 0`
+/// - `amounts[i] >= 0` in steady state. `-1` is the wire-protocol unchecked-slot
+///   sentinel from `ChestSyncReport`; it is filtered by `apply_chest_sync` and
+///   defensively skipped by storage.rs iteration paths (`total_item_amount`,
+///   `simulate_*_plan`, `deposit_into_chest`). Stored amounts on disk should
+///   never be negative; `audit_state` flags `< -1` as corruption.
 /// - `amounts[i] <= pair.shulker_capacity()` (varies by item stack size)
 ///   - Most items: 27 × 64 = 1728 max per shulker
 ///   - Stack-16 items (ender pearls, etc.): 27 × 16 = 432 max
@@ -104,8 +109,52 @@ impl Chest {
     ///
     /// # Panics
     /// Panics if `index` is not in range 0-3. This is a programming error;
-    /// all callers (Node::new, Node::load, Node::calc_chest_position) control
-    /// the index parameter directly.
+    /// all callers (Node::new, Node::load, bot validation) control the index
+    /// parameter directly.
+    /// Verifies the on-struct invariants documented above (`amounts.len()`,
+    /// `id == node_id * CHESTS_PER_NODE + index`, redundant id-field
+    /// agreement, and that `index` is in range). Save/load boundary helper —
+    /// callers should NOT invoke this on every mutation; the invariants
+    /// concerned cannot be violated by `amounts[i]` writes.
+    pub(crate) fn check_invariants(
+        &self,
+        expected_node_id: i32,
+        expected_index: i32,
+    ) -> Result<(), StoreError> {
+        if !(0..CHESTS_PER_NODE as i32).contains(&self.index) {
+            return Err(StoreError::InvariantViolation(format!(
+                "Chest has invalid index {} (must be 0..{}) for node {}",
+                self.index, CHESTS_PER_NODE, expected_node_id
+            )));
+        }
+        if self.index != expected_index {
+            return Err(StoreError::InvariantViolation(format!(
+                "Node {} chest at slot {} has index {} (duplicate or missing)",
+                expected_node_id, expected_index, self.index
+            )));
+        }
+        if self.node_id != expected_node_id {
+            return Err(StoreError::InvariantViolation(format!(
+                "Node {} chest {} has node_id {} (expected {})",
+                expected_node_id, self.index, self.node_id, expected_node_id
+            )));
+        }
+        let expected_id = expected_node_id * CHESTS_PER_NODE as i32 + self.index;
+        if self.id != expected_id {
+            return Err(StoreError::InvariantViolation(format!(
+                "Node {} chest at index {} has id {} (expected {})",
+                expected_node_id, self.index, self.id, expected_id
+            )));
+        }
+        if self.amounts.len() != DOUBLE_CHEST_SLOTS {
+            return Err(StoreError::InvariantViolation(format!(
+                "Node {} chest {} has amounts.len()={}, expected {}",
+                expected_node_id, self.index, self.amounts.len(), DOUBLE_CHEST_SLOTS
+            )));
+        }
+        Ok(())
+    }
+
     pub fn calc_position(node_position: &Position, index: i32) -> Position {
         match index {
             0 => Position {

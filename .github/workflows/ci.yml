@@ -5,29 +5,68 @@ on:
     branches: [master]
   pull_request:
 
+# Least-privilege: this pipeline only checks/builds/tests, so the implicit
+# GITHUB_TOKEN is restricted to read-only on repository contents. Shrinks
+# blast radius if a third-party action is ever compromised.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a fast push train doesn't keep
+# running stale Windows builds. Safe for a build/test pipeline (no deploy).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: build / clippy / test
-    runs-on: windows-latest
+    name: build / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      # Third-party actions are SHA-pinned (Dependabot keeps them fresh via
+      # the github-actions ecosystem in .github/dependabot.yml). Floating
+      # major tags would let an upstream tag re-point silently change what
+      # runs in CI.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Linux lane needs clang + lld because .cargo/config.toml pins
+      # `linker = "clang"` and `-Clink-arg=-fuse-ld=lld` for
+      # x86_64-unknown-linux-gnu. Without these the cargo invocations below
+      # would fail at link time.
+      - name: Install clang and lld (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y clang lld
 
       # The pinned dated nightly in rust-toolchain.toml is honored automatically.
       - name: Show toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
+
+      # `cargo test --all-targets` deliberately EXCLUDES doctests; the project
+      # ships ``` fences in src/bot/shulker.rs, src/types/chest.rs, and
+      # src/types/node.rs, and doctest breakage would otherwise ship silently.
+      - name: cargo test --doc
+        run: cargo test --locked --doc
+
+      # Release-profile gate: Cargo.toml enables `lto = "thin"` for release;
+      # LTO/codegen failures only surface under that profile. Operators ship
+      # from `cargo build --release`, so a release-only break must not
+      # bypass CI. `cargo check --release` is the cheap insurance variant.
+      - name: cargo check --release
+        run: cargo check --locked --release --all-targets

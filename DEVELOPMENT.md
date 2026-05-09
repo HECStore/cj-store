@@ -21,7 +21,7 @@ see [ARCHITECTURE.md](ARCHITECTURE.md); for on-disk formats see
   would therefore need both removing the `-Z...` flags from the
   Linux/macOS stanzas of `.cargo/config.toml` AND replacing or vendoring
   Azalea to a stable-compatible cut.
-- Tested on Windows; Linux and macOS should work unchanged.
+- Tested on Windows; Linux works unchanged (CI gate); macOS configuration is in `.cargo/config.toml` but not exercised by CI.
 - Logs go **only** to `data/logs/store.log`. `stdout` gets a handful of
   startup lines telling the operator how to tail the log (the exact
   commands for PowerShell and bash/tail are printed); every subsequent

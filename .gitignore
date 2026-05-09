@@ -5,7 +5,8 @@
 .env
 .env.*
 !.env.example
-# Cargo registry tokens (cargo login writes here; .cargo/ is partially tracked via config.toml)
+# Cargo registry tokens — only credential files are excluded; the rest of
+# .cargo/ (notably config.toml) is tracked normally.
 .cargo/credentials
 .cargo/credentials.toml
 

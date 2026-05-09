@@ -2,6 +2,7 @@
 name = "cj-store"
 version = "1.0.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1.0.102"
@@ -36,7 +37,7 @@ anyhow = "1.0.102"
 # ViaBackwards ≥5.9.0 with the post-26.1 `custom_data` hashing fixes),
 # both pins can be dropped to track `main` again for the 26.1 protocol
 # features.
-azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11" }
+azalea = { git = "https://github.com/azalea-rs/azalea", rev = "41a9ae6aaff77646c08c64ac1334a8cc6081c24f" }
 azalea-viaversion = { path = "vendor/azalea-viaversion" }
 chrono = { version = "0.4.44", features = ["serde"] }
 dialoguer = "0.12.0"
@@ -71,5 +72,22 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# Long-running daemon (24/7 bot) — pay one-time release-build cost for
+# tighter inlining on the AMM/pricing/journal-serialization hot paths.
+# Conservative: thin LTO only; codegen-units left at default to keep
+# release wall time reasonable.
+[profile.release]
+lto = "thin"
+
 [lints.rust]
 unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stderr = "warn"
+print_stdout = "warn"

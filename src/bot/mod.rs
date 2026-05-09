@@ -591,6 +591,7 @@ pub async fn bot_task(
                         &bot.history_tx,
                         name,
                         Some(&target),
+                        None,
                         &message,
                         /* is_whisper */ true,
                     )
@@ -614,7 +615,12 @@ pub async fn bot_task(
                     );
                 }
             }
-            BotInstruction::SendChat { content, respond_to } => {
+            BotInstruction::SendChat {
+                content,
+                target,
+                target_uuid,
+                respond_to,
+            } => {
                 // The chat module is responsible for the
                 // critical-section gate and pacing limits — by the time a
                 // SendChat reaches here, those checks have already run. The
@@ -626,7 +632,8 @@ pub async fn bot_task(
                     && let Err(e) = crate::chat::history::enqueue_bot_output(
                         &bot.history_tx,
                         name,
-                        None,
+                        target.as_deref(),
+                        target_uuid.as_deref(),
                         &content,
                         /* is_whisper */ false,
                     )

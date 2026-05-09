@@ -41,12 +41,15 @@ pub(super) async fn handle_balance(
             }
         };
         if !bal.is_finite() || bal < 0.0 {
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                "Internal error: invalid stored balance",
-            )
-            .await;
+            // Symmetry with `get_user_balance_async`'s typed
+            // `InvariantViolation` path — route through the canonical
+            // sanitization helper so both balance-corruption guards
+            // produce the same operator-actionable error log and the
+            // same player-facing GENERIC message.
+            let err = StoreError::InvariantViolation(format!(
+                "balance for self-lookup '{player_name}' is non-finite or negative ({bal})"
+            ));
+            return utils::whisper_error_to_player(store, player_name, &err).await;
         }
         let message = format!("{}'s balance: {:.2} diamonds", player_name, bal);
         return utils::send_message_to_player(store, player_name, &message).await;
@@ -58,18 +61,20 @@ pub(super) async fn handle_balance(
             let message = format!("{}'s balance: {:.2} diamonds", target_name, balance);
             utils::send_message_to_player(store, player_name, &message).await
         }
-        Err(e) => {
-            if e.contains("not found") || e.contains("No user") {
-                utils::send_message_to_player(
-                    store,
-                    player_name,
-                    &format!("{} has no account yet (balance: 0 diamonds)", target_name),
-                )
-                .await
-            } else {
-                utils::send_message_to_player(store, player_name, &e).await
-            }
+        // Friendly "no account yet" branch keys off the typed
+        // `UserNotFound` variant — no more substring matching on
+        // "not found" / "No user" error text. Every other typed
+        // variant routes through the sanitization helper so transport
+        // and Mojang-resolver internals never reach a player whisper.
+        Err(StoreError::UserNotFound { .. }) => {
+            utils::send_message_to_player(
+                store,
+                player_name,
+                &format!("{} has no account yet (balance: 0 diamonds)", target_name),
+            )
+            .await
         }
+        Err(e) => utils::whisper_error_to_player(store, player_name, &e).await,
     }
 }
 
@@ -540,19 +545,32 @@ async fn handle_help_command(
     }
 }
 
-async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64, String> {
+async fn get_user_balance_async(store: &mut Store, username: &str) -> Result<f64, StoreError> {
+    // Returns `Result<f64, StoreError>` so `assert_invariants?` and
+    // `resolve_user_uuid?` no longer round-trip through
+    // `From<StoreError> for String` / `From<MojangResolveError> for String`
+    // — both of which used to flatten typed errors into a single string
+    // the caller had to substring-match. The typed enum lets
+    // `handle_balance` branch on `StoreError::UserNotFound` directly and
+    // route everything else through `whisper_error_to_player`.
     state::assert_invariants(store, "pre-balance", false)?;
     let uuid = crate::mojang::resolve_user_uuid(username).await?;
     // Do NOT auto-create a User record for the lookup target: a balance
     // query is read-only, and creating empty records on demand lets any
     // caller pollute `store.users` with arbitrary names. The friendly
-    // "no account yet" branch in `handle_balance` keys off "not found".
+    // "no account yet" branch in `handle_balance` keys off `UserNotFound`.
     let bal = match store.users.get(&uuid) {
         Some(u) => u.balance,
-        None => return Err(format!("User '{}' not found", username)),
+        None => {
+            return Err(StoreError::UserNotFound {
+                username: username.to_string(),
+            });
+        }
     };
     if !bal.is_finite() || bal < 0.0 {
-        return Err("Internal error: invalid stored balance".to_string());
+        return Err(StoreError::InvariantViolation(format!(
+            "balance for user '{username}' is non-finite or negative ({bal})"
+        )));
     }
     Ok(bal)
 }
@@ -582,9 +600,11 @@ pub async fn pay_async(
         return Err(StoreError::ValidationError("Amount must be positive".to_string()));
     }
 
-    let payee_uuid = crate::mojang::resolve_user_uuid(payee_username)
-        .await
-        .map_err(StoreError::ValidationError)?;
+    // Convert the typed `MojangResolveError` to a sanitized `StoreError` via
+    // the central `From` impl in `error.rs`. This is the same routing every
+    // store-layer Mojang call site uses: `NotFound` → `UserNotFound`,
+    // `InvalidShape` → `ValidationError`, everything else → `MojangNetwork`.
+    let payee_uuid = crate::mojang::resolve_user_uuid(payee_username).await?;
 
     // UUID-level self-pay reject: usernames may differ in casing or via a
     // Mojang rename, so canonical identity equality is the right check. A

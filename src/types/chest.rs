@@ -66,6 +66,10 @@ impl Chest {
     /// the caller (Node::new, Node::load) — these callers control the index
     /// directly, so an out-of-range value is unrecoverable, not a runtime error.
     pub fn new(node_id: i32, node_position: &Position, index: i32) -> Chest {
+        assert!(
+            (0..CHESTS_PER_NODE as i32).contains(&index),
+            "Chest::new: index {index} out of range 0..{CHESTS_PER_NODE} (node_id={node_id})"
+        );
         let id = node_id * CHESTS_PER_NODE as i32 + index;
         let position = Self::calc_position(node_position, index);
 
@@ -124,7 +128,9 @@ impl Chest {
                 y: node_position.y,
                 z: node_position.z - 1,
             },
-            _ => panic!("Invalid chest index: {index} (must be 0-3)"),
+            _ => panic!(
+                "Invalid chest index: {index} (must be 0-3) at node_position {node_position:?}"
+            ),
         }
     }
 }

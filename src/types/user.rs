@@ -15,7 +15,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fmt, fs, io,
     path::Path,
     sync::OnceLock,
 };
@@ -90,6 +90,59 @@ struct MojangResponse {
     id: String,
 }
 
+/// Typed Mojang-resolver error. The `Display` impl is short and entirely
+/// author-controlled — no `reqwest` internals (URLs, header dumps, TLS chain
+/// errors) leak through. Convert at the `reqwest::Error` boundary inside
+/// `User::get_uuid_async` by inspecting `e.is_connect()` / `e.is_timeout()` /
+/// `e.is_status()` / `e.is_decode()`; route every variant to a sanitized
+/// `StoreError` at the call site (`StoreError::UserNotFound`,
+/// `StoreError::ValidationError`, or `StoreError::MojangNetwork`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MojangResolveError {
+    /// Mojang returned 204 No Content — the username does not exist.
+    /// `username` is the original (caller-supplied) username for whisper
+    /// rendering: "Player 'X' not found" reaches the player verbatim.
+    NotFound { username: String },
+    /// Username failed the in-process shape gate (3-16 ASCII alphanumeric+`_`)
+    /// before any network call. Distinct from `NotFound` so callers can
+    /// short-circuit a Mojang round-trip on garbage input.
+    InvalidShape,
+    /// `reqwest::Error::is_timeout()` — the HTTP client tripped its
+    /// per-request timeout. Operator-visible detail goes to logs only.
+    NetworkTimeout,
+    /// Connection-level failure (DNS, TCP, TLS handshake, etc.) —
+    /// `reqwest::Error::is_connect()`. Same operator-only sanitization rule.
+    NetworkError,
+    /// Non-success HTTP status (`is_status()`) other than the 204 mapped
+    /// to `NotFound`. Generic-message at the player; full status logged.
+    UpstreamError,
+    /// Mojang returned 2xx but the body was undecodable JSON, or the
+    /// `id` field failed the 32-char lowercase-hex shape check. Same
+    /// generic player whisper.
+    MalformedResponse,
+}
+
+impl fmt::Display for MojangResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MojangResolveError::NotFound { username } => {
+                write!(f, "Player '{username}' not found")
+            }
+            MojangResolveError::InvalidShape => {
+                write!(f, "Invalid Minecraft username")
+            }
+            MojangResolveError::NetworkTimeout => write!(f, "Mojang API timeout"),
+            MojangResolveError::NetworkError => write!(f, "Mojang API network error"),
+            MojangResolveError::UpstreamError => write!(f, "Mojang API upstream error"),
+            MojangResolveError::MalformedResponse => {
+                write!(f, "Mojang API returned malformed response")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MojangResolveError {}
+
 /// Mojang-shape username validator (3-16 chars, ASCII alphanumeric + `_`).
 /// Mirrors `crate::chat::tools::validate_username_shape`; intentionally
 /// duplicated here so this module has no dependency on `chat::*`. The two
@@ -140,17 +193,21 @@ impl User {
 
     /// Resolves a Minecraft username to a hyphenated Mojang UUID via
     /// `https://api.mojang.com/users/profiles/minecraft/{username}`.
-    /// HTTP 204 → player not found; other non-2xx or network errors → `Err`.
-    /// Rejects out-of-shape usernames before constructing the URL so a
-    /// malformed name (slash, query, fragment, control char) cannot escape
-    /// the path component into an attacker-chosen Mojang endpoint.
+    /// HTTP 204 → `NotFound`; other non-2xx or network errors → typed
+    /// [`MojangResolveError`]. Rejects out-of-shape usernames before
+    /// constructing the URL so a malformed name (slash, query, fragment,
+    /// control char) cannot escape the path component into an
+    /// attacker-chosen Mojang endpoint.
+    ///
+    /// Returns a typed error rather than a stringified `reqwest::Error` so
+    /// nothing from the underlying HTTP client (URLs, header dumps, TLS
+    /// errors) can reach a player whisper. Operator-visible detail is
+    /// emitted via the `warn!`/`debug!` log lines below.
     #[cfg_attr(test, allow(dead_code))]
-    pub async fn get_uuid_async(username: &str) -> Result<String, String> {
+    pub async fn get_uuid_async(username: &str) -> Result<String, MojangResolveError> {
         if !is_valid_username_shape(username) {
             warn!("[Mojang] rejecting out-of-shape username '{username}' before URL build");
-            return Err(format!(
-                "Invalid Minecraft username '{username}' (must be 3-16 chars, ASCII alphanumeric or _)"
-            ));
+            return Err(MojangResolveError::InvalidShape);
         }
         let url = format!("https://api.mojang.com/users/profiles/minecraft/{username}");
 
@@ -158,30 +215,32 @@ impl User {
         let response = client.get(&url).send().await.map_err(|e| {
             if e.is_timeout() {
                 warn!("[Mojang] timeout after {MOJANG_TIMEOUT_SECS}s resolving '{username}'");
-                format!("Mojang API timeout after {MOJANG_TIMEOUT_SECS}s for username '{username}'")
+                MojangResolveError::NetworkTimeout
             } else if e.is_connect() {
                 warn!("[Mojang] connect failed resolving '{username}': {e}");
-                format!("Failed to connect to Mojang API: {e}")
+                MojangResolveError::NetworkError
             } else {
                 warn!("[Mojang] request failed resolving '{username}': {e}");
-                format!("Mojang API request failed: {e}")
+                MojangResolveError::NetworkError
             }
         })?;
 
         if response.status() == reqwest::StatusCode::NO_CONTENT {
             debug!("[Mojang] username '{username}' not found (204)");
-            return Err(format!("Player '{username}' not found"));
+            return Err(MojangResolveError::NotFound {
+                username: username.to_string(),
+            });
         }
 
         if !response.status().is_success() {
             let status = response.status();
             warn!("[Mojang] non-success resolving '{username}': HTTP {status}");
-            return Err(format!("Mojang API error for '{username}': {status}"));
+            return Err(MojangResolveError::UpstreamError);
         }
 
         let mojang_response: MojangResponse = response.json().await.map_err(|e| {
             warn!("[Mojang] malformed response for '{username}': {e}");
-            format!("Failed to parse Mojang API response for '{username}': {e}")
+            MojangResolveError::MalformedResponse
         })?;
 
         // Mojang returns a bare-hex UUID; hyphenate to the canonical
@@ -202,7 +261,7 @@ impl User {
                 "[Mojang] invalid UUID shape for '{username}': got {:?}",
                 id
             );
-            return Err(format!("Invalid UUID from Mojang API: {id}"));
+            return Err(MojangResolveError::MalformedResponse);
         }
         let formatted = format!(
             "{}-{}-{}-{}-{}",

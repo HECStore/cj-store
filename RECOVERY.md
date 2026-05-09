@@ -508,33 +508,40 @@ Don't just delete the file blindly, though:
   error: `PENDING ORDERS LOST: failed to load order queue, starting
   fresh: {e}`. Grep for either string — but if you only have the second
   one, the sidecar path you actually need is in the first.
-- A file named `data/queue.json.corrupt-<stamp>` appears next to the
-  now-empty `data/queue.json`. The `<stamp>` is an RFC3339 timestamp
-  with every `:` replaced by `-` (because Windows / NTFS reject `:` in
-  filenames; the colon-stripping happens in
-  [src/store/queue.rs](src/store/queue.rs) right before the rename), so
-  on disk you'll see something like
-  `data/queue.json.corrupt-2026-04-29T15-30-45.123456789+00-00` rather
-  than the canonical RFC3339 form.
+- A file named `data/queue.json.corrupt-<unix_ms>-<seq>.json` appears
+  next to the now-empty `data/queue.json`. `<unix_ms>` is the
+  millisecond-resolution Unix epoch when the quarantine ran and `<seq>`
+  is a per-process atomic counter so back-to-back loads (rare, but
+  possible across rapid restarts or tests) don't clobber each other.
+  On disk you'll see something like
+  `data/queue.json.corrupt-1714402245123-0.json`. If the queue file
+  failed to *read* (permissions, transient I/O error) rather than parse,
+  the same path scheme is used with the `unreadable` kind tag —
+  `data/queue.json.unreadable-<unix_ms>-<seq>.json`.
 - Players whose orders were queued before the restart see no evidence of
   them; their queue positions are gone.
 
 **Fix**
 
 1. In the common case, `OrderQueue::load_from` already moved the bad
-   bytes out of the way into `data/queue.json.corrupt-<stamp>` so they
+   bytes out of the way into
+   `data/queue.json.{corrupt,unreadable}-<unix_ms>-<seq>.json` so they
    are not overwritten by the next save — open that sidecar to see what
-   was queued. **Rare branch:** if the rename itself failed (permissions,
-   the sidecar path was already taken, the disk filled up between the
-   parse error and the rename, etc.), no sidecar is created and the
-   queue-side log line is the alternate form
-   `[Queue] PENDING ORDERS LOST: corrupt queue file {path:?}; parse error: {e}; failed to move to {sidecar:?}: {rename_err}`.
-   In that case the bad bytes are still sitting at `data/queue.json` —
-   the next queue mutation (any add/pop/cancel) will rewrite
-   `data/queue.json` and overwrite the bad bytes — move them aside before
-   restarting if you want to keep them (e.g.
-   `mv data/queue.json data/queue.json.bad`). Operators should grep for
-   **both** queue-side messages, not just the moved-to-sidecar form.
+   was queued. **Rare branch:** if the quarantine itself failed
+   (permissions, the disk filled up between the parse error and the
+   rename, a held handle that also blocks copy+remove, etc.), no
+   sidecar is created and the queue-side log line is the alternate form
+   `[Queue] PENDING ORDERS LOST: corrupt queue file {path:?}; parse error: {e}; quarantine also failed: {quarantine_err}`
+   (or, for the read-failure path, the `[Queue] could not quarantine
+   unreadable queue file ...` warn followed by the original read error
+   propagated to the caller). In that case the bad bytes are still
+   sitting at `data/queue.json` — the next queue mutation (any
+   add/pop/cancel) will rewrite `data/queue.json` and overwrite the bad
+   bytes — move them aside before restarting if you want to keep them
+   (e.g. `mv data/queue.json data/queue.json.bad` on POSIX, or
+   `Move-Item data/queue.json data/queue.json.bad` in PowerShell).
+   Operators should grep for **both** queue-side messages, not just the
+   moved-to-sidecar form.
 2. If the JSON is recoverable by eye (e.g. a trailing comma, a truncated
    last entry), repair it and rename it back to `data/queue.json` **while
    the bot is stopped**. On restart the queue is loaded as normal.

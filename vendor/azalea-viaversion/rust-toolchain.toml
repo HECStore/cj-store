@@ -1,2 +1,4 @@
 [toolchain]
-channel = "nightly"
+# Mirror the parent project's pinned dated nightly (see ../../rust-toolchain.toml).
+# Move in lockstep with that file when upstream needs a newer nightly.
+channel = "nightly-2026-04-21"

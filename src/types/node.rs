@@ -32,6 +32,16 @@ use crate::types::chest::Chest;
 use crate::types::ItemId;
 use crate::types::position::Position;
 
+/// On-disk directory for per-node files. Single source of truth shared by
+/// `Node::load`, `Node::save`, `Storage::load`, and the CLI removeNode path.
+pub(crate) const STORAGE_DIR: &str = "data/storage";
+
+/// On-disk path for node `id`. Mirrors the convention encoded by
+/// [`STORAGE_DIR`] so callers don't hand-roll the format string.
+pub(crate) fn node_file_path(id: i32) -> std::path::PathBuf {
+    Path::new(STORAGE_DIR).join(format!("{id}.json"))
+}
+
 /// A storage node: 4 chests plus a bot access position, placed on the
 /// storage spiral by [`Node::calc_position`].
 ///
@@ -69,7 +79,9 @@ impl Node {
             // These assignments are invariants, not defaults — see Self::load.
             if node_id == 0 {
                 if index == 0 {
-                    chest.item = ItemId::from_normalized("diamond".to_string());
+                    chest.item = ItemId::from_normalized(
+                        crate::constants::BASE_CURRENCY_ITEM.to_string(),
+                    );
                 } else if index == 1 {
                     chest.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                 }
@@ -98,12 +110,12 @@ impl Node {
     /// chest 1 = overflow) are re-enforced even on load in case the file was
     /// edited manually, and any correction is persisted back to disk.
     pub fn load(id: i32, storage_position: &Position) -> Result<Self, StoreError> {
-        let file_path = format!("data/storage/{}.json", id);
+        let file_path = node_file_path(id);
 
-        if !Path::new(&file_path).exists() {
+        if !file_path.exists() {
             return Err(StoreError::InvariantViolation(format!(
                 "Node file not found: {}",
-                file_path
+                file_path.display()
             )));
         }
 
@@ -129,6 +141,19 @@ impl Node {
                 return Err(StoreError::InvariantViolation(format!(
                     "Node {} has chest with invalid index {} (must be 0..{})",
                     id, chest.index, CHESTS_PER_NODE
+                )));
+            }
+            // The Chest doc-comment claims amounts.len() == DOUBLE_CHEST_SLOTS
+            // is an invariant. Enforce it here so storage.rs's raw iterations
+            // (total_item_amount, simulate_*_plan) cannot silently feed wrong
+            // totals into pricing on a hand-edited or partially-migrated file.
+            if chest.amounts.len() != crate::constants::DOUBLE_CHEST_SLOTS {
+                return Err(StoreError::InvariantViolation(format!(
+                    "Node {} chest {} has amounts.len()={}, expected {}",
+                    id,
+                    chest.index,
+                    chest.amounts.len(),
+                    crate::constants::DOUBLE_CHEST_SLOTS
                 )));
             }
         }
@@ -184,8 +209,10 @@ impl Node {
             let mut needs_save = false;
 
             if let Some(chest_0) = node.chests.get_mut(0)
-                && chest_0.item != "diamond" {
-                    chest_0.item = ItemId::from_normalized("diamond".to_string());
+                && chest_0.item != crate::constants::BASE_CURRENCY_ITEM {
+                    chest_0.item = ItemId::from_normalized(
+                        crate::constants::BASE_CURRENCY_ITEM.to_string(),
+                    );
                     needs_save = true;
                 }
 
@@ -219,9 +246,40 @@ impl Node {
     /// Uses [`write_atomic`] (write-to-temp + rename) so a crash mid-write
     /// cannot leave a partially-written node file on disk.
     pub fn save(&self) -> Result<(), StoreError> {
-        let file_path = format!("data/storage/{}.json", self.id);
+        // Validate in-memory invariants before persisting so a mutation bug
+        // (accidental Vec::push of a 5th chest, swapped indices, etc.) fails
+        // at the save boundary rather than corrupting disk and surfacing only
+        // on the next load — far from the offending mutation site.
+        if self.chests.len() != CHESTS_PER_NODE {
+            return Err(StoreError::InvariantViolation(format!(
+                "Node {} has {} chests, expected {}",
+                self.id,
+                self.chests.len(),
+                CHESTS_PER_NODE
+            )));
+        }
+        for (expected_idx, chest) in self.chests.iter().enumerate() {
+            let expected_idx = expected_idx as i32;
+            if chest.index != expected_idx
+                || chest.node_id != self.id
+                || chest.id != self.id * CHESTS_PER_NODE as i32 + chest.index
+                || chest.amounts.len() != crate::constants::DOUBLE_CHEST_SLOTS
+            {
+                return Err(StoreError::InvariantViolation(format!(
+                    "Node {} chest at slot {} fails invariant: index={} node_id={} id={} amounts.len()={}",
+                    self.id,
+                    expected_idx,
+                    chest.index,
+                    chest.node_id,
+                    chest.id,
+                    chest.amounts.len()
+                )));
+            }
+        }
 
-        if let Some(parent_dir) = Path::new(&file_path).parent()
+        let file_path = node_file_path(self.id);
+
+        if let Some(parent_dir) = file_path.parent()
             && !parent_dir.exists() {
                 fs::create_dir_all(parent_dir)?;
             }
@@ -255,13 +313,12 @@ impl Node {
     /// . 4 3 2 .
     /// ```
     pub fn calc_position(id: i32, storage_position: &Position) -> Position {
-        // Negative IDs would silently produce garbage coordinates: the ring
-        // loop never iterates, `pos_in_ring / side` truncates toward zero
-        // through a `_` arm, and the function returns Position(-12, -1) ×
-        // NODE_SPACING with no error. Filenames are validated at the
-        // `Storage::load` boundary, so this should be unreachable; the
-        // assert documents the invariant.
-        debug_assert!(
+        // Negative IDs would silently produce garbage coordinates and can
+        // collide with a real node (e.g. id=-5 → (0,-1) which is node 7).
+        // Filenames are validated at the `Storage::load` boundary, so this
+        // should be unreachable; promote to a release-effective `assert!`
+        // because silent garbage in release is worse than no assert at all.
+        assert!(
             id >= 0,
             "Node::calc_position requires id >= 0, got {id}",
         );
@@ -291,11 +348,20 @@ impl Node {
         let side = 2 * ring;
 
         // Note: -z is "up" / north in Minecraft, so "top side" uses dz=-ring.
+        // Section 4 happens exactly once per ring at pos_in_ring == 8*ring
+        // (the last id of every ring); the top-edge formula evaluates to
+        // (ring, -ring), the top-right corner that closes the ring. This
+        // is a consistent consequence of the parameterisation, not a
+        // coincidence — a future refactor of the top edge must preserve
+        // the corner case explicitly.
         let (dx, dz) = match pos_in_ring / side {
-            0 => (ring, -ring + pos_in_ring),               // Right edge, walking +z
-            1 => (ring - (pos_in_ring - side), ring),       // Bottom edge, walking -x
-            2 => (-ring, ring - (pos_in_ring - 2 * side)),  // Left edge, walking -z
-            _ => (-ring + (pos_in_ring - 3 * side), -ring), // Top edge, walking +x
+            0 => (ring, -ring + pos_in_ring),                  // Right edge, walking +z
+            1 => (ring - (pos_in_ring - side), ring),          // Bottom edge, walking -x
+            2 => (-ring, ring - (pos_in_ring - 2 * side)),     // Left edge, walking -z
+            3 | 4 => (-ring + (pos_in_ring - 3 * side), -ring), // Top edge + ring corner
+            other => unreachable!(
+                "pos_in_ring/side must be 0..=4 by construction, got {other}"
+            ),
         };
 
         // NODE_SPACING leaves room for the 2-wide chest footprint plus a

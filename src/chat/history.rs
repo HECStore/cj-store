@@ -246,6 +246,7 @@ pub fn enqueue_bot_output(
     history_tx: &mpsc::Sender<HistoryItem>,
     bot_username: &str,
     target: Option<&str>,
+    target_uuid: Option<&str>,
     content: &str,
     is_whisper: bool,
 ) -> Result<(), TrySendError<HistoryItem>> {
@@ -254,7 +255,7 @@ pub fn enqueue_bot_output(
     history_tx.try_send(HistoryItem::BotOut {
         kind_label,
         target: target.map(|s| s.to_string()),
-        target_uuid: None,
+        target_uuid: target_uuid.map(|s| s.to_string()),
         sender: bot_username.to_string(),
         content: content.to_string(),
         recv_at,

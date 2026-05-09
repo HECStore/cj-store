@@ -58,19 +58,23 @@ pub async fn handle_player_command(
     // alphanumeric+underscore usernames that reach this point.
     let name_key = format!("n:{}", player_name.to_lowercase());
     if let Err(wait_duration) = store.rate_limiter.check(&name_key) {
-        let wait_secs = wait_duration.as_secs_f64();
-        let msg = if wait_secs < 1.0 {
-            format!("Please wait {:.1}s before sending another message.", wait_secs)
-        } else {
-            format!("Please wait {:.0}s before sending another message.", wait_secs.ceil())
-        };
-        debug!(
-            player = player_name,
-            command = command,
-            wait_ms = wait_duration.as_millis() as u64,
-            "Pre-resolve rate-limited whispered command; whispering cooldown notice without Mojang lookup"
-        );
-        return utils::send_message_to_player(store, player_name, &msg).await;
+        let should_whisper = store.rate_limiter.should_whisper_rejection(&name_key);
+        if !should_whisper {
+            // Suppress the whisper to cap outbound chat amplification on
+            // sustained spam (attacker cycling distinct usernames). The
+            // rejection still lands; only the player-facing notice is
+            // throttled — see RateLimiter::should_whisper_rejection.
+            return Ok(());
+        }
+        return whisper_rate_limit_notice(
+            store,
+            player_name,
+            command,
+            wait_duration,
+            None,
+            "pre-resolve",
+        )
+        .await;
     }
 
     let user_uuid = match crate::mojang::resolve_user_uuid(player_name).await {
@@ -81,13 +85,20 @@ pub async fn handle_player_command(
             // tells the player anything. The player has already consumed
             // their `n:` rate-limit slot above, so silence here looks like
             // "the bot ignored me". Whisper a sanitized notice and stop.
+            //
+            // The typed `MojangResolveError` is converted to a sanitized
+            // `StoreError` via the central `From` impl in `error.rs`:
+            // `NotFound` → `UserNotFound` (passes the username through),
+            // `InvalidShape` → `ValidationError`, everything else →
+            // `MojangNetwork` (collapses to the generic whisper). Operator
+            // visibility is preserved by the `warn!` above with `%reason`.
             tracing::warn!(
                 player = player_name,
                 command = command,
                 reason = %reason,
                 "Mojang UUID lookup failed; whispering player-facing notice"
             );
-            let err = StoreError::ValidationError(reason);
+            let err: StoreError = reason.into();
             return utils::whisper_error_to_player(store, player_name, &err).await;
         }
     };
@@ -97,20 +108,19 @@ pub async fn handle_player_command(
     // toward the per-user cooldown.
     let uuid_key = format!("u:{}", user_uuid);
     if let Err(wait_duration) = store.rate_limiter.check(&uuid_key) {
-        let wait_secs = wait_duration.as_secs_f64();
-        let msg = if wait_secs < 1.0 {
-            format!("Please wait {:.1}s before sending another message.", wait_secs)
-        } else {
-            format!("Please wait {:.0}s before sending another message.", wait_secs.ceil())
-        };
-        debug!(
-            player = player_name,
-            user_uuid = %user_uuid,
-            command = command,
-            wait_ms = wait_duration.as_millis() as u64,
-            "Rate-limited player command; whispering cooldown notice"
-        );
-        return utils::send_message_to_player(store, player_name, &msg).await;
+        let should_whisper = store.rate_limiter.should_whisper_rejection(&uuid_key);
+        if !should_whisper {
+            return Ok(());
+        }
+        return whisper_rate_limit_notice(
+            store,
+            player_name,
+            command,
+            wait_duration,
+            Some(&user_uuid),
+            "post-resolve",
+        )
+        .await;
     }
 
     let parsed = match parse_command(command) {
@@ -187,6 +197,44 @@ pub async fn handle_player_command(
             operator::handle_remove_currency(store, player_name, &item, amount).await
         }
     }
+}
+
+/// Format and whisper a rate-limit cooldown notice. Single helper used by
+/// both the pre-resolve (`n:` gate) and post-resolve (`u:` gate) sites so
+/// one fix lands in both places — earlier the two sites duplicated 14 lines
+/// each and the sub-second formatting branch printed `"Please wait 0.0s"`
+/// at the saturation cap, telling a still-throttled user to wait zero
+/// seconds. The fixed formatting drops to milliseconds for sub-second
+/// remainders with a 1ms floor so the displayed wait is never zero.
+async fn whisper_rate_limit_notice(
+    store: &Store,
+    player_name: &str,
+    command: &str,
+    wait_duration: std::time::Duration,
+    user_uuid: Option<&str>,
+    stage: &str,
+) -> Result<(), StoreError> {
+    let wait_ms = wait_duration.as_millis() as u64;
+    let msg = if wait_ms < 1_000 {
+        format!(
+            "Please wait {} ms before sending another message.",
+            wait_ms.max(1)
+        )
+    } else {
+        format!(
+            "Please wait {:.0}s before sending another message.",
+            wait_duration.as_secs_f64().ceil()
+        )
+    };
+    debug!(
+        player = player_name,
+        user_uuid = user_uuid.unwrap_or(""),
+        command = command,
+        wait_ms = wait_ms,
+        stage = stage,
+        "Rate-limited player command; whispering cooldown notice"
+    );
+    utils::send_message_to_player(store, player_name, &msg).await
 }
 
 /// Returns `Ok(true)` if the user is an operator; otherwise whispers the

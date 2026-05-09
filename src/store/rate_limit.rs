@@ -62,6 +62,19 @@ struct UserRateLimit {
     last_attempt_time: Instant,
     /// Number of consecutive rate limit violations
     consecutive_violations: u32,
+    /// When we last emitted a `warn!` for this user. Gates the per-rejection
+    /// log so a sustained DoS at e.g. 50 attempts/sec/user doesn't drown the
+    /// operator-interesting transitions (first violation, saturation,
+    /// recovery) in identical "Violation recorded" spam — the rate limiter
+    /// rate-limits its own observability.
+    last_warn_time: Option<Instant>,
+    /// When we last emitted a player-facing whisper for this user. Tracked
+    /// independently of `last_warn_time` so the operator log gate and the
+    /// outbound chat gate don't entangle — `check()` updates `last_warn_time`
+    /// on its way out, and a co-located `should_whisper_rejection()` call
+    /// must NOT see that update treated as "whisper just fired" or every
+    /// rejection after the first would be silently suppressed.
+    last_whisper_time: Option<Instant>,
 }
 
 impl UserRateLimit {
@@ -75,9 +88,18 @@ impl UserRateLimit {
             last_message_time: now,
             last_attempt_time: now,
             consecutive_violations: 0,
+            last_warn_time: None,
+            last_whisper_time: None,
         }
     }
 }
+
+/// Hard cap on entries in `RateLimiter::limits` between cleanup sweeps. The
+/// constants comment names `attacker_rate * STALE_AFTER_SECS` as the bound
+/// — that's an unbounded multiplication on attacker_rate. This cap turns the
+/// best-effort O(n) memory bound into a real upper bound and protects
+/// long-running instances against a memory-pressure DoS.
+const MAX_RATE_LIMIT_ENTRIES: usize = 10_000;
 
 /// Rate limiter for player messages with exponential backoff
 #[derive(Debug)]
@@ -165,15 +187,31 @@ impl RateLimiter {
     pub fn check(&mut self, user_uuid: &str) -> Result<(), Duration> {
         let now = Instant::now();
 
-        // Single-lookup match on `get_mut(&str)`: the warm path (entry already
-        // exists) returns the existing `&mut UserRateLimit` directly with NO
-        // `String` allocation — `get_mut(&str)` borrows the key. The cold path
-        // pays one extra hash lookup for the post-insert re-fetch, which is
-        // unavoidable due to the borrow checker but irrelevant in practice
-        // (cold path runs once per user lifetime).
-        let user_limit = match self.limits.get_mut(user_uuid) {
-            Some(limit) => limit,
-            None => {
+        // Cold-path cap: an attacker cycling shape-valid usernames creates
+        // one fresh entry per name. Between cleanup sweeps that's bounded
+        // by `MAX_RATE_LIMIT_ENTRIES`; on overflow evict the entry with
+        // the oldest `last_attempt_time` so actively-throttled users are
+        // not preferentially evicted.
+        if !self.limits.contains_key(user_uuid) && self.limits.len() >= MAX_RATE_LIMIT_ENTRIES {
+            if let Some(victim) = self
+                .limits
+                .iter()
+                .min_by_key(|(_, l)| l.last_attempt_time)
+                .map(|(k, _)| k.clone())
+            {
+                self.limits.remove(&victim);
+            }
+        }
+
+        // `entry()` collapses the warm-path-vs-cold-path lookup into one
+        // hash and removes the `expect("just inserted")` panic site. The
+        // cold-path branch fires once per attacker-invented name, so the
+        // win matters under spam — exactly the regime the limiter exists
+        // to handle.
+        let user_limit = self
+            .limits
+            .entry(user_uuid.to_string())
+            .or_insert_with(|| {
                 // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
                 // so the `elapsed >= required_cooldown` check below always passes on
                 // the very first message; without this, a new user would be treated
@@ -191,12 +229,8 @@ impl RateLimiter {
                 // rejected attempt also clear violations on a phantom "idle"
                 // window that never actually occurred.
                 limit.last_attempt_time = now;
-                self.limits.insert(user_uuid.to_string(), limit);
-                self.limits
-                    .get_mut(user_uuid)
-                    .expect("just inserted")
-            }
-        };
+                limit
+            });
 
         let elapsed = now.duration_since(user_limit.last_message_time);
 
@@ -242,23 +276,76 @@ impl RateLimiter {
             // plus a `saturated` flag indicating "the cooldown has been at
             // MAX for at least one cycle", which is the operationally
             // interesting signal.
-            warn!(
-                user_uuid = %user_uuid,
-                violations = user_limit.consecutive_violations.min(SATURATION_THRESHOLD),
-                saturated = user_limit.consecutive_violations > SATURATION_THRESHOLD,
-                wait_ms = remaining.as_millis() as u64,
-                "[RateLimit] Violation recorded"
-            );
+            //
+            // Gate the warn so a sustained DoS doesn't drown operators in
+            // identical lines: emit on the FIRST violation, on the
+            // SATURATION transition, and at most once per RESET_AFTER
+            // window thereafter. Per-rejection observability stays at
+            // `debug!`.
+            let saturation_transition = user_limit.consecutive_violations == SATURATION_THRESHOLD;
+            let warn_window = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
+            let should_warn = match user_limit.last_warn_time {
+                None => true,
+                Some(_) if saturation_transition => true,
+                Some(prev) => now.duration_since(prev) >= warn_window,
+            };
+            if should_warn {
+                warn!(
+                    gate_key = %user_uuid,
+                    violations = user_limit.consecutive_violations.min(SATURATION_THRESHOLD),
+                    saturated = user_limit.consecutive_violations > SATURATION_THRESHOLD,
+                    wait_ms = remaining.as_millis() as u64,
+                    "[RateLimit] Violation recorded"
+                );
+                user_limit.last_warn_time = Some(now);
+            } else {
+                debug!(
+                    gate_key = %user_uuid,
+                    violations = user_limit.consecutive_violations.min(SATURATION_THRESHOLD),
+                    wait_ms = remaining.as_millis() as u64,
+                    "[RateLimit] Violation (suppressed warn)"
+                );
+            }
             Err(remaining)
         }
     }
 
+    /// Decide whether the caller should whisper a cooldown notice for the
+    /// most recent rejection on `user_uuid`, and update internal state to
+    /// throttle subsequent whispers. Returns true on the FIRST rejection in
+    /// the current cycle, on the SATURATION transition, and at most once
+    /// per `RATE_LIMIT_RESET_AFTER_MS` window thereafter. This caps the
+    /// outbound chat amplification when an attacker spams cycled distinct
+    /// usernames — without it, every rejected attempt forces the bot to
+    /// whisper a notice, turning the limiter into a chat-spam source.
+    /// Caller must invoke this only AFTER `check()` returned Err.
+    pub fn should_whisper_rejection(&mut self, user_uuid: &str) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
+        let entry = match self.limits.get_mut(user_uuid) {
+            Some(e) => e,
+            None => return true,
+        };
+        let saturation_transition = entry.consecutive_violations == SATURATION_THRESHOLD;
+        let should = match entry.last_whisper_time {
+            None => true,
+            Some(_) if saturation_transition => true,
+            Some(prev) => now.duration_since(prev) >= window,
+        };
+        if should {
+            entry.last_whisper_time = Some(now);
+        }
+        should
+    }
+
     /// Drop entries for users idle longer than `stale_threshold`. Call
     /// periodically to prevent unbounded memory growth. The threshold must
-    /// exceed the violation-reset window (`RATE_LIMIT_RESET_AFTER_MS`) so an
-    /// entry whose `consecutive_violations` would not yet reset naturally
-    /// cannot be evicted — otherwise a returning spammer would receive a
-    /// fresh `violations = 0` instead of their escalated backoff.
+    /// be **at least** `RATE_LIMIT_RESET_AFTER_MS` — equality is permitted
+    /// because the retain predicate is strict-`<`, so an entry whose
+    /// elapsed equals the threshold is dropped, but at that boundary the
+    /// natural reset would have cleared violations on the next check
+    /// anyway. A threshold strictly less than the floor would let an
+    /// actively-throttled spammer get a free reset by being evicted.
     ///
     /// Idleness is measured against `last_attempt_time` (any attempt counts,
     /// accepted or rejected) rather than `last_message_time`, so a
@@ -539,7 +626,7 @@ mod tests {
         assert_eq!(limiter.len(), 2);
 
         assert!(limiter.backdate("old_user", Duration::from_secs(600)));
-        limiter.cleanup_stale(Duration::from_secs(300));
+        limiter.cleanup_stale(Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS));
         assert_eq!(limiter.len(), 1);
         assert_eq!(limiter.violations_for("old_user"), None);
         assert_eq!(limiter.violations_for("recent_user"), Some(0));
@@ -550,7 +637,7 @@ mod tests {
         let mut limiter = RateLimiter::new();
         let _ = limiter.check("user1");
         let _ = limiter.check("user2");
-        limiter.cleanup_stale(Duration::from_secs(300));
+        limiter.cleanup_stale(Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS));
         assert_eq!(limiter.len(), 2);
     }
 

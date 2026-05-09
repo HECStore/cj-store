@@ -7,11 +7,19 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
+
+/// Per-process disambiguator for queue archive filenames.
+///
+/// Mirrors the same-named statics in `journal.rs` and `trade_state.rs`. Two
+/// archive operations colliding on `unix_ms` (e.g. both falling back to
+/// `unwrap_or(0)` from a clock error) would otherwise overwrite each other.
+static ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::constants::{MAX_ORDERS_PER_USER, MAX_QUEUE_SIZE, QUEUE_FILE};
 use crate::fsutil::write_atomic;
@@ -107,6 +115,11 @@ impl OrderQueue {
 
     /// Path-parameterized load, separated so tests can round-trip without
     /// touching the production `QUEUE_FILE`.
+    ///
+    /// On a parse error or a non-`NotFound` IO error, the offending file is
+    /// quarantined to a `queue.json.{corrupt,unreadable}-<unix_ms>-<seq>.json`
+    /// sibling and an empty queue is returned. Mirrors the patterns in
+    /// `journal.rs::load_from` and `trade_state::load_persisted_from`.
     fn load_from(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
 
@@ -115,32 +128,49 @@ impl OrderQueue {
             return Ok(Self::new());
         }
 
-        let contents = fs::read_to_string(path)?;
+        let contents = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(read_err) => {
+                warn!(
+                    "[Queue] failed to read queue file {:?}: {read_err} - attempting to quarantine before falling back to empty queue",
+                    path
+                );
+                match Self::quarantine_to(path, "unreadable") {
+                    Ok(archived) => {
+                        error!(
+                            "[Queue] PENDING ORDERS LOST: quarantined unreadable queue file {:?} to {:?} - preserve for operator review",
+                            path, archived
+                        );
+                        return Ok(Self::new());
+                    }
+                    Err(quarantine_err) => {
+                        error!(
+                            "[Queue] could not quarantine unreadable queue file {:?}: {quarantine_err} - returning original read error so caller is aware",
+                            path
+                        );
+                        return Err(read_err);
+                    }
+                }
+            }
+        };
         let queue_data: QueuePersist = match serde_json::from_str(&contents) {
             Ok(q) => q,
-            Err(e) => {
-                // Preserve the raw bytes on a timestamped sidecar before the
-                // caller falls back to an empty queue. Colons are stripped
-                // from the RFC3339 stamp because Windows (and some other
-                // filesystems) reject them in filenames.
-                let stamp = Utc::now().to_rfc3339().replace(':', "-");
-                let sidecar = {
-                    let mut os = path.as_os_str().to_os_string();
-                    os.push(format!(".corrupt-{}", stamp));
-                    std::path::PathBuf::from(os)
-                };
-                match fs::rename(path, &sidecar) {
-                    Ok(()) => error!(
+            Err(e) => match Self::quarantine_to(path, "corrupt") {
+                Ok(archived) => {
+                    error!(
                         "[Queue] PENDING ORDERS LOST: corrupt queue file {:?} moved to {:?}; parse error: {}",
-                        path, sidecar, e
-                    ),
-                    Err(rename_err) => error!(
-                        "[Queue] PENDING ORDERS LOST: corrupt queue file {:?}; parse error: {}; failed to move to {:?}: {}",
-                        path, e, sidecar, rename_err
-                    ),
+                        path, archived, e
+                    );
+                    return Ok(Self::new());
                 }
-                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-            }
+                Err(quarantine_err) => {
+                    error!(
+                        "[Queue] PENDING ORDERS LOST: corrupt queue file {:?}; parse error: {}; quarantine also failed: {}",
+                        path, e, quarantine_err
+                    );
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+                }
+            },
         };
 
         info!(
@@ -154,6 +184,39 @@ impl OrderQueue {
             orders: queue_data.orders.into_iter().collect(),
             next_id: queue_data.next_id,
         })
+    }
+
+    /// Move the file at `path` aside to a `queue.json.<kind>-<unix_ms>-<seq>.json`
+    /// sibling. Uses rename → copy+remove fallback so a held handle on Windows
+    /// (AV scanner, indexer) doesn't leave the bad bytes at the active path.
+    fn quarantine_to(path: &Path, kind: &str) -> io::Result<PathBuf> {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "queue.json".to_string());
+        let archived_name = format!("{file_name}.{kind}-{unix_ms}-{seq}.json");
+        let archived = match path.parent() {
+            Some(parent) => parent.join(archived_name),
+            None => PathBuf::from(archived_name),
+        };
+        match fs::rename(path, &archived) {
+            Ok(()) => Ok(archived),
+            Err(_) => {
+                fs::copy(path, &archived)?;
+                if let Err(remove_err) = fs::remove_file(path) {
+                    warn!(
+                        "[Queue] archived queue file to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
+                        archived, path
+                    );
+                }
+                Ok(archived)
+            }
+        }
     }
 
     /// Path-parameterized save, separated so tests can round-trip without
@@ -787,12 +850,15 @@ mod tests {
     }
 
     #[test]
-    fn load_from_rejects_malformed_json_as_invalid_data() {
+    fn load_from_returns_empty_on_corrupt_json_after_quarantine() {
         let dir = TmpDir::new("bad-json");
         let path = dir.path("queue.json");
         fs::write(&path, "{ this is not json").unwrap();
-        let err = OrderQueue::load_from(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // After T4 fixes: corrupt JSON quarantined, returns Ok(empty),
+        // mirroring trade_state's parse-error-with-quarantine-success path.
+        let queue = OrderQueue::load_from(&path).expect("quarantine succeeds → Ok");
+        assert_eq!(queue.len(), 0);
+        assert!(!path.exists(), "corrupt file must be moved aside");
     }
 
     #[test]
@@ -999,8 +1065,8 @@ mod tests {
         let bad_bytes = "{ this is not json";
         fs::write(&path, bad_bytes).unwrap();
 
-        let err = OrderQueue::load_from(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let queue = OrderQueue::load_from(&path).expect("quarantine succeeds → Ok");
+        assert_eq!(queue.len(), 0);
 
         // (a) A `.corrupt-*` sibling exists next to the original path.
         let parent = path.parent().expect("path has parent");
@@ -1028,5 +1094,44 @@ mod tests {
         // Sanity: the sidecar holds the exact bytes we wrote.
         let preserved = fs::read_to_string(&sidecar).unwrap();
         assert_eq!(preserved, bad_bytes);
+    }
+
+    #[test]
+    fn load_from_quarantines_unreadable_file() {
+        // Pre-create a directory at the queue path so read_to_string fails
+        // with a non-NotFound error; quarantine must move the directory
+        // aside (or fail cleanly) and load_from returns Ok(empty).
+        let dir = TmpDir::new("unreadable-queue");
+        let path = dir.path("queue.json");
+        fs::create_dir_all(&path).unwrap();
+        let queue = OrderQueue::load_from(&path).expect("quarantine succeeds → Ok");
+        assert_eq!(queue.len(), 0);
+        let parent = path.parent().expect("path has parent");
+        let prefix = format!(
+            "{}.unreadable-",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        let archived = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with(&prefix));
+        assert!(archived, "expected a queue.json.unreadable-* sibling");
+    }
+
+    #[test]
+    fn load_from_quarantine_disambiguates_rapid_successive_calls() {
+        let dir = TmpDir::new("queue-quarantine-rapid");
+        let parent = dir.path("");
+        let path1 = parent.join("queue.json");
+        fs::write(&path1, "garbage 1").unwrap();
+        let _ = OrderQueue::load_from(&path1).unwrap();
+        fs::write(&path1, "garbage 2").unwrap();
+        let _ = OrderQueue::load_from(&path1).unwrap();
+        let count = fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("queue.json.corrupt-"))
+            .count();
+        assert_eq!(count, 2, "two rapid quarantines must produce two distinct sibling files");
     }
 }

@@ -845,26 +845,54 @@ pub async fn chat_task(
                                     min_distinct_senders: config.reflection_min_distinct_senders as usize,
                                     substring_overlap_threshold: 0.40,
                                 };
-                                // Trust function: looks up the per-player file
-                                // and computes derived trust. Auto-triggered
-                                // runs require Trust >= 1.
-                                let history_dir = std::path::Path::new(history::HISTORY_DIR);
-                                let trust_for_sender = |sender: &str| -> u8 {
-                                    // Cache-only lookup: avoid stalling the
-                                    // reflection pass on a Mojang fetch.
-                                    // Senders not yet in cache are treated
-                                    // as Trust 0 — the lesson validator
-                                    // requires Trust ≥ 1 across multiple
-                                    // distinct senders, so a cold cache
-                                    // simply rejects more lessons (safe).
-                                    let uuid = match crate::mojang::lookup_cached_uuid(sender) {
-                                        Some(u) => u,
-                                        None => return 0,
+                                // Trust function: pre-compute Trust for every
+                                // distinct sender in the pending batch BEFORE
+                                // running the validator, so the closure handed
+                                // to the (sync) validator never blocks the
+                                // runtime worker on a multi-MB read+parse.
+                                // Auto-triggered runs require Trust >= 1.
+                                //
+                                // Cache-only Mojang lookup: avoid stalling on a
+                                // network fetch. Senders not yet in cache are
+                                // treated as Trust 0 — the lesson validator
+                                // requires Trust ≥ 1 across multiple distinct
+                                // senders, so a cold cache simply rejects more
+                                // lessons (safe).
+                                let mut distinct_senders_lc: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                for p in &pending {
+                                    distinct_senders_lc.insert(p.sender.to_lowercase());
+                                }
+                                let mut trust_map: std::collections::HashMap<String, u8> =
+                                    std::collections::HashMap::new();
+                                for sender_lc in distinct_senders_lc {
+                                    let Some(uuid) = crate::mojang::lookup_cached_uuid(&sender_lc) else {
+                                        // Trust 0 by default; skip insertion.
+                                        continue;
                                     };
-                                    let file = memory::read_player(&uuid).ok().flatten().unwrap_or_default();
-                                    let (interactions, distinct_days) =
-                                        memory::count_interactions_for_uuid(history_dir, &uuid, &sender.to_lowercase(), 14);
-                                    memory::compute_trust(&file, interactions, distinct_days, false)
+                                    let uuid_for_blocking = uuid.clone();
+                                    let sender_for_blocking = sender_lc.clone();
+                                    let trust = tokio::task::spawn_blocking(move || {
+                                        let history_dir = std::path::Path::new(history::HISTORY_DIR);
+                                        let file = memory::read_player(&uuid_for_blocking)
+                                            .ok()
+                                            .flatten()
+                                            .unwrap_or_default();
+                                        let (interactions, distinct_days) =
+                                            memory::count_interactions_for_uuid(
+                                                history_dir,
+                                                &uuid_for_blocking,
+                                                &sender_for_blocking,
+                                                14,
+                                            );
+                                        memory::compute_trust(&file, interactions, distinct_days, false)
+                                    })
+                                    .await
+                                    .unwrap_or(0);
+                                    trust_map.insert(sender_lc, trust);
+                                }
+                                let trust_for_sender = move |sender: &str| -> u8 {
+                                    trust_map.get(sender).copied().unwrap_or(0)
                                 };
                                 let today_iso = chrono::Utc::now().format("%Y-%m-%d").to_string();
                                 let adj = read_adjustments_or_empty();
@@ -1894,13 +1922,26 @@ async fn process_event(
         Ok(uuid) => {
             let _ = memory::ensure_player_file(&uuid, &event.sender);
             let file = memory::read_player(&uuid).ok().flatten().unwrap_or_default();
-            let history_dir = std::path::Path::new(history::HISTORY_DIR);
-            let (interactions, distinct_days) = memory::count_interactions_for_uuid(
-                history_dir,
-                &uuid,
-                &event.sender.to_lowercase(),
-                7,
-            );
+            // count_interactions_for_uuid does a multi-MB read_to_string +
+            // per-line JSON parse over `days_back` history files; offload
+            // it from the chat runtime worker. Mirrors the pattern used
+            // by `search_history_tool` (tools.rs) and `build_replay_prompt`.
+            // The `_cached` wrapper adds a 60 s per-process TTL cache so
+            // a regular speaker doesn't trigger the same week of disk +
+            // parse work every 30-60 s on the hot path.
+            let uuid_blocking = uuid.clone();
+            let sender_lc = event.sender.to_lowercase();
+            let (interactions, distinct_days) = tokio::task::spawn_blocking(move || {
+                let history_dir = std::path::Path::new(history::HISTORY_DIR);
+                memory::count_interactions_for_uuid_cached(
+                    history_dir,
+                    &uuid_blocking,
+                    &sender_lc,
+                    7,
+                )
+            })
+            .await
+            .unwrap_or((0, 0));
             let trust = memory::compute_trust(&file, interactions, distinct_days, false);
             let block = if directly_addressed || trust >= 1 {
                 Some(file)
@@ -2693,8 +2734,15 @@ async fn process_event(
             respond_to: resp_tx,
         }
     } else {
+        // Public reply addressed to `event.sender`. Thread the partner's
+        // username (and UUID when it resolved) through so the JSONL
+        // `bot_chat` record carries the addressee — without this the
+        // public-chat trust ladder pins at 0 because
+        // `count_interactions_for_uuid` cannot match `target: None`.
         BotInstruction::SendChat {
             content: reply.clone(),
+            target: Some(event.sender.clone()),
+            target_uuid: resolved_sender_uuid.clone(),
             respond_to: resp_tx,
         }
     };
@@ -3115,6 +3163,11 @@ async fn process_proactive_tick(
     if bot_tx
         .send(BotInstruction::SendChat {
             content: reply.clone(),
+            // Proactive turns are aimed at a specific `partner.username`
+            // (already resolved upstream); thread through so the JSONL
+            // `bot_chat` record attributes the interaction for trust.
+            target: Some(partner.username.clone()),
+            target_uuid: resolved_partner_uuid.clone(),
             respond_to: resp_tx,
         })
         .await
@@ -3530,6 +3583,11 @@ async fn scrub_history_for_player(
     .map_err(|e| format!("forget_index_entry: {e}"))?;
     stats.index_entries = stats.index_entries.saturating_add(index_entries);
 
+    // Drop any cached `(interactions, distinct_days)` for this UUID
+    // from the composer trust-cache so a stale post-scrub lookup
+    // can't resurrect counts derived from the now-rewritten history.
+    memory::invalidate_trust_cache_for_uuid(uuid);
+
     Ok(stats)
 }
 
@@ -3684,7 +3742,12 @@ async fn resolve_username_via_index_or_mojang(username: &str) -> Result<String, 
     {
         u.to_string()
     } else {
-        crate::mojang::resolve_user_uuid(username).await?
+        // Use the typed `MojangResolveError`'s `Display` so the chat-layer
+        // gets a sanitized, author-controlled string without depending on
+        // the (now-deleted) `From<MojangResolveError> for String` bridge.
+        crate::mojang::resolve_user_uuid(username)
+            .await
+            .map_err(|e| format!("{e}"))?
     };
     crate::chat::tools::validate_uuid(&uuid).map_err(|e| {
         format!("resolved uuid for {username:?} failed shape check: {e}")

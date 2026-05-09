@@ -19,7 +19,8 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Writes a file atomically using a temporary file + rename pattern.
 ///
@@ -82,14 +83,84 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     match fs::rename(&tmp_path, path) {
         Ok(_) => {
             #[cfg(unix)]
-            {
-                if let Ok(dir) = fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
+            sync_parent_dir(parent);
             Ok(())
         }
         Err(e) => rename_failed_fallback_copy(path, parent, file_name, &tmp_path, e),
+    }
+}
+
+/// Pick a free `<dir>/<base>.<kind>-<unix_ms>-<seq>[-<bump>].json` path.
+///
+/// The caller passes a per-module `ARCHIVE_SEQ` so within-process collisions
+/// are impossible. The bump suffix protects across-process restarts where
+/// `unix_ms` falls back to 0 from a clock error AND the sibling counter is
+/// reset — without it, `fs::rename` would silently overwrite the prior
+/// archive, destroying exactly the crash evidence the helper preserves.
+pub(crate) fn pick_archive_path(
+    parent: Option<&Path>,
+    base: &str,
+    kind: &str,
+    seq: &AtomicU64,
+) -> PathBuf {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = seq.fetch_add(1, Ordering::Relaxed);
+    let primary = format!("{base}.{kind}-{unix_ms}-{n}.json");
+    let mut candidate = match parent {
+        Some(p) => p.join(&primary),
+        None => PathBuf::from(&primary),
+    };
+    let mut bump: u32 = 0;
+    while candidate.exists() && bump < 1000 {
+        bump += 1;
+        let alt = format!("{base}.{kind}-{unix_ms}-{n}-{bump}.json");
+        candidate = match parent {
+            Some(p) => p.join(&alt),
+            None => PathBuf::from(&alt),
+        };
+    }
+    candidate
+}
+
+/// `sync_all` an archived file (best-effort) and its parent directory on Unix.
+/// Mirrors `write_atomic`'s durability dance for the cross-device fallback in
+/// archive helpers — without this, a power loss between `fs::copy` and the OS
+/// page-cache flush can leave the archive empty or partial.
+pub(crate) fn durably_sync_archive(archived: &Path) {
+    match fs::File::open(archived) {
+        Ok(file) => {
+            if let Err(e) = file.sync_all() {
+                tracing::warn!(
+                    "[Archive] sync_all on {archived:?} failed: {e} — continuing; archive may not be fully durable across crashes"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "[Archive] cannot reopen {archived:?} to fsync: {e} — continuing; archive may not be fully durable across crashes"
+        ),
+    }
+    #[cfg(unix)]
+    if let Some(parent) = archived.parent() {
+        sync_parent_dir(parent);
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) {
+    match fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(e) = dir.sync_all() {
+                tracing::warn!(
+                    "[File] sync_all on parent dir {parent:?} failed: {e} — rename's directory entry may not be fully durable across crashes"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "[File] cannot open parent dir {parent:?} to fsync: {e} — rename's directory entry may not be fully durable across crashes"
+        ),
     }
 }
 
@@ -121,16 +192,28 @@ fn rename_failed_fallback_copy(
     let recovery_tmp = parent.join(format!("{file_name}.recovery.tmp"));
     // Stale recovery-temp from an earlier failed run must not block this attempt.
     let _ = fs::remove_file(&recovery_tmp);
+    let prior_existed = path.exists();
     if let Err(copy_err) = fs::copy(tmp_path, &recovery_tmp) {
-        tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy-to-recovery-temp={copy_err}; prior bytes at {path:?} are still intact (untouched by this branch)");
+        let prior_state = if prior_existed {
+            format!("prior file preserved at: {path:?}")
+        } else {
+            format!("no prior file existed at {path:?} — this was a first write")
+        };
+        tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy-to-recovery-temp={copy_err}; {prior_state}");
         return Err(io::Error::other(format!(
-            "Failed to save file: rename error: {rename_err}, copy-to-recovery-temp error: {copy_err} (path: {path:?}, prior file preserved at: {path:?})"
+            "Failed to save file: rename error: {rename_err}, copy-to-recovery-temp error: {copy_err} (path: {path:?}, {prior_state})"
         )));
     }
-    if let Ok(file) = fs::File::open(&recovery_tmp)
-        && let Err(sync_err) = file.sync_all() {
-            tracing::warn!("[File] sync_all on recovery-temp {recovery_tmp:?} failed: {sync_err} — continuing; rename remains atomic");
+    match fs::File::open(&recovery_tmp) {
+        Ok(file) => {
+            if let Err(sync_err) = file.sync_all() {
+                tracing::warn!("[File] sync_all on recovery-temp {recovery_tmp:?} failed: {sync_err} — continuing; rename remains atomic");
+            }
         }
+        Err(open_err) => tracing::warn!(
+            "[File] cannot reopen recovery-temp {recovery_tmp:?} to fsync: {open_err} — continuing; second rename may not be fully durable across crashes"
+        ),
+    }
 
     // 2. On both platforms, aside-rename the live `path` to `{path}.bak` so
     //    that the final atomic rename below has a known-empty target slot.
@@ -139,7 +222,7 @@ fn rename_failed_fallback_copy(
     //    AV/indexer locks; one attempt on Unix where rename is reliable.
     let bak_path: Option<std::path::PathBuf> = {
         let mut bak: Option<std::path::PathBuf> = None;
-        if path.exists() {
+        if prior_existed {
             let candidate = parent.join(format!("{file_name}.bak"));
             // A stale .bak from a prior failed write must not block the
             // aside-rename; remove it before moving the current good file aside.
@@ -183,11 +266,7 @@ fn rename_failed_fallback_copy(
     match fs::rename(&recovery_tmp, path) {
         Ok(_) => {
             #[cfg(unix)]
-            {
-                if let Ok(dir) = fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
+            sync_parent_dir(parent);
             // Live path is fresh; clean up the bookkeeping siblings.
             let _ = fs::remove_file(tmp_path);
             if let Some(ref bak) = bak_path {
@@ -200,13 +279,16 @@ fn rename_failed_fallback_copy(
             // (if the aside-rename succeeded) or still at `path` (if it
             // didn't — Windows-only fallthrough). Leave the recovery-temp
             // and tmp_path on disk so an operator can recover by hand.
-            let preserved = bak_path.as_ref().map(|p| format!("{p:?}"))
-                .unwrap_or_else(|| format!("{path:?}"));
+            let preserved = match bak_path.as_ref() {
+                Some(p) => format!("prior file preserved at {p:?}"),
+                None if prior_existed => format!("prior file preserved at {path:?}"),
+                None => format!("no prior file existed at {path:?} — this was a first write"),
+            };
             tracing::error!(
-                "[File] cannot save {path:?}: rename={rename_err}, recovery-rename={final_err}; new bytes preserved at {recovery_tmp:?} for manual recovery; prior file preserved at {preserved}"
+                "[File] cannot save {path:?}: rename={rename_err}, recovery-rename={final_err}; new bytes preserved at {recovery_tmp:?} for manual recovery; {preserved}"
             );
             Err(io::Error::other(format!(
-                "Failed to save file: rename error: {rename_err}, recovery-rename error: {final_err} (path: {path:?}, new bytes at: {recovery_tmp:?}, prior file preserved at: {preserved})"
+                "Failed to save file: rename error: {rename_err}, recovery-rename error: {final_err} (path: {path:?}, new bytes at: {recovery_tmp:?}, {preserved})"
             )))
         }
     }
@@ -392,6 +474,26 @@ mod tests {
     /// the contract on the happy path (the only path testable in CI) — the
     /// failure-path .bak invariant is documented in
     /// `rename_failed_fallback_copy`.
+    #[test]
+    fn stale_recovery_tmp_does_not_block_overwrite() {
+        // A stale `.recovery.tmp` from a prior failed run must not block the
+        // next successful write — the happy path goes straight through
+        // `fs::rename`, which never touches `.recovery.tmp`. The stale file
+        // is left in place for an operator to inspect (matches the
+        // .bak-stale-after-failure semantics).
+        let dir = TmpDir::new("stale-recovery-tmp");
+        let target = dir.path("ledger.json");
+        let stale_recovery = dir.path("ledger.json.recovery.tmp");
+        fs::write(&target, "good").unwrap();
+        fs::write(&stale_recovery, "ancient garbage").unwrap();
+
+        write_atomic(&target, "fresh").unwrap();
+        assert_eq!(read_to_string(&target), "fresh");
+        // Happy-path overwrite: stale recovery-temp is not touched (it
+        // would only be cleared if the recovery branch had run).
+        assert!(stale_recovery.exists(), "stale .recovery.tmp left for operator review on happy path");
+    }
+
     #[test]
     fn good_file_bytes_preserved_across_overwrite() {
         let dir = TmpDir::new("preserve-bytes");

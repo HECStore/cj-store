@@ -1448,7 +1448,7 @@ injection defense, SSRF defense) are real safety/cost guards.
 | Whisper routing (Store vs chat)                      | [src/chat/conversation.rs](src/chat/conversation.rs) `route_whisper`                                   |
 | Composer system-prompt assembly                      | [src/chat/composer.rs](src/chat/composer.rs) `build_request`, `PromptSnapshot`                         |
 | Tools the model can call                             | [src/chat/tools.rs](src/chat/tools.rs)                                                                 |
-| Trust derivation                                     | [src/chat/memory.rs](src/chat/memory.rs) `compute_trust`, `count_interactions_for_uuid`                |
+| Trust derivation                                     | [src/chat/memory.rs](src/chat/memory.rs) `compute_trust`, `count_interactions_for_uuid` (uncached primitive — used by the reflection pass), `count_interactions_for_uuid_cached` (composer hot-path wrapper, 60 s per-process TTL cache; GDPR scrub calls `invalidate_trust_cache_for_uuid`) |
 | AI call-out → adjustments                            | [src/chat/classifier.rs](src/chat/classifier.rs) `write_pending_adjustment` → [src/chat/reflection.rs](src/chat/reflection.rs) `run_pass` |
 | Anthropic API client + rate limiter                  | [src/chat/client.rs](src/chat/client.rs)                                                               |
 | Pacing post-process and post-sleep recheck           | [src/chat/pacing.rs](src/chat/pacing.rs) `compute_typing_delay`, `recheck_after_sleep`                 |

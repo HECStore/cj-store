@@ -6,17 +6,23 @@
 //! hierarchy so higher-level code can match on the cause and react
 //! appropriately (retry, notify player, escalate to operator, etc.).
 //!
-//! `From<StoreError> for String` is the one-way bridge that lets handlers
-//! still return `Result<(), String>` at the outermost boundary (what the bot
-//! whisper pipeline expects) without forcing every call site to stringify by
-//! hand. There is intentionally **no** `From<String> for StoreError` — a
-//! conversion in that direction would silently collapse every legacy error
-//! into `ValidationError` regardless of its real category, hiding the
-//! migration work we already did to give errors meaningful types.
+//! There is intentionally **no** `From<StoreError> for String` and **no**
+//! `From<String> for StoreError`: the former silently smuggled raw error
+//! text (including stringified `reqwest::Error` content) through `?` into
+//! `Result<_, String>` boundaries, defeating `user_message()`'s
+//! sanitization; the latter would collapse every legacy error into
+//! `ValidationError` regardless of its real category, hiding the migration
+//! work we already did to give errors meaningful types. Player-facing
+//! rendering goes through [`StoreError::user_message`] (preferably via
+//! [`crate::store::utils::whisper_error_to_player`]); cross-boundary
+//! conversion from typed Mojang-resolver errors goes through
+//! [`From<MojangResolveError> for StoreError`].
 
 use std::borrow::Cow;
 
 use thiserror::Error;
+
+use crate::types::user::MojangResolveError;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -79,6 +85,27 @@ pub enum StoreError {
     #[error("Validation failed: {0}")]
     ValidationError(String),
 
+    /// Mojang resolver failed below the `NotFound`/`InvalidShape` boundary —
+    /// a network, timeout, upstream-status, or malformed-response error. The
+    /// inner string is the short author-controlled `Display` of
+    /// `MojangResolveError`; it is operator-visible only via
+    /// `Display`/logs, never via `user_message()` (which collapses to the
+    /// generic player-safe string). Distinct from `ValidationError` so the
+    /// "garbage username typed by the player" branch can be passed through
+    /// while the "Mojang glitched" branch is sanitized.
+    #[error("Mojang resolver failed: {0}")]
+    MojangNetwork(String),
+
+    /// Mojang reported the username does not exist (HTTP 204) — a known,
+    /// safe-to-whisper player-facing condition. The inner `username` is
+    /// the original user-supplied input and is rendered into the whisper
+    /// verbatim ("Player 'X' not found"). Distinct from
+    /// `MojangNetwork`/`ValidationError` so callers can branch on the
+    /// "no account yet" / lookup-target-missing case without substring
+    /// matching on error text.
+    #[error("Player '{username}' not found")]
+    UserNotFound { username: String },
+
     /// Bot reported a chest action failure (after timeouts have been re-routed to `ChestTimeout`).
     #[error("Chest operation failed: {0}")]
     ChestOp(String),
@@ -107,12 +134,20 @@ impl StoreError {
     /// calling this directly.** The helper is the canonical "tell the player
     /// about a `StoreError`" path; routing every player notification through
     /// it makes the sanitization discipline grep-able from a single name.
-    pub fn user_message(&self) -> Cow<'static, str> {
+    pub fn user_message(&self) -> Cow<'_, str> {
         const GENERIC: &str = "Internal error. Please retry; the operator has been notified.";
         match self {
+            // Pass-through variants borrow their inner text (no clone) —
+            // callers that need an owned String can `.into_owned()` the Cow.
             StoreError::ValidationError(s)
             | StoreError::TradeRejected(s)
-            | StoreError::ChestOp(s) => Cow::Owned(s.clone()),
+            | StoreError::ChestOp(s) => Cow::Borrowed(s.as_str()),
+            // `UserNotFound` is the one Mojang-resolver outcome whose inner
+            // text is safe to whisper verbatim — the username comes from
+            // the player's own input.
+            StoreError::UserNotFound { username } => {
+                Cow::Owned(format!("Player '{username}' not found"))
+            }
             StoreError::UnknownPair { .. }
             | StoreError::UnknownUser { .. }
             | StoreError::InvariantViolation(_)
@@ -123,13 +158,40 @@ impl StoreError {
             | StoreError::TradeTimeout { .. }
             | StoreError::ChestTimeout { .. }
             | StoreError::BotAckTimeout(_)
-            | StoreError::BotDisconnected => Cow::Borrowed(GENERIC),
+            | StoreError::BotDisconnected
+            // `MojangNetwork` collapses to GENERIC: it represents an
+            // operator-visible upstream failure, not anything the player
+            // can act on. Display still carries the typed reason for
+            // logs / `whisper_error_to_player` audit trails.
+            | StoreError::MojangNetwork(_) => Cow::Borrowed(GENERIC),
         }
     }
 }
 
-impl From<StoreError> for String {
-    fn from(err: StoreError) -> Self {
-        err.to_string()
+/// Single canonical mapping from a typed Mojang-resolver error to a
+/// `StoreError`. Every store-layer call site that funnels a Mojang lookup
+/// into the error type goes through this conversion so the routing rules
+/// stay grep-able from one place:
+/// - `NotFound` → `UserNotFound` (player-safe whisper, name passed through)
+/// - `InvalidShape` → `ValidationError` (player typed garbage, tell them)
+/// - everything else (network / timeout / upstream / decode) →
+///   `MojangNetwork` (operator-visible Display only; player gets the
+///   generic sanitized whisper from `user_message()`)
+impl From<MojangResolveError> for StoreError {
+    fn from(err: MojangResolveError) -> Self {
+        match err {
+            MojangResolveError::NotFound { username } => {
+                StoreError::UserNotFound { username }
+            }
+            MojangResolveError::InvalidShape => {
+                StoreError::ValidationError("Invalid Minecraft username".to_string())
+            }
+            other @ (MojangResolveError::NetworkTimeout
+            | MojangResolveError::NetworkError
+            | MojangResolveError::UpstreamError
+            | MojangResolveError::MalformedResponse) => {
+                StoreError::MojangNetwork(other.to_string())
+            }
+        }
     }
 }

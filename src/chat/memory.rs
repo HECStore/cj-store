@@ -19,11 +19,14 @@
 //! `_index.json` rebuild. Tools that wrap these functions (with section
 //! allow-lists, dedup, cap enforcement) arrive in Phase 5.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -333,9 +336,14 @@ pub fn operator_trust3_expired(player_md: &str) -> bool {
 /// `(interactions, distinct_days_count)`. Used by [`compute_trust`] to
 /// derive Trust 1/2.
 ///
+/// `partner_username_lc` is the username the bot was talking WITH (the
+/// player whose trust we're computing) — callers pre-lowercase it so the
+/// inner comparator is case-insensitive against the original-case `target`
+/// field on disk.
+///
 /// Records are JSON lines under `<history_dir>/<YYYY-MM-DD>.jsonl`. A
 /// record matches if its `target_uuid` equals `target_uuid`, OR its
-/// `target` field equals `target_username_lc` (case-insensitive). Any of
+/// `target` field equals `partner_username_lc` (case-insensitive). Any of
 /// `bot_out`, `bot_chat`, or `bot_whisper` count as a bot-output record
 /// — CHAT.md describes the conceptual kind as `bot_out`, but the writer
 /// emits the more specific `bot_chat`/`bot_whisper` labels for log
@@ -344,42 +352,212 @@ pub fn operator_trust3_expired(player_md: &str) -> bool {
 pub fn count_interactions_for_uuid(
     history_dir: &Path,
     target_uuid: &str,
-    target_username_lc: &str,
+    partner_username_lc: &str,
     days_back: u32,
 ) -> (u32, u32) {
     let mut interactions = 0u32;
-    let mut days: HashSet<String> = HashSet::new();
+    let mut distinct_days = 0u32;
     let today = chrono::Utc::now().date_naive();
+    let kind_marker = b"\"kind\":\"bot_";
+    let username_lc_bytes = partner_username_lc.as_bytes();
+    let uuid_bytes = target_uuid.as_bytes();
     for d in 0..days_back as i64 {
         let date = today - chrono::Duration::days(d);
         let path = crate::chat::jsonl::day_file_for_date(history_dir, date);
-        let body = match fs::read_to_string(&path) {
-            Ok(b) => b,
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
             Err(_) => continue,
         };
-        for line in body.lines() {
-            let v: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
+        let reader = io::BufReader::new(file);
+        let mut matched_today = false;
+        for line_res in reader.lines() {
+            let line = match line_res {
+                Ok(l) => l,
                 Err(_) => continue,
             };
-            let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+            // Cheap byte prefilter: skip the DOM parse for the 95%+ of
+            // history lines that aren't bot output addressed to the
+            // partner. The line must contain `"kind":"bot_` AND either
+            // the lowercased partner username (case-insensitive) or the
+            // partner's UUID, before we pay the JSON parse cost.
+            let bytes = line.as_bytes();
+            if !contains_bytes(bytes, kind_marker) {
+                continue;
+            }
+            if !contains_bytes_ci(bytes, username_lc_bytes)
+                && !contains_bytes(bytes, uuid_bytes)
+            {
+                continue;
+            }
+            let row: HistRow = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let kind = row.kind.as_deref().unwrap_or("");
             if !matches!(kind, "bot_out" | "bot_chat" | "bot_whisper") {
                 continue;
             }
-            let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
-            let target_uuid_field = v
-                .get("target_uuid")
-                .and_then(|x| x.as_str())
-                .unwrap_or("");
+            let target = row.target.as_deref().unwrap_or("");
+            let target_uuid_field = row.target_uuid.as_deref().unwrap_or("");
             if target_uuid_field == target_uuid
-                || target.eq_ignore_ascii_case(target_username_lc)
+                || target.eq_ignore_ascii_case(partner_username_lc)
             {
                 interactions += 1;
-                days.insert(date.format("%Y-%m-%d").to_string());
+                matched_today = true;
             }
         }
+        if matched_today {
+            distinct_days += 1;
+        }
+        // Early exit: once auto-Trust-2 is locked (`>=20` interactions
+        // AND `>=7` distinct days) the verdict can't change with more
+        // history reads — `compute_trust` saturates there.
+        if interactions >= 20 && distinct_days >= 7 {
+            break;
+        }
     }
-    (interactions, days.len() as u32)
+    (interactions, distinct_days)
+}
+
+#[derive(Deserialize)]
+struct HistRow {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    target_uuid: Option<String>,
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn contains_bytes_ci(haystack: &[u8], needle_lc: &[u8]) -> bool {
+    if needle_lc.is_empty() || needle_lc.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle_lc.len())
+        .any(|w| w.iter().zip(needle_lc).all(|(h, n)| h.eq_ignore_ascii_case(n)))
+}
+
+// ===== TTL cache for count_interactions_for_uuid =====================
+//
+// The composer hot path calls `count_interactions_for_uuid` once per
+// inbound chat event to derive the sender's Trust ladder rung. With a
+// regular speaker the inputs only change when the writer task appends a
+// new bot_out — re-reading and re-parsing the same week of JSONL every
+// 30-60 s is wasted disk + CPU. A tiny per-process TTL cache trades a
+// trivial amount of memory for material savings on the hottest path.
+//
+// Cache key: `(uuid, days_back, today_yyyymmdd)`. Including today's date
+// in the key means a midnight rollover naturally invalidates yesterday's
+// entries (the new day's lookups miss and recompute under the new key).
+// Cache value: `(interactions, distinct_days)` plus the `Instant` it was
+// inserted, for TTL eviction.
+//
+// `invalidate_trust_cache_for_uuid` lets a GDPR scrub drop entries for a
+// forgotten player so the cached counts can't leak post-scrub.
+
+const TRUST_CACHE_TTL: Duration = Duration::from_secs(60);
+const TRUST_CACHE_MAX_ENTRIES: usize = 1024;
+
+#[derive(Eq, Hash, PartialEq)]
+struct TrustCacheKey {
+    uuid: String,
+    days_back: u32,
+    date_today: String,
+}
+
+struct TrustCacheEntry {
+    inserted_at: Instant,
+    interactions: u32,
+    distinct_days: u32,
+}
+
+fn trust_cache() -> &'static Mutex<HashMap<TrustCacheKey, TrustCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<TrustCacheKey, TrustCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cached wrapper around [`count_interactions_for_uuid`].
+///
+/// Looks up `(uuid, days_back, today)` in a per-process TTL cache (60 s).
+/// On hit, returns the cached `(interactions, distinct_days)` without
+/// touching disk. On miss (or expired entry), runs the underlying counter
+/// and stores the result. Bounded to 1024 entries; oldest is evicted on
+/// overflow.
+///
+/// Today's UTC date is captured once at call time and folded into the key
+/// so a midnight rollover transparently invalidates yesterday's entries.
+pub fn count_interactions_for_uuid_cached(
+    history_dir: &Path,
+    target_uuid: &str,
+    partner_username_lc: &str,
+    days_back: u32,
+) -> (u32, u32) {
+    let date_today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let key = TrustCacheKey {
+        uuid: target_uuid.to_string(),
+        days_back,
+        date_today,
+    };
+    let now = Instant::now();
+    {
+        let mut guard = trust_cache().lock();
+        if let Some(entry) = guard.get(&key) {
+            if now.saturating_duration_since(entry.inserted_at) < TRUST_CACHE_TTL {
+                return (entry.interactions, entry.distinct_days);
+            }
+            // Expired — evict so the recomputed value replaces it cleanly.
+            guard.remove(&key);
+        }
+    }
+    let (interactions, distinct_days) = count_interactions_for_uuid(
+        history_dir,
+        target_uuid,
+        partner_username_lc,
+        days_back,
+    );
+    let mut guard = trust_cache().lock();
+    if guard.len() >= TRUST_CACHE_MAX_ENTRIES {
+        // Cap reached — drop the oldest entry by `inserted_at` to make
+        // room. Linear scan is fine at 1024 entries (cap-bounded) on
+        // what is already a multi-millisecond disk path.
+        if let Some(oldest_key) = guard
+            .iter()
+            .min_by_key(|(_, v)| v.inserted_at)
+            .map(|(k, _)| TrustCacheKey {
+                uuid: k.uuid.clone(),
+                days_back: k.days_back,
+                date_today: k.date_today.clone(),
+            })
+        {
+            guard.remove(&oldest_key);
+        }
+    }
+    guard.insert(
+        key,
+        TrustCacheEntry {
+            inserted_at: now,
+            interactions,
+            distinct_days,
+        },
+    );
+    (interactions, distinct_days)
+}
+
+/// Drop every cached entry whose key matches `uuid`. Called from the
+/// GDPR scrub path so a forgotten player's stale interaction counts
+/// don't survive in the per-process cache after disk rewrite.
+pub fn invalidate_trust_cache_for_uuid(uuid: &str) {
+    let mut guard = trust_cache().lock();
+    guard.retain(|k, _| k.uuid != uuid);
 }
 
 /// Returns true iff `current_file_bytes` exceeds `cap_bytes` by more than

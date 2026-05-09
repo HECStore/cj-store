@@ -17,7 +17,7 @@
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use serde::{Deserialize, Serialize};
 
@@ -427,19 +427,17 @@ fn load_persisted_from(path: &Path) -> io::Result<Option<TradeState>> {
 /// or held-handle cases. Returns the archived path on success so callers can
 /// log it.
 fn quarantine_unreadable_to(path: &Path) -> io::Result<std::path::PathBuf> {
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let archived = match path.parent() {
-        Some(parent) => parent.join(format!("current_trade.unreadable-{unix_ms}-{seq}.json")),
-        None => std::path::PathBuf::from(format!("current_trade.unreadable-{unix_ms}-{seq}.json")),
-    };
+    let archived = crate::fsutil::pick_archive_path(
+        path.parent(),
+        "current_trade",
+        "unreadable",
+        &ARCHIVE_SEQ,
+    );
     match std::fs::rename(path, &archived) {
         Ok(()) => Ok(archived),
         Err(_) => {
             std::fs::copy(path, &archived)?;
+            crate::fsutil::durably_sync_archive(&archived);
             if let Err(remove_err) = std::fs::remove_file(path) {
                 tracing::warn!(
                     "[TradeState] quarantined unreadable trade-state to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
@@ -465,19 +463,17 @@ fn clear_persisted_from(path: &Path) -> io::Result<()> {
 /// touching the production `TRADE_STATE_FILE`. Mirrors
 /// `Journal::archive_leftover`'s rename → copy+remove fallback.
 pub fn archive_persisted_to(path: &Path) -> io::Result<std::path::PathBuf> {
-    let unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let archived = match path.parent() {
-        Some(parent) => parent.join(format!("current_trade.leftover-{unix_ms}-{seq}.json")),
-        None => std::path::PathBuf::from(format!("current_trade.leftover-{unix_ms}-{seq}.json")),
-    };
+    let archived = crate::fsutil::pick_archive_path(
+        path.parent(),
+        "current_trade",
+        "leftover",
+        &ARCHIVE_SEQ,
+    );
     match std::fs::rename(path, &archived) {
         Ok(()) => Ok(archived),
         Err(_) => {
             std::fs::copy(path, &archived)?;
+            crate::fsutil::durably_sync_archive(&archived);
             if let Err(remove_err) = std::fs::remove_file(path) {
                 tracing::warn!(
                     "[TradeState] archived persisted trade-state to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",

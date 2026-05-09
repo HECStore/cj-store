@@ -1,9 +1,6 @@
-# This file was borrowed from Bevy: https://github.com/bevyengine/bevy/blob/main/.cargo/config_fast_builds
-
-# Add the contents of this file to `config.toml` to enable "fast build" configuration. Please read the notes below.
-
-# NOTE: For maximum performance, build using a nightly compiler
-# If you are using rust stable, remove the "-Zshare-generics=y" below.
+# Adapted from bevy/.cargo/config_fast_builds — fast-build linker + share-generics
+# knobs. Active config for this project; nightly-only `-Zshare-generics=y` is
+# guarded by the rust-toolchain.toml pin.
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
@@ -25,10 +22,9 @@ rustflags = [
     "-Zshare-generics=y",
 ]
 
-[target.x86_64-pc-windows-msvc]
-# Using default MSVC linker instead of rust-lld to avoid linker errors
-# linker = "rust-lld.exe"
-# rustflags = ["-Zshare-generics=n"]
+# No Windows MSVC overrides: tried `linker = "rust-lld.exe"` plus
+# `-Zshare-generics=n`, hit linker errors on this codebase. Default MSVC
+# linker is preferred per upstream Bevy guidance for share-generics.
 
 # Optional: Uncommenting the following improves compile times, but reduces the amount of debug info to 'line number tables only'
 # In most cases the gains are negligible, but if you are on macos and have slow compile times you should see significant gains.

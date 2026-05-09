@@ -169,31 +169,61 @@ impl Journal {
                 }
             }
         };
-        // Corrupt JSON → empty journal. We keep the swallow-and-continue
-        // behaviour (the journal is a diagnostic aid, not a hard dependency),
-        // but surface a warning so operators don't silently lose in-flight
-        // state on a malformed file. `unwrap_or_default()` on its own would
-        // hide the corruption entirely.
+        // Corrupt JSON → quarantine the file before falling back to empty.
+        // serde_json failures on this single-line compact JSON typically
+        // indicate a torn-write or partial-flush — exactly the case where
+        // forensic evidence matters. Mirroring the IO-error sibling above
+        // and trade_state.rs's parse-error path, we move the bad bytes
+        // aside so the next persist() doesn't silently overwrite them.
         let entries: Vec<JournalEntry> = match serde_json::from_str(&json) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    "[Journal] corrupt journal file {:?}: {e} - treating as empty, any in-flight shulker operation record is lost",
+                    "[Journal] corrupt journal file {:?}: {e} - attempting to quarantine before falling back to empty journal",
                     path
                 );
-                Vec::new()
+                match Self::quarantine_unreadable(path) {
+                    Ok(archived) => {
+                        tracing::error!(
+                            "[Journal] quarantined corrupt journal to {:?} - preserve for operator review (likely torn-write or partial-flush)",
+                            archived
+                        );
+                        return Ok((
+                            Self { entry: None, path: path.to_path_buf() },
+                            None,
+                        ));
+                    }
+                    Err(rename_err) => {
+                        tracing::error!(
+                            "[Journal] could not quarantine corrupt journal {:?}: {rename_err} - any in-flight shulker operation record will be overwritten on next persist",
+                            path
+                        );
+                        Vec::new()
+                    }
+                }
             }
         };
-        // The file format is forward-compatible to multiple entries, but the
-        // current writer emits at most one. If we ever see >1 entry on disk
-        // we still take only the last (existing semantics) but surface the
-        // discarded count so an operator notices instead of silently losing
-        // forensic state.
+        // The current writer emits at most one entry. If we ever see >1
+        // we quarantine the file to preserve all entries on disk for an
+        // operator, then fall through to "take the last entry" so the
+        // bot still recovers a usable in-memory state from the most
+        // recent record. Without quarantine, N-1 entries are discarded
+        // forever the moment the loader runs.
         if entries.len() > 1 {
             tracing::warn!(
-                "[Journal] file {:?} contains {} entries; only the most recent is used (forward-compat slot for multi-entry tracking, not yet implemented) - earlier entries discarded",
+                "[Journal] file {:?} contains {} entries; quarantining to preserve all entries before falling back to most-recent",
                 path, entries.len()
             );
+            match Self::quarantine_unreadable(path) {
+                Ok(archived) => tracing::error!(
+                    "[Journal] quarantined multi-entry journal to {:?} - preserve for operator review",
+                    archived
+                ),
+                Err(e) => tracing::warn!(
+                    "[Journal] could not quarantine multi-entry journal {:?}: {e} - earlier entries will be lost on next persist",
+                    path
+                ),
+            }
         }
         let leftover = entries.into_iter().next_back();
         if let Some(entry) = &leftover {
@@ -238,19 +268,17 @@ impl Journal {
     /// the destination (rare on a single-disk deploy, but rename on Windows
     /// can also fail if another process holds a handle).
     pub fn archive_leftover(&self) -> io::Result<std::path::PathBuf> {
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let archived = match self.path.parent() {
-            Some(parent) => parent.join(format!("journal.leftover-{unix_ms}-{seq}.json")),
-            None => std::path::PathBuf::from(format!("journal.leftover-{unix_ms}-{seq}.json")),
-        };
+        let archived = crate::fsutil::pick_archive_path(
+            self.path.parent(),
+            "journal",
+            "leftover",
+            &ARCHIVE_SEQ,
+        );
         match fs::rename(&self.path, &archived) {
             Ok(()) => Ok(archived),
             Err(_) => {
                 fs::copy(&self.path, &archived)?;
+                crate::fsutil::durably_sync_archive(&archived);
                 if let Err(remove_err) = fs::remove_file(&self.path) {
                     tracing::warn!(
                         "[Journal] archived leftover to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
@@ -271,19 +299,17 @@ impl Journal {
     /// copy+remove fallback for cross-device or held-handle cases. Returns the
     /// archived path on success so callers can log it.
     fn quarantine_unreadable(path: &Path) -> io::Result<PathBuf> {
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let archived = match path.parent() {
-            Some(parent) => parent.join(format!("journal.unreadable-{unix_ms}-{seq}.json")),
-            None => PathBuf::from(format!("journal.unreadable-{unix_ms}-{seq}.json")),
-        };
+        let archived = crate::fsutil::pick_archive_path(
+            path.parent(),
+            "journal",
+            "unreadable",
+            &ARCHIVE_SEQ,
+        );
         match fs::rename(path, &archived) {
             Ok(()) => Ok(archived),
             Err(_) => {
                 fs::copy(path, &archived)?;
+                crate::fsutil::durably_sync_archive(&archived);
                 if let Err(remove_err) = fs::remove_file(path) {
                     tracing::warn!(
                         "[Journal] quarantined unreadable journal to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
@@ -490,6 +516,25 @@ mod tests {
         assert!(
             leftover.is_none(),
             "corrupt JSON must surface as empty leftover, not an error"
+        );
+        assert!(
+            !path.exists(),
+            "corrupt JSON file must be quarantined out of the active path"
+        );
+        let parent = path.parent().unwrap();
+        let archived: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("journal.unreadable-")
+            })
+            .collect();
+        assert_eq!(
+            archived.len(),
+            1,
+            "expected exactly one journal.unreadable-* sibling after corrupt-JSON quarantine"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

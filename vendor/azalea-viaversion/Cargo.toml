@@ -16,13 +16,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dependencies]
 anyhow = "1.0"
 async-compat = "0.2.5"
-# LOCAL VENDOR EDIT (do not upstream): pin to the same `1.21.11` branch the
+# LOCAL VENDOR EDIT (do not upstream): pin to the same `41a9ae6a` rev the
 # parent project uses, so cargo unifies this dep with the parent's
-# `azalea = { git = "...", branch = "1.21.11" }` into a single git source
+# `azalea = { git = "...", rev = "41a9ae6a..." }` into a single git source
 # instead of compiling two azalea instances. See parent Cargo.toml for the
 # full rationale and link to the upstream bug (ViaProxy 1.21.9 → 26.1
-# `container_set_content` decode failure).
-azalea = { git = "https://github.com/azalea-rs/azalea", branch = "1.21.11", default-features = false, features = [
+# `container_set_content` decode failure). Mirror future bumps in lockstep.
+azalea = { git = "https://github.com/azalea-rs/azalea", rev = "41a9ae6aaff77646c08c64ac1334a8cc6081c24f", default-features = false, features = [
   "online-mode",
 ] }
 futures-util = "0.3"

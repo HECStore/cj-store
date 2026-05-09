@@ -147,6 +147,36 @@ pub async fn whisper_error_to_player(
     send_message_to_player(store, player_name, &err.user_message()).await
 }
 
+/// Whisper an action-prefixed rejection notice for a `TradeRejected`-shape
+/// failure. Single helper for the recurring `format!("{action} aborted: {reason}{suffix}", ...)`
+/// shape used by deposit/additem/removeitem/withdraw handlers, so the
+/// canonical sanitization discipline is grep-able from one place and
+/// future variant renames don't require touching every caller.
+///
+/// `reason` is the inner text (the destructured `String` from
+/// `StoreError::TradeRejected(s)`); pass `None` for `suffix` when no
+/// rollback note applies, or `Some(" Items returned to storage.")` etc.
+pub async fn whisper_action_aborted(
+    store: &Store,
+    player_name: &str,
+    action: &str,
+    reason: &str,
+    suffix: Option<&str>,
+) -> Result<(), crate::error::StoreError> {
+    send_message_to_player(store, player_name, &format_action_aborted(action, reason, suffix)).await
+}
+
+/// Format-only sibling of [`whisper_action_aborted`]. Use this when the
+/// caller needs to defer sending — e.g. the removeitem partial-rollback
+/// path, which assembles its `final_status` string inside an if/else and
+/// whispers it later in a single point-of-exit.
+pub fn format_action_aborted(action: &str, reason: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) => format!("{action} aborted: trade failed: {reason}.{s}"),
+        None => format!("{action} aborted: trade failed: {reason}"),
+    }
+}
+
 /// Helper to format transfer summaries (excludes coordinates for security).
 ///
 /// Player-facing output must NEVER leak chest coordinates: exposing them would

@@ -8,6 +8,40 @@ use crate::messages::TradeItem;
 use crate::types::{ItemId, Order, Trade, TradeType};
 use super::super::{Store, state, utils};
 
+/// Resolve `player_name` to a Mojang UUID for an operator command and, on
+/// failure, whisper a sanitized notice to the operator IN-PLACE before
+/// surfacing the error.
+///
+/// The four operator handlers used to `?`-propagate the resolver error up to
+/// `handle_bot_message`, which only `error!`-logs it — so a Mojang glitch
+/// (timeout, upstream blip, malformed response) left the operator with no
+/// feedback. Mirrors `player.rs`'s call site: log + whisper-via-
+/// `whisper_error_to_player` + return `Err(...)`.
+///
+/// `Ok(Some(uuid))` on success, `Ok(None)` when the resolver error has
+/// already been whispered (caller should `return Ok(())` from the handler),
+/// `Err(...)` only if the whisper itself failed.
+async fn resolve_operator_uuid(
+    store: &mut Store,
+    player_name: &str,
+    verb: &str,
+) -> Result<Option<String>, StoreError> {
+    match crate::mojang::resolve_user_uuid(player_name).await {
+        Ok(uuid) => Ok(Some(uuid)),
+        Err(reason) => {
+            warn!(
+                player = player_name,
+                command = verb,
+                reason = %reason,
+                "Mojang UUID lookup failed for operator command; whispering player-facing notice"
+            );
+            let err: StoreError = reason.into();
+            utils::whisper_error_to_player(store, player_name, &err).await?;
+            Ok(None)
+        }
+    }
+}
+
 /// Operator command: move items from the operator's inventory into storage via
 /// a one-sided trade, then deposit them across chests according to the planner.
 /// The operator is made whole with a reverse trade if any deposit step fails.
@@ -18,9 +52,10 @@ pub async fn handle_additem_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-additem", false)?;
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
+    let user_uuid = match resolve_operator_uuid(store, player_name, "additem").await? {
+        Some(uuid) => uuid,
+        None => return Ok(()),
+    };
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -95,12 +130,7 @@ pub async fn handle_additem_order(
     {
         Ok(_) => {}
         Err(StoreError::TradeRejected(err)) => {
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!("Additem aborted: trade failed: {}", err),
-            )
-            .await;
+            return utils::whisper_action_aborted(store, player_name, "Additem", &err, None).await;
         }
         Err(other) => return Err(other),
     }
@@ -347,9 +377,10 @@ pub async fn handle_removeitem_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-removeitem", false)?;
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
+    let user_uuid = match resolve_operator_uuid(store, player_name, "removeitem").await? {
+        Some(uuid) => uuid,
+        None => return Ok(()),
+    };
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
     if !store.pairs.contains_key(item) {
@@ -425,7 +456,10 @@ pub async fn handle_removeitem_order(
         utils::send_message_to_player(
             store,
             player_name,
-            &format!("Removeitem aborted: bot failed chest withdrawal step: {}", e),
+            &format!(
+                "Removeitem aborted: bot failed chest withdrawal step: {}",
+                e.user_message()
+            ),
         )
         .await?;
         return Err(e);
@@ -521,9 +555,10 @@ pub async fn handle_removeitem_order(
                     qty_i32 - rb.items_returned, err
                 ));
             } else {
-                final_status = Some(format!(
-                    "Removeitem aborted: trade failed: {}. Items returned to storage.",
-                    err
+                final_status = Some(utils::format_action_aborted(
+                    "Removeitem",
+                    &err,
+                    Some(" Items returned to storage."),
                 ));
             }
         }
@@ -600,9 +635,10 @@ pub async fn handle_add_currency(
     amount: f64,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-add-currency", false)?;
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
+    let user_uuid = match resolve_operator_uuid(store, player_name, "addcurrency").await? {
+        Some(uuid) => uuid,
+        None => return Ok(()),
+    };
 
     // Validate inputs BEFORE recording the operator as a user. A rejected
     // request must leave the store untouched (dirty unchanged); creating
@@ -683,9 +719,10 @@ pub async fn handle_remove_currency(
     amount: f64,
 ) -> Result<(), StoreError> {
     state::assert_invariants(store, "pre-remove-currency", false)?;
-    let user_uuid = crate::mojang::resolve_user_uuid(player_name)
-        .await
-        .map_err(StoreError::ValidationError)?;
+    let user_uuid = match resolve_operator_uuid(store, player_name, "removecurrency").await? {
+        Some(uuid) => uuid,
+        None => return Ok(()),
+    };
 
     // Validate inputs BEFORE recording the operator as a user. A rejected
     // request must leave the store untouched (dirty unchanged); creating

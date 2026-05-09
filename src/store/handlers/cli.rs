@@ -59,10 +59,10 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 ));
                 return Ok(());
             } else {
-                // Username shape OK; resolve via Mojang.
-                crate::mojang::resolve_user_uuid(trimmed)
-                    .await
-                    .map_err(StoreError::ValidationError)?
+                // Username shape OK; resolve via Mojang. The typed
+                // `MojangResolveError` is converted to a sanitized
+                // `StoreError` via the central `From` impl in `error.rs`.
+                crate::mojang::resolve_user_uuid(trimmed).await?
             };
             // When the operator typed a UUID, we must NOT pass `trimmed` as a
             // username to `ensure_user_exists` — `trimmed == uuid` in that
@@ -230,9 +230,9 @@ pub async fn handle_cli_message(store: &mut Store, message: CliMessage) -> Resul
                 store.storage.nodes.remove(idx);
                 // Delete data/storage/{node_id}.json so a stale file isn't
                 // reloaded on next startup.
-                let file_path = format!("data/storage/{}.json", node_id);
+                let file_path = crate::types::node::node_file_path(node_id);
                 if let Err(e) = std::fs::remove_file(&file_path) {
-                    warn!("[CLI-Store] Failed to remove node file {}: {} (node removed from memory anyway)", file_path, e);
+                    warn!("[CLI-Store] Failed to remove node file {}: {} (node removed from memory anyway)", file_path.display(), e);
                 }
                 store.dirty = true;
                 info!("[CLI-Store] Removed node {}", node_id);

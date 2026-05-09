@@ -40,13 +40,19 @@ architectural layer. They meet at the Store boundary.
 canonical variant list; at time of writing the variants are
 `UnknownPair`, `UnknownUser`, `BotDisconnected`, `TradeTimeout`,
 `ChestTimeout`, `BotAckTimeout`, `TradeRejected`, `BotSendFailed`,
-`BotResponseDropped`, `BotReportedError`, `ValidationError`, `ChestOp`,
-`InvariantViolation`, and `Io`. Only `From<StoreError> for String` is
-implemented (so handlers can stringify at the outermost whisper-pipeline
-boundary); the reverse direction is intentionally **not** implemented —
-auto-converting bare strings would silently collapse every legacy error
-into `ValidationError` and erase the typed-error work. String-returning
-helpers must be wrapped at their call sites with an explicit variant.
+`BotResponseDropped`, `BotReportedError`, `ValidationError`,
+`MojangNetwork`, `UserNotFound`, `ChestOp`, `InvariantViolation`, and
+`Io`. Neither `From<StoreError> for String` nor `From<String> for
+StoreError` is implemented: the former silently smuggled raw error text
+(including stringified `reqwest::Error` content) through `?` into
+`Result<_, String>` boundaries, defeating `StoreError::user_message`'s
+sanitization; the latter would collapse every legacy error into
+`ValidationError` and erase the typed-error work. Player-facing
+rendering goes through [`StoreError::user_message`] (preferably via
+[`crate::store::utils::whisper_error_to_player`]), and cross-boundary
+conversion from typed Mojang-resolver errors goes through
+`From<MojangResolveError> for StoreError`. String-returning helpers
+must be wrapped at their call sites with an explicit variant.
 
 ### Bot layer — `Result<T, String>`
 

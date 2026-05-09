@@ -115,7 +115,7 @@ impl Storage {
     ///
     /// Creates `data/storage/` on first run and returns an empty storage.
     pub fn load(storage_position: &Position) -> Result<Self, Box<dyn std::error::Error>> {
-        let storage_path = "data/storage";
+        let storage_path = crate::types::node::STORAGE_DIR;
 
         if !Path::new(storage_path).exists() {
             fs::create_dir_all(storage_path)?;

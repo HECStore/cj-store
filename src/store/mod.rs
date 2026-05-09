@@ -161,9 +161,10 @@ impl Store {
         }
 
         // Load order queue from disk (persistent across restarts).
-        // On corruption, `OrderQueue::load` renames the bad file to a
-        // `.corrupt-<stamp>` sidecar so the raw bytes survive for forensic
-        // recovery before the next `save()` overwrites it.
+        // On corruption or unreadable IO, `OrderQueue::load` quarantines the
+        // bad file to a `queue.json.{corrupt,unreadable}-<unix_ms>-<seq>.json`
+        // sibling and returns Ok(empty) so the raw bytes survive for forensic
+        // recovery before the next `save()` overwrites the active path.
         let order_queue = match OrderQueue::load() {
             Ok(queue) => queue,
             Err(e) => {

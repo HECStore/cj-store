@@ -155,12 +155,7 @@ pub async fn handle_deposit_balance_queued(
                 error = %err,
                 "Deposit trade failed"
             );
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!("Deposit aborted: trade failed: {}", err),
-            )
-            .await;
+            return utils::whisper_action_aborted(store, player_name, "Deposit", &err, None).await;
         }
         Err(other) => return Err(other),
     };

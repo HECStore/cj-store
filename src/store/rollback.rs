@@ -763,18 +763,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn under_plan_is_surfaced_as_failure() {
-        // Storage with NO nodes at all — `simulate_deposit_plan` cannot place
-        // anything, so the planner returns an empty plan and a planned-total of
-        // zero. Before this fix `rollback_amount_to_storage` returned a
-        // `Default::default()` `RollbackResult` and `has_failures()` was false,
-        // so callers cheerfully told the player "items returned to storage"
-        // while the items were physically still on the bot.
+    async fn rollback_surfaces_dispatch_failure_when_bot_unreachable() {
+        // Storage with NO nodes at all — `simulate_deposit_plan` plans nothing,
+        // but `rollback_amount_to_storage` then falls back to the mutating
+        // `deposit_plan` which unconditionally grows a fresh node to absorb
+        // the shortfall (see the safety-net comment in `rollback.rs` —
+        // rollback must accept growth rather than strand items already in
+        // the bot's inventory). So `items_unplanned` ends at 0.
         //
-        // We deliberately use empty-Storage rather than a "full chest" fixture:
-        // `simulate_deposit_plan` falls through to allocate empty chests in any
-        // node it can find, so a full-chest scenario won't actually trigger
-        // under-planning in the presence of free chests.
+        // The actual rollback contract this test now locks in: when the
+        // bot dispatch step fails (here because no mock-bot task is
+        // reading the channel), `RollbackResult` MUST surface failure via
+        // `has_failures()` and `partial_message()` — otherwise callers
+        // would tell the player "items returned to storage" while the
+        // items were physically still on the bot. Before the original
+        // rollback fix, `Default::default()` had `has_failures() == false`,
+        // hiding exactly this shape of failure.
         let origin = Position { x: 0, y: 64, z: 0 };
         let storage = Storage::new(&origin); // zero nodes
         let (tx, _rx) = mpsc::channel(4);
@@ -783,15 +787,20 @@ mod tests {
         let result =
             rollback_amount_to_storage(&mut store, "cobblestone", 5, 64, "[Test]").await;
 
-        assert_eq!(result.items_unplanned, 5, "all 5 items must be flagged unplanned");
-        assert_eq!(
-            result.operations_failed, 0,
-            "no per-step failure occurred — only a planning shortfall"
+        // Grow-fallback absorbed the planning shortfall.
+        assert_eq!(result.items_unplanned, 0, "grow-fallback must absorb the shortfall");
+        // No bot to ack the dispatched plan → operations_failed > 0.
+        assert!(
+            result.operations_failed > 0,
+            "dispatch with no live bot must surface as a failed op"
         );
+        // Nothing was physically moved; the items are stranded on the bot.
         assert_eq!(result.items_returned, 0, "no items were physically returned");
+        // The combined shape MUST flip has_failures() so callers don't
+        // silently report success.
         assert!(
             result.has_failures(),
-            "planning shortfall must surface via has_failures()"
+            "dispatch failure must surface via has_failures()"
         );
         assert!(
             result.partial_message().is_some(),

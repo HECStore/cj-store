@@ -222,7 +222,10 @@ pub async fn handle_withdraw_balance_queued(
             utils::send_message_to_player(
                 store,
                 player_name,
-                &format!("Withdraw aborted: failed to get diamonds from storage: {}", e),
+                &format!(
+                    "Withdraw aborted: failed to get diamonds from storage: {}",
+                    e.user_message()
+                ),
             )
             .await?;
             return Err(e);

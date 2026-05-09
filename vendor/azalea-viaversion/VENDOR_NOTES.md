@@ -7,11 +7,13 @@ copied in.
 
 Cargo treats two `git = "<URL>"` deps as the same source only if their
 ref specs match exactly. Our parent `Cargo.toml` pins
-`azalea = { git = "...", branch = "1.21.11" }` so the bot dodges the
-26.1 protocol's broken ViaBackwards `container_set_content` translation.
-Upstream `azalea-viaversion`'s `Cargo.toml` has plain
-`azalea = { git = "..." }` (no ref). Cargo therefore creates two
-distinct git sources and compiles two `azalea` instances side-by-side.
+`azalea = { git = "...", rev = "41a9ae6aaff77646c08c64ac1334a8cc6081c24f" }`
+(the `1.21.11` branch tip as of 2026-03-22, immediately before the 26.1
+protocol bump) so the bot dodges the 26.1 protocol's broken
+ViaBackwards `container_set_content` translation. Upstream
+`azalea-viaversion`'s `Cargo.toml` has plain `azalea = { git = "..." }`
+(no ref). Cargo therefore creates two distinct git sources and compiles
+two `azalea` instances side-by-side.
 The build still succeeds — Bevy's plugin trait happens to unify across
 the two — but the plugin's systems capture 26.1's ECS event types
 (`ReceiveCustomQueryEvent`, `StartJoinServerEvent`, `Swarm`, ...) and
@@ -28,15 +30,19 @@ exact pre-release pins (`signature = "=3.0.0-rc.8"`, `crypto-primes =
 `rsa`/`pkcs8`/`der` pre-releases no longer compiles. The git branch
 tip has refreshed those deps but never got a new crates.io release.
 
-Vendoring lets us add `branch = "1.21.11"` to the local copy's
-`azalea` dep so cargo unifies it with the parent's spec into a single
-git source — one azalea instance, plugin systems hooked to the same
-ECS world.
+Vendoring lets us add the same `rev = "41a9ae6a..."` pin to the local
+copy's `azalea` dep so cargo unifies it with the parent's spec into a
+single git source — one azalea instance, plugin systems hooked to the
+same ECS world.
 
 # What was changed vs upstream
 
-`Cargo.toml`: added `branch = "1.21.11"` to the `azalea` dep. Nothing
-else.
+- `Cargo.toml`: added `rev = "41a9ae6aaff77646c08c64ac1334a8cc6081c24f"`
+  to the `azalea` dep, mirroring the parent project's pin.
+- `rust-toolchain.toml`: added, pinning `channel = "nightly-2026-04-21"`
+  to mirror the parent's dated nightly so the vendored crate doesn't
+  pick up a different toolchain when built standalone (e.g. when an
+  upstream-sync diff is run from inside this directory).
 
 # When to re-sync
 

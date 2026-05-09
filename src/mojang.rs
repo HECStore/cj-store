@@ -22,6 +22,7 @@ use parking_lot::Mutex;
 use tracing::debug;
 
 use crate::constants::UUID_CACHE_TTL_SECS;
+use crate::types::user::MojangResolveError;
 #[cfg(not(test))]
 use crate::types::User;
 
@@ -43,11 +44,13 @@ fn uuid_cache() -> &'static Mutex<UuidCache> {
 /// Mojang API on every interaction. Cache keys are lowercased so `Steve` and
 /// `steve` share an entry.
 ///
-/// Returns `Result<String, String>` — the error string is user-safe and ready
-/// to be whispered straight back to the player. Store-layer callers wrap it in
-/// `StoreError::ValidationError` at the call site; chat-layer callers consume
-/// it directly.
-pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
+/// Returns a typed [`MojangResolveError`] so call sites can route each
+/// failure mode to a sanitized `StoreError` (`UserNotFound` /
+/// `ValidationError` / `MojangNetwork`) without ever stringifying a
+/// `reqwest::Error` into a player-facing whisper. Chat-layer callers that
+/// still want a `String` should rely on the `Display` impl, which is short
+/// and entirely author-controlled — or call [`resolve_user_uuid_string`].
+pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveError> {
     #[cfg(test)]
     {
         // Offline deterministic UUID for integration tests: avoids hitting the
@@ -65,7 +68,9 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         {
-            return Err(format!("Player '{username}' not found"));
+            return Err(MojangResolveError::NotFound {
+                username: username.to_string(),
+            });
         }
         // After the shape gate the username is guaranteed ASCII, so byte-level
         // trim-then-pad produces exactly 12 ASCII bytes in the trailing
@@ -97,9 +102,7 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, String> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         {
-            return Err(format!(
-                "Invalid Minecraft username '{username}' (must be 3-16 chars, ASCII alphanumeric or _)"
-            ));
+            return Err(MojangResolveError::InvalidShape);
         }
         // After the shape gate the username is ASCII, so `to_ascii_lowercase`
         // is correct and avoids Unicode case-folding (which is locale-aware

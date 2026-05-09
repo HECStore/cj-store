@@ -315,8 +315,18 @@ pub enum BotInstruction {
     },
     /// Send a public chat line. Used by the chat module to speak in open
     /// chat. Whispers (DMs) reuse the existing `Whisper` variant.
+    ///
+    /// `target` / `target_uuid` carry the partner the bot is addressing
+    /// when the public line is a directed reply (or proactive engagement
+    /// with a specific player). Threaded into the JSONL `bot_chat` record
+    /// so `count_interactions_for_uuid` can match public replies — without
+    /// this the trust ladder pins at 0 for any player who only interacts
+    /// via public chat. `None` is reserved for true broadcasts (no
+    /// addressee).
     SendChat {
         content: String,
+        target: Option<String>,
+        target_uuid: Option<String>,
         respond_to: oneshot::Sender<Result<(), String>>,
     },
     /// Navigate to a chest, perform the given action, then read chest

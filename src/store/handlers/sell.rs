@@ -9,19 +9,20 @@ use tracing::debug;
 use super::super::{Store, utils};
 use crate::error::StoreError;
 use crate::messages::QueuedOrderType;
+use crate::types::ItemId;
 
 pub(super) async fn handle(
     store: &mut Store,
     player_name: &str,
     user_uuid: &str,
-    item: &str,
+    item: &ItemId,
     quantity: u32,
 ) -> Result<(), StoreError> {
-    if !store.pairs.contains_key(item) {
+    if !store.pairs.contains_key(item.as_str()) {
         debug!(
             player = player_name,
             uuid = user_uuid,
-            item = item,
+            item = %item,
             "Rejected sell command: item not tradable"
         );
         return utils::send_message_to_player(
@@ -35,7 +36,7 @@ pub(super) async fn handle(
     debug!(
         player = player_name,
         uuid = user_uuid,
-        item = item,
+        item = %item,
         quantity = quantity,
         "Queueing sell order"
     );
@@ -44,7 +45,7 @@ pub(super) async fn handle(
         user_uuid.to_string(),
         player_name.to_string(),
         QueuedOrderType::Sell,
-        item.to_string(),
+        item.as_str().to_string(),
         quantity,
     ) {
         Ok((order_id, position)) => {

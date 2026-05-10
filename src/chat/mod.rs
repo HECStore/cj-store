@@ -141,6 +141,15 @@ pub async fn chat_task(
             pricing::PricingTable::default_table()
         }
     };
+    // Cross-file invariant: every configured model name must exist in
+    // the loaded pricing table, else `usd_for_call` fail-closes to +INF
+    // and every call trips the daily USD cap with a mysterious symptom.
+    // Surface a clear error and self-disable so operators see the real
+    // cause at startup.
+    if let Err(e) = config.validate_against_pricing(&pricing) {
+        error!(error = %e, "[Chat] pricing/config mismatch; chat self-disabling");
+        return;
+    }
     // Acquire the API key. Failure is loud and self-disables.
     let api_key = match client::ApiKey::from_env(&config.api_key_env) {
         Ok(k) => k,

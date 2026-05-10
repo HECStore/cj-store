@@ -1154,6 +1154,20 @@ incomplete; defenses cover:
   [`pricing::PricingTable`](src/chat/pricing.rs) loaded from
   `data/chat/pricing.json` — defaults shipped with the binary,
   operator-overridable. Price changes don't require a code release.
+- **Pricing/config cross-file invariant**. At chat-task startup
+  (right after `PricingTable::load_or_create`), `chat_task` calls
+  `ChatConfig::validate_against_pricing(&pricing)`, which errors if any
+  of `composer_model`, `classifier_model`, or `reasoning_filter_model`
+  is not a key in the loaded table. Without this check, an operator
+  who rotates an Anthropic Haiku snapshot ID in `config.toml` without
+  adding the corresponding entry to `data/chat/pricing.json` would see
+  every call refused with `UsdCap` (because `usd_for_call` fail-closes
+  to `f64::INFINITY` for unknown models). The check runs only when
+  `chat.enabled = true`; on failure the chat task self-disables with
+  the missing model name in the log. If the startup hook is ever moved,
+  the new call site must invoke `validate_against_pricing` before any
+  composer/classifier dispatch — leaving it unhooked is the failure
+  mode the invariant exists to prevent.
 
 ## Bot username sharing + reconnect lifecycle
 

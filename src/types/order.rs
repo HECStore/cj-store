@@ -163,16 +163,28 @@ impl Order {
     /// Saves a VecDeque of Orders to `ORDERS_FILE`, keeping only the most
     /// recent `max_orders` entries.
     pub fn save_all_with_limit(orders: &VecDeque<Self>, max_orders: usize) -> io::Result<()> {
-        let file_path = Path::new(ORDERS_FILE);
+        Self::save_all_with_limit_at(orders, max_orders, Path::new(ORDERS_FILE))
+    }
 
+    /// Path-parameterized form of `save_all_with_limit`. Tests drive this
+    /// directly against a `tempfile::TempDir` so the on-disk write path is
+    /// covered without touching `data/orders.json`; the public
+    /// `save_all_with_limit` is a thin one-liner over this helper.
+    fn save_all_with_limit_at(
+        orders: &VecDeque<Self>,
+        max_orders: usize,
+        file_path: &Path,
+    ) -> io::Result<()> {
         if let Some(parent) = file_path.parent()
             && !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
 
         // Skipping `len - max_orders` from the front keeps the most recent
-        // entries, matching the pop_front pruning used at the in-memory layer
-        // but without requiring a mutable borrow of the caller's queue.
+        // entries. Note: there is no in-memory pruning of `store.orders` —
+        // `state::save` (src/store/state.rs) drains the front before calling
+        // this function as the primary cap; this branch is a defense-in-depth
+        // second cap that fires only if the caller passes an unbounded queue.
         let orders_to_save: VecDeque<Self> = if orders.len() > max_orders {
             tracing::info!("[Order] pruning {} -> {} before save", orders.len(), max_orders);
             orders.iter().skip(orders.len() - max_orders).cloned().collect()
@@ -184,7 +196,11 @@ impl Order {
             .map_err(io::Error::other)?;
 
         write_atomic(file_path, &json_str)?;
-        tracing::debug!("[Order] wrote {} orders to {}", orders_to_save.len(), ORDERS_FILE);
+        tracing::debug!(
+            "[Order] wrote {} orders to {}",
+            orders_to_save.len(),
+            file_path.display()
+        );
         Ok(())
     }
 }
@@ -227,23 +243,57 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_most_recent_and_preserves_order() {
-        // Simulate what save_all_with_limit does to the in-memory queue.
+    fn save_all_with_limit_at_prunes_oldest_and_round_trips() {
+        // Drives the real `save_all_with_limit_at` against a tempdir so the
+        // prune branch and the on-disk JSON round-trip are both covered;
+        // replaces the previous self-referential test that re-implemented the
+        // skip expression inline rather than calling the function.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("orders.json");
+
         let mut q = VecDeque::new();
         for i in 0..5u32 { q.push_back(make(i)); }
-        let max = 3;
-        let kept: VecDeque<Order> = q.iter().skip(q.len() - max).cloned().collect();
-        assert_eq!(kept.len(), 3);
-        assert_eq!(kept.front().unwrap().amount, 2);
-        assert_eq!(kept.back().unwrap().amount, 4);
+
+        Order::save_all_with_limit_at(&q, 3, &file_path).unwrap();
+
+        let json = std::fs::read_to_string(&file_path).unwrap();
+        let on_disk: VecDeque<Order> = serde_json::from_str(&json).unwrap();
+        assert_eq!(on_disk.len(), 3);
+        assert_eq!(on_disk.front().unwrap().amount, 2);
+        assert_eq!(on_disk.back().unwrap().amount, 4);
     }
 
     #[test]
-    fn no_pruning_when_under_limit() {
+    fn save_all_with_limit_at_under_limit_writes_full_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("orders.json");
+
         let mut q = VecDeque::new();
         for i in 0..3u32 { q.push_back(make(i)); }
-        assert!(q.len() <= 10);
-        assert_eq!(q.len(), 3);
+
+        Order::save_all_with_limit_at(&q, 10, &file_path).unwrap();
+
+        let json = std::fs::read_to_string(&file_path).unwrap();
+        let on_disk: VecDeque<Order> = serde_json::from_str(&json).unwrap();
+        assert_eq!(on_disk.len(), 3);
+        assert_eq!(on_disk.front().unwrap().amount, 0);
+        assert_eq!(on_disk.back().unwrap().amount, 2);
+    }
+
+    #[test]
+    fn save_all_with_limit_at_boundary_len_equals_max_is_no_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("orders.json");
+
+        let mut q = VecDeque::new();
+        for i in 0..3u32 { q.push_back(make(i)); }
+
+        Order::save_all_with_limit_at(&q, 3, &file_path).unwrap();
+
+        let json = std::fs::read_to_string(&file_path).unwrap();
+        let on_disk: VecDeque<Order> = serde_json::from_str(&json).unwrap();
+        assert_eq!(on_disk.len(), 3);
+        assert_eq!(on_disk.front().unwrap().amount, 0);
     }
 
     #[test]
@@ -266,6 +316,92 @@ mod tests {
             assert_eq!(back, o);
             assert_eq!(back.currency_amount, mag);
         }
+    }
+
+    #[test]
+    fn buy_constructor_shape() {
+        let item = ItemId::new("iron_ingot").unwrap();
+        let o = Order::buy(item.clone(), 7, 14.5, "user-1".to_string());
+        assert_eq!(o.order_type, OrderType::Buy);
+        assert_eq!(o.item, item);
+        assert_eq!(o.amount, 7);
+        assert_eq!(o.currency_amount, 14.5);
+        assert_eq!(o.user_uuid, "user-1");
+    }
+
+    #[test]
+    fn sell_constructor_shape() {
+        let item = ItemId::new("gold_ingot").unwrap();
+        let o = Order::sell(item.clone(), 3, 6.0, "user-2".to_string());
+        assert_eq!(o.order_type, OrderType::Sell);
+        assert_eq!(o.item, item);
+        assert_eq!(o.amount, 3);
+        assert_eq!(o.currency_amount, 6.0);
+        assert_eq!(o.user_uuid, "user-2");
+    }
+
+    #[test]
+    fn deposit_balance_constructor_shape() {
+        let o = Order::deposit_balance(42.0, "user-3".to_string());
+        assert_eq!(o.order_type, OrderType::DepositBalance);
+        assert_eq!(o.item, ItemId::new("diamond").unwrap());
+        assert_eq!(o.amount, 42);
+        assert_eq!(o.currency_amount, 42.0);
+        assert_eq!(o.user_uuid, "user-3");
+    }
+
+    #[test]
+    fn withdraw_balance_constructor_shape() {
+        let o = Order::withdraw_balance(17.0, "user-4".to_string());
+        assert_eq!(o.order_type, OrderType::WithdrawBalance);
+        assert_eq!(o.item, ItemId::new("diamond").unwrap());
+        assert_eq!(o.amount, 17);
+        assert_eq!(o.currency_amount, 17.0);
+        assert_eq!(o.user_uuid, "user-4");
+    }
+
+    #[test]
+    fn add_currency_constructor_shape() {
+        let item = ItemId::new("emerald").unwrap();
+        let o = Order::add_currency(item.clone(), 25.5, "op-1".to_string());
+        assert_eq!(o.order_type, OrderType::AddCurrency);
+        assert_eq!(o.item, item);
+        assert_eq!(o.amount, 0);
+        assert_eq!(o.currency_amount, 25.5);
+        assert_eq!(o.user_uuid, "op-1");
+    }
+
+    #[test]
+    fn remove_currency_constructor_shape() {
+        let item = ItemId::new("emerald").unwrap();
+        let o = Order::remove_currency(item.clone(), 9.25, "op-2".to_string());
+        assert_eq!(o.order_type, OrderType::RemoveCurrency);
+        assert_eq!(o.item, item);
+        assert_eq!(o.amount, 0);
+        assert_eq!(o.currency_amount, 9.25);
+        assert_eq!(o.user_uuid, "op-2");
+    }
+
+    #[test]
+    fn add_item_constructor_shape() {
+        let item = ItemId::new("oak_log").unwrap();
+        let o = Order::add_item(item.clone(), 64, "op-3".to_string());
+        assert_eq!(o.order_type, OrderType::AddItem);
+        assert_eq!(o.item, item);
+        assert_eq!(o.amount, 64);
+        assert_eq!(o.currency_amount, 0.0);
+        assert_eq!(o.user_uuid, "op-3");
+    }
+
+    #[test]
+    fn remove_item_constructor_shape() {
+        let item = ItemId::new("cobblestone").unwrap();
+        let o = Order::remove_item(item.clone(), 32, "op-4".to_string());
+        assert_eq!(o.order_type, OrderType::RemoveItem);
+        assert_eq!(o.item, item);
+        assert_eq!(o.amount, 32);
+        assert_eq!(o.currency_amount, 0.0);
+        assert_eq!(o.user_uuid, "op-4");
     }
 
     #[test]

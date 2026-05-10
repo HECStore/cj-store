@@ -52,6 +52,17 @@ pub struct PricingTable {
 const VERSION: u32 = 1;
 
 impl PricingTable {
+    /// Whether `model` is a known key in this table. Used by
+    /// `ChatConfig::validate_against_pricing` to surface a clear startup
+    /// error when an operator updates `composer_model` /
+    /// `classifier_model` / `reasoning_filter_model` without adding the
+    /// corresponding entry to `data/chat/pricing.json` — without this
+    /// check, `usd_for_call` would silently bill +INF and trip the daily
+    /// USD cap on every call, which is hard to diagnose from the symptom.
+    pub fn has_model(&self, model: &str) -> bool {
+        self.rates.contains_key(model)
+    }
+
     /// Default table shipped with the binary. Numbers are placeholder
     /// list prices that operators are expected to override; the file
     /// header explicitly invites that. Sourced as of late-2025 published
@@ -98,7 +109,16 @@ impl PricingTable {
     /// they are logged and the in-memory default is returned, leaving the
     /// disk file alone for the operator to fix.
     pub fn load_or_create() -> std::io::Result<Self> {
-        let path = Path::new(PRICING_FILE);
+        Self::load_from_path(Path::new(PRICING_FILE))
+    }
+
+    /// Inner implementation of [`load_or_create`] parameterized on the
+    /// file path so the validation + fallback branches can be tested
+    /// without touching `data/chat/pricing.json`. Behaves identically to
+    /// `load_or_create`: missing file is created with defaults; corrupt /
+    /// invalid / wrong-version files log a warning and return the
+    /// built-in defaults WITHOUT overwriting the on-disk bytes.
+    pub(crate) fn load_from_path(path: &Path) -> std::io::Result<Self> {
         if !path.exists() {
             let table = Self::default_table();
             let json = serde_json::to_string_pretty(&table)?;
@@ -164,10 +184,12 @@ impl PricingTable {
         }
     }
 
-    /// Compute USD cost for a given model + token spend. Returns 0.0 if
-    /// the model is unknown — better to under-report cost than crash on
-    /// a freshly-deployed model name; this function logs unknowns once
-    /// at warn level (see [`usd_for_call`]).
+    /// Compute USD cost for a given model + token spend. Returns
+    /// `f64::INFINITY` (fail-closed) if the model is unknown so the
+    /// `daily_dollar_cap_usd` safety net trips immediately on a
+    /// misconfigured `composer_model` or rotated Anthropic snapshot ID;
+    /// this function logs unknowns once at warn level (see
+    /// [`usd_for_call`]).
     ///
     /// Cache tokens are NOT charged here. Use [`usd_for_call`] when the
     /// API response carries `cache_creation_input_tokens` /
@@ -196,9 +218,12 @@ impl PricingTable {
     /// relative to the true ~0.1× rate), but never panics on a
     /// freshly-deployed model.
     ///
-    /// Unknown models bill as $0.00 and this function logs them once at
-    /// warn level so a misconfigured composer model is visible to the
-    /// operator instead of silently disabling the daily USD cap.
+    /// Unknown models bill as `f64::INFINITY` (fail-closed) and this
+    /// function logs them once at warn level so a misconfigured composer
+    /// model or rotated Anthropic snapshot ID trips the daily USD cap
+    /// immediately instead of silently disabling it. The INF sentinel
+    /// propagates correctly through `usd += INF` (sum stays INF) and
+    /// `INF > cap` (trips `would_exceed_caps_*`).
     pub fn usd_for_call(
         &self,
         model: &str,
@@ -215,10 +240,10 @@ impl PricingTable {
                 warn!(
                     target: LOG_TARGET,
                     model = %model,
-                    "pricing: unknown model, billing as $0.00 — add it to data/chat/pricing.json to enforce the daily USD cap"
+                    "pricing: unknown model, billing as +INF to fail-closed and trip the daily USD cap — add it to data/chat/pricing.json"
                 );
             }
-            return 0.0;
+            return f64::INFINITY;
         };
         let cache_write_rate = r
             .cache_write_per_million
@@ -269,10 +294,40 @@ mod tests {
     }
 
     #[test]
-    fn usd_for_tokens_returns_zero_for_unknown_model() {
+    fn usd_for_tokens_returns_infinity_for_unknown_model_to_fail_closed() {
         let t = PricingTable::default_table();
         let cost = t.usd_for_tokens("not-a-real-model", 1_000_000, 1_000_000);
-        assert_eq!(cost, 0.0);
+        assert!(
+            cost.is_infinite() && cost.is_sign_positive(),
+            "unknown model must bill as +INF to fail-closed (got {cost})"
+        );
+    }
+
+    #[test]
+    fn unknown_model_trips_dollar_cap_via_infinity() {
+        // A misconfigured composer_model or a rotated Anthropic snapshot
+        // ID must not silently disable the daily USD cap. Build a small
+        // table with one known model and verify usd_for_call for an
+        // unknown name returns +INF so `INF > cap` trips downstream.
+        let mut rates = HashMap::new();
+        rates.insert(
+            "known-model".to_string(),
+            ModelRates {
+                input_per_million: 1.0,
+                output_per_million: 5.0,
+                cache_write_per_million: None,
+                cache_read_per_million: None,
+            },
+        );
+        let t = PricingTable {
+            version: VERSION,
+            rates,
+        };
+        let result = t.usd_for_call("unknown-model", 100, 100, 0, 0);
+        assert!(
+            result.is_infinite() && result.is_sign_positive(),
+            "unknown model must return +INF to trip dollar cap (got {result})"
+        );
     }
 
     #[test]
@@ -341,5 +396,97 @@ mod tests {
         let s = t.usd_for_call("claude-sonnet-4-6", 1_000_000, 200_000, 0, 0);
         let o = t.usd_for_call("claude-opus-4-7", 1_000_000, 200_000, 0, 0);
         assert!(s < o, "Sonnet must be cheaper than Opus on a typical I/O mix");
+    }
+
+    // ---- load_from_path: validation + fallback branches --------------------
+    //
+    // Every recovery path in `load_from_path` silently substitutes the
+    // built-in default table; a regression that accidentally overwrote an
+    // operator's edited file would not be caught without these tests. For
+    // each case we assert BOTH the returned table AND that the on-disk
+    // bytes are byte-for-byte unchanged.
+
+    fn write_pricing(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+        let p = dir.join("pricing.json");
+        fs::write(&p, contents).expect("write fixture");
+        p
+    }
+
+    #[test]
+    fn load_from_path_rejects_negative_input_rate_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = r#"{
+            "version": 1,
+            "rates": {
+                "claude-opus-4-7": {
+                    "input_per_million": -1.0,
+                    "output_per_million": 75.0
+                }
+            }
+        }"#;
+        let path = write_pricing(tmp.path(), raw);
+        let before = fs::read(&path).unwrap();
+        let t = PricingTable::load_from_path(&path).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(t, PricingTable::default_table());
+        assert_eq!(before, after, "file must NOT be rewritten on validation failure");
+    }
+
+    #[test]
+    fn load_from_path_rejects_newer_version_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = r#"{"version": 999, "rates": {}}"#;
+        let path = write_pricing(tmp.path(), raw);
+        let before = fs::read(&path).unwrap();
+        let t = PricingTable::load_from_path(&path).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(t, PricingTable::default_table());
+        assert_eq!(before, after, "newer-version file must NOT be rewritten");
+    }
+
+    #[test]
+    fn load_from_path_rejects_older_version_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = r#"{"version": 0, "rates": {}}"#;
+        let path = write_pricing(tmp.path(), raw);
+        let before = fs::read(&path).unwrap();
+        let t = PricingTable::load_from_path(&path).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(t, PricingTable::default_table());
+        assert_eq!(before, after, "older-version file must NOT be rewritten");
+    }
+
+    #[test]
+    fn load_from_path_rejects_unparseable_json_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = "this is not { valid json at all";
+        let path = write_pricing(tmp.path(), raw);
+        let before = fs::read(&path).unwrap();
+        let t = PricingTable::load_from_path(&path).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(t, PricingTable::default_table());
+        assert_eq!(before, after, "corrupt file must NOT be rewritten");
+    }
+
+    #[test]
+    fn load_from_path_rejects_negative_cache_write_without_overwriting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = r#"{
+            "version": 1,
+            "rates": {
+                "claude-opus-4-7": {
+                    "input_per_million": 15.0,
+                    "output_per_million": 75.0,
+                    "cache_write_per_million": -1.0,
+                    "cache_read_per_million": 1.5
+                }
+            }
+        }"#;
+        let path = write_pricing(tmp.path(), raw);
+        let before = fs::read(&path).unwrap();
+        let t = PricingTable::load_from_path(&path).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(t, PricingTable::default_table());
+        assert_eq!(before, after, "negative cache_write file must NOT be rewritten");
     }
 }

@@ -95,6 +95,7 @@ pub async fn handle_player_command(
             player_name,
             command,
             throttled.wait,
+            throttled.reason,
             None,
             "pre-resolve",
         )
@@ -140,6 +141,7 @@ pub async fn handle_player_command(
             player_name,
             command,
             throttled.wait,
+            throttled.reason,
             Some(&user_uuid),
             "post-resolve",
         )
@@ -234,26 +236,34 @@ async fn whisper_rate_limit_notice(
     player_name: &str,
     command: &str,
     wait_duration: std::time::Duration,
+    reason: crate::store::rate_limit::ThrottleReason,
     user_uuid: Option<&str>,
     stage: &str,
 ) -> Result<(), StoreError> {
+    use crate::store::rate_limit::ThrottleReason;
     let wait_ms = wait_duration.as_millis() as u64;
-    let msg = if wait_ms < 1_000 {
-        format!(
-            "Please wait {} ms before sending another message.",
-            wait_ms.max(1)
-        )
-    } else {
-        format!(
-            "Please wait {:.0}s before sending another message.",
-            wait_duration.as_secs_f64().ceil()
-        )
+    let secs_ceil = wait_duration.as_secs_f64().ceil().max(1.0) as u64;
+    let msg = match reason {
+        ThrottleReason::GlobalCap => format!(
+            "Server is busy with too many active users; please try again in {secs_ceil}s."
+        ),
+        ThrottleReason::PerUser => {
+            if wait_ms < 1_000 {
+                format!(
+                    "Please wait {} ms before sending another message.",
+                    wait_ms.max(1)
+                )
+            } else {
+                format!("Please wait {secs_ceil}s before sending another message.")
+            }
+        }
     };
     debug!(
         player = player_name,
         user_uuid = user_uuid.unwrap_or(""),
         command = command,
         wait_ms = wait_ms,
+        reason = ?reason,
         stage = stage,
         "Rate-limited player command; whispering cooldown notice"
     );

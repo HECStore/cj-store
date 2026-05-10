@@ -13,18 +13,21 @@
 //! it for non-operators, so the error message can be consistent with the
 //! rest of the permission system.
 
+use crate::constants::MAX_TRADE_DIAMONDS;
+use crate::types::ItemId;
+
 use super::handlers::validation::{validate_item_name, validate_quantity, validate_username};
 
 /// A parsed player command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     // Order commands (enqueued for the bot task to process)
-    Buy { item: String, quantity: u32 },
-    Sell { item: String, quantity: u32 },
+    Buy { item: ItemId, quantity: u32 },
+    Sell { item: ItemId, quantity: u32 },
     Deposit { amount: Option<f64> },
     Withdraw { amount: Option<f64> },
     // Quick commands (handled inline on the Store task)
-    Price { item: String, quantity: Option<u32> },
+    Price { item: ItemId, quantity: Option<u32> },
     Balance { target: Option<String> },
     Pay { target: String, amount: f64 },
     Items { page: usize },
@@ -33,10 +36,10 @@ pub enum Command {
     Status,
     Help { topic: Option<String> },
     // Operator commands (permission checked by dispatcher)
-    AddItem { item: String, quantity: u32 },
-    RemoveItem { item: String, quantity: u32 },
-    AddCurrency { item: String, amount: f64 },
-    RemoveCurrency { item: String, amount: f64 },
+    AddItem { item: ItemId, quantity: u32 },
+    RemoveItem { item: ItemId, quantity: u32 },
+    AddCurrency { item: ItemId, amount: f64 },
+    RemoveCurrency { item: ItemId, amount: f64 },
 }
 
 /// Parse a raw command string into a [`Command`].
@@ -87,20 +90,20 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
     }
 }
 
-fn parse_item_quantity(parts: &[&str], verb: &str) -> Result<(String, u32), String> {
+fn parse_item_quantity(parts: &[&str], verb: &str) -> Result<(ItemId, u32), String> {
     if parts.len() < 3 {
         return Err(format!("Usage: {} <item> <quantity>. Example: {} cobblestone 64", verb, verb));
     }
-    let item = validate_item_name(parts[1])?.to_string();
+    let item = validate_item_name(parts[1])?;
     let quantity = validate_quantity(parts[2], verb)?;
     Ok((item, quantity))
 }
 
-fn parse_item_amount(parts: &[&str], verb: &str) -> Result<(String, f64), String> {
+fn parse_item_amount(parts: &[&str], verb: &str) -> Result<(ItemId, f64), String> {
     if parts.len() < 3 {
         return Err(format!("Usage: {} <item> <amount>", verb));
     }
-    let item = validate_item_name(parts[1])?.to_string();
+    let item = validate_item_name(parts[1])?;
     let amount: f64 = parts[2]
         .parse()
         .map_err(|_| format!("Invalid amount '{}'. Please enter a number.", parts[2]))?;
@@ -129,6 +132,16 @@ fn parse_optional_amount(parts: &[&str], verb: &str) -> Result<Option<f64>, Stri
     if !amt.is_finite() || amt <= 0.0 {
         return Err("Amount must be positive".to_string());
     }
+    // Reject above the per-trade physical cap at parse time so junk values
+    // (e.g. `deposit 1e100`) don't cross the persistence boundary into
+    // `data/queue.json` and round-trip through dequeue/restart cycles before
+    // the per-handler `MAX_TRADE_DIAMONDS` check rejects them.
+    if amt > MAX_TRADE_DIAMONDS as f64 {
+        return Err(format!(
+            "Amount too large. Maximum is {} diamonds (12 stacks).",
+            MAX_TRADE_DIAMONDS
+        ));
+    }
     Ok(Some(amt))
 }
 
@@ -136,7 +149,7 @@ fn parse_price(parts: &[&str]) -> Result<Command, String> {
     if parts.len() < 2 {
         return Err("Usage: price <item> [quantity]. Example: price cobblestone 64".to_string());
     }
-    let item = validate_item_name(parts[1])?.to_string();
+    let item = validate_item_name(parts[1])?;
 
     let quantity: Option<u32> = if parts.len() >= 3 {
         match parts[2].parse::<u32>() {
@@ -247,7 +260,7 @@ mod tests {
         assert_eq!(
             parse_command("buy cobblestone 64").unwrap(),
             Command::Buy {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 quantity: 64
             }
         );
@@ -258,7 +271,7 @@ mod tests {
         assert_eq!(
             parse_command("b diamond 1").unwrap(),
             Command::Buy {
-                item: "diamond".to_string(),
+                item: ItemId::new("diamond").unwrap(),
                 quantity: 1
             }
         );
@@ -269,7 +282,7 @@ mod tests {
         assert_eq!(
             parse_command("buy minecraft:iron_ingot 32").unwrap(),
             Command::Buy {
-                item: "iron_ingot".to_string(),
+                item: ItemId::new("iron_ingot").unwrap(),
                 quantity: 32
             }
         );
@@ -315,7 +328,7 @@ mod tests {
         assert_eq!(
             parse_command("sell iron_ingot 128").unwrap(),
             Command::Sell {
-                item: "iron_ingot".to_string(),
+                item: ItemId::new("iron_ingot").unwrap(),
                 quantity: 128
             }
         );
@@ -326,7 +339,7 @@ mod tests {
         assert_eq!(
             parse_command("s diamond 5").unwrap(),
             Command::Sell {
-                item: "diamond".to_string(),
+                item: ItemId::new("diamond").unwrap(),
                 quantity: 5
             }
         );
@@ -400,6 +413,34 @@ mod tests {
         assert!(parse_command("withdraw inf").is_err());
     }
 
+    #[test]
+    fn deposit_rejects_above_trade_cap() {
+        // Junk values (e.g. `deposit 1e100`) must fail at parse time so they
+        // never reach the persistence layer; the cap matches the per-trade
+        // physical limit MAX_TRADE_DIAMONDS = 768.
+        let above = (MAX_TRADE_DIAMONDS as f64) + 1.0;
+        let err = parse_command(&format!("deposit {above}")).unwrap_err();
+        assert!(err.contains("Maximum"), "got: {err}");
+        assert!(parse_command("deposit 1e100").is_err());
+    }
+
+    #[test]
+    fn deposit_accepts_at_trade_cap() {
+        // Boundary: exactly MAX_TRADE_DIAMONDS must parse.
+        let at = MAX_TRADE_DIAMONDS as f64;
+        assert_eq!(
+            parse_command(&format!("deposit {at}")).unwrap(),
+            Command::Deposit { amount: Some(at) }
+        );
+    }
+
+    #[test]
+    fn withdraw_rejects_above_trade_cap() {
+        let above = (MAX_TRADE_DIAMONDS as f64) + 1.0;
+        let err = parse_command(&format!("withdraw {above}")).unwrap_err();
+        assert!(err.contains("Maximum"), "got: {err}");
+    }
+
     // ---- price -------------------------------------------------------------
 
     #[test]
@@ -407,7 +448,7 @@ mod tests {
         assert_eq!(
             parse_command("price cobblestone").unwrap(),
             Command::Price {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 quantity: None
             }
         );
@@ -418,7 +459,7 @@ mod tests {
         assert_eq!(
             parse_command("p cobblestone 64").unwrap(),
             Command::Price {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 quantity: Some(64)
             }
         );
@@ -652,7 +693,7 @@ mod tests {
         assert_eq!(
             parse_command("additem diamond 100").unwrap(),
             Command::AddItem {
-                item: "diamond".to_string(),
+                item: ItemId::new("diamond").unwrap(),
                 quantity: 100
             }
         );
@@ -663,7 +704,7 @@ mod tests {
         assert_eq!(
             parse_command("ai diamond 100").unwrap(),
             Command::AddItem {
-                item: "diamond".to_string(),
+                item: ItemId::new("diamond").unwrap(),
                 quantity: 100
             }
         );
@@ -681,7 +722,7 @@ mod tests {
         assert_eq!(
             parse_command("removeitem coal 50").unwrap(),
             Command::RemoveItem {
-                item: "coal".to_string(),
+                item: ItemId::new("coal").unwrap(),
                 quantity: 50
             }
         );
@@ -692,7 +733,7 @@ mod tests {
         assert_eq!(
             parse_command("ri coal 50").unwrap(),
             Command::RemoveItem {
-                item: "coal".to_string(),
+                item: ItemId::new("coal").unwrap(),
                 quantity: 50
             }
         );
@@ -703,7 +744,7 @@ mod tests {
         assert_eq!(
             parse_command("addcurrency cobblestone 1000").unwrap(),
             Command::AddCurrency {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 amount: 1000.0
             }
         );
@@ -714,7 +755,7 @@ mod tests {
         assert_eq!(
             parse_command("ac cobblestone 1000").unwrap(),
             Command::AddCurrency {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 amount: 1000.0
             }
         );
@@ -726,7 +767,7 @@ mod tests {
         assert_eq!(
             parse_command("ac diamond 12.5").unwrap(),
             Command::AddCurrency {
-                item: "diamond".to_string(),
+                item: ItemId::new("diamond").unwrap(),
                 amount: 12.5
             }
         );
@@ -755,7 +796,7 @@ mod tests {
         assert_eq!(
             parse_command("removecurrency cobblestone 500").unwrap(),
             Command::RemoveCurrency {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 amount: 500.0
             }
         );
@@ -766,7 +807,7 @@ mod tests {
         assert_eq!(
             parse_command("rc cobblestone 500").unwrap(),
             Command::RemoveCurrency {
-                item: "cobblestone".to_string(),
+                item: ItemId::new("cobblestone").unwrap(),
                 amount: 500.0
             }
         );
@@ -808,7 +849,7 @@ mod tests {
         assert_eq!(
             parse_command("addcurrency diamond 1000000").unwrap(),
             Command::AddCurrency {
-                item: "diamond".to_string(),
+                item: ItemId::new("diamond").unwrap(),
                 amount: 1_000_000.0
             }
         );

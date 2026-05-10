@@ -652,6 +652,45 @@ impl ChatConfig {
             Err(errors.join("; "))
         }
     }
+
+    /// Cross-file invariant: every model name configured here
+    /// (`composer_model`, `classifier_model`, `reasoning_filter_model`)
+    /// must be a known key in the loaded `PricingTable`. Without this
+    /// check, an operator who edits `config.toml` to point at a rotated
+    /// Anthropic snapshot ID without also adding the entry to
+    /// `data/chat/pricing.json` would see every call refused with
+    /// `UsdCap` because [`crate::chat::pricing::PricingTable::usd_for_call`]
+    /// fail-closes to `f64::INFINITY` for unknown models — a mysterious
+    /// symptom whose root cause this startup-time error names directly.
+    ///
+    /// No-op when `enabled = false`, so the check never blocks an
+    /// operator who keeps the chat module disabled.
+    pub fn validate_against_pricing(
+        &self,
+        pricing: &crate::chat::pricing::PricingTable,
+    ) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let mut missing = Vec::new();
+        for (field, name) in [
+            ("composer_model", &self.composer_model),
+            ("classifier_model", &self.classifier_model),
+            ("reasoning_filter_model", &self.reasoning_filter_model),
+        ] {
+            if !pricing.has_model(name) {
+                missing.push(format!("{field} = {name:?}"));
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "model name(s) not found in pricing table (add them to data/chat/pricing.json or correct the config): {}",
+                missing.join(", ")
+            ))
+        }
+    }
 }
 
 /// Whether the active-hours window includes the given UTC hour. Returns

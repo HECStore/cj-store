@@ -274,7 +274,7 @@ option 11 ("View recent trades") without forcing a full rescan of
     "order_type": "Buy",
     "item": "cobblestone",
     "amount": 500,
-    "currency_amount": 0.0,
+    "currency_amount": 12.5,
     "user_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
   }
 ]
@@ -286,9 +286,12 @@ see [src/types/order.rs](src/types/order.rs). Only runtime tracking for
 the current session; historical records live in `data/trades/*.json`.
 
 `currency_amount` is the diamond-denominated value associated with the
-order; for `AddCurrency` / `RemoveCurrency` this is the real amount moved,
-and for all other variants it is `0.0`. The field has `#[serde(default)]`
-so older snapshots without it still load.
+order. The constructors in [src/types/order.rs](src/types/order.rs) populate
+it for every value-bearing variant: `Buy` (total cost), `Sell` (total
+payout), `DepositBalance` / `WithdrawBalance` (the diamond magnitude), and
+`AddCurrency` / `RemoveCurrency` (the real amount moved). It is `0.0` only
+for `AddItem` / `RemoveItem`, which move items without a currency leg. The
+field has `#[serde(default)]` so older snapshots without it still load.
 
 ## `data/queue.json`
 

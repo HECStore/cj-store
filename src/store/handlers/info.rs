@@ -9,11 +9,12 @@ use tracing::{info, warn};
 use super::super::{Store, state, utils};
 use super::super::pricing;
 use crate::error::StoreError;
+use crate::types::ItemId;
 
 pub(super) async fn handle_price(
     store: &mut Store,
     player_name: &str,
-    item: &str,
+    item: &ItemId,
     quantity: Option<u32>,
 ) -> Result<(), StoreError> {
     handle_price_command(store, player_name, item, quantity).await
@@ -244,10 +245,10 @@ pub(super) async fn handle_help(
 async fn handle_price_command(
     store: &mut Store,
     player_name: &str,
-    item: &str,
+    item: &ItemId,
     quantity: Option<u32>,
 ) -> Result<(), StoreError> {
-    let pair = match store.pairs.get(item) {
+    let pair = match store.pairs.get(item.as_str()) {
         Some(p) => p,
         None => {
             return utils::send_message_to_player(
@@ -273,7 +274,7 @@ async fn handle_price_command(
         (Some(buy_cost), Some(sell_payout)) => {
             let buy_per = buy_cost / (qty as f64);
             let sell_per = sell_payout / (qty as f64);
-            let pair = store.pairs.get(item).expect("pair existed above");
+            let pair = store.pairs.get(item.as_str()).expect("pair existed above");
             let message = format!(
                 "{} x{}: Buy for {:.2} diamonds ({:.4}/ea), Sell for {:.2} diamonds ({:.4}/ea). Stock: {}",
                 item, qty, buy_cost, buy_per, sell_payout, sell_per, pair.item_stock
@@ -282,7 +283,7 @@ async fn handle_price_command(
         }
         (None, Some(sell_payout)) => {
             let sell_per = sell_payout / (qty as f64);
-            let pair = store.pairs.get(item).expect("pair existed above");
+            let pair = store.pairs.get(item.as_str()).expect("pair existed above");
             let message = format!(
                 "{} x{}: Buy unavailable (exceeds stock {}), Sell for {:.2} diamonds ({:.4}/ea)",
                 item, qty, pair.item_stock, sell_payout, sell_per
@@ -290,7 +291,7 @@ async fn handle_price_command(
             utils::send_message_to_player(store, player_name, &message).await
         }
         _ => {
-            let pair = store.pairs.get(item).expect("pair existed above");
+            let pair = store.pairs.get(item.as_str()).expect("pair existed above");
             let message = if pair.item_stock == 0 {
                 format!("{}: No stock available (item_stock: 0)", item)
             } else if pair.currency_stock <= 0.0 {

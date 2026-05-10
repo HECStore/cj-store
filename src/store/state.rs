@@ -114,7 +114,13 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
 /// set so only users whose balance/operator changed since the last save get
 /// rewritten + fsynced. The caller is responsible for clearing
 /// `store.dirty_users` after this returns `Ok(())`.
-pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Drains the front of `store.orders` and `store.trades` so they sit at-or-
+/// below their configured caps. Handlers append on every transaction without
+/// checking the cap, so the in-memory deques would otherwise grow unbounded
+/// between restarts; this is the primary cap, called from `save` before each
+/// persistence pass. Pulled out of `save` so the trim invariant is unit-
+/// testable without the surrounding I/O.
+pub(crate) fn trim_in_memory_to_caps(store: &mut Store) {
     if store.orders.len() > store.config.max_orders {
         let drop = store.orders.len() - store.config.max_orders;
         store.orders.drain(..drop);
@@ -123,6 +129,10 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
         let drop = store.trades.len() - store.config.max_trades_in_memory;
         store.trades.drain(..drop);
     }
+}
+
+pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    trim_in_memory_to_caps(store);
 
     debug!("saving pairs={} users={} (dirty={}) orders={} trades={} nodes={}",
         store.pairs.len(), store.users.len(), store.dirty_users.len(),
@@ -769,5 +779,56 @@ mod tests {
             repair_applied: false,
         };
         assert_eq!(r.to_lines(), vec!["x".to_string(), "y".to_string()]);
+    }
+
+    // ---------- trim_in_memory_to_caps ----------
+    //
+    // Pulls the prune test back to the site that actually does the prune
+    // (`state::save`), replacing the previous self-referential test in
+    // `types/order.rs` that re-implemented the skip expression inline.
+
+    fn diamond_id() -> ItemId {
+        ItemId::new("diamond").expect("diamond is a valid item ID")
+    }
+
+    fn make_order(amount: i32) -> Order {
+        use crate::types::order::OrderType;
+        Order {
+            order_type: OrderType::Buy,
+            item: diamond_id(),
+            amount,
+            currency_amount: 0.0,
+            user_uuid: format!("u-{amount}"),
+        }
+    }
+
+    #[test]
+    fn trim_drops_oldest_orders_when_over_cap() {
+        let mut store = build_store(HashMap::new(), HashMap::new(), test_storage());
+        store.config.max_orders = 3;
+        for i in 0..5i32 {
+            store.orders.push_back(make_order(i));
+        }
+
+        trim_in_memory_to_caps(&mut store);
+
+        assert_eq!(store.orders.len(), 3);
+        assert_eq!(store.orders.front().unwrap().amount, 2);
+        assert_eq!(store.orders.back().unwrap().amount, 4);
+    }
+
+    #[test]
+    fn trim_is_noop_when_at_or_under_cap() {
+        let mut store = build_store(HashMap::new(), HashMap::new(), test_storage());
+        store.config.max_orders = 3;
+        store.orders.push_back(make_order(7));
+        store.orders.push_back(make_order(8));
+        store.orders.push_back(make_order(9));
+
+        trim_in_memory_to_caps(&mut store);
+
+        assert_eq!(store.orders.len(), 3);
+        assert_eq!(store.orders.front().unwrap().amount, 7);
+        assert_eq!(store.orders.back().unwrap().amount, 9);
     }
 }

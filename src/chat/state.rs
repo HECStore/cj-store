@@ -298,9 +298,13 @@ impl ChatState {
         estimated_usd_added: f64,
         config: &crate::config::ChatConfig,
     ) -> CapVerdict {
-        // USD cap trips first if it's the more conservative one.
+        // USD cap trips first if it's the more conservative one. Treat any
+        // non-finite projected total (NaN/INF) as a cap trip — the recorder
+        // guards NaN at the source (filters non-finite/negative on add), but
+        // the cap predicate must mirror that defense so a single layer of
+        // protection isn't load-bearing.
         let new_usd = self.tokens_today.estimated_usd + estimated_usd_added;
-        if new_usd > config.daily_dollar_cap_usd {
+        if !new_usd.is_finite() || new_usd > config.daily_dollar_cap_usd {
             return CapVerdict::UsdCap;
         }
         let new_input = self.tokens_today.composer_input.saturating_add(input_tokens);
@@ -326,7 +330,7 @@ impl ChatState {
         config: &crate::config::ChatConfig,
     ) -> CapVerdict {
         let new_usd = self.tokens_today.estimated_usd + estimated_usd_added;
-        if new_usd > config.daily_dollar_cap_usd {
+        if !new_usd.is_finite() || new_usd > config.daily_dollar_cap_usd {
             return CapVerdict::UsdCap;
         }
         let new_total = self
@@ -526,6 +530,47 @@ mod tests {
         s.tokens_today.estimated_usd = 1.5;
         s.record_classifier(&day, 1000, 200, -1.5);
         assert_eq!(s.tokens_today.estimated_usd, 1.5);
+    }
+
+    #[test]
+    fn would_exceed_caps_composer_treats_non_finite_as_usd_cap() {
+        // The recorder filters NaN/INF on add (record_composer_ignores_nan_usd
+        // pins it), but the cap predicate must mirror that defense — otherwise
+        // a single bypass on the source filter (e.g. via fail-closed pricing
+        // returning INF) would slip through `new_usd > cap` because INF
+        // comparisons short-circuit but NaN comparisons silently evaluate
+        // false. Both branches must trip the cap.
+        let mut s = ChatState::default();
+        let cfg = crate::config::ChatConfig::default();
+        // NaN baseline: the predicate must trip even though NaN > cap is false.
+        s.tokens_today.estimated_usd = f64::NAN;
+        assert_eq!(
+            s.would_exceed_caps_composer(0, 0, 0.0, &cfg),
+            CapVerdict::UsdCap
+        );
+        // INF baseline: the predicate trips via the > comparison anyway, but
+        // pinning it covers the fail-closed pricing sentinel path.
+        s.tokens_today.estimated_usd = f64::INFINITY;
+        assert_eq!(
+            s.would_exceed_caps_composer(0, 0, 0.0, &cfg),
+            CapVerdict::UsdCap
+        );
+    }
+
+    #[test]
+    fn would_exceed_caps_classifier_treats_non_finite_as_usd_cap() {
+        let mut s = ChatState::default();
+        let cfg = crate::config::ChatConfig::default();
+        s.tokens_today.estimated_usd = f64::NAN;
+        assert_eq!(
+            s.would_exceed_caps_classifier(0, 0, 0.0, &cfg),
+            CapVerdict::UsdCap
+        );
+        s.tokens_today.estimated_usd = f64::INFINITY;
+        assert_eq!(
+            s.would_exceed_caps_classifier(0, 0, 0.0, &cfg),
+            CapVerdict::UsdCap
+        );
     }
 
     #[test]

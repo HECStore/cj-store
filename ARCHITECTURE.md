@@ -542,6 +542,17 @@ resets on bot restart.
   `violations` (clamped at the saturation threshold for log readability)
   plus a `saturated` boolean indicating the cooldown is pinned at MAX;
   the stored counter continues accumulating unbounded.
+- **Cap-overflow path** (`ThrottleReason::GlobalCap`): if the limiter's
+  per-user map is at `MAX_RATE_LIMIT_ENTRIES = 10_000` and a fresh key
+  arrives, an inline `cleanup_stale` runs at the
+  `RATE_LIMIT_RESET_AFTER_MS` floor (so actively-throttled users are
+  preserved); if no slot frees up, the new attempt is refused with a
+  wait of `RATE_LIMIT_RESET_AFTER_MS` (the earliest a victim can become
+  evictable) and a distinct player-facing whisper — `Server is busy
+  with too many active users; please try again in {N}s.` — instead of
+  the per-user `Please wait Ns ...` wording. Both the inline sweep and
+  the whisper are themselves rate-limited so a Sybil flood at cap can't
+  amplify into CPU or chat traffic.
 
 Example:
 

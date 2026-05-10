@@ -102,6 +102,21 @@ impl UserRateLimit {
     }
 }
 
+/// Why a `check()` was rejected. Lets the caller render different
+/// player-facing wording for per-user spam vs. global capacity
+/// pressure — the underlying `wait` for `GlobalCap` is also longer
+/// (entries can only become evictable once the reset window passes),
+/// so a one-message-fits-all "please wait Ns" string is misleading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottleReason {
+    /// This user exceeded their own cooldown.
+    PerUser,
+    /// The global limiter was at `MAX_RATE_LIMIT_ENTRIES` and could
+    /// not free a slot; the user is being refused because the server
+    /// is busy, not because of their own pace.
+    GlobalCap,
+}
+
 /// Outcome of a rejected `RateLimiter::check`. Combines the suggested
 /// wait duration with the whisper-throttling decision so callers
 /// cannot accidentally drop one or skip the second-phase call.
@@ -114,6 +129,9 @@ pub struct Throttled {
     /// this cycle is exhausted (cap on chat amplification under
     /// sustained spam).
     pub should_whisper: bool,
+    /// Why the request was throttled. Drives the player-facing
+    /// message wording in `handlers::player::whisper_rate_limit_notice`.
+    pub reason: ThrottleReason,
 }
 
 /// Hard cap on entries in `RateLimiter::limits` between cleanup sweeps. The
@@ -258,9 +276,17 @@ impl RateLimiter {
                 if should_whisper {
                     self.cap_refusal_last_whisper = Some(now);
                 }
+                // Honest wait: the user is being refused because the map is
+                // full, not because of their own cooldown. The earliest
+                // moment any victim entry can become evictable is
+                // RATE_LIMIT_RESET_AFTER_MS after its last attempt.
+                // Returning `calculate_cooldown(0)` (2s) here would train
+                // legitimate users to retry every 2s, exactly the cadence
+                // that re-fires the throttled inline sweep.
                 return Err(Throttled {
-                    wait: calculate_cooldown(0),
+                    wait: Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS),
                     should_whisper,
+                    reason: ThrottleReason::GlobalCap,
                 });
             }
         }
@@ -403,6 +429,7 @@ impl RateLimiter {
             Err(Throttled {
                 wait: remaining,
                 should_whisper,
+                reason: ThrottleReason::PerUser,
             })
         }
     }
@@ -499,6 +526,15 @@ impl RateLimiter {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.limits.len()
+    }
+
+    /// The last time the cap-overflow path actually ran an inline
+    /// `cleanup_stale`. Test-only window into the throttle gate that
+    /// bounds the O(MAX_RATE_LIMIT_ENTRIES) `HashMap::retain` work
+    /// adversarial cap-pressure could otherwise force on every call.
+    #[cfg(test)]
+    fn last_inline_sweep_for_test(&self) -> Option<Instant> {
+        self.last_inline_sweep
     }
 }
 
@@ -957,11 +993,18 @@ mod tests {
 
         match limiter.check("newcomer") {
             Ok(()) => panic!("expected refusal when no entry is past the reset window"),
-            Err(Throttled { wait, .. }) => assert_eq!(
-                wait,
-                Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS),
-                "refusal must use the base cooldown"
-            ),
+            Err(Throttled { wait, reason, .. }) => {
+                assert_eq!(
+                    wait,
+                    Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS),
+                    "cap-overflow refusal must report the earliest possible eviction window"
+                );
+                assert_eq!(
+                    reason,
+                    ThrottleReason::GlobalCap,
+                    "cap-overflow path must tag the rejection so callers can render distinct wording"
+                );
+            }
         }
         assert_eq!(
             limiter.len(),
@@ -972,6 +1015,66 @@ mod tests {
             limiter.violations_for("newcomer").is_none(),
             "new key must NOT have an entry after refusal"
         );
+    }
+
+    #[test]
+    fn cap_overflow_throttles_should_whisper_across_burst() {
+        // The `cap_refusal_last_whisper` field exists specifically to prevent
+        // a Sybil-style cap-overflow flood from being amplified into outbound
+        // whispers. Drive the map to cap, then burst many distinct fresh
+        // names through `check`: exactly the first refusal in the current
+        // window must whisper, and the remainder in the same window must not.
+        let mut limiter = RateLimiter::new();
+        fill_to_cap(&mut limiter);
+
+        let mut whisper_count = 0u32;
+        let burst = 50;
+        for i in 0..burst {
+            let name = format!("flood_newcomer_{i}");
+            match limiter.check(&name) {
+                Ok(()) => panic!("expected refusal under cap pressure (i={i})"),
+                Err(Throttled { should_whisper, reason, .. }) => {
+                    assert_eq!(reason, ThrottleReason::GlobalCap);
+                    if should_whisper {
+                        whisper_count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            whisper_count, 1,
+            "cap-overflow whisper budget must yield exactly one whisper per RESET_AFTER_MS window — got {whisper_count} of {burst}"
+        );
+    }
+
+    #[test]
+    fn cap_overflow_inline_sweep_is_throttled_under_burst() {
+        // The `last_inline_sweep` field exists specifically to bound CPU work
+        // under a Sybil-style flood at cap. Without it, every fresh-name
+        // attempt would re-run a 10k-element `HashMap::retain`. Burst many
+        // refusals within `RATE_LIMIT_BASE_COOLDOWN_MS` and assert that the
+        // sweep stamp is set exactly once (not bumped on every call).
+        let mut limiter = RateLimiter::new();
+        fill_to_cap(&mut limiter);
+
+        // First refusal seeds the sweep stamp.
+        let _ = limiter.check("flood_first");
+        let first_sweep = limiter
+            .last_inline_sweep_for_test()
+            .expect("first cap-overflow refusal must run the inline sweep");
+
+        // Subsequent refusals within the throttle window must NOT re-stamp.
+        for i in 1..50 {
+            let name = format!("flood_more_{i}");
+            let _ = limiter.check(&name);
+            let now_sweep = limiter
+                .last_inline_sweep_for_test()
+                .expect("sweep stamp must remain set");
+            assert_eq!(
+                now_sweep, first_sweep,
+                "inline sweep must be throttled — re-stamped at i={i}"
+            );
+        }
     }
 
     #[test]

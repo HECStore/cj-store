@@ -267,7 +267,15 @@ async fn validate_and_plan_buy(
         Some(cost) => cost,
         None => {
             let pair = store.expect_pair(item, "buy/price-fail")?;
-            let msg = if qty_i32 >= pair.item_stock {
+            // Zero-stock must be handled BEFORE the qty>=item_stock branch:
+            // when `pair.item_stock == 0` the latter would otherwise tell the
+            // player to "try a smaller amount" of an architecturally
+            // impossible smaller quantity. The doc-mandated wording for
+            // drained reserves is the "no stock or reserves" message — see
+            // RECOVERY.md §1.
+            let msg = if pair.item_stock <= 0 {
+                format!("Item '{}' is not available for trading (no stock or reserves).", item)
+            } else if qty_i32 >= pair.item_stock {
                 format!(
                     "Cannot buy {} {} - would exceed available stock ({}). Try a smaller amount.",
                     qty_i32, item, pair.item_stock
@@ -2066,5 +2074,485 @@ mod tests {
             store.current_trade.is_none(),
             "current_trade must be None after handler returns"
         );
+    }
+
+    // ===================================================================
+    // Money-flow handler tests (RECOVERY.md commit-math table pins).
+    //
+    // Every test below pins one row of the commit-math table or one of the
+    // hand-off invariants (no minting unbacked currency, self-pay rejection
+    // at the UUID layer, etc.).
+    // ===================================================================
+
+    /// Deposit happy path — N diamonds in trade → balance += N, a
+    /// `DepositBalance` trade is recorded, and `current_trade` reaches the
+    /// `Committed` terminal state.
+    #[tokio::test]
+    async fn deposit_credits_user_balance_on_happy_path() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Depper", 12.5);
+        users.insert(uuid.clone(), user);
+
+        // No item pairs needed; deposit only touches the diamond chest.
+        // `make_storage` materializes node 0 which has chest 0 reserved for
+        // diamonds, so `rollback_amount_to_storage("diamond", …)` will land
+        // its deposit in the existing chest rather than triggering grow.
+        let storage = make_storage("cobblestone", 0);
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+        let balance_before = store.users.get(&uuid).unwrap().balance;
+
+        // Deposit exactly 5 diamonds (non-flexible).
+        let result = player::handle_deposit_balance_queued(
+            &mut store,
+            "Depper",
+            &test_uuid("Depper"),
+            Some(5.0),
+        )
+        .await;
+        assert!(result.is_ok(), "deposit failed: {:?}", result);
+
+        // Balance grew by exactly the requested amount.
+        assert_eq!(
+            store.users.get(&uuid).unwrap().balance,
+            balance_before + 5.0,
+            "balance must equal pre-balance + diamonds deposited"
+        );
+        // Trade journal got exactly one DepositBalance entry of size 5.
+        assert_eq!(store.trades.len(), trades_before + 1);
+        let last_trade = store.trades.last().unwrap();
+        assert_eq!(last_trade.trade_type, crate::types::TradeType::DepositBalance);
+        assert_eq!(last_trade.amount, 5);
+        // Order history grew by one (the queued-order ledger).
+        assert_eq!(store.orders.len(), orders_before + 1);
+        // State machine reached a terminal state.
+        assert!(store.current_trade.is_none());
+    }
+
+    /// Mock bot for the deposit partial-rollback test: succeeds on the first
+    /// deposit chest op (returns the matching `ChestSyncReport`) and fails
+    /// every subsequent deposit. `rollback_amount_to_storage` splits a large
+    /// deposit across multiple chest ops when one chest's slot is too small,
+    /// so this models the case where part of the trade landed in storage
+    /// and part stayed on the bot.
+    fn spawn_mock_bot_deposit_fail_after_n(
+        mut rx: mpsc::Receiver<BotInstruction>,
+        claimed_diamonds: i32,
+        success_calls: usize,
+    ) {
+        tokio::spawn(async move {
+            let mut deposit_calls = 0usize;
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BotInstruction::Whisper { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    BotInstruction::InteractWithChestAndSync {
+                        target_chest,
+                        action,
+                        respond_to,
+                        ..
+                    } => {
+                        match action {
+                            crate::messages::ChestAction::Withdraw { item, amount, .. } => {
+                                let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                                let prior = target_chest.amounts.first().copied().unwrap_or(0);
+                                amounts[0] = (prior - amount).max(0);
+                                let _ = respond_to.send(Ok(ChestSyncReport {
+                                    chest_id: target_chest.id,
+                                    item,
+                                    amounts,
+                                }));
+                            }
+                            crate::messages::ChestAction::Deposit { item, amount, .. } => {
+                                if deposit_calls < success_calls {
+                                    let mut amounts =
+                                        [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                                    let prior =
+                                        target_chest.amounts.first().copied().unwrap_or(0);
+                                    amounts[0] = (prior + amount).max(0);
+                                    let _ = respond_to.send(Ok(ChestSyncReport {
+                                        chest_id: target_chest.id,
+                                        item,
+                                        amounts,
+                                    }));
+                                } else {
+                                    // Simulate a bot-reported deposit failure
+                                    // (e.g. shulker placement was rejected by
+                                    // server). `items_stuck_on_bot += amount`
+                                    // and `items_returned` is NOT credited
+                                    // for this step.
+                                    let _ = respond_to.send(Err(
+                                        "simulated deposit failure".to_string(),
+                                    ));
+                                }
+                                deposit_calls += 1;
+                            }
+                        }
+                    }
+                    BotInstruction::TradeWithPlayer { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(vec![TradeItem {
+                            item: "diamond".to_string(),
+                            amount: claimed_diamonds,
+                        }]));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Deposit rollback when storage rejects every diamond — the user's
+    /// balance must NOT be credited for diamonds the bot still physically
+    /// holds. Pins the "no minting unbacked currency" contract documented
+    /// in deposit.rs (`credited_diamonds = rb.items_returned`).
+    ///
+    /// The `record_transfer` planner coalesces transfers to the same
+    /// `chest_id` (see `simulate_deposit_plan`), so a deposit that fits in
+    /// chest 0 emits exactly one ChestTransfer. By failing every deposit
+    /// chest op, `items_returned` stays at 0, `credited_diamonds == 0`, and
+    /// the handler must route through the "none of your diamonds could be
+    /// deposited" early-return — leaving the balance unchanged. Crediting
+    /// `claimed` here would mint currency unbacked by storage.
+    #[tokio::test]
+    async fn deposit_partial_rollback_credits_only_physical_amount() {
+        let claimed = 10;
+        let (tx, rx) = mpsc::channel(64);
+        // Fail every deposit chest op: `items_returned = 0`.
+        spawn_mock_bot_deposit_fail_after_n(rx, claimed, 0);
+
+        let mut users = HashMap::new();
+        let starting_balance = 1.5;
+        let (uuid, user) = make_user("PartDep", starting_balance);
+        users.insert(uuid.clone(), user);
+
+        let storage = make_storage("cobblestone", 0);
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let trades_before = store.trades.len();
+
+        let result = player::handle_deposit_balance_queued(
+            &mut store,
+            "PartDep",
+            &test_uuid("PartDep"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "handler must not propagate error: {:?}", result);
+
+        // Balance must be UNCHANGED — zero diamonds reached storage, so the
+        // ledger must not mint the `claimed` figure (it would be unbacked).
+        let bal = store.users.get(&uuid).unwrap().balance;
+        assert_eq!(
+            bal, starting_balance,
+            "balance must not grow by claimed amount when no diamonds reached storage \
+             (got {bal}, want {starting_balance}). Crediting `claimed` here would mint \
+             currency unbacked by physical reserves."
+        );
+        // No DepositBalance trade was recorded.
+        assert_eq!(store.trades.len(), trades_before);
+    }
+
+    /// Mock bot that auto-succeeds chest ops but returns zero diamonds from
+    /// the trade GUI (player closed the GUI without offering anything).
+    fn spawn_mock_bot_zero_trade(mut rx: mpsc::Receiver<BotInstruction>) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BotInstruction::Whisper { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    BotInstruction::InteractWithChestAndSync {
+                        target_chest,
+                        action,
+                        respond_to,
+                        ..
+                    } => {
+                        let (item, delta) = match action {
+                            crate::messages::ChestAction::Withdraw { item, amount, .. } => {
+                                (item, -amount)
+                            }
+                            crate::messages::ChestAction::Deposit { item, amount, .. } => {
+                                (item, amount)
+                            }
+                        };
+                        let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                        let prior = target_chest.amounts.first().copied().unwrap_or(0);
+                        amounts[0] = (prior + delta).max(0);
+                        let _ = respond_to.send(Ok(ChestSyncReport {
+                            chest_id: target_chest.id,
+                            item,
+                            amounts,
+                        }));
+                    }
+                    BotInstruction::TradeWithPlayer { respond_to, .. } => {
+                        // Empty trade: player gave 0 diamonds.
+                        let _ = respond_to.send(Ok(vec![]));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Deposit with zero diamonds received — handler must roll back without
+    /// touching the user's balance (no spurious credit, no spurious debit).
+    #[tokio::test]
+    async fn deposit_zero_diamonds_received_rolls_back_without_balance_change() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot_zero_trade(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Empty", 42.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = make_storage("cobblestone", 0);
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let trades_before = store.trades.len();
+
+        // Flexible deposit so the trade GUI accepts the empty offering.
+        let result = player::handle_deposit_balance_queued(
+            &mut store,
+            "Empty",
+            &test_uuid("Empty"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "handler should not propagate error: {:?}", result);
+
+        // Balance is unchanged.
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 42.0);
+        // No DepositBalance trade was recorded.
+        assert_eq!(store.trades.len(), trades_before);
+        // Terminal state reached.
+        assert!(store.current_trade.is_none());
+    }
+
+    /// Withdraw happy path — N diamonds → balance -= N, a `WithdrawBalance`
+    /// trade is recorded, and `current_trade` reaches the `Committed`
+    /// terminal state.
+    #[tokio::test]
+    async fn withdraw_debits_user_balance_on_happy_path() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Wither", 100.0);
+        users.insert(uuid.clone(), user);
+
+        // Storage with a diamond chest pre-stocked so the withdraw plan
+        // succeeds.
+        let mut storage = make_storage("cobblestone", 0);
+        let diamond_chest = &mut storage.nodes[0].chests[0];
+        diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        diamond_chest.amounts[0] = 64;
+
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let trades_before = store.trades.len();
+        let orders_before = store.orders.len();
+
+        let result = player::handle_withdraw_balance_queued(
+            &mut store,
+            "Wither",
+            &test_uuid("Wither"),
+            Some(7.0),
+        )
+        .await;
+        assert!(result.is_ok(), "withdraw failed: {:?}", result);
+
+        // Balance debited by exactly the withdraw amount.
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 93.0);
+        // Trade journal got one WithdrawBalance entry.
+        assert_eq!(store.trades.len(), trades_before + 1);
+        let last_trade = store.trades.last().unwrap();
+        assert_eq!(last_trade.trade_type, crate::types::TradeType::WithdrawBalance);
+        assert_eq!(last_trade.amount, 7);
+        // Order history grew by one.
+        assert_eq!(store.orders.len(), orders_before + 1);
+        // State machine reached terminal.
+        assert!(store.current_trade.is_none());
+    }
+
+    /// `/withdraw 5.7` → withdraws 5 (floor) and debits balance by 5.0, not
+    /// 5.7. Fractional remainder must be surfaced but not silently consumed.
+    #[tokio::test]
+    async fn withdraw_fractional_amount_snaps_down_and_debits_integer() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Frac", 100.0);
+        users.insert(uuid.clone(), user);
+
+        let mut storage = make_storage("cobblestone", 0);
+        let diamond_chest = &mut storage.nodes[0].chests[0];
+        diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        diamond_chest.amounts[0] = 64;
+
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let result = player::handle_withdraw_balance_queued(
+            &mut store,
+            "Frac",
+            &test_uuid("Frac"),
+            Some(5.7),
+        )
+        .await;
+        assert!(result.is_ok(), "withdraw failed: {:?}", result);
+
+        // Snap-down: balance debited by exactly 5.0, not 5.7. The
+        // fractional 0.7 must NOT vaporize into round-off.
+        let bal = store.users.get(&uuid).unwrap().balance;
+        assert!(
+            (bal - 95.0).abs() < 1e-9,
+            "fractional remainder must not be silently consumed (got {bal}, want 95.0)"
+        );
+        // The Trade entry must record the *whole* (5) and amount_currency
+        // also 5.0 (the floored amount, matching the actual debit).
+        let last_trade = store.trades.last().unwrap();
+        assert_eq!(last_trade.amount, 5);
+    }
+
+    /// `/withdraw` with balance > MAX_TRADE_DIAMONDS must cap at the max and
+    /// instruct the player to re-issue for the remainder. Balance is
+    /// debited by the capped amount, not the original full balance.
+    #[tokio::test]
+    async fn withdraw_full_balance_above_max_caps_to_max_with_remainder_message() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let starting_balance = (crate::constants::MAX_TRADE_DIAMONDS as f64) + 250.0;
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Tycoon", starting_balance);
+        users.insert(uuid.clone(), user);
+
+        let mut storage = make_storage("cobblestone", 0);
+        let diamond_chest = &mut storage.nodes[0].chests[0];
+        diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        // Plenty of physical diamonds — well above MAX_TRADE_DIAMONDS.
+        diamond_chest.amounts[0] = 64;
+        diamond_chest.amounts[1] = 64;
+        diamond_chest.amounts[2] = 64;
+        diamond_chest.amounts[3] = 64;
+        diamond_chest.amounts[4] = 64;
+        diamond_chest.amounts[5] = 64;
+        diamond_chest.amounts[6] = 64;
+        diamond_chest.amounts[7] = 64;
+        diamond_chest.amounts[8] = 64;
+        diamond_chest.amounts[9] = 64;
+        diamond_chest.amounts[10] = 64;
+        diamond_chest.amounts[11] = 64;
+
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        // Full-balance withdraw (`amount = None`).
+        let result = player::handle_withdraw_balance_queued(
+            &mut store,
+            "Tycoon",
+            &test_uuid("Tycoon"),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "withdraw failed: {:?}", result);
+
+        // Balance debited by exactly MAX_TRADE_DIAMONDS, not the full
+        // balance.
+        let remaining = store.users.get(&uuid).unwrap().balance;
+        let expected = starting_balance - crate::constants::MAX_TRADE_DIAMONDS as f64;
+        assert!(
+            (remaining - expected).abs() < 1e-9,
+            "balance must drop by MAX_TRADE_DIAMONDS, not full balance (got {remaining}, want {expected})"
+        );
+        // The Trade entry must record exactly MAX_TRADE_DIAMONDS.
+        let last_trade = store.trades.last().unwrap();
+        assert_eq!(last_trade.amount, crate::constants::MAX_TRADE_DIAMONDS);
+    }
+
+    /// `pay` self-pay reject — same UUID after Mojang resolution must be
+    /// rejected even when the typed payee_username has different casing.
+    /// Pins the UUID-level equality check in info.rs (`payer_uuid ==
+    /// payee_uuid`).
+    #[tokio::test]
+    async fn pay_async_rejects_self_pay_by_uuid() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        // The test fixture's `resolve_user_uuid` (see mojang.rs `#[cfg(test)]`)
+        // is case-sensitive on the username's first 12 chars. To exercise
+        // the UUID-equality reject path with different casings hitting the
+        // same UUID, we feed an identical-string payer/payee pair: the
+        // `payer_uuid` argument is what `test_uuid("Self")` produces and
+        // the lookup of `payee_username` "Self" produces the same UUID.
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Self", 100.0);
+        users.insert(uuid.clone(), user);
+
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(
+            tx,
+            test_config(),
+            HashMap::new(),
+            users,
+            storage,
+        );
+
+        let result = player::pay_async(
+            &mut store,
+            "Self",
+            &test_uuid("Self"),
+            "Self", // resolves to the same fixture UUID
+            5.0,
+        )
+        .await;
+        let err = result.expect_err("self-pay must be rejected by UUID equality");
+        assert!(
+            matches!(err, StoreError::ValidationError(ref m) if m.contains("cannot pay yourself")),
+            "expected self-pay ValidationError, got {err:?}"
+        );
+        // Balance must be unchanged — neither debit nor credit happened.
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
     }
 }

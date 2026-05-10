@@ -254,6 +254,13 @@ pub struct BotChannels {
     /// that would land at a now-disconnected client (CHAT.md in-flight
     /// cancellation).
     pub chat_cmd_tx: Option<mpsc::Sender<ChatCommand>>,
+    /// Shared history-drop counter. The bot's publisher path increments
+    /// this on every `history_tx.try_send` failure; the chat task drains
+    /// it with a pull-with-swap each loop iteration into
+    /// `runtime_state.history_drops_today`. Constructed once in `main`
+    /// so both sides see the same Arc — a fresh Arc per task would
+    /// silently make `Chat: status` report zero forever.
+    pub history_drops: Arc<parking_lot::Mutex<u64>>,
 }
 
 impl Bot {
@@ -298,7 +305,11 @@ impl Bot {
             history_tx: channels.history_tx,
             bot_username: channels.bot_username,
             chat_config: channels.chat_config,
-            history_drops: Arc::new(parking_lot::Mutex::new(0)),
+            // Use the shared Arc plumbed through `BotChannels`, NOT a fresh
+            // allocation — both the publisher (here) and the subscriber
+            // (chat_task) must observe the same counter for
+            // `history_drops_today` to reflect real drops.
+            history_drops: channels.history_drops,
             in_critical_section: channels.in_critical_section,
             chat_cmd_tx: channels.chat_cmd_tx,
             via_plugin,

@@ -5,7 +5,7 @@ use azalea::inventory::ItemStack;
 use azalea::inventory::operations::PickupClick;
 use tracing::{debug, error, info, warn};
 
-use crate::constants::HOTBAR_SLOT_0;
+use crate::constants::{HOTBAR_SLOT_0, VERIFY_POLL_FAST_MS, VERIFY_POLL_SLOW_MS};
 use super::{Bot, shulker};
 
 /// Container slot range for the player's main inventory rows (rows 1-3).
@@ -840,16 +840,17 @@ pub async fn ensure_shulker_in_hotbar_slot_0(bot: &Bot) -> Result<(), String> {
 /// This is called when a normal placement fails and we need to search for where the shulker ended up.
 async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Result<(), String> {
     use azalea::inventory::operations::PickupClick;
-    
-    const MAX_RETRIES: u32 = 3;
-    
+
+    const MAX_ATTEMPTS: u32 = 3;
+
     warn!("recover_shulker_to_slot_0: Starting shulker recovery process");
-    
-    for retry in 0..MAX_RETRIES {
-        debug!("recover_shulker_to_slot_0: Recovery attempt {}/{}", retry + 1, MAX_RETRIES);
-        
-        // Wait a bit for server sync before each attempt
-        tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+
+    for retry in 0..MAX_ATTEMPTS {
+        debug!("recover_shulker_to_slot_0: Recovery attempt {}/{}", retry + 1, MAX_ATTEMPTS);
+
+        // Wait for server sync before each attempt — VERIFY_POLL_SLOW_MS (350ms)
+        // is the empirically-tuned outer-loop sync delay; see constants.rs.
+        tokio::time::sleep(tokio::time::Duration::from_millis(VERIFY_POLL_SLOW_MS)).await;
         
         let inv_handle = client.open_inventory()
             .ok_or_else(|| {
@@ -1022,40 +1023,45 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
             inv_handle.click(PickupClick::Left {
                 slot: Some(HOTBAR_SLOT_0 as u16),
             });
-            tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
-            
-            // Verify placement (with retries for timing)
-            for verify_attempt in 0..5 {
-                let updated_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
-                if let Some(slot_item) = updated_slots.get(HOTBAR_SLOT_0)
-                    && slot_item.count() > 0 && shulker::is_shulker_box(&slot_item.kind().to_string()) {
-                        info!(
-                            "recover_shulker_to_slot_0: SUCCESS - Shulker moved to hotbar slot 0 (verified on attempt {})", 
-                            verify_attempt + 1
-                        );
-                        drop(inv_handle);
-                        return Ok(());
-                    }
-                if verify_attempt < 4 {
-                    debug!(
-                        "recover_shulker_to_slot_0: Verification attempt {} - shulker not in slot 0 yet", 
-                        verify_attempt + 1
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                }
+            tokio::time::sleep(tokio::time::Duration::from_millis(VERIFY_POLL_SLOW_MS)).await;
+
+            // Verify placement via the shared poll helper so the cadence stays
+            // in sync with `place_shulker_in_chest_slot_verified` (same idiom,
+            // previously hand-rolled with three slightly-different delays).
+            let verified = super::chest_io::poll_container_until(
+                &inv_handle,
+                |slots| {
+                    slots
+                        .get(HOTBAR_SLOT_0)
+                        .map(|item| {
+                            item.count() > 0
+                                && shulker::is_shulker_box(&item.kind().to_string())
+                        })
+                        .unwrap_or(false)
+                },
+                5,
+                VERIFY_POLL_FAST_MS,
+            )
+            .await?;
+            if verified {
+                info!(
+                    "recover_shulker_to_slot_0: SUCCESS - Shulker moved to hotbar slot 0 (verified)"
+                );
+                drop(inv_handle);
+                return Ok(());
             }
-            
+
             // Log final state on verification failure
             let final_slots = inv_handle.slots().ok_or_else(|| "Inventory closed".to_string())?;
             let final_cursor = carried_item(client);
             warn!(
-                "recover_shulker_to_slot_0: Verification failed. Hotbar slot 0: {} x{}, Cursor: {} x{}", 
+                "recover_shulker_to_slot_0: Verification failed. Hotbar slot 0: {} x{}, Cursor: {} x{}",
                 final_slots.get(HOTBAR_SLOT_0).map(|s| s.kind().to_string()).unwrap_or_else(|| "None".to_string()),
                 final_slots.get(HOTBAR_SLOT_0).map(|s| s.count()).unwrap_or(0),
                 final_cursor.kind(),
                 final_cursor.count()
             );
-            
+
             drop(inv_handle);
             // Continue to next retry attempt
         } else {
@@ -1066,7 +1072,7 @@ async fn recover_shulker_to_slot_0(_bot: &Bot, client: &azalea::Client) -> Resul
         }
     }
     
-    error!("recover_shulker_to_slot_0: FAILED after {} attempts", MAX_RETRIES);
+    error!("recover_shulker_to_slot_0: FAILED after {} attempts", MAX_ATTEMPTS);
     Err("Failed to recover shulker to hotbar slot 0 after multiple attempts".to_string())
 }
 

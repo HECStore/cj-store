@@ -76,11 +76,27 @@ pub fn fresh_nonce() -> String {
     s
 }
 
-/// Pre-wrap byte cap for `wrap_untrusted` content. Aligned with
-/// `chat::history::CONTENT_MAX_BYTES` (4096) so the on-wire bound matches
-/// the persisted bound; raise both together if Minecraft chat ever
-/// stops being a 256-char-per-line system.
-const WRAP_CONTENT_MAX_BYTES: usize = 4096;
+/// Pre-wrap byte cap for `wrap_untrusted` on `tag_kind = "chat"`. Aligned
+/// with `chat::history::CONTENT_MAX_BYTES` (4096) so the on-wire bound
+/// matches the persisted bound; raise both together if Minecraft chat
+/// ever stops being a 256-char-per-line system.
+const WRAP_CHAT_MAX_BYTES: usize = 4096;
+
+/// Pre-wrap byte cap for `wrap_untrusted` on `tag_kind = "tool_result"` /
+/// `tag_kind = "web"`. Tool results legitimately carry up to
+/// `web_fetch_max_bytes` of fetched body (default 256 KB), plus larger
+/// history/store-tool payloads. Capping every tool_result at the 4 KB
+/// chat-line bound would silently truncate a `web_fetch` body — making
+/// the configured `web_fetch_max_bytes` an effective lie. 256 KB matches
+/// the `web_fetch` ceiling; if a future tool needs more, raise this and
+/// the `web_fetch` cap together.
+const WRAP_TOOL_RESULT_MAX_BYTES: usize = 262_144;
+
+/// Back-compat alias used by tests that pin the chat-line bound; equal to
+/// `WRAP_CHAT_MAX_BYTES`. Kept under the old name so referenced test
+/// assertions don't need to be updated when this cap is tuned.
+#[cfg(test)]
+const WRAP_CONTENT_MAX_BYTES: usize = WRAP_CHAT_MAX_BYTES;
 
 /// Wrap a piece of untrusted content with nonce-tagged delimiters. The
 /// `tag_kind` is `chat`, `web`, or `tool_result`.
@@ -97,20 +113,35 @@ const WRAP_CONTENT_MAX_BYTES: usize = 4096;
 /// mimics the real closer for any tag-kind, and is just as dangerous
 /// as a forged opener.
 ///
-/// **Pre-wrap byte cap**: oversized content is truncated to
-/// `WRAP_CONTENT_MAX_BYTES` on a UTF-8 boundary with a `…[truncated]`
-/// sentinel. Untrusted-string passthrough to a downstream paid API is
-/// a classic resource-exhaustion vector — even with rate limiting the
-/// per-call token cost scales linearly with input.
+/// **Pre-wrap byte cap**: oversized content is truncated on a UTF-8
+/// boundary with a `…[truncated]` sentinel. The cap depends on
+/// `tag_kind`:
+///
+/// - `"chat"` → `WRAP_CHAT_MAX_BYTES` (4 KB; one Minecraft chat line).
+/// - `"web"` / `"tool_result"` → `WRAP_TOOL_RESULT_MAX_BYTES` (256 KB;
+///   matches the `web_fetch` body ceiling so an honest fetch result
+///   reaches the model intact).
+/// - unknown kind → falls back to the smaller chat cap as defense-in-
+///   depth (callers should always pass one of the three documented
+///   kinds; the fallback exists so a future caller typo can't bypass
+///   the cap by claiming an unrecognized kind).
+///
+/// Untrusted-string passthrough to a downstream paid API is a classic
+/// resource-exhaustion vector — even with rate limiting the per-call
+/// token cost scales linearly with input.
 ///
 /// The function always returns `Ok`; the `Result` signature is kept so
 /// existing `.unwrap_or_else(|_| "[content withheld]")` recovery paths
 /// stay source-compatible — the `Err` arm is now unreachable.
 pub fn wrap_untrusted(tag_kind: &str, nonce: &str, content: &str) -> Result<String, &'static str> {
-    let working: std::borrow::Cow<'_, str> = if content.len() <= WRAP_CONTENT_MAX_BYTES {
+    let cap = match tag_kind {
+        "tool_result" | "web" => WRAP_TOOL_RESULT_MAX_BYTES,
+        _ => WRAP_CHAT_MAX_BYTES,
+    };
+    let working: std::borrow::Cow<'_, str> = if content.len() <= cap {
         std::borrow::Cow::Borrowed(content)
     } else {
-        let mut cut = WRAP_CONTENT_MAX_BYTES;
+        let mut cut = cap;
         while cut > 0 && !content.is_char_boundary(cut) {
             cut -= 1;
         }

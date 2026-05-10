@@ -1,10 +1,12 @@
 //! Order Management
 //!
-//! Orders represent the audit log of all buy/sell/deposit/withdraw operations.
-//! The order queue is limited to prevent unbounded memory growth.
+//! Orders are an in-memory transient session log of recently-issued user
+//! requests. The file at `data/orders.json` is rewritten on each save and
+//! deleted unconditionally on startup; the persistent audit log lives in
+//! `data/trades/`.
 //!
-//! The maximum number of orders can be configured in `data/config.json` via
-//! the `max_orders` field. The default is 10,000.
+//! The maximum number of orders kept in memory can be configured in
+//! `data/config.json` via the `max_orders` field. The default is 10,000.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -16,14 +18,15 @@ use serde::{Deserialize, Serialize};
 use crate::fsutil::write_atomic;
 use crate::types::ItemId;
 
-/// The kind of transaction recorded in the audit log.
+/// The kind of transaction recorded in the transient session log.
 ///
 /// Variants are split between user-initiated trades (`Buy`/`Sell`),
 /// operator inventory adjustments (`AddItem`/`RemoveItem`), user balance
 /// movements (`DepositBalance`/`WithdrawBalance`), and operator balance
 /// adjustments (`AddCurrency`/`RemoveCurrency`). Serialized variant names
 /// are part of the on-disk format in `data/orders.json`, so renaming them
-/// is a breaking change.
+/// is a breaking change. The persistent audit log of completed operations
+/// lives in `data/trades/` (see `Trade`).
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 #[cfg_attr(test, derive(Default))]
 pub enum OrderType {
@@ -46,11 +49,12 @@ pub enum OrderType {
     RemoveCurrency,
 }
 
-/// A single entry in the audit log.
+/// A single entry in the transient session log.
 ///
 /// `currency_amount` is the diamond magnitude for every value-bearing variant
 /// (Buy/Sell/Deposit/Withdraw/AddCurrency/RemoveCurrency); 0.0 only for
-/// AddItem/RemoveItem which move items without a currency leg.
+/// AddItem/RemoveItem which move items without a currency leg. This is NOT
+/// the persistent audit log — see `Trade` (`data/trades/`) for that.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 #[cfg_attr(test, derive(Default))]
 pub struct Order {
@@ -62,16 +66,25 @@ pub struct Order {
     pub user_uuid: String,
 }
 
-/// Canonical filesystem path for the session-only orders file.
+/// Canonical filesystem path for the transient orders file.
 ///
-/// Exposed at module scope (not as an `impl Order` const) so unrelated callers
-/// that need to reference the same path — e.g. `Store::new` deleting stale
-/// orders on startup — can `use` it instead of duplicating the literal.
+/// This file is rewritten on each save and deleted unconditionally on startup
+/// (see `Store::new`). It is not the persistent audit log — that lives in
+/// `data/trades/`. Exposed at module scope (not as an `impl Order` const) so
+/// unrelated callers that need to reference the same path — e.g. `Store::new`
+/// deleting stale orders on startup — can `use` it instead of duplicating
+/// the literal.
 pub const ORDERS_FILE: &str = "data/orders.json";
 
 impl Order {
     /// User purchased `qty` of `item` for `price` total diamonds.
     pub fn buy(item: ItemId, qty: i32, price: f64, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(qty > 0, "qty must be positive (got {qty})");
+        debug_assert!(
+            price.is_finite() && price >= 0.0,
+            "price must be finite and non-negative (got {price})"
+        );
         Self {
             order_type: OrderType::Buy,
             item,
@@ -83,6 +96,12 @@ impl Order {
 
     /// User sold `qty` of `item` for `payout` total diamonds.
     pub fn sell(item: ItemId, qty: i32, payout: f64, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(qty > 0, "qty must be positive (got {qty})");
+        debug_assert!(
+            payout.is_finite() && payout >= 0.0,
+            "payout must be finite and non-negative (got {payout})"
+        );
         Self {
             order_type: OrderType::Sell,
             item,
@@ -92,32 +111,48 @@ impl Order {
         }
     }
 
-    /// User deposited `amount` diamonds into their store balance. `amount`
-    /// is the diamond magnitude credited; `Order::amount` carries the whole
-    /// diamond count.
-    pub fn deposit_balance(amount: f64, uuid: String) -> Self {
+    /// User deposited `whole_diamonds` diamonds into their store balance.
+    /// Both `Order::amount` and `Order::currency_amount` carry the same
+    /// integer-valued diamond count; the f64 mirror exists only because
+    /// `currency_amount` is f64 for the variants that genuinely need it.
+    pub fn deposit_balance(whole_diamonds: i32, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(
+            whole_diamonds > 0,
+            "whole_diamonds must be positive (got {whole_diamonds})"
+        );
         Self {
             order_type: OrderType::DepositBalance,
             item: ItemId::from_normalized("diamond".to_string()),
-            amount: amount as i32,
-            currency_amount: amount,
+            amount: whole_diamonds,
+            currency_amount: whole_diamonds as f64,
             user_uuid: uuid,
         }
     }
 
-    /// User withdrew `amount` diamonds from their store balance.
-    pub fn withdraw_balance(amount: f64, uuid: String) -> Self {
+    /// User withdrew `whole_diamonds` diamonds from their store balance.
+    pub fn withdraw_balance(whole_diamonds: i32, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(
+            whole_diamonds > 0,
+            "whole_diamonds must be positive (got {whole_diamonds})"
+        );
         Self {
             order_type: OrderType::WithdrawBalance,
             item: ItemId::from_normalized("diamond".to_string()),
-            amount: amount as i32,
-            currency_amount: amount,
+            amount: whole_diamonds,
+            currency_amount: whole_diamonds as f64,
             user_uuid: uuid,
         }
     }
 
     /// Operator credited `amount` of currency to the reserve for `item`.
     pub fn add_currency(item: ItemId, amount: f64, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(
+            amount.is_finite() && amount >= 0.0,
+            "amount must be finite and non-negative (got {amount})"
+        );
         Self {
             order_type: OrderType::AddCurrency,
             item,
@@ -129,6 +164,11 @@ impl Order {
 
     /// Operator debited `amount` of currency from the reserve for `item`.
     pub fn remove_currency(item: ItemId, amount: f64, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(
+            amount.is_finite() && amount >= 0.0,
+            "amount must be finite and non-negative (got {amount})"
+        );
         Self {
             order_type: OrderType::RemoveCurrency,
             item,
@@ -140,6 +180,8 @@ impl Order {
 
     /// Operator added `qty` of `item` to storage (no currency leg).
     pub fn add_item(item: ItemId, qty: i32, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(qty > 0, "qty must be positive (got {qty})");
         Self {
             order_type: OrderType::AddItem,
             item,
@@ -151,6 +193,8 @@ impl Order {
 
     /// Operator removed `qty` of `item` from storage (no currency leg).
     pub fn remove_item(item: ItemId, qty: i32, uuid: String) -> Self {
+        debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
+        debug_assert!(qty > 0, "qty must be positive (got {qty})");
         Self {
             order_type: OrderType::RemoveItem,
             item,
@@ -185,20 +229,20 @@ impl Order {
         // `state::save` (src/store/state.rs) drains the front before calling
         // this function as the primary cap; this branch is a defense-in-depth
         // second cap that fires only if the caller passes an unbounded queue.
-        let orders_to_save: VecDeque<Self> = if orders.len() > max_orders {
+        // Both branches serialize by borrow to avoid cloning every entry on
+        // the hot save path.
+        let json_str = if orders.len() > max_orders {
             tracing::info!("[Order] pruning {} -> {} before save", orders.len(), max_orders);
-            orders.iter().skip(orders.len() - max_orders).cloned().collect()
+            let pruned: Vec<&Self> = orders.iter().skip(orders.len() - max_orders).collect();
+            serde_json::to_string_pretty(&pruned).map_err(io::Error::other)?
         } else {
-            orders.clone()
+            serde_json::to_string_pretty(orders).map_err(io::Error::other)?
         };
-
-        let json_str = serde_json::to_string_pretty(&orders_to_save)
-            .map_err(io::Error::other)?;
 
         write_atomic(file_path, &json_str)?;
         tracing::debug!(
             "[Order] wrote {} orders to {}",
-            orders_to_save.len(),
+            orders.len().min(max_orders),
             file_path.display()
         );
         Ok(())
@@ -342,7 +386,7 @@ mod tests {
 
     #[test]
     fn deposit_balance_constructor_shape() {
-        let o = Order::deposit_balance(42.0, "user-3".to_string());
+        let o = Order::deposit_balance(42, "user-3".to_string());
         assert_eq!(o.order_type, OrderType::DepositBalance);
         assert_eq!(o.item, ItemId::new("diamond").unwrap());
         assert_eq!(o.amount, 42);
@@ -352,7 +396,7 @@ mod tests {
 
     #[test]
     fn withdraw_balance_constructor_shape() {
-        let o = Order::withdraw_balance(17.0, "user-4".to_string());
+        let o = Order::withdraw_balance(17, "user-4".to_string());
         assert_eq!(o.order_type, OrderType::WithdrawBalance);
         assert_eq!(o.item, ItemId::new("diamond").unwrap());
         assert_eq!(o.amount, 17);

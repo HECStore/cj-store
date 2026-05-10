@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 use super::Bot;
 use crate::constants::{
     DELAY_CONTAINER_SYNC_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS, RETRY_BASE_DELAY_MS,
-    RETRY_MAX_DELAY_MS, SHULKER_OP_MAX_RETRIES, exponential_backoff_delay,
+    RETRY_MAX_DELAY_MS, SHULKER_OP_MAX_ATTEMPTS, exponential_backoff_delay_jittered,
 };
 use crate::types::Position;
 
@@ -316,10 +316,13 @@ pub async fn open_shulker_at_station(
 ) -> Result<azalea::container::ContainerHandle, String> {
     let mut last_error = String::new();
 
-    for attempt in 0..SHULKER_OP_MAX_RETRIES {
+    for attempt in 0..SHULKER_OP_MAX_ATTEMPTS {
         if attempt > 0 {
-            let delay_ms =
-                exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
+            let delay_ms = exponential_backoff_delay_jittered(
+                attempt - 1,
+                RETRY_BASE_DELAY_MS,
+                RETRY_MAX_DELAY_MS,
+            );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
 
@@ -329,7 +332,7 @@ pub async fn open_shulker_at_station(
                     info!(
                         "open_shulker_at_station: succeeded on attempt {}/{} at ({}, {}, {})",
                         attempt + 1,
-                        SHULKER_OP_MAX_RETRIES,
+                        SHULKER_OP_MAX_ATTEMPTS,
                         station_pos.x,
                         station_pos.y,
                         station_pos.z
@@ -342,7 +345,7 @@ pub async fn open_shulker_at_station(
                 warn!(
                     "open_shulker_at_station: attempt {}/{} failed at ({}, {}, {}): {}",
                     attempt + 1,
-                    SHULKER_OP_MAX_RETRIES,
+                    SHULKER_OP_MAX_ATTEMPTS,
                     station_pos.x,
                     station_pos.y,
                     station_pos.z,
@@ -354,11 +357,11 @@ pub async fn open_shulker_at_station(
 
     error!(
         "open_shulker_at_station: exhausted {} attempts at ({}, {}, {}): {}",
-        SHULKER_OP_MAX_RETRIES, station_pos.x, station_pos.y, station_pos.z, last_error
+        SHULKER_OP_MAX_ATTEMPTS, station_pos.x, station_pos.y, station_pos.z, last_error
     );
     Err(format!(
         "Failed to open shulker at ({}, {}, {}) after {} attempts: {}",
-        station_pos.x, station_pos.y, station_pos.z, SHULKER_OP_MAX_RETRIES, last_error
+        station_pos.x, station_pos.y, station_pos.z, SHULKER_OP_MAX_ATTEMPTS, last_error
     ))
 }
 

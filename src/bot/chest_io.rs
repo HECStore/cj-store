@@ -9,12 +9,13 @@ use tracing::{debug, error, info, warn};
 
 use super::Bot;
 use crate::constants::{
-    CHEST_OP_MAX_RETRIES, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
+    CHEST_OP_MAX_ATTEMPTS, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
     CHUNK_RELOAD_MAX_DELAY_MS, DELAY_BLOCK_OP_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS,
     DELAY_MEDIUM_MS, DELAY_SETTLE_MS, DELAY_SHORT_MS, DELAY_SHULKER_PLACE_MS,
     DOUBLE_CHEST_SLOTS, HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
-    SHULKER_BOX_SLOTS, exponential_backoff_delay,
+    SHULKER_BOX_SLOTS, VERIFY_POLL_DEFAULT_MS, exponential_backoff_delay_jittered,
 };
+use azalea::inventory::ItemStack;
 use crate::types::Position;
 
 /// Error prefix used to tag chunk-not-loaded / transient world-state failures.
@@ -32,6 +33,57 @@ const CHUNK_NOT_LOADED_PREFIX: &str = "[chunk-not-loaded] ";
 /// the same packet again, so `open_chest_container` short-circuits on this
 /// prefix instead of burning the full retry budget on identical 15s timeouts.
 const PACKET_DECODE_PREFIX: &str = "[packet-decode] ";
+
+/// Error prefix used to tag the "bot was not connected when we tried to open
+/// the chest" failure. A bot that's lost its `azalea::Client` will not recover
+/// inside the 500ms-2s retry window — reconnection is a multi-second
+/// process driven by the swarm loop, not the open-chest helper. Short-circuit
+/// on this prefix so we don't burn 3 × 15s on guaranteed-fail attempts.
+const BOT_DISCONNECTED_PREFIX: &str = "[bot-disconnected] ";
+
+/// Error prefix used to tag the "expected a chest at this position but found
+/// something else" failure. Wrong-block conditions are configuration drift
+/// (chests file out of date with the world) — never transient. Short-circuit
+/// so an operator sees the real cause immediately instead of after 45s of
+/// timeouts.
+const WRONG_BLOCK_PREFIX: &str = "[wrong-block] ";
+
+/// Poll an open container's slot snapshot until `predicate` returns true,
+/// the container closes, or `max_attempts` is exhausted.
+///
+/// Replaces three near-identical inline poll loops (different attempt
+/// counts and different hardcoded sleeps) that had drifted out of sync.
+///
+/// # Returns
+/// * `Ok(true)`  — predicate became true on some attempt
+/// * `Ok(false)` — predicate never became true within `max_attempts`
+/// * `Err(...)`  — container closed before predicate could be evaluated
+///
+/// The poll sleeps **between** attempts (not before the first attempt) so
+/// the first check captures the snapshot immediately after the click that
+/// motivated the poll — matches the behavior of the original loops.
+pub(crate) async fn poll_container_until<F>(
+    container: &azalea::container::ContainerHandle,
+    predicate: F,
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Result<bool, String>
+where
+    F: Fn(&[ItemStack]) -> bool,
+{
+    for attempt in 0..max_attempts {
+        let slots = container
+            .slots()
+            .ok_or_else(|| "Container closed while polling".to_string())?;
+        if predicate(&slots) {
+            return Ok(true);
+        }
+        if attempt < max_attempts - 1 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        }
+    }
+    Ok(false)
+}
 
 /// Locate the first shulker box in the player-inventory portion of an open
 /// double-chest container view.
@@ -86,7 +138,7 @@ pub async fn place_shulker_in_chest_slot_verified(
     chest_slot: usize,
 ) -> Result<(), String> {
     const MAX_VERIFICATION_ATTEMPTS: u32 = 7;
-    const VERIFY_DELAY_MS: u64 = 250;
+    // VERIFY_POLL_DEFAULT_MS (250) — see constants.rs for the empirical basis.
 
     info!(
         "place_shulker_in_chest_slot_verified: Moving shulker from container slot {} to chest slot {}", 
@@ -191,31 +243,24 @@ pub async fn place_shulker_in_chest_slot_verified(
         }
     }
 
-    // Verify the shulker is now in the chest slot
-    let mut verified = false;
-    for attempt in 0..MAX_VERIFICATION_ATTEMPTS {
-        let updated_slots = container
-            .slots()
-            .ok_or_else(|| "Container closed while verifying shulker placement".to_string())?;
-
-        if let Some(chest_item) = updated_slots.get(chest_slot)
-            && chest_item.count() > 0
-                && super::shulker::is_shulker_box(&chest_item.kind().to_string())
-            {
-                verified = true;
-                break;
-            }
-
-        if attempt < MAX_VERIFICATION_ATTEMPTS - 1 {
-            debug!(
-                "place_shulker_in_chest_slot_verified: Verification attempt {}/{} - shulker not in chest slot {} yet",
-                attempt + 1,
-                MAX_VERIFICATION_ATTEMPTS,
-                chest_slot
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(VERIFY_DELAY_MS)).await;
-        }
-    }
+    // Verify the shulker is now in the chest slot — delegate the poll loop
+    // to `poll_container_until` so the cadence stays consistent with the
+    // other verification sites (`recover_shulker_to_slot_0`).
+    let verified = poll_container_until(
+        container,
+        |slots| {
+            slots
+                .get(chest_slot)
+                .map(|item| {
+                    item.count() > 0
+                        && super::shulker::is_shulker_box(&item.kind().to_string())
+                })
+                .unwrap_or(false)
+        },
+        MAX_VERIFICATION_ATTEMPTS,
+        VERIFY_POLL_DEFAULT_MS,
+    )
+    .await?;
 
     if !verified {
         // Check if shulker is still in cursor (we might need to click again)
@@ -287,7 +332,8 @@ async fn open_chest_container_once(
             chest_pos.x, chest_pos.y, chest_pos.z
         );
         format!(
-            "Bot not connected - cannot open chest at ({}, {}, {})",
+            "{}Bot not connected - cannot open chest at ({}, {}, {})",
+            BOT_DISCONNECTED_PREFIX,
             chest_pos.x, chest_pos.y, chest_pos.z
         )
     })?;
@@ -310,6 +356,14 @@ async fn open_chest_container_once(
                     "open_chest_container_once: Expected chest but found: {} - open may fail!",
                     block_name
                 );
+                // Wrong block type is configuration drift — never recoverable
+                // via the retry-with-sleep loop. Return tagged so
+                // `open_chest_container` short-circuits.
+                return Err(format!(
+                    "{}Expected chest at ({}, {}, {}) but found: {}",
+                    WRONG_BLOCK_PREFIX,
+                    chest_pos.x, chest_pos.y, chest_pos.z, block_name
+                ));
             }
         } else {
             // Block state is None — the chunk containing this block is not loaded.
@@ -475,13 +529,17 @@ pub async fn open_chest_container(
     let mut last_error = String::new();
     let mut chunk_not_loaded_seen = false;
 
-    // Start with the normal retry budget; if we detect a chunk-not-loaded
-    // condition we extend the budget once so the bot waits for chunks to
-    // stream back in rather than giving up immediately.
-    let mut max_retries = CHEST_OP_MAX_RETRIES;
+    // Start with the normal attempt budget; each chunk-not-loaded response
+    // extends the budget by one (up to a hard cap), so a slow server doing
+    // a long chunk-rebuild after teleport can't burn the budget on
+    // transient world-state issues. The cap prevents an infinite loop in
+    // the pathological case where every attempt sees a chunk-not-loaded.
+    let hard_cap = CHEST_OP_MAX_ATTEMPTS
+        .saturating_add(CHUNK_RELOAD_EXTRA_RETRIES.saturating_mul(2));
+    let mut max_attempts = CHEST_OP_MAX_ATTEMPTS;
 
     let mut attempt = 0u32;
-    while attempt < max_retries {
+    while attempt < max_attempts {
         if attempt > 0 {
             // Use longer backoff when waiting for chunks to reload
             let (base, max_delay) = if chunk_not_loaded_seen {
@@ -489,11 +547,11 @@ pub async fn open_chest_container(
             } else {
                 (RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS)
             };
-            let delay_ms = exponential_backoff_delay(attempt - 1, base, max_delay);
+            let delay_ms = exponential_backoff_delay_jittered(attempt - 1, base, max_delay);
             info!(
                 "Retrying chest open at ({}, {}, {}) attempt {}/{} after {}ms{}",
                 chest_pos.x, chest_pos.y, chest_pos.z,
-                attempt + 1, max_retries, delay_ms,
+                attempt + 1, max_attempts, delay_ms,
                 if chunk_not_loaded_seen { " (waiting for chunk reload)" } else { "" }
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
@@ -502,26 +560,44 @@ pub async fn open_chest_container(
         match open_chest_container_once(bot, chest_pos).await {
             Ok(container) => return Ok(container),
             Err(e) => {
-                // First time we see a chunk-not-loaded error, extend the retry
-                // budget so we don't exhaust normal retries on a transient issue.
-                if !chunk_not_loaded_seen && e.starts_with(CHUNK_NOT_LOADED_PREFIX) {
-                    chunk_not_loaded_seen = true;
-                    max_retries = max_retries.saturating_add(CHUNK_RELOAD_EXTRA_RETRIES);
-                    warn!(
-                        "open_chest_container: Chunk not loaded at ({}, {}, {}), extending retries to {}",
-                        chest_pos.x, chest_pos.y, chest_pos.z, max_retries
-                    );
+                // Each chunk-not-loaded response extends the budget by one
+                // (capped at `hard_cap`). A slow server doing a long
+                // chunk-rebuild after teleport can produce several
+                // consecutive chunk-not-loaded responses, and the previous
+                // "extend-once" gate caused us to give up while chunks were
+                // still streaming in. We only extend on chunk-not-loaded,
+                // not on every error, so other persistent failures still hit
+                // the normal budget.
+                if e.starts_with(CHUNK_NOT_LOADED_PREFIX) && max_attempts < hard_cap {
+                    let new_max = max_attempts
+                        .saturating_add(1)
+                        .min(hard_cap);
+                    if !chunk_not_loaded_seen {
+                        chunk_not_loaded_seen = true;
+                    }
+                    if new_max > max_attempts {
+                        max_attempts = new_max;
+                        warn!(
+                            "open_chest_container: Chunk not loaded at ({}, {}, {}), extending attempts to {} (cap {})",
+                            chest_pos.x, chest_pos.y, chest_pos.z, max_attempts, hard_cap
+                        );
+                    }
                 }
                 // Short-circuit on packet-decode failures: the server consistently
                 // sends the same unparseable item-NBT for this chest, so retrying
                 // burns 15s per attempt with no chance of recovery. Surface the
                 // real cause to the order layer immediately instead.
                 let is_decode_failure = e.starts_with(PACKET_DECODE_PREFIX);
+                // Same short-circuit logic for permanent failure modes:
+                // disconnection won't recover in a 500ms-2s sleep, and wrong
+                // block type is config drift that won't fix itself.
+                let is_disconnected = e.starts_with(BOT_DISCONNECTED_PREFIX);
+                let is_wrong_block = e.starts_with(WRONG_BLOCK_PREFIX);
                 last_error = e;
                 warn!(
                     "open_chest_container: Attempt {}/{} FAILED at ({}, {}, {}): {}",
                     attempt + 1,
-                    max_retries,
+                    max_attempts,
                     chest_pos.x,
                     chest_pos.y,
                     chest_pos.z,
@@ -546,6 +622,30 @@ pub async fn open_chest_container(
                         chest_pos.x, chest_pos.y, chest_pos.z, clean_error
                     ));
                 }
+                if is_disconnected {
+                    let clean_error = last_error
+                        .strip_prefix(BOT_DISCONNECTED_PREFIX)
+                        .unwrap_or(&last_error);
+                    error!(
+                        "open_chest_container: ABORTING retries at ({}, {}, {}) — bot is \
+                        disconnected and cannot recover inside the retry-sleep window. \
+                        Last error: {}",
+                        chest_pos.x, chest_pos.y, chest_pos.z, clean_error
+                    );
+                    return Err(clean_error.to_string());
+                }
+                if is_wrong_block {
+                    let clean_error = last_error
+                        .strip_prefix(WRONG_BLOCK_PREFIX)
+                        .unwrap_or(&last_error);
+                    error!(
+                        "open_chest_container: ABORTING retries at ({}, {}, {}) — expected \
+                        block type missing; this is configuration drift and cannot recover \
+                        by retrying. Last error: {}",
+                        chest_pos.x, chest_pos.y, chest_pos.z, clean_error
+                    );
+                    return Err(clean_error.to_string());
+                }
             }
         }
         attempt += 1;
@@ -555,11 +655,11 @@ pub async fn open_chest_container(
     let clean_error = last_error.strip_prefix(CHUNK_NOT_LOADED_PREFIX).unwrap_or(&last_error);
     error!(
         "open_chest_container: FAILED after {} attempts at ({}, {}, {}): {}",
-        max_retries, chest_pos.x, chest_pos.y, chest_pos.z, clean_error
+        max_attempts, chest_pos.x, chest_pos.y, chest_pos.z, clean_error
     );
     Err(format!(
         "Failed to open chest at ({}, {}, {}) after {} attempts: {}",
-        chest_pos.x, chest_pos.y, chest_pos.z, max_retries, clean_error
+        chest_pos.x, chest_pos.y, chest_pos.z, max_attempts, clean_error
     ))
 }
 

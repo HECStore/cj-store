@@ -142,9 +142,10 @@ recovered). The usual async discipline — never hold the guard across
 
 1. **Physical node validation is optional** — "Add node (no validation)"
    trusts the operator. Prefer options 5 or 6 when extending storage.
-2. **Order audit log is session-only** — `data/orders.json` is cleared on
-   each startup. For history use `data/trades/*.json`. The pending queue
-   (`queue.json`) IS persistent.
+2. **Order log is a transient session log, not an audit log** —
+   `data/orders.json` is cleared on each startup. For the persistent
+   audit log use `data/trades/*.json`. The pending queue (`queue.json`)
+   IS persistent.
 3. **Trade history grows unbounded on disk** — one file per trade under
    `data/trades/`, never pruned. `max_trades_in_memory` (default 50 000)
    caps how many are *loaded into memory* at startup; older files stay on
@@ -156,10 +157,10 @@ recovered). The usual async discipline — never hold the guard across
 
    | Operation                 | Trigger                      | Retries                              | Base backoff | Max backoff | Notes                                       |
    | ------------------------- | ---------------------------- | ------------------------------------ | ------------ | ----------- | ------------------------------------------- |
-   | Chest open (normal)       | Transient I/O                | 3 (`CHEST_OP_MAX_RETRIES`)           | 500 ms       | 5 s         | Exponential backoff                         |
+   | Chest open (normal)       | Transient I/O                | 3 (`CHEST_OP_MAX_ATTEMPTS`)          | 500 ms       | 5 s         | Exponential backoff                         |
    | Chest open (chunk reload) | Chunk not loaded             | +2 (`CHUNK_RELOAD_EXTRA_RETRIES`)    | 3 s          | 10 s        | Slower backoff to let the chunk stream in   |
-   | Shulker open              | GUI open timeout             | 2 (`SHULKER_OP_MAX_RETRIES`)         | 500 ms       | 5 s         | Exponential backoff                         |
-   | Navigation                | Path failure                 | 2 (`NAVIGATION_MAX_RETRIES`)         | 500 ms       | 5 s         | Exponential backoff                         |
+   | Shulker open              | GUI open timeout             | 2 (`SHULKER_OP_MAX_ATTEMPTS`)        | 500 ms       | 5 s         | Exponential backoff                         |
+   | Navigation                | Path failure                 | 2 (`NAVIGATION_MAX_ATTEMPTS`)        | 500 ms       | 5 s         | Exponential backoff                         |
    | Validation / discovery    | Fail-fast                    | 0                                    | —            | —           | Fast fail (5 s per op)                      |
 5. **Single-server design** — no coordination between instances. Two bots
    pointing at the same `data/` directory will race each other's atomic

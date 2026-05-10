@@ -69,7 +69,7 @@ running config and logs the error.
 | `buffer_chest_position`   | `{x,y,z} \| null`| `null`  | Optional emergency-dump chest. Used when a shulker cannot be returned to its slot (slot unexpectedly occupied, chunk not loaded, etc.) — a non-fatal fallback so the bot doesn't stall mid-operation. Leave `null` and the bot instead keeps the shulker in its inventory and logs an alert |
 | `trade_timeout_ms`        | `u64`            | 45000   | Max wait for a trade-GUI interaction before aborting                                                                 |
 | `pathfinding_timeout_ms`  | `u64`            | 60000   | Max wait for the bot to reach a destination before aborting                                                          |
-| `max_orders`              | `usize`          | 10000   | Prune target for the in-memory order audit log (session-only)                                                        |
+| `max_orders`              | `usize`          | 10000   | Prune target for the in-memory transient order session log (session-only; not the audit log — that lives in `data/trades/`) |
 | `max_trades_in_memory`    | `usize`          | 50000   | Max trades loaded into memory on startup (older trades stay on disk)                                                 |
 | `autosave_interval_secs`  | `u64`            | 2       | Minimum interval between debounced autosaves                                                                         |
 
@@ -261,12 +261,13 @@ Invariants (checked by CLI option 12 "Audit state" where noted):
 
 ## `data/orders.json`
 
-Session-scoped audit log. The Store mirrors it to disk so an operator can
-tail the file or view it after a crash, but the bot rebuilds it from scratch
-on every startup — the persistent source of truth for historical orders is
-always `data/trades/*.json`. This file exists primarily to back CLI
-option 11 ("View recent trades") without forcing a full rescan of
-`data/trades/` on every invocation. See [src/types/order.rs](src/types/order.rs).
+Transient session log — **not** an audit log. The Store mirrors it to
+disk so an operator can tail the file or view it after a crash, but the
+file is deleted unconditionally on startup; the persistent audit log of
+completed operations is always `data/trades/*.json`. This file exists
+primarily to back CLI option 11 ("View recent trades") without forcing
+a full rescan of `data/trades/` on every invocation. See
+[src/types/order.rs](src/types/order.rs).
 
 ```json
 [

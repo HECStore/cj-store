@@ -224,13 +224,34 @@ Option A doesn't balance out.
 
 **When it's safe to just delete `data/journal.json`**
 
-Always, at startup. The bot self-heals by renaming any leftover entry to
-a `data/journal.leftover-<unix-millis>-<seq>.json` archive (so the original
-file is no longer in place to interfere with the next run). The procedures
-above are for fixing the *world/ledger drift* that the journal merely
-points at — deleting the journal alone does not fix the drift. The
-archived `journal.leftover-*.json` files are forensic-only and may be
-removed once their corresponding world state has been reconciled.
+Almost always, at startup — the bot normally self-heals by renaming any
+leftover entry to a `data/journal.leftover-<unix-millis>-<seq>.json`
+archive (so the original file is no longer in place to interfere with
+the next run). The procedures above are for fixing the *world/ledger
+drift* that the journal merely points at — deleting the journal alone
+does not fix the drift. The archived `journal.leftover-*.json` files
+are forensic-only and may be removed once their corresponding world
+state has been reconciled.
+
+> [!WARNING]
+> **Rare archive-failed branch.** `bot/mod.rs`'s startup recovery
+> (`begin_recovery` / startup handler) only calls
+> `Journal::restore_leftover` when *both* `fs::rename` *and* the
+> copy+remove fallback fail to move the file aside. In that exotic case
+> the leftover stays at `data/journal.json` and the next `begin()` will
+> overwrite the only forensic copy. Grep `data/logs/store.log` for
+> `[Bot] Failed to archive leftover journal:` after every startup that
+> reported a leftover entry; if you see it, **snapshot
+> `data/journal.json` manually** (e.g. `cp data/journal.json
+> data/journal.json.bak.$(date -u +%s)`) *before* the next chest
+> operation, otherwise the forensic record is gone the moment the bot
+> starts a new shulker op. Same caveat applies to
+> `data/current_trade.json` via `trade_state::clear_persisted()`'s
+> fallback in `store/mod.rs` (`Store::new` — the auto-archive path
+> documented in §4's WARNING falls back to delete-and-continue when
+> rename + copy+remove both fail, so the file is gone with no archive).
+> In both exotic failure modes the **only** surviving copy lives in
+> whatever `data.bak.*` snapshot was taken before the failed startup.
 
 ---
 
@@ -323,17 +344,27 @@ being popped from the queue but before reaching a terminal state.
 balance deterministically. Use this table to reconstruct what a crashed
 commit *would* have done; each phase-subsection below refers back to it.
 
-| Order type          | `pair.item_stock` | `pair.currency_stock` | `user.balance`     |
-| ------------------- | ----------------- | --------------------- | ------------------ |
-| `Buy` (qty, cost)   | `− qty`           | `+ cost`              | unchanged†         |
-| `Sell` (qty, payout)| `+ qty`           | `− payout`            | `+ fractional`†    |
-| `DepositBalance`    | unchanged         | unchanged             | `+ amount`         |
-| `WithdrawBalance`   | unchanged         | unchanged             | `− amount`         |
+| Order type          | `pair.item_stock` | `pair.currency_stock`                                                                   | `user.balance`     |
+| ------------------- | ----------------- | --------------------------------------------------------------------------------------- | ------------------ |
+| `Buy` (qty, cost)   | `− qty`           | `+ physical_diamonds_deposited + balance_deduction` (≤ cost; see note ‡)                | unchanged†         |
+| `Sell` (qty, payout)| `+ qty`           | `− payout`                                                                              | `+ fractional`†    |
+| `DepositBalance`    | unchanged         | unchanged                                                                               | `+ amount`         |
+| `WithdrawBalance`   | unchanged         | unchanged                                                                               | `− amount`         |
 
 † Buy may debit balance if the player paid via balance; sell pays whole
 diamonds via trade and credits only the fractional remainder. See
 [src/store/orders.rs](src/store/orders.rs) `execute_queued_order` for the
 authoritative math.
+
+‡ For a buy, `currency_stock` grows only by diamonds the bot actually
+got into storage plus the balance the player paid from — strictly less
+than `cost` whenever the post-trade diamond-deposit step partially
+fails (the bot won't credit reserves for diamonds it still physically
+holds). The actual physical figure used at commit time is logged on
+the `phase = "buy.diamond_deposit"` line as `items_returned`; consult
+that value (not `cost`) when reconstructing what the crashed commit
+*would* have done. Only when every received diamond reaches storage
+does the row collapse to `+ cost`.
 
 **Fix**
 
@@ -416,6 +447,30 @@ bot's inventory — reach for player reports only if that's ambiguous.
      [Commit math table](#commit-math) for the
      order's type. (Note: storage counts were *not* synced back after the
      crash, so run `audit-state` after restart.)
+
+   **Buy sub-branch.** Buys are different from sells in that, *after* the
+   GUI closes but *before* the trade reaches `Committed`, the bot also
+   deposits the diamonds it just received back into chest 0 (the diamond
+   chest) — see `handle_buy_order` post-trade `rollback_amount_to_storage`
+   for the `"[Buy] diamond-deposit"` step. So a `Trading`-phase crash on
+   a buy can leave the diamonds *still in the bot's inventory* even
+   though the GUI exchange completed. Procedure: first decode any leftover
+   `data/journal.json` entry on `chest_id == 0` (the diamond chest),
+   reseat any loose diamond shulker back into its slot, and *only then*
+   classify the trade as cancelled vs. committed by the bot-inventory
+   check above. Otherwise you'd see the bot's diamonds, conclude "trade
+   never confirmed", and miss that the items half already moved.
+
+   **Sell sub-branch.** On a sell, "bot offers" are diamonds the bot
+   withdrew from chest 0 *before* opening the GUI (see `handle_sell_order`
+   in src/store/orders.rs for the pre-trade withdrawal). A `Trading`-phase
+   crash therefore means diamonds are sitting in the bot's inventory
+   while chest 0 storage has already been debited. Procedure: (1) reseat
+   any loose diamond shulker named by a leftover journal entry on
+   `chest_id == 0` first — the journal points at the exact slot to
+   restore — and (2) for committed sells, run `audit-state` after the
+   restart to confirm `pair.currency_stock` matches storage. Skipping
+   step 1 would leave the diamonds in the bot's inventory permanently.
 4. **Only if step 3 is ambiguous**, contact the affected player. If they
    say the trade went through, treat as committed; otherwise treat as
    cancelled. Server logs can corroborate either way.
@@ -476,12 +531,23 @@ Don't just delete the file blindly, though:
    take different paths to this terminal state:
    - **`Buy` orders.** Items already changed hands during the `Trading`
      GUI exchange (the player handed over diamonds, the bot handed over
-     items). There was **no** `Depositing` phase — buys go straight
-     `Trading → Committed` (see the trade phase ladder above). Reconcile
-     `pair.item_stock`, `pair.currency_stock`, and `user.balance` against
-     the [Commit math table](#commit-math) and stop there. **Do not**
-     follow the `Depositing` procedure — there are no chest deposit
-     operations to undo, redo, or look for.
+     items). There is no formal `Depositing` phase for buys (buys go
+     straight `Trading → Committed`; see the trade phase ladder above)
+     — but **between GUI close and `commit()`**, `handle_buy_order` does
+     still deposit the received diamonds back into chest 0 (the diamond
+     chest) via `rollback_amount_to_storage("diamond", …)` so they
+     physically back the post-commit `currency_stock` bump. So before
+     concluding the buy is fully reconciled: (1) check whether a
+     leftover journal entry on `chest_id == 0` exists from the diamond
+     deposit (see the [Phase: Trading](#phase-trading) Buy sub-branch
+     for the same decoding) and reseat any loose diamonds, then (2)
+     reconcile `pair.item_stock`, `pair.currency_stock`, and
+     `user.balance` against the [Commit math table](#commit-math). Use
+     the `phase = "buy.diamond_deposit"` log line's `items_returned`
+     field for the actual `physical_diamonds_deposited` figure that
+     went into the row formula. **Do not** otherwise follow the full
+     `Depositing` procedure — there is no multi-chest item deposit plan
+     for a buy to walk.
    - **`Sell` orders.** Sells always traverse `Depositing` before
      `Committed` (the bot must put the items the player sold into
      storage chests). Verify the [Commit math table](#commit-math) row
@@ -639,9 +705,18 @@ action; they're documented here as a cross-reference.
   error: computed price is invalid" (the "internal error" wording is
   intentional — it means a pair has drained and the operator needs to
   re-seed reserves).
-- Mojang API unreachable / unknown username — lookup fails for the first
-  command from that player; subsequent commands in the 5-minute cache
-  window succeed.
+- Mojang API unreachable / unknown username — both successful and
+  failing resolutions are cached. Successful lookups live for
+  `UUID_CACHE_TTL_SECS` (5 min default). `NotFound` results are
+  negatively cached for `UUID_NEG_CACHE_TTL_SECS` (30 s default) so a
+  chat-spam loop of "Player 'X' not found" does not fan out to one
+  Mojang round-trip per command. A `RateLimited` response stores a typed
+  cooldown entry whose `until` instant short-circuits subsequent calls
+  with `MojangResolveError::RateLimited` until the cooldown expires; the
+  typed error is preserved through `StoreError::MojangRateLimited` so
+  callers see the cooldown rather than a generic network error. Single-
+  flight coalescing in `mojang.rs::resolve_user_uuid` further collapses
+  concurrent lookups for the same lowercased username into one round-trip.
 
 ---
 

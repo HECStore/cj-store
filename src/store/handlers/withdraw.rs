@@ -405,7 +405,7 @@ pub async fn handle_withdraw_balance_queued(
     );
 
     store.orders.push_back(crate::types::Order::withdraw_balance(
-        amount,
+        whole_diamonds,
         user_uuid.clone(),
     ));
 

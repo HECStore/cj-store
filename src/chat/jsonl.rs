@@ -8,20 +8,57 @@
 //! to another.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use tracing::warn;
+
+/// Sentinel returned by [`iso_utc_millis`] when a `SystemTime` falls
+/// outside chrono's representable range. The Unix-epoch string is
+/// chosen so downstream JSONL parsers / log greppers still see a
+/// well-formed RFC-3339 timestamp; a corrupt persisted timestamp logs
+/// loud (via [`warn!`]) instead of panicking the audit-write call.
+const ISO_UTC_MILLIS_SENTINEL: &str = "1970-01-01T00:00:00.000Z";
 
 /// Format a `SystemTime` as a UTC ISO-8601 string with millisecond
 /// precision and a trailing `Z`. This is the canonical `ts` shape for
 /// every per-day JSONL stream under `data/chat/`.
 ///
+/// **Fallible-but-infallible-looking**: if `t` predates the Unix
+/// epoch or otherwise overflows chrono's representable range (corrupt
+/// persisted timestamp — e.g. a structure deserialized from an
+/// untrusted disk file with a wild seconds field), we log a
+/// [`warn!`] and return [`ISO_UTC_MILLIS_SENTINEL`] instead of
+/// panicking. The audit-write call sites uniformly invoke this helper
+/// from non-error paths where a panic would abort an unrelated
+/// player-chat handler; a sentinel keeps the JSONL record well-formed
+/// while the warn line surfaces the corruption to the operator.
+///
 /// Note: `state.rs::iso_utc` deliberately diverges — it takes
 /// `DateTime<Utc>` and emits `SecondsFormat::Secs` for `state.json`
 /// fields. Do not unify the two without auditing every state.json reader.
 pub(crate) fn iso_utc_millis(t: SystemTime) -> String {
-    let dt: DateTime<Utc> = t.into();
-    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+    match system_time_to_chrono(t) {
+        Some(dt) => dt.to_rfc3339_opts(SecondsFormat::Millis, true),
+        None => {
+            warn!(
+                target: "chat::jsonl",
+                "iso_utc_millis: SystemTime out of chrono range; using sentinel"
+            );
+            ISO_UTC_MILLIS_SENTINEL.to_string()
+        }
+    }
+}
+
+/// Convert a `SystemTime` to `DateTime<Utc>` without panicking on a
+/// corrupt input. Handles both the pre-epoch case (`t < UNIX_EPOCH`)
+/// and the post-epoch overflow case
+/// (`(secs, nanos)` outside chrono's representable range).
+fn system_time_to_chrono(t: SystemTime) -> Option<DateTime<Utc>> {
+    let d = t.duration_since(UNIX_EPOCH).ok()?;
+    let secs: i64 = d.as_secs().try_into().ok()?;
+    let nanos: u32 = d.subsec_nanos();
+    DateTime::<Utc>::from_timestamp(secs, nanos)
 }
 
 /// Same canonical millisecond-precision UTC ISO-8601 string, but for an
@@ -33,9 +70,25 @@ pub(crate) fn iso_utc_millis_dt(t: DateTime<Utc>) -> String {
 }
 
 /// Per-day JSONL file path: `<dir>/<UTC-date>.jsonl` for `t`.
+///
+/// Mirrors [`iso_utc_millis`]'s out-of-range guard: a corrupt
+/// `SystemTime` that would otherwise panic the `Into<DateTime<Utc>>`
+/// conversion is logged via [`warn!`] and routed to a sentinel epoch
+/// date (`1970-01-01`) so the audit-write call still produces a
+/// well-formed path rather than aborting the caller. The sentinel
+/// filename surfaces the corruption to the operator in directory
+/// listings.
 pub(crate) fn day_file(dir: &Path, t: SystemTime) -> PathBuf {
-    let dt: DateTime<Utc> = t.into();
-    dir.join(format!("{}.jsonl", dt.date_naive()))
+    match system_time_to_chrono(t) {
+        Some(dt) => dir.join(format!("{}.jsonl", dt.date_naive())),
+        None => {
+            warn!(
+                target: "chat::jsonl",
+                "day_file: SystemTime out of chrono range; using epoch sentinel date"
+            );
+            dir.join("1970-01-01.jsonl")
+        }
+    }
 }
 
 /// Per-day JSONL file path: `<dir>/<date>.jsonl` for an already-derived
@@ -49,7 +102,7 @@ pub(crate) fn day_file_for_date(dir: &Path, date: NaiveDate) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
     use chrono::TimeZone;
 
@@ -112,6 +165,35 @@ mod tests {
             day_file(dir, after).ends_with("2024-01-16.jsonl"),
             "after-midnight path = {:?}",
             day_file(dir, after)
+        );
+    }
+
+    #[test]
+    fn iso_utc_millis_returns_sentinel_for_pre_epoch_input() {
+        // A `SystemTime` earlier than UNIX_EPOCH (e.g. a corrupt
+        // persisted-timestamp field deserialized from disk) MUST NOT
+        // panic the helper. The pre-fix `DateTime<Utc> = t.into()`
+        // would crash on this input on platforms where SystemTime can
+        // represent pre-epoch instants. The fix returns a sentinel and
+        // logs a warn; assert the sentinel shape so the audit JSONL
+        // stays parseable.
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let s = iso_utc_millis(pre_epoch);
+        assert_eq!(s, "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn day_file_returns_epoch_sentinel_for_pre_epoch_input() {
+        // Same out-of-range guard as `iso_utc_millis`: a corrupt
+        // pre-epoch SystemTime should route to the epoch-date sentinel
+        // filename, not panic.
+        let dir = Path::new("data/chat/history");
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        let p = day_file(dir, pre_epoch);
+        assert!(
+            p.ends_with("1970-01-01.jsonl"),
+            "pre-epoch path should be sentinel, got: {:?}",
+            p,
         );
     }
 

@@ -249,7 +249,7 @@ pub async fn handle_deposit_balance_queued(
     );
 
     store.orders.push_back(crate::types::Order::deposit_balance(
-        actual_amount,
+        credited_diamonds,
         user_uuid.clone(),
     ));
 

@@ -17,8 +17,21 @@
 //! it's the security-load-bearing piece.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+/// Per-process disambiguator for rotated `pending_adjustments` filenames.
+///
+/// Stamp-only naming (`pending_adjustments.<YYYYMMDDTHHMMSSZ>.jsonl`) is
+/// second-precision, so two rotations in the same UTC second — e.g. a
+/// size-cap rotation followed within ~1s by a retry — would land on the
+/// same destination and `fs::rename` would silently overwrite the prior
+/// rotated batch (CHAT.md two-stage-poisoning evidence). A
+/// monotonically-bumped suffix keeps each rotated archive distinct
+/// within one run; mirrors the same-named statics in
+/// `store::journal`, `store::queue`, `store::trade_state`.
+static ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One pending entry. Written by the classifier when `ai_callout.detected`,
 /// consumed by the reflection pass.
@@ -290,24 +303,133 @@ pub fn read_pending() -> std::io::Result<Vec<PendingEntry>> {
         }
         match serde_json::from_str::<PendingEntry>(line) {
             Ok(e) => out.push(e),
-            Err(e) => tracing::warn!(error = %e, line = %line, "[Chat] skipping malformed pending entry"),
+            Err(e) => {
+                // Surfacing the raw line through `tracing::warn!` would let
+                // players plant ANSI escape sequences, terminal control
+                // bytes, or log-format injection in chat — the line is
+                // verbatim untrusted input. Sanitize the same way
+                // `reasoning_filter::sanitize_reason` does (collapse
+                // control bytes to spaces, cap length) and log only that.
+                let preview = sanitize_log_preview(line);
+                tracing::warn!(error = %e, len = line.len(), preview = %preview, "[Chat] skipping malformed pending entry");
+            }
         }
     }
     Ok(out)
 }
 
+/// Defense-in-depth sanitizer for raw player-supplied bytes that may end
+/// up in `tracing::warn!` output. Mirrors
+/// `chat::reasoning_filter::sanitize_reason` (collapse control chars to
+/// spaces) but caps at 120 chars so a runaway line doesn't bloat the
+/// audit log. Kept private — the only caller is the malformed-entry
+/// warn path above.
+fn sanitize_log_preview(s: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 120;
+    let collapsed: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = collapsed.trim();
+    if trimmed.chars().count() <= MAX_PREVIEW_CHARS {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().take(MAX_PREVIEW_CHARS).collect()
+    }
+}
+
 /// After a successful pass, atomically rotate the pending file out of
 /// the way so a fresh batch starts empty (CHAT.md crash-recovery
 /// shape: rename to `pending_adjustments.<UTC>.jsonl`).
-pub fn rotate_pending() -> std::io::Result<()> {
+///
+/// Returns the rotated path so callers (notably [`run_pass`]) can
+/// quarantine the snapshot to a `.failed.jsonl` sibling if a downstream
+/// step (Haiku call, adjustments write) fails after the rotation.
+///
+/// Collision handling: stamp resolution is only one second, so two
+/// rotations in the same UTC second would collide. We use
+/// [`ARCHIVE_SEQ`] + a bump-suffix loop so each rotated archive is
+/// distinct — same pattern as `fsutil::pick_archive_path`, adapted for
+/// the JSONL naming the retention sweep expects.
+pub fn rotate_pending() -> std::io::Result<std::path::PathBuf> {
+    rotate_pending_with_kind("")
+}
+
+/// Same as [`rotate_pending`] but writes to
+/// `pending_adjustments.<stamp>.failed.jsonl`. Used when a downstream
+/// step in [`run_pass`] fails *after* the rotation: the entries must
+/// not be silently lost, but we also don't want the retention sweep to
+/// later confuse them with successfully-processed batches.
+fn rotate_pending_failed_from(rotated: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    // The rotated archive already exists at `rotated`. Pick a `.failed`
+    // sibling with the same stamp/seq family and `fs::rename` onto it.
+    // We accept the (rare) case where the matching `.failed` slot is
+    // occupied: bump until we find a free one.
+    let file_stem = rotated
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("rotated path has no filename"))?
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| std::io::Error::other("rotated path missing .jsonl suffix"))?
+        .to_string();
+    let parent = rotated.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let primary = parent.join(format!("{file_stem}.failed.jsonl"));
+    let mut candidate = primary;
+    let mut bump: u32 = 0;
+    while candidate.exists() && bump < 1000 {
+        bump += 1;
+        candidate = parent.join(format!("{file_stem}.failed-{bump}.jsonl"));
+    }
+    if candidate.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "rotate_pending_failed exhausted bump suffixes",
+        ));
+    }
+    std::fs::rename(rotated, &candidate)?;
+    Ok(candidate)
+}
+
+/// Common rotation routine. `kind` is `""` for the success path
+/// (sweep-matched `pending_adjustments.<stamp>.jsonl`) — the
+/// `.failed.jsonl` quarantine path is handled by
+/// [`rotate_pending_failed_from`] *after* a successful rotation.
+fn rotate_pending_with_kind(kind: &str) -> std::io::Result<std::path::PathBuf> {
     let p = std::path::Path::new(PENDING_FILE);
     if !p.exists() {
-        return Ok(());
+        // Caller can treat a missing pending file as a no-op: return a
+        // sentinel path the caller can `exists()`-check.
+        return Ok(std::path::PathBuf::new());
     }
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let dest = std::path::Path::new("data/chat")
-        .join(format!("pending_adjustments.{stamp}.jsonl"));
-    std::fs::rename(p, dest)
+    let parent = std::path::Path::new("data/chat");
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let seq = ARCHIVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let kind_part = if kind.is_empty() {
+        String::new()
+    } else {
+        format!(".{kind}")
+    };
+    // Primary candidate includes the seq so within-process collisions
+    // are impossible even at the same UTC second.
+    let primary = parent.join(format!(
+        "pending_adjustments.{stamp}-{seq}{kind_part}.jsonl"
+    ));
+    let mut candidate = primary;
+    let mut bump: u32 = 0;
+    while candidate.exists() && bump < 1000 {
+        bump += 1;
+        candidate = parent.join(format!(
+            "pending_adjustments.{stamp}-{seq}-{bump}{kind_part}.jsonl"
+        ));
+    }
+    if candidate.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "rotate_pending exhausted bump suffixes",
+        ));
+    }
+    std::fs::rename(p, &candidate)?;
+    Ok(candidate)
 }
 
 /// Drive a complete reflection pass: read pending, ask Haiku to
@@ -333,6 +455,16 @@ pub async fn run_pass(
     if pending.is_empty() {
         return Ok(outcome);
     }
+    // Rotate BEFORE awaiting Haiku. Previously the order was
+    // read → Haiku (~30s) → write adjustments → rotate, which meant a
+    // crash (or `BotDisconnected`) between the adjustments write and
+    // the rotate left the live pending file intact — the next
+    // reflection pass would then re-process the same entries and
+    // duplicate the same lessons into `adjustments.md`. Rotating first
+    // makes the snapshot crash-safe; on a downstream Haiku failure we
+    // quarantine it to `pending_adjustments.<stamp>.failed.jsonl` so
+    // entries are never silently lost.
+    let rotated_path = rotate_pending().map_err(|e| format!("rotate pending: {e}"))?;
     // Wrap each trigger in nonce-tagged untrusted markers so the
     // reflection model can't be hijacked by player-planted text.
     let mut payload = String::new();
@@ -391,9 +523,26 @@ pub async fn run_pass(
         tools: vec![],
     };
 
-    let resp = crate::chat::client::call_with_retry(api_key, &req, false)
-        .await
-        .map_err(|e| format!("reflection call failed: {e}"))?;
+    let resp = match crate::chat::client::call_with_retry(api_key, &req, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Haiku failed AFTER we rotated. Quarantine the rotated
+            // snapshot to `pending_adjustments.<stamp>.failed.jsonl` so
+            // the entries aren't lost — an operator (or a future repair
+            // pass) can decide whether to merge them back in.
+            if rotated_path.as_os_str().is_empty() {
+                // Nothing was rotated (file didn't exist) — nothing to
+                // quarantine, just surface the error.
+            } else if let Err(quar_err) = rotate_pending_failed_from(&rotated_path) {
+                tracing::warn!(
+                    rotated = %rotated_path.display(),
+                    error = %quar_err,
+                    "[Chat] reflection: failed to quarantine rotated snapshot to .failed.jsonl"
+                );
+            }
+            return Err(format!("reflection call failed: {e}"));
+        }
+    };
     outcome.haiku_input_tokens = resp.usage.input_tokens;
     outcome.haiku_output_tokens = resp.usage.output_tokens;
     outcome.haiku_cache_creation_input_tokens = resp.usage.cache_creation_input_tokens;
@@ -406,7 +555,23 @@ pub async fn run_pass(
         }
     }
     // Same brace-matched JSON extraction as classifier::parse_verdict.
-    let lessons = parse_lessons(&text_buf)?;
+    let lessons = match parse_lessons(&text_buf) {
+        Ok(v) => v,
+        Err(e) => {
+            // Haiku replied but we couldn't parse it. Same quarantine
+            // logic as the call-failure path above.
+            if !rotated_path.as_os_str().is_empty() {
+                if let Err(quar_err) = rotate_pending_failed_from(&rotated_path) {
+                    tracing::warn!(
+                        rotated = %rotated_path.display(),
+                        error = %quar_err,
+                        "[Chat] reflection: failed to quarantine rotated snapshot to .failed.jsonl"
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
 
     let pending_refs: Vec<&PendingEntry> = pending.iter().collect();
     let mut admitted_text = String::new();
@@ -440,11 +605,26 @@ pub async fn run_pass(
             new_body.push('\n');
         }
         new_body.push_str(&admitted_text);
-        crate::fsutil::write_atomic(ADJUSTMENTS_FILE, &new_body)
-            .map_err(|e| format!("write adjustments.md: {e}"))?;
+        if let Err(e) = crate::fsutil::write_atomic(ADJUSTMENTS_FILE, &new_body) {
+            // adjustments.md write failed — quarantine the rotated
+            // snapshot so admitted lessons that DIDN'T make it to disk
+            // aren't silently dropped along with the rotation.
+            if !rotated_path.as_os_str().is_empty() {
+                if let Err(quar_err) = rotate_pending_failed_from(&rotated_path) {
+                    tracing::warn!(
+                        rotated = %rotated_path.display(),
+                        error = %quar_err,
+                        "[Chat] reflection: failed to quarantine rotated snapshot to .failed.jsonl"
+                    );
+                }
+            }
+            return Err(format!("write adjustments.md: {e}"));
+        }
     }
 
-    rotate_pending().map_err(|e| format!("rotate pending: {e}"))?;
+    // Rotation already happened up-front (see top of run_pass); the
+    // successful-path rotated snapshot at `rotated_path` is the
+    // canonical archive of this batch.
     Ok(outcome)
 }
 

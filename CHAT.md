@@ -1344,7 +1344,8 @@ Operator-editable when the chat task is stopped. **NOT** LLM-writable.
   "model_404_backoff_until": "<UTC ISO>|null",
   "composer_throttle_backoff_until": "<UTC ISO>|null",
   "persona_regen_cooldown_until": "<UTC ISO>|null",
-  "history_drops_today": 0
+  "history_drops_today": 0,
+  "events_dropped_during_composer": 0
 }
 ```
 

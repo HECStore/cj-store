@@ -11,8 +11,8 @@ use azalea::pathfinder::PathfinderClientExt;
 use tracing::{debug, info, warn};
 
 use crate::constants::{
-    DELAY_MEDIUM_MS, NAVIGATION_MAX_RETRIES,
-    RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay,
+    DELAY_MEDIUM_MS, NAVIGATION_MAX_ATTEMPTS,
+    RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay_jittered,
 };
 use crate::types::{Chest, Position};
 use super::Bot;
@@ -115,7 +115,7 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
 
 /// Navigate to a position using pathfinding with retry logic.
 /// Uses Azalea's built-in pathfinding to walk to the target position.
-/// Retries up to NAVIGATION_MAX_RETRIES times if pathfinding times out.
+/// Retries up to NAVIGATION_MAX_ATTEMPTS times if pathfinding times out.
 ///
 /// # Arguments
 /// * `bot` - Bot instance
@@ -124,25 +124,27 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
 /// # Errors
 /// Returns an error with context including current and target positions if:
 /// - Bot is not connected
-/// - All retry attempts fail to reach the target
+/// - All attempts fail to reach the target
 pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), String> {
-    for attempt in 0..NAVIGATION_MAX_RETRIES {
+    for attempt in 0..NAVIGATION_MAX_ATTEMPTS {
         if attempt > 0 {
-            // Exponential backoff between retries: transient pathfinding failures
-            // are often caused by chunk loading, server lag, or temporary mob
-            // obstruction, so waiting progressively longer gives the world state
-            // a chance to settle before we ask Azalea to recompute the path.
-            // Capped at RETRY_MAX_DELAY_MS to avoid unbounded stalls.
-            let delay_ms = exponential_backoff_delay(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
+            // Exponential backoff with equal jitter between attempts: transient
+            // pathfinding failures are often caused by chunk loading, server
+            // lag, or temporary mob obstruction, so waiting progressively
+            // longer (with jitter to avoid lockstep retries when multiple
+            // operations fail simultaneously) gives the world state a chance
+            // to settle before we ask Azalea to recompute the path. Capped
+            // at RETRY_MAX_DELAY_MS to avoid unbounded stalls.
+            let delay_ms = exponential_backoff_delay_jittered(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
             info!(
-                "Retry {}/{} for navigation to ({}, {}, {}) after {}ms delay",
-                attempt + 1, NAVIGATION_MAX_RETRIES,
+                "Attempt {}/{} for navigation to ({}, {}, {}) after {}ms delay",
+                attempt + 1, NAVIGATION_MAX_ATTEMPTS,
                 target.x, target.y, target.z,
                 delay_ms
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
-        
+
         match navigate_to_position_once(bot, target).await {
             Ok(true) => return Ok(()), // Successfully reached target
             Ok(false) => {
@@ -158,13 +160,13 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
                 match current {
                     Some(cur) => warn!(
                         "Navigation attempt {}/{} timed out - target: ({}, {}, {}), current: ({}, {}, {})",
-                        attempt + 1, NAVIGATION_MAX_RETRIES,
+                        attempt + 1, NAVIGATION_MAX_ATTEMPTS,
                         target.x, target.y, target.z,
                         cur.x, cur.y, cur.z
                     ),
                     None => warn!(
                         "Navigation attempt {}/{} timed out - target: ({}, {}, {}), current: unknown (bot disconnected)",
-                        attempt + 1, NAVIGATION_MAX_RETRIES,
+                        attempt + 1, NAVIGATION_MAX_ATTEMPTS,
                         target.x, target.y, target.z
                     ),
                 }
@@ -175,31 +177,47 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
             }
         }
     }
-    
-    // Best-effort semantics: after exhausting retries we deliberately return
-    // Ok(()) rather than Err. Navigation is advisory for the store workflow -
-    // the caller (chest interaction logic) will perform its own position and
-    // inventory validation, and aborting the entire task here would strand the
-    // bot mid-operation. A loud warning is logged so failures remain visible,
-    // but the pipeline is allowed to continue and recover downstream.
+
+    // Fail closed: after exhausting attempts we return Err so callers using
+    // `?` propagation (e.g. `pickup_shulker_from_station` in shulker.rs)
+    // correctly abort instead of proceeding with a stuck/disconnected bot.
+    // Previously this path returned Ok(()) "best-effort" — but the chest
+    // interaction logic that downstream caller relies on can't actually
+    // recover from a bot that's nowhere near the target node, so silent
+    // success here merely deferred the failure into a harder-to-diagnose
+    // wrong-chest interaction.
     let final_current = {
         let guard = bot.client.read().await;
         guard.as_ref().map(|c| BlockPos::from(c.entity().position()))
     };
     match final_current {
-        Some(cur) => warn!(
-            "Navigation to ({}, {}, {}) failed after {} attempts - current: ({}, {}, {}), continuing anyway",
-            target.x, target.y, target.z,
-            NAVIGATION_MAX_RETRIES,
-            cur.x, cur.y, cur.z
-        ),
-        None => warn!(
-            "Navigation to ({}, {}, {}) failed after {} attempts - current: unknown (bot disconnected), continuing anyway",
-            target.x, target.y, target.z,
-            NAVIGATION_MAX_RETRIES
-        ),
+        Some(cur) => {
+            warn!(
+                "Navigation to ({}, {}, {}) failed after {} attempts - current: ({}, {}, {})",
+                target.x, target.y, target.z,
+                NAVIGATION_MAX_ATTEMPTS,
+                cur.x, cur.y, cur.z
+            );
+            Err(format!(
+                "Navigation failed after {} attempts at ({}, {}, {}); current=({}, {}, {})",
+                NAVIGATION_MAX_ATTEMPTS,
+                target.x, target.y, target.z,
+                cur.x, cur.y, cur.z
+            ))
+        }
+        None => {
+            warn!(
+                "Navigation to ({}, {}, {}) failed after {} attempts - current: unknown (bot disconnected)",
+                target.x, target.y, target.z,
+                NAVIGATION_MAX_ATTEMPTS
+            );
+            Err(format!(
+                "Navigation failed after {} attempts at ({}, {}, {}); current=unknown (bot disconnected)",
+                NAVIGATION_MAX_ATTEMPTS,
+                target.x, target.y, target.z
+            ))
+        }
     }
-    Ok(())
 }
 
 /// Navigate to a node position (where bot stands to access the node).

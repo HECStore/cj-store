@@ -4,6 +4,11 @@ on:
   push:
     branches: [master]
   pull_request:
+  # Weekly cron drives the `security-audit` job below — fresh RustSec
+  # advisories land continuously, so we want to flag a newly-disclosed
+  # vuln in a transitive even when no PR is touching the repo.
+  schedule:
+    - cron: '0 8 * * 1'
 
 # Least-privilege: this pipeline only checks/builds/tests, so the implicit
 # GITHUB_TOKEN is restricted to read-only on repository contents. Shrinks
@@ -27,20 +32,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # Dated runner images instead of *-latest: matches the SHA-pinning
+        # convention used for actions in this file. `*-latest` silently
+        # migrates to a newer image (e.g. ubuntu-22.04 → 24.04) and can
+        # break CI without any repo change. Bump these explicitly.
+        os: [windows-2022, ubuntu-24.04]
     steps:
       # Third-party actions are SHA-pinned (Dependabot keeps them fresh via
       # the github-actions ecosystem in .github/dependabot.yml). Floating
       # major tags would let an upstream tag re-point silently change what
       # runs in CI.
+      # `persist-credentials: false` keeps the GITHUB_TOKEN out of the
+      # on-disk git config after checkout — closes the credential-exfil
+      # vector that least-privilege permissions alone don't address.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       # Linux lane needs clang + lld because .cargo/config.toml pins
       # `linker = "clang"` and `-Clink-arg=-fuse-ld=lld` for
       # x86_64-unknown-linux-gnu. Without these the cargo invocations below
       # would fail at link time.
       - name: Install clang and lld (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: sudo apt-get update && sudo apt-get install -y clang lld
 
       # The pinned dated nightly in rust-toolchain.toml is honored automatically.
@@ -48,6 +62,28 @@ jobs:
         run: rustup show
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+
+      # Parity check: the parent Cargo.toml and vendor/azalea-viaversion/
+      # Cargo.toml MUST pin azalea to the same git rev, otherwise cargo
+      # resolves two separate git sources and silently compiles two azalea
+      # instances side by side — events fire on the wrong type. See the
+      # rationale block in the parent Cargo.toml. Cheap shell guard.
+      - name: Verify azalea rev parity (parent vs vendor)
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          parent_rev=$(grep -oE 'rev = "[0-9a-f]{40}"' Cargo.toml | head -n1)
+          vendor_rev=$(grep -oE 'rev = "[0-9a-f]{40}"' vendor/azalea-viaversion/Cargo.toml | head -n1)
+          echo "parent: $parent_rev"
+          echo "vendor: $vendor_rev"
+          if [ -z "$parent_rev" ] || [ -z "$vendor_rev" ]; then
+            echo "::error::Could not extract azalea rev from one of the manifests"
+            exit 1
+          fi
+          if [ "$parent_rev" != "$vendor_rev" ]; then
+            echo "::error::azalea rev mismatch between parent Cargo.toml and vendor/azalea-viaversion/Cargo.toml"
+            exit 1
+          fi
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -64,9 +100,68 @@ jobs:
       - name: cargo test --doc
         run: cargo test --locked --doc
 
+      # `cargo check` on the workspace passes through reqwest's path-dep
+      # `azalea-viaversion`, but local edits to that vendored crate may
+      # introduce dev-dep / feature-gated breakage that only the crate
+      # itself surfaces. Cheapest gate is a direct check against its
+      # manifest so vendor-local regressions don't ship.
+      - name: cargo check (vendor/azalea-viaversion)
+        run: cargo check --locked --manifest-path vendor/azalea-viaversion/Cargo.toml
+
       # Release-profile gate: Cargo.toml enables `lto = "thin"` for release;
-      # LTO/codegen failures only surface under that profile. Operators ship
-      # from `cargo build --release`, so a release-only break must not
-      # bypass CI. `cargo check --release` is the cheap insurance variant.
-      - name: cargo check --release
-        run: cargo check --locked --release --all-targets
+      # LTO/codegen failures only surface under a real codegen step.
+      # `cargo check` skips codegen entirely and therefore would NOT catch
+      # LTO breakage. Run a real `cargo build --release` on the Linux lane
+      # only — Windows lane is the slower of the two and a release build
+      # there roughly doubles CI wall time without catching anything Linux
+      # doesn't already cover for codegen/LTO purposes.
+      - name: cargo build --release (Linux only)
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo build --locked --release --all-targets
+
+      # Rustdoc hygiene: src/main.rs sets
+      # `#![deny(rustdoc::broken_intra_doc_links)]` + invalid_html_tags.
+      # `RUSTDOCFLAGS: -D warnings` makes every other rustdoc warning
+      # (missing-code-example link target, bare-URL, etc.) also fail CI.
+      # `--document-private-items` ensures the private modules that the
+      # daemon is mostly made of actually get scanned.
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --document-private-items
+
+  # Supply-chain audit. Runs on push/PR/cron (cron defined at top of file)
+  # so newly-disclosed advisories show up on master even with no code change.
+  # Kept as a separate job so a slow advisory database fetch can't slow the
+  # main matrix and so its failure mode is distinct from a code regression.
+  security-audit:
+    name: cargo audit + cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          # Distinct cache namespace so the audit job's tool-install
+          # artifacts don't collide with the build matrix cache.
+          shared-key: security-audit
+
+      # `--locked` keeps the installed tool versions reproducible against
+      # whatever Cargo.lock currently records inside each tool's own crate.
+      - name: Install cargo-audit and cargo-deny
+        run: cargo install --locked cargo-audit cargo-deny
+
+      # `--deny warnings` upgrades yanked-crate warnings to errors —
+      # matches `clippy -D warnings` posture for the rest of CI.
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+      # Full sweep: advisories, banned crates / duplicate versions,
+      # license allowlist, and source registry/git allowlist.
+      - name: cargo deny
+        run: cargo deny check advisories bans licenses sources

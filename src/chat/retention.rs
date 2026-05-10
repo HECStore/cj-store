@@ -17,7 +17,6 @@
 //!   rotated sub-files.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -34,6 +33,15 @@ pub struct SweepReport {
     pub pending_self_memory_deleted: usize,
     pub persona_archives_deleted: usize,
     pub markdown_archives_deleted: usize,
+    /// Dates seen on a `history/<date>.jsonl` whose paired
+    /// `history/<date>.uuids.json` was missing entirely (i.e. an
+    /// overlay was never written, or was already pruned).
+    pub history_without_overlay: usize,
+    /// Dates seen on a `history/<date>.uuids.json` whose paired
+    /// `history/<date>.jsonl` was missing entirely. Surfaces a UUID
+    /// overlay that points at non-existent rows — typically the
+    /// fingerprint of a half-completed earlier sweep.
+    pub orphan_overlay: usize,
 }
 
 impl SweepReport {
@@ -65,22 +73,16 @@ pub struct SweepConfig {
 pub fn run_sweep(config: &SweepConfig) -> SweepReport {
     let mut r = SweepReport::default();
 
-    // History + paired overlays.
+    // History + paired overlays: walked together so a successful jsonl
+    // delete with a failed uuids.json delete (or vice-versa) doesn't leave
+    // a dangling overlay pointing at non-existent rows.
     let history_dir = config.chat_dir.join("history");
     if history_dir.exists() {
-        sweep_dated_jsonl(
+        sweep_history_paired(
             &history_dir,
-            "jsonl",
             config.history_retention_days,
             config.today,
-            &mut r.history_deleted,
-        );
-        sweep_dated_jsonl(
-            &history_dir,
-            "uuids.json",
-            config.history_retention_days,
-            config.today,
-            &mut r.overlays_deleted,
+            &mut r,
         );
     }
 
@@ -132,7 +134,7 @@ pub fn run_sweep(config: &SweepConfig) -> SweepReport {
         );
     }
 
-    if r.total() > 0 {
+    if r.total() > 0 || r.history_without_overlay > 0 || r.orphan_overlay > 0 {
         info!(
             history = r.history_deleted,
             decisions = r.decisions_deleted,
@@ -141,6 +143,8 @@ pub fn run_sweep(config: &SweepConfig) -> SweepReport {
             pending_self = r.pending_self_memory_deleted,
             persona_archives = r.persona_archives_deleted,
             markdown_archives = r.markdown_archives_deleted,
+            history_without_overlay = r.history_without_overlay,
+            orphan_overlay = r.orphan_overlay,
             "[Chat] retention sweep deleted files"
         );
     } else {
@@ -193,7 +197,122 @@ fn sweep_dated_jsonl(
     }
 }
 
-/// Sweep rotated pending files: `<prefix>.<YYYYMMDDTHHMMSSZ>.jsonl`.
+/// Sweep history `.jsonl` and `.uuids.json` siblings as a single unit.
+///
+/// The earlier two-call approach (one `sweep_dated_jsonl` per extension)
+/// could delete one sibling while leaving the other — typically a
+/// `.uuids.json` overlay whose `.jsonl` rows had already been removed,
+/// pointing at nothing. This pass enumerates candidate dates first,
+/// then for each date deletes BOTH siblings (or neither, on a partial
+/// failure). Orphan-without-history and history-without-overlay are
+/// surfaced in the [`SweepReport`] so dashboards can see them.
+fn sweep_history_paired(
+    dir: &Path,
+    retain_days: u32,
+    today: DateTime<Utc>,
+    report: &mut SweepReport,
+) {
+    use std::collections::BTreeMap;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "could not list dir for sweep");
+            return;
+        }
+    };
+    // For each date, track whether we saw a `.jsonl`, a `.uuids.json`, or both.
+    let mut by_date: BTreeMap<String, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Extract owned classification first so the `name` borrow drops
+        // before we move `path` into the map.
+        // Order matters: `.uuids.json` ends in `.json` too, so check the
+        // compound suffix FIRST.
+        enum Kind {
+            History,
+            Overlay,
+        }
+        let parsed: Option<(String, Kind)> = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|name| {
+                if let Some(date_part) = name.strip_suffix(".uuids.json") {
+                    if parse_date_str(date_part).is_some() {
+                        return Some((date_part.to_string(), Kind::Overlay));
+                    }
+                } else if let Some(date_part) = name.strip_suffix(".jsonl") {
+                    if parse_date_str(date_part).is_some() {
+                        return Some((date_part.to_string(), Kind::History));
+                    }
+                }
+                None
+            });
+        if let Some((date_str, kind)) = parsed {
+            let slot = by_date.entry(date_str).or_default();
+            match kind {
+                Kind::History => slot.0 = Some(path),
+                Kind::Overlay => slot.1 = Some(path),
+            }
+        }
+    }
+    for (date_str, (jsonl_path, overlay_path)) in by_date {
+        let Some(file_date) = parse_date_str(&date_str) else {
+            continue;
+        };
+        if days_between(file_date, today) <= retain_days as i64 {
+            // Within retention. Still surface anomalies for visibility.
+            match (&jsonl_path, &overlay_path) {
+                (Some(_), None) => report.history_without_overlay += 1,
+                (None, Some(_)) => report.orphan_overlay += 1,
+                _ => {}
+            }
+            continue;
+        }
+        // Past retention. Try to delete both siblings; only count
+        // successes. A failure on one logs a warn but doesn't block
+        // the other — leaving a partial state on disk is no worse than
+        // the prior independent-sweep behavior, and the dashboard will
+        // notice next sweep via the orphan counters.
+        if let Some(p) = &jsonl_path {
+            match fs::remove_file(p) {
+                Ok(()) => report.history_deleted += 1,
+                Err(e) => {
+                    warn!(path = %p.display(), error = %e, "sweep delete (history) failed");
+                }
+            }
+        } else {
+            // Overlay-only past retention: still record as orphan
+            // before we delete it, so the dashboard sees the prior
+            // partial-sweep fingerprint.
+            report.orphan_overlay += 1;
+        }
+        if let Some(p) = &overlay_path {
+            match fs::remove_file(p) {
+                Ok(()) => report.overlays_deleted += 1,
+                Err(e) => {
+                    warn!(path = %p.display(), error = %e, "sweep delete (overlay) failed");
+                }
+            }
+        } else if jsonl_path.is_some() {
+            // History-only past retention: no overlay was ever written
+            // (or it was already pruned). Surface for visibility.
+            report.history_without_overlay += 1;
+        }
+    }
+}
+
+/// Sweep rotated pending files: `<prefix>.<YYYYMMDDTHHMMSSZ>[-<seq>[-<bump>]][.failed[-<bump>]].jsonl`.
+///
+/// Accepts the broader grammar because `reflection::rotate_pending` now
+/// uses an `ARCHIVE_SEQ` + bump-suffix-on-collision pattern (so two
+/// rotations in the same UTC second don't overwrite each other), and the
+/// `.failed.jsonl` variant for Haiku-failure quarantine. The leading
+/// `<YYYYMMDDTHHMMSSZ>` stamp remains canonical — anything after the
+/// first `-` (or `.`) following it is decoration we ignore for age
+/// purposes.
 fn sweep_rotated_pending(
     chat_dir: &Path,
     prefix: &str,
@@ -222,10 +341,17 @@ fn sweep_rotated_pending(
         let Some(rest) = name.strip_prefix(&p_prefix) else {
             continue;
         };
-        let Some(stamp) = rest.strip_suffix(p_suffix) else {
+        let Some(rest_no_ext) = rest.strip_suffix(p_suffix) else {
             continue;
         };
-        let Some(file_date) = parse_compact_utc_stamp(stamp) else {
+        // Extract the leading `<YYYYMMDDTHHMMSSZ>` stamp. The compact
+        // grammar is fixed-width (16 chars), so just slice the leading
+        // segment up to the first non-stamp char.
+        let stamp_segment = rest_no_ext
+            .split(|c: char| c == '-' || c == '.')
+            .next()
+            .unwrap_or(rest_no_ext);
+        let Some(file_date) = parse_compact_utc_stamp(stamp_segment) else {
             continue;
         };
         if days_between(file_date, today) > retain_days as i64 {
@@ -256,33 +382,32 @@ fn sweep_persona_archives(chat_dir: &Path, max: u32, out: &mut usize) {
             return;
         }
     };
-    let mut archives: Vec<(PathBuf, String)> = Vec::new();
+    let mut archives: Vec<(PathBuf, DateTime<Utc>)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        // Extract the owned stamp string first, dropping the borrow on
+        // Parse the stamp into a `DateTime<Utc>` first, dropping the borrow on
         // `path` before we move `path` into the vec.
-        let stamp_owned: Option<String> = path
+        let parsed: Option<DateTime<Utc>> = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|name| name.strip_prefix("persona.md.").map(str::to_string))
-            .filter(|stamp| parse_compact_utc_stamp(stamp).is_some());
-        if let Some(stamp) = stamp_owned {
-            archives.push((path, stamp));
+            .and_then(|name| name.strip_prefix("persona.md."))
+            .and_then(parse_compact_utc_stamp);
+        if let Some(dt) = parsed {
+            archives.push((path, dt));
         }
     }
     if archives.len() <= max as usize {
         return;
     }
-    // Sort by stamp ascending → oldest first. Relies on parse_compact_utc_stamp's
-    // strict fixed-width `YYYYMMDDTHHMMSSZ` grammar, which makes lexicographic
-    // string ordering equal to chronological ordering. If that grammar is
-    // ever loosened (fractional seconds, non-zero-padded fields), this sort
-    // would silently invert delete order — start wiping the newest archives
-    // instead of the oldest. Re-pin in tests if the grammar ever changes.
-    archives.sort_by(|a, b| a.1.cmp(&b.1));
+    // Sort by parsed `DateTime<Utc>` ascending → oldest first. The earlier
+    // implementation sorted by lexicographic stamp string, which only happens
+    // to match chronological order because the grammar is fixed-width — a
+    // brittle coupling. Sorting on the already-parsed timestamp makes the
+    // ordering robust to any future grammar relaxation.
+    archives.sort_by_key(|(_, dt)| *dt);
     let to_delete = archives.len() - max as usize;
     for (path, _) in archives.into_iter().take(to_delete) {
         if let Err(e) = fs::remove_file(&path) {
@@ -357,9 +482,17 @@ pub fn parse_compact_utc_stamp(s: &str) -> Option<DateTime<Utc>> {
     Some(DateTime::from_naive_utc_and_offset(dt, Utc))
 }
 
+/// Whole UTC days between two timestamps. Uses `NaiveDate` arithmetic so
+/// the boundary is calendar-day-aligned regardless of the time-of-day
+/// component of `today`: a file written at 2026-04-01T00:00:00Z and a
+/// `today` of 2026-05-01T23:59:59Z is 30 days, not 30.999... that flooring
+/// `(secs / 86_400)` rounds down to 30 on the day boundary and 29 the
+/// minute before — both wrong against a calendar-day retention policy.
 fn days_between(older: DateTime<Utc>, newer: DateTime<Utc>) -> i64 {
-    let secs = newer.timestamp() - older.timestamp();
-    secs / 86_400
+    newer
+        .date_naive()
+        .signed_duration_since(older.date_naive())
+        .num_days()
 }
 
 /// Detect whether the chat-task should run a sweep right now. The
@@ -376,15 +509,10 @@ pub fn sweep_due_today(last_sweep_day: Option<&str>) -> Option<String> {
 }
 
 
-// io::Result is referenced indirectly via error handling above; pull
-// the import into scope to satisfy unused-import lints in some build
-// configurations.
-#[allow(unused_imports)]
-use io::Result as _IoResult;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::time::Duration;
 
     /// Scratch chat-dir laid out like `data/chat/`. Cleanup via Drop.

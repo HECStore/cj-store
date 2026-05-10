@@ -53,28 +53,15 @@ impl OnlinePlayers {
     /// Mark a player as joined. Idempotent — re-joins refresh `last_seen`
     /// but preserve `first_seen`. Empty / non-Mojang-shaped names are
     /// rejected to keep system-sender shrapnel out of the roster.
+    /// Returns `true` when the call admitted the name (whether or not
+    /// it was a fresh insert); the `false` return is reserved for the
+    /// validation-rejected case only, preserving the previous contract.
     pub fn mark_joined(&mut self, username: &str) -> bool {
-        let mut buf = [0u8; 16];
-        let Some(lc_str) = ascii_lc_buf(username, &mut buf) else {
-            return false;
-        };
-        let now = Instant::now();
-        if let Some(e) = self.by_lc.get_mut(lc_str) {
-            e.last_seen = now;
-            if e.username != username {
-                e.username = username.to_string();
-            }
-        } else {
-            self.by_lc.insert(
-                String::from(lc_str),
-                OnlinePlayerInfo {
-                    username: username.to_string(),
-                    first_seen: now,
-                    last_seen: now,
-                },
-            );
-        }
-        true
+        // `upsert` returns `Some(true)` for a fresh insert and
+        // `Some(false)` for an existing-entry refresh; both are
+        // legitimate joins from the caller's perspective. `None`
+        // signals a validation reject (non-Mojang-shaped name).
+        self.upsert(username).is_some()
     }
 
     /// Note that we just heard from this player (chat, whisper, etc.).
@@ -82,16 +69,34 @@ impl OnlinePlayers {
     /// chat is to be on the server, so a chat event proves liveness even
     /// when we missed the join broadcast (e.g. bot connected mid-session).
     pub fn mark_seen(&mut self, username: &str) {
+        // Same upsert dance as `mark_joined` — we don't care whether the
+        // entry was new or refreshed, just that the roster reflects the
+        // sighting. Validation rejects (non-Mojang-shaped names) are
+        // silently dropped, matching the prior contract.
+        let _ = self.upsert(username);
+    }
+
+    /// Private upsert shared by `mark_joined` and `mark_seen` so the
+    /// lc-buffer dance, the get_mut/insert branch, and the
+    /// `OnlinePlayerInfo` construction live in exactly one place.
+    /// Returns:
+    /// - `Some(true)` when the username was newly inserted,
+    /// - `Some(false)` when an existing entry was refreshed,
+    /// - `None` when the username failed the Mojang-shape gate.
+    ///
+    /// Keeping the public API unchanged (`mark_joined -> bool`,
+    /// `mark_seen -> ()`) means external callers see no semantic
+    /// difference; only the internal duplication is removed.
+    fn upsert(&mut self, username: &str) -> Option<bool> {
         let mut buf = [0u8; 16];
-        let Some(lc_str) = ascii_lc_buf(username, &mut buf) else {
-            return;
-        };
+        let lc_str = ascii_lc_buf(username, &mut buf)?;
         let now = Instant::now();
         if let Some(e) = self.by_lc.get_mut(lc_str) {
             e.last_seen = now;
             if e.username != username {
                 e.username = username.to_string();
             }
+            Some(false)
         } else {
             self.by_lc.insert(
                 String::from(lc_str),
@@ -101,6 +106,7 @@ impl OnlinePlayers {
                     last_seen: now,
                 },
             );
+            Some(true)
         }
     }
 

@@ -19,6 +19,7 @@
 //! [`From<MojangResolveError> for StoreError`].
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -96,6 +97,19 @@ pub enum StoreError {
     #[error("Mojang resolver failed: {0}")]
     MojangNetwork(String),
 
+    /// Mojang rate-limited (HTTP 429). `retry_after` is the parsed
+    /// `Retry-After` hint when Mojang supplied one, or `None` otherwise.
+    /// Preserved as a typed variant (rather than collapsed into
+    /// `MojangNetwork`) so callers that want to schedule backoff (or
+    /// short-circuit fresh callers) can match on the duration without
+    /// substring-parsing the inner `Display`. Player-facing rendering
+    /// still collapses to the generic sanitized string in `user_message()`.
+    #[error("Mojang API rate-limited{}", match .retry_after {
+        Some(d) => format!(" (retry after {}s)", d.as_secs()),
+        None => String::new(),
+    })]
+    MojangRateLimited { retry_after: Option<Duration> },
+
     /// Mojang reported the username does not exist (HTTP 204) — a known,
     /// safe-to-whisper player-facing condition. The inner `username` is
     /// the original user-supplied input and is rendered into the whisper
@@ -159,11 +173,12 @@ impl StoreError {
             | StoreError::ChestTimeout { .. }
             | StoreError::BotAckTimeout(_)
             | StoreError::BotDisconnected
-            // `MojangNetwork` collapses to GENERIC: it represents an
-            // operator-visible upstream failure, not anything the player
-            // can act on. Display still carries the typed reason for
-            // logs / `whisper_error_to_player` audit trails.
-            | StoreError::MojangNetwork(_) => Cow::Borrowed(GENERIC),
+            // `MojangNetwork` and `MojangRateLimited` collapse to GENERIC:
+            // both represent an operator-visible upstream failure, not
+            // anything the player can act on. Display still carries the
+            // typed reason for logs / `whisper_error_to_player` audit trails.
+            | StoreError::MojangNetwork(_)
+            | StoreError::MojangRateLimited { .. } => Cow::Borrowed(GENERIC),
         }
     }
 }
@@ -174,14 +189,12 @@ impl StoreError {
 /// stay grep-able from one place:
 /// - `NotFound` → `UserNotFound` (player-safe whisper, name passed through)
 /// - `InvalidShape` → `ValidationError` (player typed garbage, tell them)
-/// - everything else (network / timeout / upstream / decode / rate-limited) →
+/// - `RateLimited` → `MojangRateLimited` (typed, retains `retry_after` for
+///   schedulers that want to back off; player gets the generic sanitized
+///   whisper from `user_message()`)
+/// - everything else (network / timeout / upstream / decode) →
 ///   `MojangNetwork` (operator-visible Display only; player gets the
-///   generic sanitized whisper from `user_message()`). The new
-///   `RateLimited` variant routes here too so callers that want to
-///   distinguish "retry later" from "upstream broken" can match on the
-///   typed `MojangResolveError` directly *before* the conversion; once
-///   collapsed into `StoreError::MojangNetwork`, the retry-after hint is
-///   only available through the inner `Display` text.
+///   generic sanitized whisper from `user_message()`).
 impl From<MojangResolveError> for StoreError {
     fn from(err: MojangResolveError) -> Self {
         match err {
@@ -191,11 +204,13 @@ impl From<MojangResolveError> for StoreError {
             MojangResolveError::InvalidShape => {
                 StoreError::ValidationError("Invalid Minecraft username".to_string())
             }
+            MojangResolveError::RateLimited { retry_after } => {
+                StoreError::MojangRateLimited { retry_after }
+            }
             other @ (MojangResolveError::NetworkTimeout
             | MojangResolveError::NetworkError
             | MojangResolveError::UpstreamError
-            | MojangResolveError::MalformedResponse
-            | MojangResolveError::RateLimited { .. }) => {
+            | MojangResolveError::MalformedResponse) => {
                 StoreError::MojangNetwork(other.to_string())
             }
         }

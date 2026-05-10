@@ -368,9 +368,24 @@ pub fn count_interactions_for_uuid(
     let mut interactions = 0u32;
     let mut distinct_days = 0u32;
     let today = chrono::Utc::now().date_naive();
-    let kind_marker = b"\"kind\":\"bot_";
+    // Build the memmem `Finder`s once outside the per-file/per-line loops
+    // so the SIMD search tables are amortized across every line of every
+    // day file. `windows().any(|w| w == n)` is O(haystack*needle); memmem
+    // is linear-in-haystack with a tiny constant.
+    let kind_finder = memchr::memmem::Finder::new(b"\"kind\":\"bot_" as &[u8]);
+    let uuid_finder = memchr::memmem::Finder::new(target_uuid.as_bytes());
     let username_lc_bytes = partner_username_lc.as_bytes();
-    let uuid_bytes = target_uuid.as_bytes();
+    let username_finder = if username_lc_bytes.is_empty() {
+        None
+    } else {
+        Some(memchr::memmem::Finder::new(username_lc_bytes))
+    };
+    // Reusable per-line buffer: `BufReader::lines()` allocates a fresh
+    // `String` per call, which for a 50K-line history file is 50K small
+    // allocations. `read_until(b'\n', &mut buf)` reuses one heap buffer
+    // for the whole pass.
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    let mut lc_buf: Vec<u8> = Vec::with_capacity(512);
     for d in 0..days_back as i64 {
         let date = today - chrono::Duration::days(d);
         let path = crate::chat::jsonl::day_file_for_date(history_dir, date);
@@ -378,13 +393,15 @@ pub fn count_interactions_for_uuid(
             Ok(f) => f,
             Err(_) => continue,
         };
-        let reader = io::BufReader::new(file);
+        let mut reader = io::BufReader::new(file);
         let mut matched_today = false;
-        for line_res in reader.lines() {
-            let line = match line_res {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
             // Cheap byte prefilter: skip the DOM parse for the 95%+ of
             // history lines that aren't bot output addressed to the
             // partner. The line must contain `"kind":"bot_` AND either
@@ -392,16 +409,38 @@ pub fn count_interactions_for_uuid(
             // partner's UUID, before we pay the JSON parse cost. The
             // username branch is a cheap PARSE-OPTIMIZATION ONLY — the
             // authoritative match below is UUID-only.
-            let bytes = line.as_bytes();
-            if !contains_bytes(bytes, kind_marker) {
+            let bytes = buf.as_slice();
+            if kind_finder.find(bytes).is_none() {
                 continue;
             }
-            if !contains_bytes_ci(bytes, username_lc_bytes)
-                && !contains_bytes(bytes, uuid_bytes)
-            {
+            let uuid_hit = uuid_finder.find(bytes).is_some();
+            let username_hit = if uuid_hit {
+                // UUID already matched — skip the CI scan entirely.
+                true
+            } else if let Some(f) = username_finder.as_ref() {
+                // Pre-lower the line once into a reused buffer (ASCII
+                // fold on the bytes: history JSON is ASCII for the
+                // structural sigils, and usernames are also ASCII). The
+                // chat content may contain non-ASCII, but those bytes
+                // can't be part of an ASCII-lowercase needle anyway.
+                lc_buf.clear();
+                lc_buf.extend(bytes.iter().map(|b| b.to_ascii_lowercase()));
+                f.find(&lc_buf).is_some()
+            } else {
+                false
+            };
+            if !username_hit {
                 continue;
             }
-            let row: HistRow = match serde_json::from_str(&line) {
+            // Lossy UTF-8 is acceptable here because the prefilter has
+            // already isolated the line as a candidate; serde_json will
+            // fail-soft below on any non-UTF-8 byte and the line will be
+            // skipped.
+            let line_str = match std::str::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let row: HistRow = match serde_json::from_str(line_str) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -438,21 +477,14 @@ struct HistRow {
     target_uuid: Option<String>,
 }
 
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-fn contains_bytes_ci(haystack: &[u8], needle_lc: &[u8]) -> bool {
-    if needle_lc.is_empty() || needle_lc.len() > haystack.len() {
-        return false;
-    }
-    haystack
-        .windows(needle_lc.len())
-        .any(|w| w.iter().zip(needle_lc).all(|(h, n)| h.eq_ignore_ascii_case(n)))
-}
+// `contains_bytes` / `contains_bytes_ci` (previously O(n*m) windows-based
+// substring scans) were removed in favor of `memchr::memmem::Finder`
+// inside `count_interactions_for_uuid`. memmem is linear-time and SIMD-
+// accelerated; the Finder is built once per call and reused across every
+// line of every day file. The CI variant pre-lowers each candidate line
+// into a reused buffer rather than reallocating a `to_lowercase()` per
+// line, with the prefilter ordered so the UUID hit (case-sensitive,
+// canonical-hyphenated) short-circuits the username CI scan.
 
 // ===== TTL cache for count_interactions_for_uuid =====================
 //

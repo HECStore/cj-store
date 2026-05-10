@@ -36,6 +36,11 @@ pub struct SafeUrl {
     pub scheme: Scheme,
     pub host: Host,
     pub url: String,
+    /// Effective TCP port — explicit `:port` if present in the URL,
+    /// otherwise the scheme default (80 for http, 443 for https). Stored
+    /// at construction time so the port is a single source of truth that
+    /// the connect path can trust without re-parsing the URL string.
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,11 +95,33 @@ impl std::fmt::Display for UrlError {
 /// [`is_denied_ip`] after `tokio::net::lookup_host` (or the custom
 /// resolver) returns.
 pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
-    // Reject control chars and whitespace up front.
-    if input
-        .chars()
-        .any(|c| c.is_control() || c == ' ' || c == '\t')
-    {
+    // Hard URL length cap — defends against DoS-on-cheap-input. The
+    // prompt-injection-driven huge URL construction case (a model coaxed
+    // into emitting a multi-megabyte URL) would otherwise burn allocator
+    // bandwidth before any validation gate fires. RFC 7230 §3.1.1
+    // recommends servers support 8000 bytes; an 8192-byte cap leaves a
+    // small margin without permitting anything pathological.
+    if input.len() > 8192 {
+        return Err(UrlError::BadFormat);
+    }
+    // Reject control chars and whitespace up front. `c.is_control()` only
+    // covers Unicode Cc (C0/C1 control bytes); explicitly add the Cf
+    // format chars that are invisible in editor / log output and could
+    // smuggle authority changes past a casual review: zero-width space
+    // U+200B, BOM U+FEFF, LTR/RTL marks U+200E/U+200F, line/paragraph
+    // separators U+2028/U+2029. The host portion already requires ASCII
+    // via `looks_like_hostname` / IP-literal forms, so this gate makes
+    // the contract explicit for the whole input string.
+    if input.chars().any(|c| {
+        c.is_control()
+            || c == ' '
+            || c == '\t'
+            || matches!(
+                c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}'
+                    | '\u{2028}' | '\u{2029}' | '\u{FEFF}'
+            )
+    }) {
         return Err(UrlError::BadFormat);
     }
     // Scheme split. Done via byte-level ASCII-case-insensitive prefix
@@ -150,13 +177,14 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
             return Err(UrlError::BadHost);
         }
         // Gate the explicit port (if any) against the allow-list. An
-        // implicit (absent) port is fine — `port_for` will substitute
-        // 80/443 per scheme, both of which are on the list.
+        // implicit (absent) port is fine — default-per-scheme below.
+        let mut effective_port = default_port_for_scheme(scheme);
         if let Some(port_str) = after.strip_prefix(':') {
             let p: u16 = port_str.parse().map_err(|_| UrlError::BadHost)?;
             if !ALLOWED_PORTS.contains(&p) {
                 return Err(UrlError::DisallowedPort(p));
             }
+            effective_port = p;
         }
         return inner
             .parse::<Ipv6Addr>()
@@ -164,6 +192,7 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
                 scheme,
                 host: Host::Ip(IpAddr::V6(ip)),
                 url: input.to_string(),
+                port: effective_port,
             })
             .map_err(|_| UrlError::BadHost);
     }
@@ -190,6 +219,8 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
         return Err(UrlError::DisallowedPort(p));
     }
 
+    let effective_port = explicit_port.unwrap_or_else(|| default_port_for_scheme(scheme));
+
     // IPv4 literal? Reject decimal, octal, hex obfuscation forms; ONLY
     // accept dotted-quad with each octet in 0-255 written in decimal
     // with no leading zeros (`0177.0.0.1` is rejected).
@@ -198,6 +229,7 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
             scheme,
             host: Host::Ip(IpAddr::V4(ip)),
             url: input.to_string(),
+            port: effective_port,
         });
     }
     // If the host LOOKS like a numeric IP address in any obfuscated
@@ -206,6 +238,7 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
     if looks_numeric_hostname(host_str)
         || looks_obfuscated_dotted_quad(host_str)
         || looks_short_numeric_hostname(host_str)
+        || looks_all_numeric_labels(host_str)
     {
         return Err(UrlError::NumericHostname);
     }
@@ -217,7 +250,18 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
         scheme,
         host: Host::Name(host_str.to_lowercase()),
         url: input.to_string(),
+        port: effective_port,
     })
+}
+
+/// Default scheme port — 80 for http, 443 for https. Used by
+/// `validate_url` to populate `SafeUrl::port` when the URL omits an
+/// explicit port.
+fn default_port_for_scheme(scheme: Scheme) -> u16 {
+    match scheme {
+        Scheme::Http => 80,
+        Scheme::Https => 443,
+    }
 }
 
 /// Detect dotted-quad-with-obfuscation: 4 dot-separated parts that each
@@ -271,6 +315,23 @@ fn parse_strict_dotted_quad(s: &str) -> Option<Ipv4Addr> {
 fn looks_short_numeric_hostname(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     if !(2..=3).contains(&parts.len()) {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Catches all-digit hostnames with 5+ labels (e.g. `127.0.0.0.1`) that
+/// fall through both `looks_obfuscated_dotted_quad` (4 parts) and
+/// `looks_short_numeric_hostname` (2-3 parts). Also catches any other
+/// length where every label is purely numeric — RFC 3696 §2 forbids
+/// all-numeric TLDs, so a final all-digit label combined with all-digit
+/// preceding labels is never a legitimate hostname. Belt-and-suspenders
+/// against POSIX/Windows resolvers expanding novel numeric forms.
+fn looks_all_numeric_labels(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() < 2 {
         return false;
     }
     parts
@@ -381,6 +442,21 @@ fn is_denied_ipv4(ip: Ipv4Addr) -> bool {
     // 198.18.0.0/15 — RFC 2544 benchmarking. Routinely live on internal lab
     // networks (Cisco inter-VRF benchmarking, F5 BIG-IP defaults).
     if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        return true;
+    }
+    // RFC 5737 TEST-NET documentation ranges — must never appear on the
+    // public Internet. A resolver that returns one of these for a public
+    // hostname is misconfigured or hostile; treat as deny.
+    //   192.0.2.0/24    (TEST-NET-1)
+    //   198.51.100.0/24 (TEST-NET-2)
+    //   203.0.113.0/24  (TEST-NET-3)
+    if o[0] == 192 && o[1] == 0 && o[2] == 2 {
+        return true;
+    }
+    if o[0] == 198 && o[1] == 51 && o[2] == 100 {
+        return true;
+    }
+    if o[0] == 203 && o[1] == 0 && o[2] == 113 {
         return true;
     }
     false
@@ -506,6 +582,46 @@ pub fn is_denied_hostname(hostname: &str) -> bool {
     false
 }
 
+// ===== SSRF composition decision ===========================================
+
+/// Decision returned by [`decide`] — `Allow` if every gate (URL form,
+/// host deny-list, resolved-IP deny-list) passes, `Deny(reason)` with
+/// a stable snake_case reason code otherwise. Used to factor the
+/// fan-in of the URL+resolver checks out of `fetch` so it can be unit-
+/// tested without spinning up a network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny(&'static str),
+}
+
+/// Pure SSRF gate. Inputs:
+/// - `safe` — the already-validated URL (so the URL-form gates have
+///   already fired).
+/// - `resolved` — every IP the resolver returned (or, for `Host::Ip`,
+///   the literal address).
+///
+/// Returns `Allow` only if (a) the hostname (if any) isn't on the
+/// `is_denied_hostname` list and (b) at least one resolved IP survives
+/// `is_denied_ip` (the connect path is then pinned to the survivors).
+/// On `Deny`, the reason code is one of the constants below — chosen
+/// so each branch can be asserted in tests without relying on
+/// stringly-typed prose.
+pub fn decide(safe: &SafeUrl, resolved: &[IpAddr]) -> Decision {
+    if let Host::Name(name) = &safe.host
+        && is_denied_hostname(name)
+    {
+        return Decision::Deny("hostname_denied");
+    }
+    if resolved.is_empty() {
+        return Decision::Deny("no_addrs");
+    }
+    if resolved.iter().copied().all(is_denied_ip) {
+        return Decision::Deny("all_addrs_denied");
+    }
+    Decision::Allow
+}
+
 // ===== Live fetch ==========================================================
 
 use std::net::SocketAddr;
@@ -599,22 +715,57 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         // the same domain key (it's a HashMap insert), so calling it in a
         // loop with single-element slices leaves only the LAST accepted
         // IP pinned and lets the connect path fall back to system DNS for
-        // anything else. For `Host::Ip` literals, skip the call entirely
-        // — reqwest connects directly to the URL's literal IP, and the
-        // override map keys on the URL host string which doesn't match a
-        // synthesized IP-as-name anyway.
-        if let Host::Name(name) = &safe.host {
-            builder = builder.resolve_to_addrs(name, &resolved_addrs);
-        }
+        // anything else.
+        //
+        // For `Host::Ip` literals we ALSO call `resolve_to_addrs` keyed
+        // on the literal IP string, defense-in-depth against any future
+        // reqwest regression where a literal-IP connect honors a system
+        // resolver or hosts-file override (some platforms — Windows
+        // especially — can map literal IPs via custom name resolution
+        // providers). The override key matches what reqwest extracts
+        // from the URL's host component.
+        let host_key = match &safe.host {
+            Host::Name(n) => n.clone(),
+            Host::Ip(IpAddr::V4(v4)) => v4.to_string(),
+            Host::Ip(IpAddr::V6(v6)) => v6.to_string(),
+        };
+        builder = builder.resolve_to_addrs(&host_key, &resolved_addrs);
         let client = builder
             .build()
             .map_err(|e| format!("reqwest client build failed: {e}"))?;
 
-        let resp = client
-            .get(&safe.url)
-            .send()
-            .await
-            .map_err(|e| format!("fetch failed: {e}"))?;
+        // Single retry on transient transport failures for the FIRST hop
+        // only. Retrying mid-redirect-chain is unsafe: a 3xx after one or
+        // more redirects has already let the server see *something*, and
+        // a redirect that landed on a now-failing connection might be
+        // attacker-controlled (each `Location` is re-validated, but the
+        // server's choice of where to point us is not).
+        // `is_body()` failures mean the remote server already accepted
+        // bytes — replaying would be a duplicate request, not a true retry.
+        let send_result = client.get(&safe.url).send().await;
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) if hop == 0
+                && (e.is_connect() || e.is_timeout())
+                && !e.is_body()
+                && remaining() >= std::time::Duration::from_secs(1) =>
+            {
+                tracing::debug!(
+                    host = %match &safe.host {
+                        Host::Name(n) => n.clone(),
+                        Host::Ip(ip) => ip.to_string(),
+                    },
+                    err_kind = if e.is_timeout() { "timeout" } else { "connect" },
+                    "[Chat] web_fetch first-hop transient transport error; retrying once"
+                );
+                client
+                    .get(&safe.url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("fetch failed: {e}"))?
+            }
+            Err(e) => return Err(format!("fetch failed: {e}")),
+        };
 
         // Operator-visible log of every hop (initial + each redirect).
         // Deliberately host+status only — never path/query, so secrets
@@ -694,11 +845,37 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
             }
         }
         // Streaming body read with running byte counter.
+        //
+        // The reqwest client carries a request-level timeout, but a
+        // slow-loris peer dripping bytes *just under* that ceiling can
+        // still pin the chat task for the full FETCH_TIMEOUT_SECS on
+        // every hop. The `tokio::time::timeout` around each chunk-read
+        // enforces the wall-clock budget BETWEEN chunks, so the deadline
+        // is honored even when the request-level timer hasn't yet fired.
+        //
+        // Chunk-read error semantics: fail-closed. We drop any partial
+        // body, emit a structured warn (host + partial_bytes + err_kind,
+        // never path/query — secrets in URLs must not leak via logs),
+        // and return the error to the caller. A truncated response would
+        // be worse than no response — the LLM would happily reason over
+        // an attacker-crafted prefix as if it were the full page.
         let mut body_bytes: Vec<u8> = Vec::with_capacity(8192);
         let mut total = 0usize;
         let mut stream = resp;
         loop {
-            match stream.chunk().await {
+            let chunk_res =
+                match tokio::time::timeout(remaining(), stream.chunk()).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!(
+                            host = %host_str,
+                            partial_bytes = total,
+                            "[Chat] web_fetch body read timed out"
+                        );
+                        return Err("body read deadline exceeded".to_string());
+                    }
+                };
+            match chunk_res {
                 Ok(Some(chunk)) => {
                     total = total.saturating_add(chunk.len());
                     if total > max_bytes {
@@ -709,7 +886,19 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
                     body_bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                Err(e) => return Err(format!("body chunk error: {e}")),
+                Err(e) => {
+                    // Fail-closed contract — clear the partial buffer and
+                    // surface the error so the model sees the failure
+                    // rather than a silently truncated page.
+                    body_bytes.clear();
+                    tracing::warn!(
+                        host = %host_str,
+                        partial_bytes = total,
+                        err_kind = ?classify_chunk_err(&e),
+                        "[Chat] web_fetch body chunk error"
+                    );
+                    return Err(format!("body chunk error: {e}"));
+                }
             }
         }
         // CHAT.md: plain-text-only — strip HTML tags before returning.
@@ -719,44 +908,31 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
     Err("redirect loop terminated unexpectedly".to_string())
 }
 
-fn port_for(safe: &SafeUrl) -> u16 {
-    // Parse port from URL if present, else default per scheme.
-    // SafeUrl carries the original `url` string — quickest path is to
-    // re-extract the port from there.
-    let url = &safe.url;
-    let scheme_len = match safe.scheme {
-        Scheme::Http => 7,
-        Scheme::Https => 8,
-    };
-    let after_scheme = &url[scheme_len..];
-    // Authority terminates at `/`, `?`, or `#` — must match
-    // `validate_url`'s delimiter set, otherwise an accepted URL like
-    // `http://example.com:443?x=1` leaves `443?x=1` in the port slot,
-    // u16 parsing fails, and we silently fall back to the scheme default.
-    let path_start = after_scheme
-        .find(|c: char| c == '/' || c == '?' || c == '#')
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..path_start];
-    // Strip IPv6 brackets if present.
-    let port_part = if let Some(rest) = authority.strip_prefix('[') {
-        if let Some(close) = rest.find(']') {
-            let after_close = &rest[close + 1..];
-            after_close.strip_prefix(':')
-        } else {
-            None
-        }
+/// Coarse classifier for `reqwest::Error` to give the operator log a
+/// stable, low-cardinality `err_kind` field rather than the full Display
+/// (which can carry URLs, headers, and other content too noisy / risky
+/// to drop into structured logs). Order matters — `is_timeout` is the
+/// most-specific signal.
+fn classify_chunk_err(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_body() {
+        "body"
     } else {
-        authority.rsplit_once(':').map(|(_, p)| p)
-    };
-    if let Some(p) = port_part
-        && let Ok(n) = p.parse()
-    {
-        return n;
+        "other"
     }
-    match safe.scheme {
-        Scheme::Http => 80,
-        Scheme::Https => 443,
-    }
+}
+
+fn port_for(safe: &SafeUrl) -> u16 {
+    // Single source of truth — `validate_url` populates `safe.port` at
+    // construction time so the connect path doesn't have to re-parse
+    // the URL string. Kept as a function for callsite ergonomics and
+    // to localize any future change (e.g. per-scheme overrides).
+    safe.port
 }
 
 fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
@@ -794,11 +970,13 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
     // silently masking the security implication that a new authority
     // appeared.
     if location.starts_with("//") {
-        // `scheme` already ends in `:` (it's `http://` / `https://` minus
-        // `//`)… actually it INCLUDES the trailing `//`, so just trim
-        // those two slashes and re-attach them as part of `location`.
-        // The result is `<scheme>:<location>`.
-        let scheme_only = scheme.trim_end_matches('/');
+        // `scheme` ends in exactly `//` here (the slice is `http://` or
+        // `https://`). Use `strip_suffix("//")` rather than the greedy
+        // `trim_end_matches('/')` — the latter would happily eat any
+        // run of trailing slashes if the scheme were ever stored without
+        // its terminating `//` (or with extras), masking the bug. The
+        // exact suffix-strip is idempotent and asserts the shape we expect.
+        let scheme_only = scheme.strip_suffix("//").unwrap_or(scheme);
         return Ok(format!("{scheme_only}{location}"));
     }
     // Path-absolute or path-relative — splice onto the base authority.
@@ -819,6 +997,9 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
 /// JavaScript inside `<script>` and CSS inside `<style>` would otherwise
 /// survive a naive `<…>` strip and reach the model as tool_result, where
 /// it is a reliable indirect prompt-injection vector.
+///
+/// Stored pre-lowercased so `is_skip_block` can do an ASCII case-insensitive
+/// compare via `eq_ignore_ascii_case` without re-lowering the table.
 const SKIP_BLOCK_TAGS: &[&[u8]] = &[
     b"script",
     b"style",
@@ -960,22 +1141,44 @@ fn is_skip_block(name: &[u8]) -> bool {
 }
 
 /// Find a closing `</name>` starting at `from`, case-insensitive, where
-/// the close tag is `</name`, optional ASCII whitespace, then `>`.
+/// the close tag is `</name`, optional ASCII whitespace, then `>`. On a
+/// name mismatch the scan advances to the NEXT `<` rather than the next
+/// byte — turning a quadratic O(n*m) scan into a linear pass through
+/// `memchr(b'<', …)`. This matters on adversarial input where the body
+/// is mostly `<` bytes that don't open `</name>`.
 fn find_close_tag(bytes: &[u8], from: usize, name: &[u8]) -> Option<usize> {
     let mut i = from;
     while i + 2 < bytes.len() {
-        if bytes[i] == b'<' && bytes[i + 1] == b'/' {
-            let n_start = i + 2;
-            let n_end = n_start + name.len();
-            if n_end <= bytes.len() && bytes[n_start..n_end].eq_ignore_ascii_case(name) {
-                let mut j = n_end;
-                while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
-                    j += 1;
-                }
-                if j < bytes.len() && bytes[j] == b'>' {
-                    return Some(j + 1);
-                }
-            }
+        // Jump straight to the next `<`. If none remains, no close tag.
+        match memchr(b'<', &bytes[i..]) {
+            Some(rel) => i += rel,
+            None => return None,
+        }
+        if i + 2 >= bytes.len() {
+            return None;
+        }
+        if bytes[i + 1] != b'/' {
+            // Not a close-tag opener — advance past this `<` and keep
+            // scanning. Crucially one step past the `<` so the next
+            // `memchr` doesn't re-find the same byte.
+            i += 1;
+            continue;
+        }
+        let n_start = i + 2;
+        let n_end = n_start + name.len();
+        if n_end > bytes.len() {
+            return None;
+        }
+        if !bytes[n_start..n_end].eq_ignore_ascii_case(name) {
+            i += 1;
+            continue;
+        }
+        let mut j = n_end;
+        while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'>' {
+            return Some(j + 1);
         }
         i += 1;
     }
@@ -1072,6 +1275,16 @@ fn decode_numeric_entity(body: &str) -> Option<char> {
         rest.parse().ok()?
     };
     if cp > 0x10_FFFF || (0xD800..=0xDFFF).contains(&cp) {
+        return None;
+    }
+    // Refuse to decode ASCII control chars — `&#10;` (LF), `&#13;` (CR),
+    // `&#0;` (NUL), `&#127;` (DEL), etc. Smuggling CR/LF/NUL into a
+    // tool_result text via a crafted page would otherwise let an attacker
+    // forge fresh chat lines / break log framing downstream. Pass the
+    // entity through verbatim so it appears as literal `&#10;` text and
+    // the sanitize_outbound_chat boundary remains the single source of
+    // truth for what control bytes can reach the chat sink.
+    if cp < 0x20 || cp == 0x7F {
         return None;
     }
     char::from_u32(cp)
@@ -1690,52 +1903,44 @@ mod tests {
 
     #[test]
     fn port_for_uses_default_when_unspecified() {
-        let safe = SafeUrl {
-            scheme: Scheme::Https,
-            host: Host::Name("example.com".to_string()),
-            url: "https://example.com/x".to_string(),
-        };
+        let safe = validate_url("https://example.com/x").unwrap();
         assert_eq!(port_for(&safe), 443);
-        let safe = SafeUrl {
-            scheme: Scheme::Http,
-            host: Host::Name("example.com".to_string()),
-            url: "http://example.com/".to_string(),
-        };
+        assert_eq!(safe.port, 443);
+        let safe = validate_url("http://example.com/").unwrap();
         assert_eq!(port_for(&safe), 80);
+        assert_eq!(safe.port, 80);
     }
 
     #[test]
     fn port_for_extracts_explicit_port() {
-        let safe = SafeUrl {
-            scheme: Scheme::Http,
-            host: Host::Name("example.com".to_string()),
-            url: "http://example.com:8080/path".to_string(),
-        };
-        assert_eq!(port_for(&safe), 8080);
+        // Only allow-listed ports survive validate_url; 80/443 stand in
+        // for the explicit-port path. The stored `port` field must reflect
+        // whatever the URL specified.
+        let safe = validate_url("http://example.com:80/path").unwrap();
+        assert_eq!(port_for(&safe), 80);
+        assert_eq!(safe.port, 80);
+        let safe = validate_url("https://example.com:443/path").unwrap();
+        assert_eq!(safe.port, 443);
     }
 
     #[test]
     fn port_for_extracts_explicit_port_when_authority_terminated_by_query() {
-        // Regression: authority can end at `?` (no path). Without the
-        // multi-delimiter split, `port_for` would see `443?x=1` in the
-        // port slot, fail to parse, and fall back to scheme default 80.
-        let safe = SafeUrl {
-            scheme: Scheme::Http,
-            host: Host::Name("example.com".to_string()),
-            url: "http://example.com:443?x=1".to_string(),
-        };
+        // Regression: authority can end at `?` (no path). The validator's
+        // port-extraction must split on `?`/`#`/`/` so an authority like
+        // `example.com:443?x=1` parses cleanly and `SafeUrl::port` reflects
+        // the explicit value rather than silently falling back to the
+        // scheme default.
+        let safe = validate_url("http://example.com:443?x=1").unwrap();
         assert_eq!(port_for(&safe), 443);
+        assert_eq!(safe.port, 443);
     }
 
     #[test]
     fn port_for_extracts_explicit_port_when_authority_terminated_by_fragment() {
         // Regression: authority can end at `#` (no path).
-        let safe = SafeUrl {
-            scheme: Scheme::Http,
-            host: Host::Name("example.com".to_string()),
-            url: "http://example.com:443#frag".to_string(),
-        };
+        let safe = validate_url("http://example.com:443#frag").unwrap();
         assert_eq!(port_for(&safe), 443);
+        assert_eq!(safe.port, 443);
     }
 
     #[test]
@@ -1743,11 +1948,211 @@ mod tests {
         // Regression: same bug shape for IPv6 authority — `after_close`
         // would otherwise carry `:443?x=1` and `strip_prefix(':').parse()`
         // would fail, masking the explicit port.
+        let safe = validate_url("http://[2001:db8::1]:443?x=1").unwrap();
+        assert_eq!(port_for(&safe), 443);
+        assert_eq!(safe.port, 443);
+    }
+
+    // ---- SSRF composition: decide() ------------------------------------
+    //
+    // The decision function is the pure fan-in of the URL / host /
+    // resolved-IP gates that `fetch` consults at runtime. Testing it
+    // directly lets us pin EVERY deny path without a network — the
+    // fetch glue would otherwise need fixtures for DNS, redirects, and
+    // a real socket layer.
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn decide_allows_public_host_resolving_to_public_ip() {
+        let safe = validate_url("https://example.com/").unwrap();
+        assert_eq!(decide(&safe, &[ip("8.8.8.8")]), Decision::Allow);
+    }
+
+    #[test]
+    fn decide_denies_literal_loopback_ip() {
+        // Literal-IP URL — the IP itself is on the deny-list.
         let safe = SafeUrl {
             scheme: Scheme::Http,
-            host: Host::Ip(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap())),
-            url: "http://[2001:db8::1]:443?x=1".to_string(),
+            host: Host::Ip(ip("127.0.0.1")),
+            url: "http://127.0.0.1/".to_string(),
+            port: 80,
         };
-        assert_eq!(port_for(&safe), 443);
+        assert_eq!(
+            decide(&safe, &[ip("127.0.0.1")]),
+            Decision::Deny("all_addrs_denied")
+        );
+    }
+
+    #[test]
+    fn decide_denies_literal_metadata_ip() {
+        let safe = SafeUrl {
+            scheme: Scheme::Http,
+            host: Host::Ip(ip("169.254.169.254")),
+            url: "http://169.254.169.254/".to_string(),
+            port: 80,
+        };
+        assert_eq!(
+            decide(&safe, &[ip("169.254.169.254")]),
+            Decision::Deny("all_addrs_denied")
+        );
+    }
+
+    #[test]
+    fn decide_denies_hostname_resolving_to_loopback() {
+        // DNS rebinding shape: public-looking host, resolver returns
+        // a loopback IP. The decision must trip on the resolved IP set.
+        let safe = validate_url("https://attacker.example/").unwrap();
+        assert_eq!(
+            decide(&safe, &[ip("127.0.0.1")]),
+            Decision::Deny("all_addrs_denied")
+        );
+    }
+
+    #[test]
+    fn decide_denies_hostname_resolving_to_metadata() {
+        // Same shape, AWS/GCP metadata IP — the classic SSRF target.
+        let safe = validate_url("https://attacker.example/").unwrap();
+        assert_eq!(
+            decide(&safe, &[ip("169.254.169.254")]),
+            Decision::Deny("all_addrs_denied")
+        );
+    }
+
+    #[test]
+    fn decide_denies_hostname_literal_localhost() {
+        // The hostname `localhost` itself is on the host deny-list and
+        // must fire BEFORE the IP gate so the operator log gets the
+        // right reason code (resolver-independent decision).
+        let safe = validate_url("https://localhost/").unwrap();
+        // Even with a public resolved IP, the hostname gate wins.
+        assert_eq!(
+            decide(&safe, &[ip("8.8.8.8")]),
+            Decision::Deny("hostname_denied")
+        );
+    }
+
+    #[test]
+    fn decide_redirect_to_metadata_is_denied() {
+        // A 302 → http://169.254.169.254/… is re-validated through
+        // `decide` on the redirect hop. The new URL parses as a literal
+        // metadata IP and the deny-list catches it.
+        let safe = validate_url("http://169.254.169.254/latest/meta-data").unwrap();
+        assert_eq!(
+            decide(&safe, &[ip("169.254.169.254")]),
+            Decision::Deny("all_addrs_denied")
+        );
+    }
+
+    #[test]
+    fn decide_denies_test_net_ranges() {
+        // RFC 5737 — documentation ranges that must never reach a real
+        // network. A resolver returning one of these is misconfigured /
+        // hostile and the connect path must refuse it.
+        for s in ["192.0.2.1", "198.51.100.42", "203.0.113.7"] {
+            let safe = validate_url("https://docs.example/").unwrap();
+            assert_eq!(
+                decide(&safe, &[ip(s)]),
+                Decision::Deny("all_addrs_denied"),
+                "TEST-NET addr {s} should be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_allows_when_at_least_one_resolved_ip_is_public() {
+        // Mixed resolver answer — pin to the public survivor. (`fetch`
+        // builds the pinned-IP set from `is_denied_ip`-filtered survivors;
+        // `decide`'s job is only to say "at least one is OK".)
+        let safe = validate_url("https://mixed.example/").unwrap();
+        assert_eq!(
+            decide(&safe, &[ip("10.0.0.1"), ip("8.8.8.8")]),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn decide_denies_empty_resolution() {
+        // Resolver returned no addresses — there's nothing to connect to.
+        let safe = validate_url("https://example.com/").unwrap();
+        assert_eq!(decide(&safe, &[]), Decision::Deny("no_addrs"));
+    }
+
+    // ---- length / format gate ------------------------------------------
+
+    #[test]
+    fn rejects_url_exceeding_length_cap() {
+        // Defends against DoS-on-cheap-input from prompt-injection-driven
+        // huge URL construction.
+        let host = "x".repeat(10_000);
+        let url = format!("http://{host}/");
+        assert_eq!(validate_url(&url).unwrap_err(), UrlError::BadFormat);
+    }
+
+    #[test]
+    fn rejects_zero_width_format_chars_in_authority() {
+        // Cf format chars (U+200B etc.) are invisible in editor/log
+        // output. The URL gate must refuse them up front so an injected
+        // ZWSP-bearing URL doesn't sneak past a casual reviewer.
+        for c in [
+            '\u{200B}', '\u{200E}', '\u{200F}',
+            '\u{2028}', '\u{2029}', '\u{FEFF}',
+        ] {
+            let url = format!("http://example{c}.com/");
+            assert_eq!(
+                validate_url(&url).unwrap_err(),
+                UrlError::BadFormat,
+                "Cf char {c:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_five_part_all_digit_hostname() {
+        // `looks_obfuscated_dotted_quad` only fires on 4-part forms and
+        // `looks_short_numeric_hostname` only on 2-3-part. A 5+-part
+        // all-digit hostname (e.g. `127.0.0.0.1`) must still be caught.
+        assert_eq!(
+            validate_url("http://127.0.0.0.1/").unwrap_err(),
+            UrlError::NumericHostname
+        );
+        assert_eq!(
+            validate_url("http://1.2.3.4.5.6/").unwrap_err(),
+            UrlError::NumericHostname
+        );
+    }
+
+    // ---- entity decode security ----------------------------------------
+
+    #[test]
+    fn numeric_entity_control_chars_passed_through_verbatim() {
+        // CR/LF/NUL/DEL via numeric entity is a chat-command-injection
+        // smuggling shape — decoding it would let an attacker page
+        // forge `\n/op foo` into the tool_result text. The decoder must
+        // refuse and emit the entity literally.
+        for body in ["&#10;", "&#13;", "&#0;", "&#127;", "&#x0A;", "&#x7F;"] {
+            assert_eq!(
+                strip_html_tags(body),
+                body,
+                "control-char numeric entity {body:?} should not decode"
+            );
+        }
+        // Sanity: printable codepoints still decode.
+        assert_eq!(strip_html_tags("&#65;"), "A");
+        assert_eq!(strip_html_tags("&#x41;"), "A");
+    }
+
+    // ---- resolve_relative protocol-relative idempotence ----------------
+
+    #[test]
+    fn resolve_relative_protocol_relative_idempotent_strip() {
+        // Defensive: even if the scheme slice somehow loses its trailing
+        // `//` (it doesn't today, but a refactor could), the result
+        // should still produce a syntactically valid URL — the new
+        // `strip_suffix("//")` is idempotent on mis-shaped input.
+        let r = resolve_relative("https://example.com/x", "//other.com/").unwrap();
+        assert_eq!(r, "https://other.com/");
     }
 }

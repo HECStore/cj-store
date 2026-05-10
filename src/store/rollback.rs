@@ -141,7 +141,9 @@ pub async fn deposit_transfers(
         return result;
     }
 
-    let total_amount: i32 = transfers.iter().map(|t| t.amount).sum();
+    // i64 sum + clamp guards a 50K-step plan against silent i32 overflow in
+    // the log line; this counter is log-only and not used for accounting.
+    let total_amount: i64 = transfers.iter().map(|t| i64::from(t.amount.max(0))).sum();
     info!(
         "{} Rollback START: {} step(s), returning {} x {} to storage",
         context,
@@ -231,7 +233,9 @@ pub async fn deposit_transfers(
                     );
                     result.operations_succeeded += 1;
                 }
-                result.items_returned += t.amount;
+                // saturating_add + clamp matches the sister `items_stuck_on_bot`
+                // arithmetic; a 50K-step plan must not silently overflow this i32.
+                result.items_returned = result.items_returned.saturating_add(t.amount.max(0));
             }
             Ok(Ok(Err(e))) => {
                 error!(
@@ -306,36 +310,56 @@ pub async fn rollback_amount_to_storage(
     if amount == 0 {
         return RollbackResult::default();
     }
-    // Non-mutating planner: avoids cloning storage; `apply_chest_sync` re-syncs
-    // the authoritative state per successful step in `deposit_transfers`.
-    let (mut plan, planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
+    // Non-mutating planner: avoids cloning storage and — critically — does
+    // NOT commit slot counts in `Storage` before the bot replies. Only
+    // `apply_chest_sync` (driven by the real bot reply in `deposit_transfers`)
+    // is allowed to mutate slot counts; the previous mutating-`deposit_plan`
+    // fallback would otherwise claim items the bot was still holding if the
+    // subsequent `deposit_transfers` failed.
+    let (mut plan, mut planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
     let mut unplanned = (amount - planned).max(0);
-    if unplanned > 0 {
-        // `simulate_deposit_plan` only walks existing chests — it does NOT
-        // model node growth. Order pre-flight callers WANT this so growth
-        // becomes an operator decision; rollback is the safety net and must
-        // accept growth rather than strand items already in the bot's
-        // inventory. Fall back to the mutating `deposit_plan` for the
-        // remainder, which allocates a new node if needed.
-        info!(
-            "{} Rollback simulate under-planned by {}/{}; falling back to mutating deposit_plan to absorb remainder",
-            context, unplanned, amount
-        );
-        let extra = store.storage.deposit_plan(item, unplanned, stack_size);
-        let extra_total: i32 = extra.iter().map(|t| t.amount).sum();
-        if extra_total < unplanned {
-            // `deposit_plan` is unconditional grow-on-shortfall, so this is
-            // unreachable in practice — but if it ever short-falls, the
-            // remainder really is stranded and we should report it.
-            warn!(
-                "{} Rollback grow-fallback still under-planned: deposit_plan absorbed {}/{}; {} item(s) will remain in bot inventory",
-                context, extra_total, unplanned, unplanned - extra_total
+    // `simulate_deposit_plan` only walks EXISTING chests — it does NOT model
+    // node growth. Order pre-flight callers WANT this so growth becomes an
+    // operator decision; rollback is the safety net and must accept growth
+    // rather than strand items already in the bot's inventory. Grow by
+    // calling `add_node` (the only sanctioned non-sync mutation) and re-
+    // simulate until the plan covers `amount` or growth stops helping (defense
+    // in depth against a misconfigured topology — should be unreachable).
+    let mut grow_attempts = 0usize;
+    while unplanned > 0 {
+        if grow_attempts == 0 {
+            info!(
+                "{} Rollback simulate under-planned by {}/{}; growing storage by one node and re-simulating",
+                context, unplanned, amount
             );
-            unplanned -= extra_total;
-        } else {
-            unplanned = 0;
         }
-        plan.extend(extra);
+        grow_attempts += 1;
+        // Guard against pathological loops: each `add_node` adds one empty
+        // node with `CHESTS_PER_NODE` chests, so a healthy run absorbs the
+        // shortfall within `unplanned / (CHESTS_PER_NODE * SLOTS_PER_CHEST * stack)`
+        // iterations. 16 grows is well beyond any realistic rollback.
+        if grow_attempts > 16 {
+            warn!(
+                "{} Rollback grow-fallback gave up after {} add_node iterations; {} item(s) will remain in bot inventory",
+                context, grow_attempts, unplanned
+            );
+            break;
+        }
+        store.storage.add_node();
+        let (re_plan, re_planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
+        // If a re-simulation didn't pick up MORE than before, growth isn't
+        // helping (e.g. reserved-chest rules block this item from new nodes
+        // — currently impossible since reservations apply only to node 0).
+        if re_planned <= planned {
+            warn!(
+                "{} Rollback grow-fallback added a node but simulation still planned {}/{}; aborting growth to avoid infinite loop",
+                context, re_planned, amount
+            );
+            break;
+        }
+        plan = re_plan;
+        planned = re_planned;
+        unplanned = (amount - planned).max(0);
     }
     // Populate `items_unplanned` here, BEFORE delegating: `deposit_transfers`
     // is also called by buy/operator handlers with caller-supplied plans where
@@ -765,11 +789,12 @@ mod tests {
     #[tokio::test]
     async fn rollback_surfaces_dispatch_failure_when_bot_unreachable() {
         // Storage with NO nodes at all — `simulate_deposit_plan` plans nothing,
-        // but `rollback_amount_to_storage` then falls back to the mutating
-        // `deposit_plan` which unconditionally grows a fresh node to absorb
-        // the shortfall (see the safety-net comment in `rollback.rs` —
-        // rollback must accept growth rather than strand items already in
-        // the bot's inventory). So `items_unplanned` ends at 0.
+        // but `rollback_amount_to_storage` then grows storage via `add_node`
+        // and re-simulates (the only mutation allowed before the bot replies;
+        // `apply_chest_sync` is the only path permitted to mutate slot counts)
+        // until the shortfall is absorbed (see the safety-net comment in
+        // `rollback.rs` — rollback must accept growth rather than strand items
+        // already in the bot's inventory). So `items_unplanned` ends at 0.
         //
         // The actual rollback contract this test now locks in: when the
         // bot dispatch step fails (here because no mock-bot task is

@@ -59,6 +59,10 @@ pub struct ChatStatusReport {
     pub estimated_usd_today: f64,
     pub usd_cap: f64,
     pub history_drops_today: u64,
+    /// CHAT.md — events dropped from the chat broadcast (Lagged) while the
+    /// composer was busy. Operator-visible so chronic backpressure shows
+    /// up in `Chat: status` without grepping `decisions.jsonl`.
+    pub events_dropped_during_composer: u64,
     pub moderation_backoff_until: Option<String>,
     /// CHAT.md — operator-facing fields filled by chat orchestrator.
     pub model_404_backoff_until: Option<String>,
@@ -99,6 +103,7 @@ pub struct ChatStatusReport {
 /// Phase 1 behavior: when enabled, log every received `ChatEvent` at debug
 /// level and drain the channels. Composition, persona, memory, and tools
 /// arrive in later phases.
+#[allow(clippy::too_many_arguments)]
 pub async fn chat_task(
     mut chat_events_rx: broadcast::Receiver<ChatEvent>,
     bot_tx: mpsc::Sender<BotInstruction>,
@@ -107,6 +112,14 @@ pub async fn chat_task(
     bot_username: Arc<RwLock<Option<String>>>,
     config: ChatConfig,
     history_tx: mpsc::Sender<history::HistoryItem>,
+    // Process-local counter the bot's publisher path increments on every
+    // `history_tx.try_send` failure. The chat task drains this with
+    // `std::mem::replace(*lock, 0)` once per loop iteration and folds
+    // the delta into `runtime_state.history_drops_today` so the value
+    // surfaced by `Chat: status` and `ChatStatusReport.history_drops_today`
+    // reflects every observed drop (not just drops a future writer
+    // chooses to mirror).
+    bot_history_drops: Arc<parking_lot::Mutex<u64>>,
 ) {
     if !config.enabled {
         info!("[Chat] disabled (config.chat.enabled=false), task exiting");
@@ -315,9 +328,46 @@ pub async fn chat_task(
         None
     };
 
+    // Single-slot replay buffer for a ChatCommand sniffed off
+    // chat_cmd_rx during a `process_event` call. Because mpsc has no
+    // push-front, we hold the command here and inject it at the top of
+    // the outer loop before falling back to the regular `select!`. The
+    // slot is checked-and-cleared on every iteration so a sniffed
+    // command can't sit unhandled.
+    let mut replay_chat_cmd_next_tick: Option<ChatCommand> = None;
+
     loop {
+        // Mirror any history drops the publisher recorded since the last
+        // loop iteration. Pull-with-swap (std::mem::replace(*lock, 0)) so
+        // two readers never double-count: the chat task is the sole drainer
+        // and the bot side only adds. Folded into the runtime-state daily
+        // counter via roll_to_today first, so a midnight rollover during a
+        // long composer call still attributes new drops to today, not to a
+        // saturated yesterday bucket.
+        {
+            let drained = {
+                let mut lock = bot_history_drops.lock();
+                std::mem::replace(&mut *lock, 0)
+            };
+            if drained > 0 {
+                runtime_state.roll_to_today();
+                runtime_state.history_drops_today =
+                    runtime_state.history_drops_today.saturating_add(drained);
+            }
+        }
+        // If a previous `process_event` arm sniffed a ChatCommand off
+        // `chat_cmd_rx` (preempting on Shutdown / BotDisconnected), it
+        // parked the command here. Drain it via the same match below
+        // by replacing the recv() future with a `ready` future that
+        // yields the stashed command.
+        let next_cmd_source: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<ChatCommand>> + Send>,
+        > = match replay_chat_cmd_next_tick.take() {
+            Some(cmd) => Box::pin(std::future::ready(Some(cmd))),
+            None => Box::pin(chat_cmd_rx.recv()),
+        };
         tokio::select! {
-            cmd = chat_cmd_rx.recv() => {
+            cmd = next_cmd_source => {
                 match cmd {
                     Some(ChatCommand::Shutdown { ack }) => {
                         info!("[Chat] shutdown command received, draining and exiting");
@@ -381,6 +431,8 @@ pub async fn chat_task(
                             estimated_usd_today: runtime_state.tokens_today.estimated_usd,
                             usd_cap: config.daily_dollar_cap_usd,
                             history_drops_today: runtime_state.history_drops_today,
+                            events_dropped_during_composer: runtime_state
+                                .events_dropped_during_composer,
                             moderation_backoff_until: runtime_state.moderation_backoff_until.clone(),
                             model_404_backoff_until: runtime_state.model_404_backoff_until.clone(),
                             composer_throttle_backoff_until: runtime_state
@@ -978,45 +1030,113 @@ pub async fn chat_task(
                         // observed at the run_loop iteration boundary
                         // (inside `composer::run_loop`) and around the
                         // typing-delay sleep (inside `process_event`).
-                        // We do NOT race process_event in a `tokio::select!`
-                        // here — dropping the future at any await would
-                        // skip the post-call accounting that records
-                        // tokens billed up to abort against the daily
-                        // cap and bumps tool-call meters. The post-await
-                        // `is_cancelled()` check below replicates the old
-                        // "skip backlog drain" behavior without the drop
-                        // race.
-                        let process_result = process_event(
-                            &event,
-                            &api_key,
-                            &config,
-                            &pricing,
-                            &mut runtime_state,
-                            &bot_username,
-                            &persona_body,
-                            &persona_nicknames,
-                            persona_lowercase_default,
-                            &common_words,
-                            &blocklist,
-                            &system_senders_re,
-                            &system_senders_exact,
-                            &moderation_patterns,
-                            &mut window,
-                            &mut classifier_counter,
-                            &mut spam_guard,
-                            &mut recent_speakers,
-                            &mut recent_bot_send_times,
-                            &mut last_bot_send_at,
-                            &in_critical_section,
-                            &bot_tx,
-                            &composer_limiter,
-                            &classifier_limiter,
-                            composer_cancel.clone(),
-                            &mut online_roster,
-                        )
-                        .await;
+                        // We must NOT drop the process_event future — that
+                        // would skip post-call accounting (token billing
+                        // against the daily cap + tool-call meter bumps).
+                        //
+                        // Preemption tactic: a small async "sniffer" loop
+                        // calls `chat_cmd_rx.try_recv()` periodically while
+                        // process_event runs. When it sees Shutdown or
+                        // BotDisconnected it fires `composer_cancel.cancel()`
+                        // so the in-flight composer aborts at its next yield
+                        // — without this a Shutdown received during a
+                        // multi-second composer call sat in the channel
+                        // until the composer returned. The sniffed command
+                        // is buffered (we can't requeue back into the mpsc)
+                        // and replayed by re-injecting it into the outer
+                        // command path via a single-slot replay buffer.
+                        // Non-cancel commands captured by the sniffer are
+                        // ALSO buffered (otherwise they'd be silently
+                        // dropped with no reply on the oneshot — worse than
+                        // a brief delay) and processed by the outer arm on
+                        // the next iteration via a `sniffed_cmd_replay`
+                        // single-slot.
+                        let mut sniffed_cmd: Option<ChatCommand> = None;
+                        let process_result = {
+                            let pe = process_event(
+                                &event,
+                                &api_key,
+                                &config,
+                                &pricing,
+                                &mut runtime_state,
+                                &bot_username,
+                                &persona_body,
+                                &persona_nicknames,
+                                persona_lowercase_default,
+                                &common_words,
+                                &blocklist,
+                                &system_senders_re,
+                                &system_senders_exact,
+                                &moderation_patterns,
+                                &mut window,
+                                &mut classifier_counter,
+                                &mut spam_guard,
+                                &mut recent_speakers,
+                                &mut recent_bot_send_times,
+                                &mut last_bot_send_at,
+                                &in_critical_section,
+                                &bot_tx,
+                                &composer_limiter,
+                                &classifier_limiter,
+                                composer_cancel.clone(),
+                                &mut online_roster,
+                            );
+                            tokio::pin!(pe);
+                            loop {
+                                // Stop sniffing once we've captured a single
+                                // command this turn — keeps the buffer
+                                // bounded and lets the outer loop drain the
+                                // backlog on the next iteration.
+                                if sniffed_cmd.is_some() {
+                                    break (&mut pe).await;
+                                }
+                                tokio::select! {
+                                    res = &mut pe => break res,
+                                    maybe_cmd = chat_cmd_rx.recv() => {
+                                        match maybe_cmd {
+                                            Some(cmd) => {
+                                                let is_cancel = matches!(
+                                                    cmd,
+                                                    ChatCommand::Shutdown { .. }
+                                                        | ChatCommand::BotDisconnected
+                                                );
+                                                if is_cancel && !composer_cancel.is_cancelled() {
+                                                    composer_cancel.cancel();
+                                                    decisions::write(
+                                                        &decisions::DecisionRecord::new(
+                                                            "composer_cancelled",
+                                                        )
+                                                        .with_reason(match cmd {
+                                                            ChatCommand::Shutdown { .. } =>
+                                                                "shutdown_during_process_event",
+                                                            _ =>
+                                                                "bot_disconnected_during_process_event",
+                                                        }),
+                                                    );
+                                                }
+                                                sniffed_cmd = Some(cmd);
+                                            }
+                                            None => {
+                                                // Command channel closed —
+                                                // outer loop's None arm will
+                                                // exit on the next recv().
+                                                break (&mut pe).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
                         if let Err(e) = process_result {
                             warn!(sender = %event.sender, error = %e, "[Chat] event processing error");
+                        }
+                        // If we sniffed a command above, fold it back into
+                        // the head of the chat_cmd_rx logical stream by
+                        // assigning it to `replay_chat_cmd_next_tick` —
+                        // the outer loop checks this single-slot at the top
+                        // and routes through the existing match arms.
+                        if let Some(cmd) = sniffed_cmd.take() {
+                            replay_chat_cmd_next_tick = Some(cmd);
                         }
                         if composer_cancel.is_cancelled() {
                             // Skip the backlog drain — Shutdown is exiting,
@@ -1049,6 +1169,17 @@ pub async fn chat_task(
                             b_da.cmp(&a_da)
                         });
                         for backlog_ev in backlog {
+                            // Cancellation polling: a Shutdown/BotDisconnected
+                            // received while we were processing the previous
+                            // backlog event must break the drain immediately,
+                            // not after we walk every remaining event. The
+                            // post-await `is_cancelled()` check below catches
+                            // a cancel that landed during `process_event`; this
+                            // pre-iteration check catches one that landed in
+                            // the gap between iterations.
+                            if composer_cancel.is_cancelled() {
+                                break;
+                            }
                             // Update window before processing — but skip
                             // system pseudo-senders so they don't pollute
                             // dyad detection (same reason as the live-event
@@ -1157,9 +1288,19 @@ pub async fn chat_task(
                         // history is on the publisher side, so a lag here
                         // only delays decision logic, not persistence.
                         warn!(lagged = n, "[Chat] broadcast lag (events dropped from decision pipeline; durable history unaffected)");
+                        runtime_state.roll_to_today();
+                        runtime_state.events_dropped_during_composer = runtime_state
+                            .events_dropped_during_composer
+                            .saturating_add(n);
                         decisions::write(
                             &decisions::DecisionRecord::new("broadcast_lag")
-                                .extra("lagged", serde_json::Value::from(n)),
+                                .extra("lagged", serde_json::Value::from(n))
+                                .extra(
+                                    "events_dropped_during_composer_today",
+                                    serde_json::Value::from(
+                                        runtime_state.events_dropped_during_composer,
+                                    ),
+                                ),
                         );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -1616,15 +1757,15 @@ async fn process_event(
         return Ok(());
     }
 
-    // spam guard. Record + check, all knobs from config now
-    // (no more 5/30/300 hardcodes).
-    let _ = spam_guard.record(
-        event,
-        config.spam_msgs_per_window,
-        config.spam_window_secs,
-        config.spam_cooldown_secs,
-        now,
-    );
+    // spam guard. Two-phase commit (CHAT.md): we CHECK current
+    // suppression here (read-only `is_suppressed`) but DEFER the
+    // `record` call until after the classifier decides we're engaging
+    // — that keeps events the bot ignores (early pre-filter skips,
+    // classifier-skip, classifier-says-no-respond) from polluting the
+    // sliding window, so a busy public channel where the bot ignores
+    // 95% of traffic doesn't trip cooldown on the few players the bot
+    // does engage with. `spam_pending_record` is committed AFTER the
+    // classifier verdict says we're proceeding to composer dispatch.
     let spam_suppressed = spam_guard.is_suppressed(&event.sender, now);
 
     // direct-address detection — common-words downgrade enforced.
@@ -1869,6 +2010,21 @@ async fn process_event(
     if !verdict.respond || verdict.confidence < config.classifier_min_confidence {
         return Ok(());
     }
+
+    // Two-phase spam-guard commit (CHAT.md): now that the classifier has
+    // green-lit engagement, advance the sliding window and (if applicable)
+    // engage cooldown. Skipping this for non-engaged events means raw
+    // inbound message rate no longer trips cooldown — only bot-engaged
+    // events do. The cooldown still suppresses the NEXT event from a
+    // hot sender via `spam_suppressed` above (the next event's
+    // is_suppressed read sees the cooldown timestamp set here).
+    let _ = spam_guard.record(
+        event,
+        config.spam_msgs_per_window,
+        config.spam_window_secs,
+        config.spam_cooldown_secs,
+        now,
+    );
 
     // model-404 backoff — short-circuit composer if a recent 404
     // tripped the per-model self-disable.
@@ -2360,6 +2516,10 @@ async fn process_event(
                 const MAX_SHORTEN_ITERS: u32 = 3;
                 let mut m = m;
                 let mut iters: u32 = 0;
+                // Set when the shortener observes a model-driven Reject; the
+                // loop trailer converts this into `FilterAction::Reject`
+                // rather than shipping the prior (still-over-cap) `m`.
+                let mut shorten_force_reject = false;
                 while m.chars().count() > reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT
                     && iters < MAX_SHORTEN_ITERS
                 {
@@ -2470,6 +2630,17 @@ async fn process_event(
                                     // leaving downstream truncate to cap
                                     // the prior `m` as a last resort.
                                     if verdict.action != reasoning_filter::VerdictAction::Rewrite {
+                                        // Model-driven Reject: treat as "don't
+                                        // ship this", not "keep the over-cap
+                                        // text". Other non-Rewrite verdicts
+                                        // (Send/Strip) are model bugs against
+                                        // the shorten prompt schema and we
+                                        // still bail with the prior `m` so
+                                        // downstream truncate can cap it.
+                                        let is_reject = matches!(
+                                            verdict.action,
+                                            reasoning_filter::VerdictAction::Reject
+                                        );
                                         decisions::write(
                                             &decisions::DecisionRecord::new(
                                                 "reasoning_filter_shorten_unexpected_action",
@@ -2499,8 +2670,15 @@ async fn process_event(
                                             .extra(
                                                 "reason",
                                                 serde_json::Value::from(verdict.reason),
+                                            )
+                                            .extra(
+                                                "converted_to_reject",
+                                                serde_json::Value::from(is_reject),
                                             ),
                                         );
+                                        if is_reject {
+                                            shorten_force_reject = true;
+                                        }
                                         break;
                                     }
                                     let new_m = reasoning_filter::unescape_trusted_block(
@@ -2547,6 +2725,46 @@ async fn process_event(
                                         // it as a last resort.
                                         break;
                                     }
+                                    // Leak check on the shortened text. Haiku
+                                    // re-introducing narration during the
+                                    // shortening rewrite has been observed —
+                                    // roll back to the prior `m` (which the
+                                    // first filter pass already vetted) and
+                                    // emit an audit-decision record so the
+                                    // event is visible to operators. The
+                                    // downstream truncate caps the original
+                                    // `m` to the chat-line limit.
+                                    if reasoning_filter::looks_like_reasoning_leak(&new_m) {
+                                        decisions::write(
+                                            &decisions::DecisionRecord::new(
+                                                "reasoning_filter_shorten_leak_rollback",
+                                            )
+                                            .with_sender(&event.sender)
+                                            .with_event_ts(event.recv_at)
+                                            .with_latency(
+                                                shorten_started.elapsed().as_millis() as u64,
+                                            )
+                                            .with_tokens(
+                                                resp.usage.input_tokens,
+                                                resp.usage.output_tokens,
+                                                usd,
+                                            )
+                                            .with_cache_tokens(
+                                                resp.usage.cache_creation_input_tokens,
+                                                resp.usage.cache_read_input_tokens,
+                                            )
+                                            .extra("iter", serde_json::Value::from(iters))
+                                            .extra(
+                                                "before_chars",
+                                                serde_json::Value::from(before),
+                                            )
+                                            .extra(
+                                                "after_chars",
+                                                serde_json::Value::from(after),
+                                            ),
+                                        );
+                                        break;
+                                    }
                                     m = new_m;
                                 }
                                 Err(e) => {
@@ -2586,7 +2804,38 @@ async fn process_event(
                     }
                     iters += 1;
                 }
-                reasoning_filter::FilterAction::Rewrite(m)
+                // Item 13 audit: when the iteration cap is exhausted with
+                // the message still over the chat-line limit, emit a
+                // dedicated decision record so chronic shortener failures
+                // are visible without grepping the per-iter log.
+                if iters >= MAX_SHORTEN_ITERS
+                    && m.chars().count() > reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT
+                    && !shorten_force_reject
+                {
+                    decisions::write(
+                        &decisions::DecisionRecord::new(
+                            "reasoning_filter_shorten_exhausted",
+                        )
+                        .with_sender(&event.sender)
+                        .with_event_ts(event.recv_at)
+                        .extra("iters", serde_json::Value::from(iters))
+                        .extra(
+                            "final_chars",
+                            serde_json::Value::from(m.chars().count() as u64),
+                        )
+                        .extra(
+                            "limit_chars",
+                            serde_json::Value::from(
+                                reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT as u64,
+                            ),
+                        ),
+                    );
+                }
+                if shorten_force_reject {
+                    reasoning_filter::FilterAction::Reject
+                } else {
+                    reasoning_filter::FilterAction::Rewrite(m)
+                }
             }
             other => other,
         };
@@ -3898,12 +4147,78 @@ fn persona_summary(persona_body: &str) -> String {
     chars
 }
 
+// mtime-keyed cache for memory.md / adjustments.md.
+//
+// Each function is called on EVERY chat event and EVERY proactive tick.
+// The files only change when the reflection writer runs
+// (`write_atomic` updates mtime atomically), so on a quiet writer we
+// re-read the same bytes hundreds of times per hour. Cache an
+// `Arc<String>` keyed by mtime: on read, stat the file; if mtime
+// matches return the cached `Arc<String>` clone (cheap pointer copy);
+// otherwise re-read and update the cache.
+//
+// Two separate slots keep memory.md and adjustments.md independent.
+// `parking_lot::RwLock` lets concurrent readers share the cache
+// without contention; writers (mtime changed) take the write lock
+// only on the actual re-read.
+
+#[derive(Clone, Default)]
+struct MtimeCachedFile {
+    mtime: Option<std::time::SystemTime>,
+    body: Arc<String>,
+}
+
+fn global_memory_cache() -> &'static parking_lot::RwLock<MtimeCachedFile> {
+    static CACHE: std::sync::OnceLock<parking_lot::RwLock<MtimeCachedFile>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(MtimeCachedFile::default()))
+}
+
+fn adjustments_cache() -> &'static parking_lot::RwLock<MtimeCachedFile> {
+    static CACHE: std::sync::OnceLock<parking_lot::RwLock<MtimeCachedFile>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::RwLock::new(MtimeCachedFile::default()))
+}
+
+fn read_with_mtime_cache(
+    path: &std::path::Path,
+    cache: &parking_lot::RwLock<MtimeCachedFile>,
+    fallback: impl FnOnce() -> String,
+) -> Arc<String> {
+    // Stat first; if the file is missing or unreadable, fall back to
+    // the supplied loader (mirrors existing `unwrap_or_default` shape).
+    let current_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    {
+        let guard = cache.read();
+        if guard.mtime == current_mtime && current_mtime.is_some() {
+            return guard.body.clone();
+        }
+    }
+    // Miss or mtime changed — re-read under the write lock.
+    let fresh = fallback();
+    let arc = Arc::new(fresh);
+    let mut guard = cache.write();
+    guard.mtime = current_mtime;
+    guard.body = arc.clone();
+    arc
+}
+
 fn read_global_or_empty() -> String {
-    memory::read_global_memory().unwrap_or_default()
+    let arc = read_with_mtime_cache(
+        std::path::Path::new(memory::GLOBAL_MEMORY),
+        global_memory_cache(),
+        || memory::read_global_memory().unwrap_or_default(),
+    );
+    (*arc).clone()
 }
 
 fn read_adjustments_or_empty() -> String {
-    memory::read_adjustments().unwrap_or_default()
+    let arc = read_with_mtime_cache(
+        std::path::Path::new(memory::ADJUSTMENTS),
+        adjustments_cache(),
+        || memory::read_adjustments().unwrap_or_default(),
+    );
+    (*arc).clone()
 }
 
 /// Build the composer's online-players prompt block, with one short
@@ -3912,10 +4227,81 @@ fn read_adjustments_or_empty() -> String {
 /// chars so the block doesn't blow up the prompt when the server is
 /// busy.
 ///
-/// The closure does only on-disk work (cached UUID lookup + memory
-/// file read) so it stays cheap on a hot path.
-fn build_online_players_block(roster: &online_players::OnlinePlayers) -> String {
-    roster.format_for_composer(|username| memory_one_liner_for(username))
+/// The hot disk path is `memory_one_liner_for` — a synchronous
+/// `fs::read_to_string` per online player. The 5-second per-process
+/// LRU TTL cache (mirroring the trust cache in `memory.rs`) absorbs
+/// repeated composer dispatches within a short window so back-to-back
+/// events don't re-read the same files. Cache misses still touch
+/// disk synchronously, but the per-player budget is small (one file
+/// per online player, capped at a few hundred). We do not wrap the
+/// whole block in `spawn_blocking` because `OnlinePlayers` borrows
+/// across the await would require either a `Clone` impl (out of scope
+/// for this cluster) or a stable snapshot helper — the cache plus the
+/// short per-player file size keeps the runtime-worker latency cost
+/// bounded.
+fn build_online_players_block(
+    roster: &online_players::OnlinePlayers,
+) -> String {
+    roster.format_for_composer(|username| memory_one_liner_for_cached(username))
+}
+
+// Per-process TTL cache for `memory_one_liner_for` — mirrors the
+// trust-cache pattern in chat/memory.rs but keyed by username only
+// (the underlying inputs are UUID-keyed but resolved via
+// `lookup_cached_uuid`, and the username surface is what the roster
+// hands us). 5-second TTL is short enough that an operator hand-
+// editing a player's memory file sees the change within one
+// composer-call interval, and long enough to absorb every
+// composer/proactive dispatch in a busy chat burst.
+const MEMORY_ONELINER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+const MEMORY_ONELINER_CACHE_MAX_ENTRIES: usize = 256;
+
+struct MemoryOneLinerCacheEntry {
+    inserted_at: std::time::Instant,
+    value: Option<String>,
+}
+
+fn memory_oneliner_cache(
+) -> &'static parking_lot::Mutex<HashMap<String, MemoryOneLinerCacheEntry>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<String, MemoryOneLinerCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+fn memory_one_liner_for_cached(username: &str) -> Option<String> {
+    let key = username.to_string();
+    let now = std::time::Instant::now();
+    {
+        let guard = memory_oneliner_cache().lock();
+        if let Some(entry) = guard.get(&key)
+            && now.saturating_duration_since(entry.inserted_at)
+                < MEMORY_ONELINER_CACHE_TTL
+        {
+            return entry.value.clone();
+        }
+    }
+    let value = memory_one_liner_for(&key);
+    let mut guard = memory_oneliner_cache().lock();
+    // Bounded LRU eviction by oldest `inserted_at`. Cap-bounded; linear
+    // scan at 256 entries is cheap on what is already a multi-ms disk
+    // path (cache miss = at least one fs::read_to_string).
+    if guard.len() >= MEMORY_ONELINER_CACHE_MAX_ENTRIES
+        && let Some(oldest_key) = guard
+            .iter()
+            .min_by_key(|(_, v)| v.inserted_at)
+            .map(|(k, _)| k.clone())
+    {
+        guard.remove(&oldest_key);
+    }
+    guard.insert(
+        key,
+        MemoryOneLinerCacheEntry {
+            inserted_at: now,
+            value: value.clone(),
+        },
+    );
+    value
 }
 
 /// Compact one-line memory excerpt for `username`, used by the
@@ -3967,6 +4353,16 @@ fn memory_one_liner_for(username: &str) -> Option<String> {
 /// string literals (with `\\` escaping) so braces inside strings do
 /// not confuse the depth counter. `ctx` is interpolated into the
 /// error messages (e.g. `"classifier"`, `"reflection"`).
+///
+/// Byte-iteration is correct for UTF-8 because every byte we test
+/// (`{`, `}`, `"`, `\`) is in the 0x00..=0x7F ASCII range, and
+/// well-formed UTF-8 guarantees no continuation byte (0x80..=0xBF) or
+/// leading multi-byte byte (0xC2..=0xF4) ever equals an ASCII code
+/// point. So a multi-byte emoji inside a JSON value cannot
+/// accidentally trip the brace counter. A future refactor that
+/// switches to `chars()` would still be correct but slower; switching
+/// to a per-byte match on a non-UTF-8 wire format would break this
+/// invariant — see the multi-byte test below.
 pub(super) fn extract_first_json_object<'a>(
     text: &'a str,
     ctx: &str,
@@ -4010,17 +4406,71 @@ pub(super) fn extract_first_json_object<'a>(
 
 /// Read the trailing `n` lines of today's history JSONL. Returns
 /// empty on missing file.
+///
+/// Tail-read optimization: rather than reading the entire day file
+/// (which can grow to many MB on a busy server), seek `n * AVG_BYTES`
+/// from the end and read that chunk. If the chunk doesn't start on a
+/// line boundary, drop the first (possibly partial) line. Then take
+/// the last `n` complete lines. Fall back to a full read only for
+/// small files. The byte budget is intentionally generous — better to
+/// read a bit too much than to read too little and have to re-seek.
 async fn recent_history_slice_blocking(n: usize) -> String {
     let today = chrono::Utc::now().date_naive();
     tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
         let p = jsonl::day_file_for_date(
             std::path::Path::new(history::HISTORY_DIR),
             today,
         );
-        let body = std::fs::read_to_string(&p).unwrap_or_default();
-        let mut lines: Vec<&str> = body.lines().collect();
+        // Heuristic: average history line is well under 4 KB. Read a
+        // generous tail window so a few oversized lines don't cause us
+        // to come up short. n + 1 line of slack covers the partial-
+        // line drop on a mid-line seek.
+        const AVG_BYTES_PER_LINE: u64 = 4096;
+        let tail_budget: u64 = (n as u64).saturating_add(1) * AVG_BYTES_PER_LINE;
+
+        let mut f = match std::fs::File::open(&p) {
+            Ok(f) => f,
+            Err(_) => return String::new(),
+        };
+        let file_len = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return String::new(),
+        };
+        if file_len <= tail_budget {
+            // Full read fits within the budget; no seek needed.
+            drop(f);
+            let body = std::fs::read_to_string(&p).unwrap_or_default();
+            let mut lines: Vec<&str> = body.lines().collect();
+            if lines.len() > n {
+                lines = lines.split_off(lines.len() - n);
+            }
+            return lines.join("\n");
+        }
+        // Seek to file_len - tail_budget and read to EOF.
+        let start = file_len - tail_budget;
+        if f.seek(SeekFrom::Start(start)).is_err() {
+            return String::new();
+        }
+        let mut buf = Vec::with_capacity(tail_budget as usize);
+        if f.read_to_end(&mut buf).is_err() {
+            return String::new();
+        }
+        // The seek likely landed mid-line; lossy-utf8 decode + drop the
+        // possibly-partial first line. `String::from_utf8_lossy` is
+        // safe to call on a JSONL tail because invalid UTF-8 here would
+        // already be a corrupt history line.
+        let s = String::from_utf8_lossy(&buf);
+        // Split into lines, drop the first (partial) line, take the
+        // last `n` complete lines.
+        let mut lines: Vec<&str> = s.lines().collect();
+        if !lines.is_empty() {
+            // Drop the first line — it may be a partial mid-line slice.
+            lines.remove(0);
+        }
         if lines.len() > n {
-            lines = lines.split_off(lines.len() - n);
+            let drop_count = lines.len() - n;
+            lines.drain(..drop_count);
         }
         lines.join("\n")
     })
@@ -4032,3 +4482,47 @@ async fn recent_history_slice_blocking(n: usize) -> String {
 ///
 /// `main.rs` spawns this; the real implementation lives in [`history`].
 pub use history::writer_task as history_writer_task;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the contract that `extract_first_json_object`'s byte iteration
+    /// is multi-byte safe. The doc comment on the function explains why
+    /// (UTF-8 continuation bytes 0x80..=0xBF never collide with `{`, `}`,
+    /// `"`, `\`). This test stuffs a multi-byte emoji into a JSON string
+    /// value so a future refactor that breaks the invariant (e.g. by
+    /// switching to a non-UTF-8 wire format, or by adding a per-byte
+    /// match on bytes that DO collide with continuation bytes) fails
+    /// loud here.
+    #[test]
+    fn extract_first_json_object_passes_multibyte_emoji_in_string_value() {
+        // "🎉" is U+1F389 → UTF-8 bytes F0 9F 8E 89 (continuation bytes
+        // 9F, 8E, 89 are in 0x80..=0xBF). With a naive byte-iteration
+        // that didn't track string state, none of those bytes collide
+        // with `{`, `}`, `"`, `\` anyway — but the test pins that the
+        // function returns the entire balanced object, including the
+        // emoji bytes, unaltered.
+        let input = "prose before {\"msg\":\"hi 🎉 there\"} prose after";
+        let extracted = extract_first_json_object(input, "test").expect("must extract");
+        assert_eq!(extracted, "{\"msg\":\"hi 🎉 there\"}");
+        // Round-trip through serde to confirm the extracted slice is
+        // valid JSON (catches a wrong end index that truncates inside a
+        // multi-byte sequence).
+        let v: serde_json::Value =
+            serde_json::from_str(extracted).expect("extracted must parse as JSON");
+        assert_eq!(v["msg"], serde_json::Value::from("hi 🎉 there"));
+    }
+
+    /// Nested object with multi-byte content inside both layers — the
+    /// depth counter must not be misled by the emoji bytes.
+    #[test]
+    fn extract_first_json_object_handles_nested_multibyte() {
+        let input = "{\"a\":\"🎉\",\"b\":{\"c\":\"日本\"}}";
+        let extracted = extract_first_json_object(input, "test").expect("must extract");
+        assert_eq!(extracted, input);
+        let v: serde_json::Value =
+            serde_json::from_str(extracted).expect("extracted must parse as JSON");
+        assert_eq!(v["b"]["c"], serde_json::Value::from("日本"));
+    }
+}

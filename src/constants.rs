@@ -82,9 +82,11 @@ pub const DELAY_DISCONNECT_MS: u64 = 2_000;
 /// arrived in the meantime.
 pub const DELAY_CONFIG_DEBOUNCE_MS: u64 = 500;
 
-pub const CHEST_OP_MAX_RETRIES: u32 = 3;
+/// Total attempt count for chest operations (the retry loop runs `0..N`, so
+/// `N` is the total number of attempts, not the number of *re*tries).
+pub const CHEST_OP_MAX_ATTEMPTS: u32 = 3;
 
-/// Extra retries added when a chunk-not-loaded condition is detected.
+/// Extra attempts added when a chunk-not-loaded condition is detected.
 /// Chunks typically reload within ~10s on most servers, so we allow more
 /// attempts with a longer base delay before giving up.
 pub const CHUNK_RELOAD_EXTRA_RETRIES: u32 = 2;
@@ -96,13 +98,37 @@ pub const CHUNK_RELOAD_BASE_DELAY_MS: u64 = 3_000;
 
 pub const CHUNK_RELOAD_MAX_DELAY_MS: u64 = 10_000;
 
-pub const SHULKER_OP_MAX_RETRIES: u32 = 2;
+/// Total attempt count for shulker open operations (the retry loop runs
+/// `0..N`, so `N` is the total number of attempts).
+pub const SHULKER_OP_MAX_ATTEMPTS: u32 = 2;
 
-pub const NAVIGATION_MAX_RETRIES: u32 = 2;
+/// Total attempt count for pathfinding navigation (the retry loop runs
+/// `0..N`, so `N` is the total number of attempts).
+pub const NAVIGATION_MAX_ATTEMPTS: u32 = 2;
 
 pub const RETRY_BASE_DELAY_MS: u64 = 500;
 
 pub const RETRY_MAX_DELAY_MS: u64 = 5_000;
+
+/// Fast verification-poll cadence (ms). Used by the inner
+/// `recover_shulker_to_slot_0` verify loop: the chest GUI is already open
+/// and the cursor is on the bot's side, so server echoes of slot changes
+/// arrive promptly. Empirically the shortest cadence that doesn't race a
+/// `container_set_content` packet on a healthy connection.
+pub const VERIFY_POLL_FAST_MS: u64 = 200;
+
+/// Default verification-poll cadence (ms). Used by
+/// `place_shulker_in_chest_slot_verified` after a chest-slot click. The
+/// extra 50ms over `VERIFY_POLL_FAST_MS` absorbs the round-trip needed
+/// for a chest-side slot update (which can lag the player-side update).
+pub const VERIFY_POLL_DEFAULT_MS: u64 = 250;
+
+/// Slow verification-poll cadence (ms). Used between outer recovery
+/// attempts in `recover_shulker_to_slot_0` to let the server fully sync
+/// inventory state before re-reading it; empirically 350ms is the
+/// shortest delay that consistently produces a fresh snapshot after a
+/// failed pickup/place sequence.
+pub const VERIFY_POLL_SLOW_MS: u64 = 350;
 
 /// Exponential backoff delay: `base_ms * 2^attempt`, capped at `max_ms`.
 pub fn exponential_backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
@@ -110,6 +136,35 @@ pub fn exponential_backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> u64
     // `max_ms` dominates well before this limit matters in practice.
     let delay = base_ms.saturating_mul(1u64 << attempt.min(10));
     delay.min(max_ms)
+}
+
+/// Equal-jitter exponential backoff: returns a delay in
+/// `[exponential_backoff_delay(attempt, base, max) / 2,
+///   exponential_backoff_delay(attempt, base, max)]`.
+///
+/// Equal-jitter scheme (Marc Brooker / AWS Architecture Blog): take half
+/// of the exponential delay as the deterministic floor, then add a random
+/// amount in `[0, delay/2]`. This preserves the worst-case bound while
+/// breaking the lockstep that causes thundering-herd retries when many
+/// callers backoff together.
+///
+/// The non-jittered [`exponential_backoff_delay`] is intentionally left
+/// untouched: tests assert exact values, and the non-retry call sites
+/// rely on deterministic delays.
+pub fn exponential_backoff_delay_jittered(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
+    let delay = exponential_backoff_delay(attempt, base_ms, max_ms);
+    let half = delay / 2;
+    // Half is the deterministic floor; the random component lives in [0, half].
+    // Use a single byte from getrandom — that's enough entropy for jitter and
+    // matches the pattern used in `types/user.rs` for Mojang retries.
+    let mut buf = [0u8; 1];
+    let rand_extra: u64 = match getrandom::fill(&mut buf) {
+        Ok(()) => (buf[0] as u64) * half / 255,
+        // RNG failure is exceedingly rare; fall back to the midpoint between
+        // half and full delay rather than collapsing to a fixed value.
+        Err(_) => half / 2,
+    };
+    half + rand_extra
 }
 
 pub const FEE_MIN: f64 = 0.0;
@@ -236,5 +291,43 @@ mod tests {
     fn exponential_backoff_clamps_shift_to_avoid_overflow() {
         // attempt >> 64 would shift past u64 range without the internal clamp.
         assert_eq!(exponential_backoff_delay(u32::MAX, 1, u64::MAX), 1u64 << 10);
+    }
+
+    #[test]
+    fn exponential_backoff_jittered_stays_within_equal_jitter_bounds() {
+        // Equal-jitter: delay in [base*2^attempt / 2, base*2^attempt],
+        // capped at max_ms. Sample many times to exercise the random path
+        // without flaking on a single unlucky draw.
+        for attempt in 0..6u32 {
+            let nominal = exponential_backoff_delay(attempt, 500, 5_000);
+            let lower = nominal / 2;
+            let upper = nominal;
+            for _ in 0..64 {
+                let got = exponential_backoff_delay_jittered(attempt, 500, 5_000);
+                assert!(
+                    got >= lower && got <= upper,
+                    "jittered delay {got}ms outside [{lower}, {upper}] for attempt {attempt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exponential_backoff_jittered_respects_max_cap() {
+        // When the nominal delay saturates at max_ms, the jittered delay
+        // must stay in [max_ms/2, max_ms] — never exceed the cap.
+        for _ in 0..64 {
+            let got = exponential_backoff_delay_jittered(20, 500, 5_000);
+            assert!(got >= 2_500 && got <= 5_000, "got {got}ms");
+        }
+    }
+
+    #[test]
+    fn exponential_backoff_jittered_lower_bound_at_attempt_zero() {
+        // attempt=0, base=500: nominal=500, jittered in [250, 500].
+        for _ in 0..64 {
+            let got = exponential_backoff_delay_jittered(0, 500, 5_000);
+            assert!(got >= 250 && got <= 500, "got {got}ms");
+        }
     }
 }

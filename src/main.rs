@@ -141,6 +141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (chat_cmd_tx, chat_cmd_rx) = mpsc::channel::<ChatCommand>(64);
             let in_critical_section = Arc::new(AtomicBool::new(false));
             let bot_username = Arc::new(RwLock::new(None));
+            // Process-local history-drop counter, shared so the bot
+            // (publisher) can increment on `try_send` failure and the chat
+            // task (subscriber) can drain-and-mirror into runtime_state
+            // each loop iteration. Without this shared handle the
+            // bot-side counter and the operator-visible
+            // `history_drops_today` drift apart silently.
+            let bot_history_drops: Arc<parking_lot::Mutex<u64>> =
+                Arc::new(parking_lot::Mutex::new(0));
 
             let store = Store::new(bot_tx.clone()).await?;
 
@@ -177,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chat_bot_username = bot_username.clone();
             let chat_config_for_task = (*chat_config).clone();
             let chat_history_tx = history_tx.clone();
+            let chat_history_drops = bot_history_drops.clone();
             let chat_handle = tokio::spawn(async move {
                 let result = tokio::spawn(crate::chat::chat_task(
                     chat_events_rx_for_chat,
@@ -186,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     chat_bot_username,
                     chat_config_for_task,
                     chat_history_tx,
+                    chat_history_drops,
                 ))
                 .await;
                 if let Err(e) = result {
@@ -208,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chat_config: chat_config.clone(),
                 in_critical_section,
                 chat_cmd_tx: bot_chat_cmd_tx,
+                history_drops: bot_history_drops,
             };
             // Local spawn: Azalea's bot_task is !Send.
             let bot_handle = tokio::task::spawn_local(crate::bot::bot_task(

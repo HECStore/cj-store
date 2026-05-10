@@ -41,6 +41,14 @@ azalea = { git = "https://github.com/azalea-rs/azalea", rev = "41a9ae6aaff77646c
 azalea-viaversion = { path = "vendor/azalea-viaversion" }
 chrono = { version = "0.4.44", features = ["serde"] }
 dialoguer = "0.12.0"
+# Explicit direct dep so the chat module can call `memchr::memmem::Finder`
+# at the source level. `regex` already pulls this in transitively (see
+# `Cargo.lock` — `memchr 2.8.0`), so declaring it here only fixes the API
+# surface; no extra crate is compiled. The chat `contains_bytes` /
+# `contains_bytes_ci` helpers and the `search_history` byte-level CI scan
+# need a real O(n+m) substring algorithm; the previous `windows().any()`
+# implementation is O(n*m) and shows up under the trust-ladder hot path.
+memchr = "2"
 dotenvy = "0.15.7"
 getrandom = "0.4.2"
 reqwest = { version = "0.13.2", default-features = false, features = [
@@ -55,6 +63,10 @@ tokio = { version = "1.52.1", features = [
     "macros",
     "sync",
     "time",
+    # `signal` enables `tokio::signal::ctrl_c()` so shutdown handling can
+    # live in the async runtime instead of spinning up a dedicated `ctrlc`
+    # OS-signal thread. Call-site migration tracked separately.
+    "signal",
 ] }
 tokio-util = "0.7"
 notify = "8.2.0"
@@ -78,6 +90,34 @@ opt-level = 3
 # release wall time reasonable.
 [profile.release]
 lto = "thin"
+
+# NOTE: `simdnbt` / `simdnbt-derive` pinning.
+#
+# Upstream `azalea` (rev 41a9ae6a, see comment block above) depends on
+# `simdnbt = { git = "https://github.com/azalea-rs/simdnbt" }` with no
+# `rev = "..."` pin. Cargo will resolve that to the current branch tip
+# at lockfile-generation time, so a fresh `cargo update` (or a clean
+# checkout from a teammate without --locked) could silently pick up a
+# different simdnbt commit than what we tested against. simdnbt parses
+# wire NBT for every container, chest, and inventory packet the bot
+# handles, so a regression there is a top-class fault.
+#
+# A `[patch.<git-url>]` entry pointing at the same upstream URL is
+# rejected by cargo (`patches must point to different sources`), and
+# a `[patch.crates-io]` entry would not match a transitive *git* dep.
+# That leaves three options:
+#
+#   1. Fork `azalea` and add an explicit `rev = "4cc67bcd..."` to its
+#      simdnbt dep, then point our `azalea` rev pin at the fork.
+#   2. Fork `simdnbt` to a different URL and `[patch.<azalea-url>]` it.
+#   3. Trust the lockfile (`Cargo.lock` currently records simdnbt at
+#      `4cc67bcd980c752b412beee0ea1192f502333bf0`) and rely on
+#      `cargo {build,check,test} --locked` everywhere — which CI does.
+#
+# Current state: option 3. The CI workflow uses `--locked` on every
+# cargo invocation, and `cargo-deny`'s `sources` check allowlists
+# azalea-rs's git sources only. Tracked as FOLLOWUPS for a stronger
+# pin via option 1 if upstream simdnbt commit drift becomes a problem.
 
 [lints.rust]
 unsafe_code = "forbid"

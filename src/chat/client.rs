@@ -447,16 +447,58 @@ pub async fn send_one(
     }
 
     let response = req.send().await.map_err(|e| {
-        // `e` may include the URL but not the headers we set; reqwest
-        // already redacts the body of the source request. Still safe.
-        ClientError::Transport(e.to_string())
+        // Distinguish connect-failure (request never left the local
+        // host, safe to retry) from post-send body-loss (the request
+        // reached Anthropic — they may have already started billing,
+        // so a blind retry duplicates the charge). `is_connect()`
+        // covers DNS / TCP / TLS handshake faults; `is_body()` /
+        // `is_request()` indicate the send itself was malformed or the
+        // request body could not be streamed all the way through.
+        // `is_timeout()` is per-attempt and is treated as retryable
+        // here because the connection may have been reset cleanly.
+        //
+        // The `Transport` variant is retryable; for post-send failures
+        // we still surface `Transport` (the public error shape stays
+        // the same), but tag the message so the retry layer's tracing
+        // makes the duplicate-billing risk visible to operators. The
+        // retry policy itself is governed by `call_with_retry`, which
+        // checks the `is_connect`-derived category via the message
+        // prefix below.
+        if e.is_connect() || e.is_timeout() {
+            ClientError::Transport(format!("connect/timeout: {e}"))
+        } else if e.is_body() || e.is_request() {
+            tracing::warn!(
+                error = %e,
+                "[Chat] anthropic POST failed AFTER send (request may have been processed; \
+                 retrying could double-bill)"
+            );
+            ClientError::Transport(format!("post-send body-loss: {e}"))
+        } else {
+            ClientError::Transport(e.to_string())
+        }
     })?;
 
     let status = response.status();
     if status.is_success() {
-        return response
-            .json::<CreateMessageResponse>()
-            .await
+        // Pre-buffer the body so a transport hiccup during body
+        // streaming is reported as `Transport` (retryable) rather than
+        // `Decode` (non-retryable). `response.json()` collapses both
+        // failure modes into a single `reqwest::Error` whose `is_*`
+        // discriminators are easier to read on the raw layer. Once
+        // bytes are in hand, `serde_json::from_slice` returns a true
+        // parse error that's unambiguously a `Decode`.
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = if e.is_body() || e.is_timeout() {
+                    format!("body-stream: {e}")
+                } else {
+                    e.to_string()
+                };
+                return Err(ClientError::Transport(msg));
+            }
+        };
+        return serde_json::from_slice::<CreateMessageResponse>(&bytes)
             .map_err(|e| ClientError::Decode(e.to_string()));
     }
 
@@ -581,6 +623,22 @@ fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         }
     };
 
+    // Compute a "server-now" reference using the response `Date` header
+    // when present. The absolute-time absolute-time branches (RFC 2822
+    // `retry-after` and RFC 3339 `anthropic-ratelimit-*-reset`) compare
+    // against `chrono::Utc::now()` to derive a wait window — but if our
+    // local clock is skewed against Anthropic's, that derivation is
+    // wrong by exactly the skew. Anthropic emits a `Date:` header on
+    // every response; if it parses, use it as the server's view of "now"
+    // and compute the delta from there. Falling back to local `Utc::now`
+    // matches the prior behavior.
+    let server_now: chrono::DateTime<chrono::Utc> = headers
+        .get("date")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| chrono::DateTime::parse_from_rfc2822(s.trim()).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+
     if let Some(v) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
         let trimmed = v.trim();
         // Try decimal seconds first (Anthropic's typical form).
@@ -599,15 +657,11 @@ fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> Option<u64> {
             }
         } else if let Ok(when) = chrono::DateTime::parse_from_rfc2822(trimmed) {
             // RFC 7231 §7.1.3 HTTP-date: prefer chrono's RFC 2822
-            // parser (HTTP-date is a constrained subset).
-            //
-            // Clock-skew guard: if our local clock is ahead of
-            // Anthropic's, `delta.num_seconds()` goes negative. Treat
-            // <= 0 as "no hint" so the caller falls back to the
-            // exponential schedule rather than firing immediately and
-            // re-tripping the same 429.
-            let now = chrono::Utc::now();
-            let delta = when.with_timezone(&chrono::Utc) - now;
+            // parser (HTTP-date is a constrained subset). Compute the
+            // delta against `server_now` (Date header) so local-clock
+            // skew is cancelled out — both timestamps then live in the
+            // server's frame.
+            let delta = when.with_timezone(&chrono::Utc) - server_now;
             let secs_i = delta.num_seconds();
             if secs_i > 0
                 && let Ok(secs) = u64::try_from(secs_i)
@@ -624,12 +678,11 @@ fn parse_retry_after_hint(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         if let Some(v) = headers.get(header_name).and_then(|v| v.to_str().ok())
             && let Ok(when) = chrono::DateTime::parse_from_rfc3339(v.trim())
         {
-            // Same clock-skew guard as the RFC 2822 branch: a reset
-            // timestamp in the past (or exactly now) means our clock is
-            // ahead — falling back to exponential is safer than firing
-            // a "retry now" that the server is still rate-limiting.
-            let now = chrono::Utc::now();
-            let delta = when.with_timezone(&chrono::Utc) - now;
+            // Same clock-skew guard as the RFC 2822 branch — compute
+            // the delta against `server_now` (Date header) rather than
+            // the local clock so a misaligned host doesn't fire
+            // "retry now" when the server is still rate-limiting.
+            let delta = when.with_timezone(&chrono::Utc) - server_now;
             let secs_i = delta.num_seconds();
             if secs_i > 0
                 && let Ok(secs) = u64::try_from(secs_i)
@@ -1230,40 +1283,171 @@ pub fn truncate_log_body(s: &str, max: usize) -> Cow<'_, str> {
 /// Sanitize a raw API response body for logging. The Anthropic 401 body
 /// can include partial key fragments depending on the auth path; the
 /// 5xx bodies frequently include request IDs that are useful but no
-/// secrets. Strategy: keep at most 200 chars, replace any 32+ char
-/// hex/alphanum run with `[redacted]`.
+/// secrets. Strategy, applied in order:
+///
+/// 1. **Pre-pass**: replace any literal `sk-ant-` token (case-insensitive)
+///    plus its trailing non-whitespace run with `[redacted-key]`,
+///    regardless of length. The 32-char-alnum-run heuristic below misses
+///    short fragments and embedded keys; the prefix `sk-ant-` is the
+///    Anthropic API key shape and ALWAYS sensitive, so it gets its own
+///    explicit redaction step that the heuristic cannot accidentally
+///    weaken.
+/// 2. **Pre-pass**: scrub literal `Authorization:` and `x-api-key:`
+///    header values (case-insensitive on the field name; everything up
+///    to the next CR / LF on the same line is collapsed to
+///    `[redacted-header]`). Anthropic error bodies sometimes echo back
+///    the upstream proxy's headers; a 5xx that reflects the inbound
+///    `x-api-key` would otherwise leak the key verbatim to the tracing
+///    layer.
+/// 3. **Heuristic pass**: keep at most 200 chars, replace any 32+ char
+///    alphanumeric (plus `-` / `_`) run with `[redacted]`.
+///
+/// Iteration uses `chars()` (not raw bytes) so non-ASCII content (a 5xx
+/// HTML page with Latin-1 punctuation, JSON error strings with curly
+/// quotes) is rendered correctly rather than mojibake'd by the previous
+/// `b as char` byte-cast. Lines stay inside the 200-char output cap.
 pub fn sanitize_for_log(body: &str) -> String {
+    // Pre-pass 1: scrub `sk-ant-*` runs. Case-insensitive on the prefix;
+    // the run extends until the next whitespace OR another `sk-ant`
+    // boundary (defensive against concatenated tokens).
+    let body_owned: String;
+    let body_after_keys: &str = if body.to_ascii_lowercase().contains("sk-ant-") {
+        body_owned = redact_anthropic_keys(body);
+        body_owned.as_str()
+    } else {
+        body
+    };
+
+    // Pre-pass 2: scrub `Authorization:` / `x-api-key:` header values.
+    let body_after_headers_owned: String;
+    let body_after_headers: &str = if has_sensitive_header(body_after_keys) {
+        body_after_headers_owned = redact_sensitive_headers(body_after_keys);
+        body_after_headers_owned.as_str()
+    } else {
+        body_after_keys
+    };
+
+    // Heuristic pass: char-iteration (not bytes) so non-ASCII passes
+    // through cleanly. The 32-char run gate still operates on the byte
+    // length of each ASCII-alnum/`-`/`_` run; non-ASCII chars never
+    // participate in a run (they immediately flush whatever run was
+    // accumulating).
     let mut out = String::new();
-    let mut run_start: Option<usize> = None;
-    let bytes = body.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        let alnum = b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
-        if alnum {
-            if run_start.is_none() {
-                run_start = Some(i);
-            }
-        } else if let Some(start) = run_start.take() {
-            let run = &body[start..i];
-            if run.len() >= 32 {
-                out.push_str("[redacted]");
-            } else {
-                out.push_str(run);
-            }
-            out.push(b as char);
+    let mut run: String = String::new();
+    let mut byte_budget_hit = false;
+    for ch in body_after_headers.chars() {
+        let is_run_ch = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        if is_run_ch {
+            run.push(ch);
         } else {
-            out.push(b as char);
+            if !run.is_empty() {
+                if run.len() >= 32 {
+                    out.push_str("[redacted]");
+                } else {
+                    out.push_str(&run);
+                }
+                run.clear();
+            }
+            out.push(ch);
         }
         if out.len() >= 200 {
-            out.push_str("...");
-            return out;
+            byte_budget_hit = true;
+            break;
         }
     }
-    if let Some(start) = run_start {
-        let run = &body[start..];
+    if !byte_budget_hit && !run.is_empty() {
         if run.len() >= 32 {
             out.push_str("[redacted]");
         } else {
-            out.push_str(run);
+            out.push_str(&run);
+        }
+    }
+    if byte_budget_hit {
+        out.push_str("...");
+    }
+    out
+}
+
+/// Replace every `sk-ant-<non-whitespace>` token (case-insensitive on
+/// the prefix) with `[redacted-key]`. Used as the first sanitization
+/// pass before the generic alnum-run heuristic so short key fragments
+/// (under 32 chars) still get scrubbed.
+fn redact_anthropic_keys(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let lower = body.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+    let prefix = b"sk-ant-";
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + prefix.len() <= bytes.len() && &lower_bytes[i..i + prefix.len()] == prefix {
+            // Walk forward until whitespace OR end of buffer.
+            let mut j = i + prefix.len();
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            out.push_str("[redacted-key]");
+            i = j;
+        } else {
+            // SAFETY-equivalent: the byte index `i` is on a char
+            // boundary because `lower` is built via
+            // `to_ascii_lowercase()` (only ASCII bytes change, and only
+            // by a fold within ASCII) so positions remain aligned with
+            // `body`'s char boundaries. We still defensively bypass
+            // mid-codepoint slicing by reading one byte at a time when
+            // the byte is ASCII; the fast-path covers ASCII text and
+            // multi-byte sequences are appended byte-by-byte (which is
+            // safe because `out` is being built byte-equivalent).
+            // Push the next char from `body` starting at `i`.
+            let ch = body[i..].chars().next().unwrap_or('\u{FFFD}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// True if the body contains a likely `Authorization:` or `x-api-key:`
+/// header value (case-insensitive on the field name). Quick guard so
+/// `redact_sensitive_headers` only allocates when there's something to
+/// redact.
+fn has_sensitive_header(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("authorization:") || lower.contains("x-api-key:")
+}
+
+/// Replace each `Authorization: <...>` / `x-api-key: <...>` value
+/// (everything up to the next `\r` or `\n` on the same line) with
+/// `[redacted-header]`. The field name itself is preserved so an
+/// operator can still see WHICH header was redacted.
+fn redact_sensitive_headers(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let lower = body.to_ascii_lowercase();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let candidates: &[&[u8]] = &[b"authorization:", b"x-api-key:"];
+    while i < bytes.len() {
+        let mut matched: Option<usize> = None;
+        for cand in candidates {
+            if i + cand.len() <= bytes.len() && &lower.as_bytes()[i..i + cand.len()] == *cand {
+                matched = Some(cand.len());
+                break;
+            }
+        }
+        if let Some(name_len) = matched {
+            // Copy the field name verbatim (case preserved) then
+            // [redacted-header] in place of the value up to EOL.
+            out.push_str(&body[i..i + name_len]);
+            let mut j = i + name_len;
+            while j < bytes.len() && bytes[j] != b'\r' && bytes[j] != b'\n' {
+                j += 1;
+            }
+            out.push_str(" [redacted-header]");
+            i = j;
+        } else {
+            let ch = body[i..].chars().next().unwrap_or('\u{FFFD}');
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     out

@@ -128,6 +128,13 @@ pub(crate) fn trim_in_memory_to_caps(store: &mut Store) {
     if store.trades.len() > store.config.max_trades_in_memory {
         let drop = store.trades.len() - store.config.max_trades_in_memory;
         store.trades.drain(..drop);
+        // Trim deletes from the FRONT, so the dirty-tail span at the back
+        // is unchanged. Slide the cursor down by the drop so the post-trim
+        // dirty-tail (computed as `trades.len() - saved_trades_count` in
+        // `save`) remains correct. Without this, a trim that drops trades
+        // BELOW the cursor would shrink the dirty-tail to zero and skip
+        // writing genuinely-new trades on the next autosave.
+        store.saved_trades_count = store.saved_trades_count.saturating_sub(drop);
     }
 }
 
@@ -158,7 +165,27 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
     record("pairs", Pair::save_all(&store.pairs).map_err(|e| Box::new(e) as DynErr), &mut first_err);
     record("users", User::save_dirty(&store.users, &store.dirty_users).map_err(|e| Box::new(e) as DynErr), &mut first_err);
     record("orders", Order::save_all_with_limit(&store.orders, store.config.max_orders).map_err(|e| Box::new(e) as DynErr), &mut first_err);
-    record("trades", Trade::save_all(&store.trades).map_err(|e| Box::new(e) as DynErr), &mut first_err);
+    // Trade files are immutable after their initial write, so only the tail
+    // beyond `saved_trades_count` actually needs new bytes. The orphan sweep
+    // inside `Trade::save_all` still runs over the full set, so trim-driven
+    // deletions are propagated to disk on the same call.
+    //
+    // Clamp the cursor first: `trim_in_memory_to_caps` may have drained the
+    // FRONT so the cursor temporarily exceeds the current length; clamping
+    // makes the dirty-tail computation total.
+    if store.saved_trades_count > store.trades.len() {
+        store.saved_trades_count = store.trades.len();
+    }
+    let trades_dirty_tail = store.trades.len().saturating_sub(store.saved_trades_count);
+    let trades_result = Trade::save_all(&store.trades, trades_dirty_tail)
+        .map_err(|e| Box::new(e) as DynErr);
+    let trades_ok = trades_result.is_ok();
+    record("trades", trades_result, &mut first_err);
+    if trades_ok {
+        // Only advance the cursor on success: a failed save must keep the
+        // tail dirty so the next autosave retries the same trades.
+        store.saved_trades_count = store.trades.len();
+    }
     record(
         "storage",
         store.storage.save().map_err(|e| Box::new(std::io::Error::other(e.to_string())) as DynErr),

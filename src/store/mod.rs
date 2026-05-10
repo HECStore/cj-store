@@ -3,8 +3,8 @@
 //! The Store is the **single source of truth** for all store state:
 //! - Users (balances, operator status)
 //! - Trading pairs (item/currency reserves)
-//! - Orders (audit log)
-//! - Trades (execution history)
+//! - Orders (transient session log; cleared on startup — see `types::order`)
+//! - Trades (persistent audit log of completed operations)
 //! - Storage (nodes, chests, shulker contents)
 
 pub mod command;
@@ -42,7 +42,9 @@ pub struct Store {
     pub pairs: HashMap<String, Pair>,
     /// Users: UUID -> User (balance, operator status)
     pub users: HashMap<String, User>,
-    /// Order audit log (all executed buy/sell/deposit/withdraw orders)
+    /// Transient session log of recently-issued orders (buy/sell/deposit/
+    /// withdraw). Cleared on every startup — the persistent audit log of
+    /// completed operations lives in `self.trades` / `data/trades/`.
     pub orders: VecDeque<Order>,
     /// Trade history (executed trades)
     pub trades: Vec<Trade>,
@@ -56,6 +58,18 @@ pub struct Store {
     /// touches a single player. Mirrors the semantics of `self.dirty` but
     /// at user granularity. Cleared on successful save.
     pub(crate) dirty_users: HashSet<String>,
+    /// Total length of `self.trades` at the moment of the most recent
+    /// successful trade save. Trade files are immutable after their initial
+    /// write, so the next `state::save` only needs to (re)write entries with
+    /// index `>= saved_trades_count` — saving N × {create+write+fsync+rename}
+    /// at 50K-trade scale where N is the unchanged prefix length.
+    ///
+    /// Maintained without per-handler bookkeeping: `state::save` clamps this
+    /// to `trades.len()` after `trim_in_memory_to_caps` (which drains the
+    /// FRONT) so a trim-and-grow cycle still computes a correct dirty tail.
+    /// On a failed save the cursor is NOT advanced, so the next autosave
+    /// retries the same un-persisted tail.
+    pub(crate) saved_trades_count: usize,
 
     /// Channel to send instructions to the bot
     pub(crate) bot_tx: mpsc::Sender<BotInstruction>,
@@ -276,6 +290,11 @@ impl Store {
             storage.nodes.len()
         );
 
+        // Capture before the move into `Store`: trades loaded from disk are
+        // already persisted, so the cursor sits at `trades.len()` and the
+        // first autosave does not rewrite the entire history just because the
+        // process restarted.
+        let saved_trades_count = trades.len();
         Ok(Store {
             config,
             pairs,
@@ -285,6 +304,7 @@ impl Store {
             storage,
             dirty: needs_save, // Mark dirty if pairs were normalized (will save on first autosave)
             dirty_users: HashSet::new(),
+            saved_trades_count,
             bot_tx,
             order_queue,
             rate_limiter,
@@ -882,6 +902,9 @@ impl Store {
             storage,
             dirty: false,
             dirty_users: HashSet::new(),
+            // Test stores start with `trades.is_empty()`, so the cursor sits
+            // at zero; any subsequent push grows the dirty tail correctly.
+            saved_trades_count: 0,
             bot_tx,
             order_queue: queue::OrderQueue::new(),
             rate_limiter: RateLimiter::new(),

@@ -960,6 +960,7 @@ dependencies = [
  "dialoguer",
  "dotenvy",
  "getrandom 0.4.2",
+ "memchr",
  "notify",
  "parking_lot",
  "proptest",

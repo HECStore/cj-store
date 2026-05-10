@@ -179,6 +179,15 @@ pub(crate) fn is_valid_username_shape(username: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Upper bound on a parsed `Retry-After` hint. A hostile or buggy upstream
+/// could emit something like `Retry-After: 99999999999` which, taken at face
+/// value, would propagate into a multi-thousand-year `tokio::time::sleep` —
+/// effectively a denial of service on the resolver. 1 hour is generously
+/// larger than any reasonable Mojang throttle window while keeping the worst
+/// case bounded.
+#[cfg_attr(test, allow(dead_code))]
+const RETRY_AFTER_MAX_SECS: u64 = 3600;
+
 /// Parse an HTTP `Retry-After` header value into a `Duration`.
 ///
 /// RFC 7231 §7.1.3 permits two encodings:
@@ -196,11 +205,23 @@ pub(crate) fn is_valid_username_shape(username: &str) -> bool {
 /// `Duration::ZERO` rather than wrapping or producing a sentinel error,
 /// because a server that says "retry after a moment ago" is effectively
 /// saying "retry immediately".
+///
+/// Both encodings clamp the upper bound to [`RETRY_AFTER_MAX_SECS`] (1h)
+/// so a hostile/buggy upstream cannot weaponize the header into a
+/// multi-thousand-year sleep. The clamp emits a `warn!` so an
+/// unrealistically large hint is visible in the operator log.
 #[cfg_attr(test, allow(dead_code))]
 fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
     let s = value.to_str().ok()?.trim();
     // Form 1: integer-seconds.
     if let Ok(secs) = s.parse::<u64>() {
+        if secs > RETRY_AFTER_MAX_SECS {
+            warn!(
+                "[Mojang] Retry-After delta-seconds {} clamped to {}",
+                secs, RETRY_AFTER_MAX_SECS
+            );
+            return Some(Duration::from_secs(RETRY_AFTER_MAX_SECS));
+        }
         return Some(Duration::from_secs(secs));
     }
     // Form 2: HTTP-date (RFC 2822 / RFC 1123).
@@ -210,7 +231,15 @@ fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
     if delta <= chrono::Duration::zero() {
         return Some(Duration::ZERO);
     }
-    delta.to_std().ok()
+    let std_delta = delta.to_std().ok()?;
+    if std_delta.as_secs() > RETRY_AFTER_MAX_SECS {
+        warn!(
+            "[Mojang] Retry-After HTTP-date delta {}s clamped to {}",
+            std_delta.as_secs(), RETRY_AFTER_MAX_SECS
+        );
+        return Some(Duration::from_secs(RETRY_AFTER_MAX_SECS));
+    }
+    Some(std_delta)
 }
 
 /// Canonicalize a Mojang-API `id` field (bare 32-char hex, any case) into
@@ -302,13 +331,24 @@ impl User {
     /// errors) can reach a player whisper. Operator-visible detail is
     /// emitted via the `warn!`/`debug!` log lines below.
     ///
-    /// Retries ONCE after a ~500ms jittered backoff on `NetworkError` /
-    /// `NetworkTimeout` (transient). `NotFound`, `InvalidShape`,
-    /// `UpstreamError`, `MalformedResponse`, and `RateLimited` are
-    /// single-shot — the first four are not transient, and re-issuing on
-    /// 429 would only deepen the throttle. Total wall time stays within
-    /// the existing ~10s `MOJANG_TIMEOUT_SECS` budget per attempt plus
-    /// the sub-second jittered sleep.
+    /// Retries ONCE after a ~500ms jittered backoff on `NetworkError`
+    /// (fast-failing DNS/TCP/TLS errors that typically return well under
+    /// the per-request budget). `NetworkTimeout` is deliberately NOT
+    /// retried: the first attempt already burned the full
+    /// `MOJANG_TIMEOUT_SECS` (10s) budget, so a second attempt with the
+    /// same budget would risk a ~20s wall-time spike on a single resolve
+    /// — bad for chat responsiveness and for the single-flight follower
+    /// queue building up behind it. The other variants (`NotFound`,
+    /// `InvalidShape`, `UpstreamError`, `MalformedResponse`,
+    /// `RateLimited`) are single-shot for the same reasons as before
+    /// (not transient, or retry would deepen the throttle).
+    ///
+    /// Total worst-case wall time: one attempt up to 10s, plus optional
+    /// 300-700ms jitter sleep, plus a second 10s attempt only on
+    /// `NetworkError` — so the budget is ~10.7s on the no-retry path
+    /// (timeout) and ~20.7s on the retried path (connect/DNS failure
+    /// that recovers). Documented here so a tuning change cannot make
+    /// the contract drift silently.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn get_uuid_async(username: &str) -> Result<String, MojangResolveError> {
         if !is_valid_username_shape(username) {
@@ -318,13 +358,12 @@ impl User {
 
         match Self::get_uuid_async_once(username).await {
             Ok(uuid) => Ok(uuid),
-            Err(e @ (MojangResolveError::NetworkError | MojangResolveError::NetworkTimeout)) => {
+            Err(e @ MojangResolveError::NetworkError) => {
                 // Single jittered retry on transient transport errors.
                 // Bound the sleep tight (300-700ms) so the total wall
                 // time stays well under the 10s timeout invariant — the
-                // first attempt either errored quickly (DNS/connect) or
-                // hit the per-request timeout, and the second attempt
-                // gets the same 10s budget.
+                // first attempt errored quickly (DNS/connect) and the
+                // second attempt gets the same 10s budget.
                 let mut buf = [0u8; 1];
                 let jitter_ms: u64 = match getrandom::fill(&mut buf) {
                     Ok(()) => 300 + (buf[0] as u64 * 400 / 255), // 300..=700
@@ -391,10 +430,37 @@ impl User {
             return Err(MojangResolveError::UpstreamError);
         }
 
-        let mojang_response: MojangResponse = response.json().await.map_err(|e| {
-            warn!("[Mojang] malformed response for '{username}': {e}");
-            MojangResolveError::MalformedResponse
+        // Read the body bytes first (separate from JSON decode) so we can
+        // classify body-drop / TLS-record-truncation / read-timeout (all
+        // transient transport conditions reported by `reqwest::Error::is_body()`
+        // or `is_timeout()`) as retryable `NetworkError` / `NetworkTimeout`
+        // rather than the non-retryable `MalformedResponse`. Only a successful
+        // body read that fails the subsequent JSON parse is truly "malformed
+        // response" — i.e. Mojang spoke 2xx, gave us bytes, and the bytes
+        // weren't decodable.
+        let body_bytes = response.bytes().await.map_err(|e| {
+            if e.is_timeout() {
+                warn!(
+                    "[Mojang] timeout reading body for '{username}' (after status 2xx): {e}"
+                );
+                MojangResolveError::NetworkTimeout
+            } else if e.is_connect() || e.is_body() {
+                warn!(
+                    "[Mojang] transport error reading body for '{username}': {e}"
+                );
+                MojangResolveError::NetworkError
+            } else {
+                warn!(
+                    "[Mojang] body read failed for '{username}': {e}"
+                );
+                MojangResolveError::NetworkError
+            }
         })?;
+        let mojang_response: MojangResponse =
+            serde_json::from_slice(&body_bytes).map_err(|e| {
+                warn!("[Mojang] malformed response for '{username}': {e}");
+                MojangResolveError::MalformedResponse
+            })?;
 
         // Mojang returns a bare-hex UUID; canonicalize to the hyphenated
         // lowercase xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. The helper

@@ -221,6 +221,10 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
             );
             println!("history drops today: {}", s.history_drops_today);
             println!(
+                "events dropped during composer (today): {}",
+                s.events_dropped_during_composer
+            );
+            println!(
                 "moderation backoff: {}",
                 s.moderation_backoff_until.as_deref().unwrap_or("<none>")
             );

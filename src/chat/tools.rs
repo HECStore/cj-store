@@ -669,9 +669,18 @@ async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         // Username-only path: consult the local player index FIRST so
         // we never burn a Mojang round-trip on a request that will be
         // denied. If the lower-cased name resolves to the sender's own
-        // UUID, allow. Otherwise require the cross-player flag before
-        // falling through to Mojang — denying here keeps the username-
-        // existence oracle sealed.
+        // UUID, allow. Otherwise require the cross-player flag — and
+        // even then ONLY proceed when the name is one the bot has
+        // observed locally (in the player index). A name the bot has
+        // never seen MUST NOT fall through to Mojang: doing so would
+        // turn the tool into an LLM-driven Mojang username-existence
+        // oracle (prompt-injectable: a player can ask the model to
+        // probe arbitrary names off-server and observe whether the bot
+        // returns "unknown player" vs "access denied"). Restricting
+        // cross-player reads to locally-observed names keeps that
+        // oracle sealed; the model can still discover names through
+        // normal gameplay (chat events, online roster, history) and
+        // those names land in the index via the chat pipeline.
         let local_hit = crate::chat::memory::load_or_rebuild_index()
             .ok()
             .and_then(|idx| idx.by_lower_username.get(&name.to_lowercase()).cloned());
@@ -685,10 +694,12 @@ async fn read_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         } else if let Some(hit) = local_hit {
             hit
         } else {
-            crate::mojang::resolve_user_uuid(name).await.map_err(|e| {
-                tracing::warn!(name = %name, error = %e, "resolve_user_uuid failed");
-                "resolve username failed".to_string()
-            })?
+            // Cross-player reads ON, but this name is not in the local
+            // index — refuse, do NOT call Mojang. Same surface message
+            // as the cross-player-disabled path so a probing model
+            // cannot distinguish "name unknown locally" from "cross-
+            // player reads disabled" (both look like access denied).
+            return Err("access denied (unknown player)".to_string());
         }
     } else {
         return Err("require either uuid or username".to_string());
@@ -1161,6 +1172,135 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
     Ok(out)
 }
 
+/// Stream a JSONL file in reverse, yielding complete lines newest-first
+/// without ever loading the whole file. Reads in 64 KB chunks from the
+/// tail, splits on `\n`, and stops as soon as the caller short-circuits.
+///
+/// `f` is the consumer; it returns `true` when it has all the matches it
+/// needs and the walk should stop. Each call receives one line in
+/// newest-first order. A line that spans two chunks is stitched together
+/// inside the helper before being handed to `f`.
+fn for_each_line_reverse<F>(path: &std::path::Path, mut f: F) -> std::io::Result<()>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    use std::io::{Seek, SeekFrom};
+    const CHUNK: usize = 64 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(());
+    }
+    let mut pos = len;
+    // Carry-over: bytes from the current chunk that precede the first
+    // newline. They belong to a line whose remainder is in the NEXT
+    // (older) chunk, so we prepend them once that chunk is read.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut chunk: Vec<u8> = vec![0u8; CHUNK];
+    while pos > 0 {
+        let read_len = std::cmp::min(CHUNK as u64, pos) as usize;
+        pos -= read_len as u64;
+        file.seek(SeekFrom::Start(pos))?;
+        // Re-slice in case CHUNK is larger than the bytes left.
+        let buf = &mut chunk[..read_len];
+        let mut already_read = 0usize;
+        while already_read < read_len {
+            use std::io::Read;
+            let n = file.read(&mut buf[already_read..])?;
+            if n == 0 {
+                break;
+            }
+            already_read += n;
+        }
+        let data = &buf[..already_read];
+        // Walk newlines from the end of the chunk back toward its start.
+        // Each newline marks the END of an older line and the start of
+        // a newer one. The bytes after the last newline in this chunk
+        // pair with whatever was already in `carry` to form one
+        // complete line.
+        // We emit lines newest-first; within this chunk that means
+        // walking trailing-end-of-line first.
+        // Strategy: split into lines, drain in reverse, stitching the
+        // last segment with `carry`.
+        // Build tail segment first.
+        let mut emitted_stop = false;
+        // Index of last `\n` in `data` (if any).
+        // We iterate from the right.
+        // Find positions of all '\n' in this chunk; cheap with memchr.
+        let mut newline_positions: Vec<usize> = Vec::new();
+        for i in memchr::memchr_iter(b'\n', data) {
+            newline_positions.push(i);
+        }
+        if newline_positions.is_empty() {
+            // No newline in this chunk — entire chunk is a prefix of
+            // the same line as `carry`. Prepend and keep going.
+            let mut new_carry = Vec::with_capacity(data.len() + carry.len());
+            new_carry.extend_from_slice(data);
+            new_carry.extend_from_slice(&carry);
+            carry = new_carry;
+            continue;
+        }
+        // Tail segment: bytes after the LAST newline, stitched with
+        // existing carry → one complete line (unless this was the very
+        // last chunk's trailing-newline case, in which case the tail is
+        // empty and `carry` is unused).
+        let last_nl = *newline_positions.last().unwrap_or(&0);
+        let tail = &data[last_nl + 1..];
+        if !tail.is_empty() || !carry.is_empty() {
+            let mut line = Vec::with_capacity(tail.len() + carry.len());
+            line.extend_from_slice(tail);
+            line.extend_from_slice(&carry);
+            // Strip trailing CR if present (write_atomic uses \n on
+            // Unix; defensive against \r\n if the file was edited).
+            let slice: &[u8] = if line.last() == Some(&b'\r') {
+                &line[..line.len() - 1]
+            } else {
+                &line[..]
+            };
+            if f(slice) {
+                emitted_stop = true;
+            }
+            carry.clear();
+        }
+        if emitted_stop {
+            return Ok(());
+        }
+        // Now iterate the remaining newlines from right-to-left,
+        // yielding each fully-contained line.
+        // Each pair (prev_nl, this_nl) defines a line: data[prev_nl+1..this_nl].
+        // For the leftmost segment (before the first newline in this
+        // chunk), bytes stay in `carry` for the next (older) chunk.
+        for w in newline_positions.windows(2).rev() {
+            let prev_nl = w[0];
+            let this_nl = w[1];
+            let mut slice = &data[prev_nl + 1..this_nl];
+            if slice.last() == Some(&b'\r') {
+                slice = &slice[..slice.len() - 1];
+            }
+            if f(slice) {
+                return Ok(());
+            }
+        }
+        // Bytes before the very first newline in this chunk → carry to
+        // the next (older) chunk.
+        let first_nl = newline_positions[0];
+        carry.clear();
+        carry.extend_from_slice(&data[..first_nl]);
+    }
+    // After all chunks are consumed, `carry` holds the first line of
+    // the file (no leading newline). Emit it last (it is the OLDEST
+    // line, consistent with our newest-first ordering).
+    if !carry.is_empty() {
+        let slice: &[u8] = if carry.last() == Some(&b'\r') {
+            &carry[..carry.len() - 1]
+        } else {
+            &carry[..]
+        };
+        let _ = f(slice);
+    }
+    Ok(())
+}
+
 async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
     let query = input
         .get("query")
@@ -1173,7 +1313,12 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
         .unwrap_or(7)
         .min(ctx.history_search_max_days as u64);
 
-    // Streaming line scan via spawn_blocking.
+    // Streaming reverse scan via spawn_blocking. The previous
+    // implementation `read_to_string`d each day file then iterated
+    // `.lines().rev()` — for a 50 K-line day that's MBs of eager
+    // allocation even when the first match satisfies `max_matches`.
+    // The new helper seeks backward 64 KB at a time and short-circuits
+    // as soon as the cap is hit.
     let history_dir = crate::chat::history::HISTORY_DIR.to_string();
     let max_matches = 50;
     let max_excerpt = 1024usize;
@@ -1191,7 +1336,12 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
         sender_username_from_index(&sender_uuid)
     };
     let result: Result<String, String> = tokio::task::spawn_blocking(move || {
-        let q_lc = q.to_lowercase();
+        // Pre-lowered needle for the CI byte scan. The fast path is
+        // ASCII (memmem on lower-cased haystack windows); non-ASCII
+        // bytes inside chat content can never be part of an ASCII
+        // needle anyway, so the fold is sound.
+        let q_lc_bytes = q.to_ascii_lowercase().into_bytes();
+        let needle = memchr::memmem::Finder::new(&q_lc_bytes);
         let mut matches: Vec<String> = Vec::new();
         let dir = std::path::Path::new(&dir_clone);
         if !dir.exists() {
@@ -1220,48 +1370,72 @@ async fn search_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Str
         }
         // Newest first.
         paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        // Reusable lowercase buffer for the per-line CI byte scan.
+        let mut lc_buf: Vec<u8> = Vec::with_capacity(1024);
         for p in paths {
-            let body = match std::fs::read_to_string(&p) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            for line in body.lines().rev() {
-                if line.to_lowercase().contains(&q_lc) {
-                    // Cross-player gate. Parsing each candidate line as
-                    // JSON is paid only when the substring already
-                    // matched, so pathological cases (every line
-                    // matches) still bound the parse cost at
-                    // max_matches before short-circuit.
-                    if !cross_player_reads {
-                        let v: serde_json::Value = match serde_json::from_str(line) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        if !history_record_visible_to_sender(
-                            &v,
-                            sender_username.as_deref(),
-                            &sender_uuid,
-                        ) {
-                            continue;
-                        }
-                    }
-                    let mut excerpt = line.to_string();
-                    if excerpt.len() > max_excerpt {
-                        // Round down to a char boundary; `String::truncate`
-                        // panics if the index falls mid-codepoint, and
-                        // history lines can contain multi-byte chat content.
-                        let mut cut = max_excerpt;
-                        while cut > 0 && !excerpt.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        excerpt.truncate(cut);
-                        excerpt.push_str(" ...[truncated]");
-                    }
-                    matches.push(excerpt);
-                    if matches.len() >= max_matches {
-                        return Ok(matches.join("\n"));
+            let mut hit_cap = false;
+            // `for_each_line_reverse` yields lines newest-first. We
+            // short-circuit as soon as `matches.len() >= max_matches`.
+            let walk_res = for_each_line_reverse(&p, |line_bytes| {
+                // Byte-level CI scan: pre-lower the line into the
+                // reused buffer, then run memmem. Avoids the previous
+                // per-line `String::to_lowercase()` allocation. ASCII
+                // CI is acceptable for the prefilter; an exact match
+                // is then established when the line is re-decoded as
+                // JSON below.
+                lc_buf.clear();
+                lc_buf.extend(line_bytes.iter().map(|b| b.to_ascii_lowercase()));
+                if needle.find(&lc_buf).is_none() {
+                    return false;
+                }
+                // Decode-once for the cross-player gate and excerpt
+                // emission. Lines that aren't valid UTF-8 are skipped.
+                let line = match std::str::from_utf8(line_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return false,
+                };
+                // Cross-player gate. Parsing each candidate line as
+                // JSON is paid only when the substring already
+                // matched, so pathological cases (every line
+                // matches) still bound the parse cost at
+                // max_matches before short-circuit.
+                if !cross_player_reads {
+                    let v: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    };
+                    if !history_record_visible_to_sender(
+                        &v,
+                        sender_username.as_deref(),
+                        &sender_uuid,
+                    ) {
+                        return false;
                     }
                 }
+                let mut excerpt = line.to_string();
+                if excerpt.len() > max_excerpt {
+                    // Round down to a char boundary; `String::truncate`
+                    // panics if the index falls mid-codepoint, and
+                    // history lines can contain multi-byte chat content.
+                    let mut cut = max_excerpt;
+                    while cut > 0 && !excerpt.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    excerpt.truncate(cut);
+                    excerpt.push_str(" ...[truncated]");
+                }
+                matches.push(excerpt);
+                if matches.len() >= max_matches {
+                    hit_cap = true;
+                    return true;
+                }
+                false
+            });
+            // I/O errors on a single day file are non-fatal — skip it
+            // and continue with the next file.
+            let _ = walk_res;
+            if hit_cap {
+                break;
             }
         }
         Ok(matches.join("\n"))

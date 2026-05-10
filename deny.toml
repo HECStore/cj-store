@@ -1,0 +1,108 @@
+# cargo-deny configuration for cj-store.
+#
+# Invoked from `.github/workflows/ci.yml` (security-audit job) as:
+#   cargo deny check advisories bans licenses sources
+#
+# Layout follows cargo-deny's 2024+ schema. Bump cargo-deny in CI before
+# adjusting schema-affecting fields here.
+
+[graph]
+# Single-target binary, but checking all-features keeps optional-feature
+# advisory coverage honest.
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories: RustSec database. Treat warnings (yanked, unmaintained,
+# notice-level advisories) as errors so they can't accumulate silently.
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+# RustSec advisory db is the default; explicit for documentation.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Bans: production dep hygiene. The high-order rule is "no pre-release
+# crates in the dep graph" — pre-releases ship breaking changes without
+# semver protection and have weaker advisory coverage.
+#
+# Exceptions: the pinned azalea rev (`41a9ae6a`, see Cargo.toml lines 9-40)
+# transitively forces `rsa = "0.10.0-rc.*"`, `signature = "3.0.0-rc.*"`,
+# `pkcs1 = "0.8.0-rc.*"`, and `crypto-primes = "0.7.0-pre.*"` /
+# `0.7.0` (post-pre release line). Upstream azalea's path-of-least-resistance
+# would be to bump to the stable releases when RustCrypto cuts them, at
+# which point these exceptions should be deleted.
+#
+# TODO(azalea-bump): when the azalea rev pin advances past RustCrypto's
+# stable cuts of rsa 0.10 / signature 3.0 / pkcs1 0.8, remove the matching
+# entries from `allow` below.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Deny any crate matching a pre-release version pattern unless explicitly
+# allowed. cargo-deny doesn't have a first-class "no prereleases" knob,
+# so we lean on the deny list of known pre-release deps the azalea pin
+# pulls in. New pre-releases entering the graph will surface as
+# `multiple-versions` warnings (already escalated by --deny warnings in
+# CI) plus the `[bans] deny` list below.
+deny = []
+# Explicit allow for the azalea-forced pre-release stack. Remove these
+# entries when the azalea rev pin bumps past the upstream stable cuts.
+allow = [
+    { name = "rsa", version = "0.10.0-rc.18" },
+    { name = "signature", version = "3.0.0-rc.10" },
+    { name = "pkcs1", version = "0.8.0-rc.4" },
+    { name = "crypto-primes", version = "0.7.0" },
+]
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Licenses: standard permissive set. Anything else trips CI so a
+# copyleft / unknown-license crate can't slip in via a dependabot bump.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# Confidence threshold for the license detector; 0.8 is cargo-deny's
+# documented "high confidence" baseline.
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+]
+exceptions = []
+
+# ---------------------------------------------------------------------------
+# Sources: only crates.io + the azalea git org are allowed. The simdnbt
+# git source is azalea-rs's too, hence the org-level allowlist below
+# rather than per-repo entries.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/azalea-rs/azalea",
+    "https://github.com/azalea-rs/simdnbt",
+]
+
+[sources.allow-org]
+github = ["azalea-rs"]

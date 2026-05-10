@@ -720,4 +720,86 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `complete_with_state` is documented as a single persist (advance +
+    /// complete fused) so a crash between the two old steps could never
+    /// leave the intermediate state on disk. Pin that contract: on-disk
+    /// after the call is exactly `[]`, never the intermediate state.
+    #[test]
+    fn complete_with_state_persists_only_terminal_state() {
+        let (mut j, dir) = temp_journal("complete-with-state");
+        let path = j.path.clone();
+
+        j.begin(JournalOp::DepositToChest, 4, 6).unwrap();
+        j.advance(JournalState::ShulkerOnStation).unwrap();
+
+        // Fused advance+complete: the intermediate `ShulkerReplaced` state
+        // must never appear on disk. Only the terminal empty array.
+        j.complete_with_state(JournalState::ShulkerReplaced).unwrap();
+
+        // In-memory entry cleared.
+        assert!(j.current().is_none());
+
+        // On-disk file is exactly the empty-array sentinel "[]". If a
+        // crash interrupted the old two-step (advance THEN complete),
+        // we'd see `[{...,"state":"ShulkerReplaced"}]` here instead.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk, "[]",
+            "complete_with_state must persist only the terminal state, not the intermediate"
+        );
+
+        // Round-trip via load also confirms: no leftover entry.
+        let (_loaded, leftover) = Journal::load_from(&path).unwrap();
+        assert!(leftover.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `restore_leftover` is the safety net the bot startup path uses when
+    /// `archive_leftover` fails: it re-attaches the entry to the in-memory
+    /// journal so the next `begin()` triggers the "overwriting stale entry"
+    /// warning + re-persists the same single-entry payload, preserving the
+    /// operation_id/state. Without this hook, a load-clears-memory →
+    /// archive-failed sequence would have the next `begin()` silently
+    /// overwrite the only forensic record on disk.
+    #[test]
+    fn restore_leftover_re_persists_entry_for_next_session() {
+        let (mut j, dir) = temp_journal("restore-leftover");
+        let path = j.path.clone();
+
+        // Seed a leftover entry from a previous "session".
+        let prev_op_id = j.begin(JournalOp::WithdrawFromChest, 9, 4).unwrap();
+        j.advance(JournalState::ItemsTransferred).unwrap();
+
+        // Simulate the loader for the next session: it always returns a
+        // fresh `Journal { entry: None, … }` plus the leftover detached.
+        let (mut next_j, leftover) = Journal::load_from(&path).unwrap();
+        let leftover = leftover.expect("leftover entry must be present after restart");
+        assert_eq!(leftover.operation_id, prev_op_id);
+        assert!(next_j.current().is_none(), "loader must hand back an empty journal");
+
+        // Imagine `archive_leftover` failed: re-attach the entry to the
+        // in-memory state so the next `begin()` preserves it.
+        next_j.restore_leftover(leftover.clone());
+
+        // The entry is now back in memory.
+        let current = next_j.current().expect("entry must be reattached");
+        assert_eq!(current.operation_id, prev_op_id);
+        assert_eq!(current.state, JournalState::ItemsTransferred);
+
+        // A subsequent `begin()` overwrites it (with the documented warning
+        // log) and re-persists — but the prior entry is no longer the only
+        // forensic record, since this test pins the contract that the
+        // re-attach worked. To pin the persistence side too: trigger a
+        // fresh persist by advancing the *attached* entry, then load_from
+        // confirms the attached state was written.
+        next_j.advance(JournalState::ShulkerPickedUp).unwrap();
+        let (_again, leftover2) = Journal::load_from(&path).unwrap();
+        let leftover2 = leftover2.expect("re-attached entry must persist on next write");
+        assert_eq!(leftover2.operation_id, prev_op_id);
+        assert_eq!(leftover2.state, JournalState::ShulkerPickedUp);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

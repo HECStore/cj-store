@@ -85,8 +85,17 @@ pub struct ChatState {
     pub composer_throttle_backoff_until: Option<String>,
     pub persona_regen_cooldown_until: Option<String>,
     /// Number of history events dropped today by the publisher-side
-    /// `try_send` path.
+    /// `try_send` path. Mirrored from `bot.history_drops` via a
+    /// pull-with-swap at the top of each chat-task iteration.
     pub history_drops_today: u64,
+    /// CHAT.md — events dropped from the chat broadcast while the
+    /// composer was busy (broadcast::error::RecvError::Lagged). Each
+    /// Lagged arm accumulates the reported `lagged: N` count here so
+    /// operators can see chronic backpressure without grepping the
+    /// decisions JSONL. Reset on the same daily boundary as the token
+    /// meter.
+    #[serde(default)]
+    pub events_dropped_during_composer: u64,
     /// Web-fetch calls made today; gate for `chat.web_fetch_daily_max`.
     /// Reset at the same daily boundary as the token meter.
     #[serde(default)]
@@ -149,6 +158,7 @@ impl Default for ChatState {
             composer_throttle_backoff_until: None,
             persona_regen_cooldown_until: None,
             history_drops_today: 0,
+            events_dropped_during_composer: 0,
             web_fetches_today: 0,
             last_sweep_day: None,
             last_reflection_at: None,
@@ -276,6 +286,7 @@ impl ChatState {
             );
             self.tokens_today = TokensToday::default();
             self.history_drops_today = 0;
+            self.events_dropped_during_composer = 0;
             self.web_fetches_today = 0;
             self.update_self_memory_today = 0;
             self.update_player_memory_today = 0;
@@ -353,6 +364,14 @@ impl ChatState {
     /// FIRST (lazy reset, CHAT.md), then increments. Pass the day the
     /// call **started** as `started_day_utc` so usage is attributed
     /// correctly even if the day rolled over during the call.
+    ///
+    /// Self-rolling: this method calls [`Self::roll_to_today`]
+    /// independently of any caller-side roll, so a composer call that
+    /// dispatched before UTC midnight and recorded after UTC midnight
+    /// cannot leave the meter parked on yesterday's saturated bucket.
+    /// The `started_day_utc` parameter is then folded under
+    /// `roll_to_day` (forward-only, no backward jump) so backdated
+    /// usage folds into today rather than resetting to yesterday.
     pub fn record_composer(
         &mut self,
         started_day_utc: &str,
@@ -360,6 +379,12 @@ impl ChatState {
         output_tokens: u64,
         usd: f64,
     ) {
+        // Self-rolling order matters: today first (advances forward),
+        // then started_day_utc (no-op when started_day <= today).
+        // Reversing them would advance to started_day_utc only when
+        // started_day > last_meter_day_utc, missing the case where
+        // both are stale relative to today.
+        self.roll_to_today();
         self.roll_to_day(started_day_utc);
         self.tokens_today.composer_input =
             self.tokens_today.composer_input.saturating_add(input_tokens);
@@ -370,6 +395,8 @@ impl ChatState {
         }
     }
 
+    /// Symmetric to [`Self::record_composer`]; see that method's
+    /// doc-comment for the self-rolling semantics.
     pub fn record_classifier(
         &mut self,
         started_day_utc: &str,
@@ -377,6 +404,7 @@ impl ChatState {
         output_tokens: u64,
         usd: f64,
     ) {
+        self.roll_to_today();
         self.roll_to_day(started_day_utc);
         self.tokens_today.classifier_input = self
             .tokens_today
@@ -576,18 +604,49 @@ mod tests {
     #[test]
     fn record_composer_attributes_to_started_day() {
         // CHAT.md: tokens count against the day the call STARTED, not
-        // finished. If the dispatch day was today, recording today is
-        // straightforward — counters increment. The forward-only roll
-        // means a backdated record folds into the current day rather
-        // than resetting the meter to yesterday and losing data.
+        // finished. The forward-only `roll_to_day` means a backdated
+        // record folds into the current day rather than resetting the
+        // meter to yesterday and losing data. We pin the live meter
+        // day to today (computed at test time) so the new self-rolling
+        // `roll_to_today` call inside `record_composer` doesn't wipe
+        // the seeded counter.
         let mut s = ChatState::default();
-        s.last_meter_day_utc = "2025-01-02".to_string();
+        let today = today_utc();
+        s.last_meter_day_utc = today.clone();
         s.tokens_today.composer_input = 1000;
-        // Call started yesterday; record now. Backdated → no roll, fold
-        // into today's bucket so the 1000 already accumulated isn't lost.
-        s.record_composer("2025-01-01", 500, 100, 0.05);
+        // Call started yesterday relative to the live meter. Backdated →
+        // no roll, fold into today's bucket so the 1000 already
+        // accumulated isn't lost.
+        s.record_composer("1970-01-01", 500, 100, 0.05);
         assert_eq!(s.tokens_today.composer_input, 1500);
-        assert_eq!(s.last_meter_day_utc, "2025-01-02");
+        assert_eq!(s.last_meter_day_utc, today);
+    }
+
+    #[test]
+    fn record_composer_self_rolls_to_today_on_long_call() {
+        // Regression: a composer call that dispatched before midnight UTC
+        // and returns after midnight must NOT record into a saturated
+        // yesterday bucket. The self-rolling `record_composer` advances
+        // the meter to today before incrementing.
+        //
+        // Simulate by setting `last_meter_day_utc` to a date strictly
+        // less than today: the recorder must observe the calendar
+        // rollover internally (not just trust the caller's
+        // `started_day_utc` — that arg is for backdated attribution,
+        // not for advancing the meter).
+        let mut s = ChatState::default();
+        // Far in the past so any real "today" is strictly greater.
+        s.last_meter_day_utc = "1970-01-01".to_string();
+        s.tokens_today.composer_input = 999_999;
+        s.tokens_today.estimated_usd = 100.0;
+        // Caller's started_day_utc also stale (call started "yesterday").
+        s.record_composer("1970-01-02", 500, 100, 0.05);
+        // The meter rolled forward: yesterday's counters wiped, new
+        // call recorded against today.
+        assert_eq!(s.tokens_today.composer_input, 500);
+        assert_eq!(s.tokens_today.composer_output, 100);
+        assert!((s.tokens_today.estimated_usd - 0.05).abs() < 1e-9);
+        assert_eq!(s.last_meter_day_utc, today_utc());
     }
 
     // ---- cap checks -------------------------------------------------------

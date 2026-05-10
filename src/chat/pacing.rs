@@ -455,18 +455,47 @@ pub fn strip_ai_tells(reply: &str) -> String {
     // behind when a tell is excised mid-sentence. The rules below are
     // fixed points (a second pass is a no-op) so idempotence is
     // preserved.
-    // 1. Collapse runs of 2+ ASCII spaces into a single space. We avoid
-    //    `char::is_whitespace` here so newlines survive untouched.
-    while out.contains("  ") {
-        out = out.replace("  ", " ");
-    }
-    // 2. Collapse "<space><sentence-punct>" into the bare punctuation.
-    for pair in &[" ,", " .", " ;", " :", " !", " ?"] {
-        let bare = &pair[1..];
-        while out.contains(pair) {
-            out = out.replace(pair, bare);
+    //
+    // Single-pass scanner: walks `out` byte by byte (ASCII-safe since
+    // the rules only act on ASCII space + punctuation) and emits into a
+    // fresh buffer. The previous `while out.contains(p) { replace }`
+    // shape was O(n²) on adversarial input — a 100KB string of pure
+    // spaces would re-allocate and rescan on every pass. This pass is
+    // linear.
+    // 1. Collapse runs of 2+ ASCII `' '` into one. Tabs and newlines are
+    //    preserved unchanged.
+    // 2. Collapse `<space>(<space>)*<sentence-punct>` to the bare
+    //    punctuation — by buffering any pending space and discarding it
+    //    when the next non-space char is one of `,.;:!?`.
+    let bytes = out.as_bytes();
+    let mut collapsed = String::with_capacity(out.len());
+    let mut pending_space = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' {
+            // One pending-space marker — final emission is decided when
+            // we see the next non-space byte (or EOS).
+            pending_space = true;
+            i += 1;
+            continue;
         }
+        if pending_space {
+            if !matches!(b, b',' | b'.' | b';' | b':' | b'!' | b'?') {
+                collapsed.push(' ');
+            }
+            pending_space = false;
+        }
+        // Push this byte (or the full UTF-8 char it starts) verbatim.
+        // `out` is a `String`, so `i` is at a char boundary.
+        let ch_end = next_char_end(bytes, i);
+        collapsed.push_str(&out[i..ch_end]);
+        i = ch_end;
     }
+    if pending_space {
+        collapsed.push(' ');
+    }
+    out = collapsed;
     // 3. Trim leading runs of `,;:` plus leading ASCII whitespace.
     //    Leading `.` is preserved so an intentional "..." opener
     //    survives.
@@ -477,6 +506,26 @@ pub fn strip_ai_tells(reply: &str) -> String {
         out.drain(..trimmed_start);
     }
     out
+}
+
+/// Step `i` forward past one UTF-8 char in `bytes` (which MUST be the
+/// bytes of a `&str`, so `i` is always at a char boundary). Used by the
+/// single-pass scanners that need to advance through `&str` byte slices
+/// without splitting a multi-byte codepoint.
+fn next_char_end(bytes: &[u8], i: usize) -> usize {
+    let b = bytes[i];
+    let len = if b < 0x80 {
+        1
+    } else if b < 0xc0 {
+        1
+    } else if b < 0xe0 {
+        2
+    } else if b < 0xf0 {
+        3
+    } else {
+        4
+    };
+    (i + len).min(bytes.len())
 }
 
 /// Sanitize an outbound chat reply by stripping every ASCII control
@@ -503,16 +552,24 @@ pub fn strip_ai_tells(reply: &str) -> String {
 /// (e.g. pure `\n`) returns `""` so the caller's `is_empty` drop gate
 /// silences it.
 pub fn sanitize_outbound_chat(reply: &str) -> String {
+    // Single-pass: replace each control char with a space, while
+    // collapsing runs of spaces inline. The previous shape used a
+    // `while out.contains("  ")` collapse pass which is O(n²) on
+    // pathological input (a long run of control bytes becomes a long
+    // run of spaces, then re-scanned each iteration).
     let mut out = String::with_capacity(reply.len());
+    let mut prev_space = false;
     for c in reply.chars() {
-        if (c as u32) < 0x20 || c == '\u{7f}' {
-            out.push(' ');
+        let is_space_token = (c as u32) < 0x20 || c == '\u{7f}' || c == ' ';
+        if is_space_token {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
         } else {
             out.push(c);
+            prev_space = false;
         }
-    }
-    while out.contains("  ") {
-        out = out.replace("  ", " ");
     }
     out.trim().to_string()
 }

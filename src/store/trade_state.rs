@@ -365,7 +365,35 @@ fn persist_to(path: &Path, state: &TradeState) -> io::Result<()> {
 /// On successful quarantine we return `Ok(None)` so the bot can boot; only
 /// a quarantine failure surfaces as `Err`.
 fn load_persisted_from(path: &Path) -> io::Result<Option<TradeState>> {
-    match std::fs::read_to_string(path) {
+    // Windows AV scanners and the Search Indexer routinely hold a brief
+    // sharing-lock on freshly-renamed files (atomic-rename targets are
+    // a favorite). Treating that transient sharing violation as
+    // "corrupt → quarantine" destroys the very crash evidence the
+    // quarantine path exists to preserve. Retry NotFound-other read
+    // errors with backoff before falling through. Mirrors the pattern
+    // in `fsutil::rename_failed_fallback_copy`.
+    #[cfg(windows)]
+    let read_result = {
+        let mut last: io::Result<String> = std::fs::read_to_string(path);
+        for attempt in 0..5 {
+            match &last {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(_) => {
+                    if attempt == 4 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                    last = std::fs::read_to_string(path);
+                }
+            }
+        }
+        last
+    };
+    #[cfg(not(windows))]
+    let read_result = std::fs::read_to_string(path);
+
+    match read_result {
         Ok(content) => match serde_json::from_str::<TradeState>(&content) {
             Ok(state) => Ok(Some(state)),
             Err(parse_err) => {

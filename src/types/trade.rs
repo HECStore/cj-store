@@ -231,15 +231,25 @@ impl Trade {
     ///
     /// The orphan cleanup ensures the on-disk set matches `trades` exactly,
     /// so callers can use this to synchronize after in-memory deletions.
-    pub fn save_all(trades: &Vec<Self>) -> io::Result<()> {
-        Self::save_all_in_dir(trades, Path::new(Self::TRADES_DIR))
+    ///
+    /// `dirty_tail_count` is the number of trades AT THE TAIL of `trades`
+    /// that have been appended (or otherwise mutated) since the last
+    /// successful save and therefore actually need their bytes written.
+    /// Trade files never mutate after the initial write — every earlier
+    /// trade already on disk is byte-identical to what we'd write again,
+    /// so skipping them saves N × {create + write + fsync + rename} per
+    /// autosave at 50K-trade scale. Pass `trades.len()` for "save all".
+    /// The orphan sweep still runs over the full set so in-memory deletions
+    /// (e.g. `trim_in_memory_to_caps`) are still propagated to disk.
+    pub fn save_all(trades: &Vec<Self>, dirty_tail_count: usize) -> io::Result<()> {
+        Self::save_all_in_dir(trades, Path::new(Self::TRADES_DIR), dirty_tail_count)
     }
 
     /// Directory-parameterized form of `save_all`. The empty-vec guard lives
     /// here (not just in the public wrapper) so tests can exercise the
     /// wipe-refusal invariant directly against a temp dir; the public
     /// `save_all` is a thin one-liner over this helper.
-    fn save_all_in_dir(trades: &Vec<Self>, dir_path: &Path) -> io::Result<()> {
+    fn save_all_in_dir(trades: &Vec<Self>, dir_path: &Path, dirty_tail_count: usize) -> io::Result<()> {
         // Refuse an empty vec only when there are real `.json` files on disk
         // that the orphan sweep below would actually wipe. A fresh install
         // (no trades dir, or an empty/stub trades dir) is a legitimate no-op:
@@ -278,13 +288,24 @@ impl Trade {
         let mut written = 0usize;
         let mut first_save_err: Option<io::Error> = None;
 
-        for trade in trades {
+        // Trade files are immutable after the initial write, so only the last
+        // `dirty_tail_count` entries actually need their bytes (re)written.
+        // `expected_files` still gets every trade so the orphan sweep below
+        // does not delete an already-saved historical file.
+        let total = trades.len();
+        let dirty_start = total.saturating_sub(dirty_tail_count);
+        for (idx, trade) in trades.iter().enumerate() {
             // Always populate `expected_files` regardless of save outcome so
             // a transient write failure on one trade does not cause the
             // orphan sweep below to delete that trade's existing on-disk file.
             let timestamp_str = trade.timestamp.to_rfc3339().replace(':', "-");
             let filename = format!("{timestamp_str}.json");
             expected_files.insert(filename);
+            if idx < dirty_start {
+                // Already-persisted historical trade; bytes on disk are
+                // byte-identical (Trade is append-only and never edited).
+                continue;
+            }
             // Attempt every trade even after a previous failure: each
             // `write_atomic` is independent, so one transient hiccup must
             // not silently drop later trades. Capture only the first error
@@ -434,7 +455,7 @@ mod tests {
         let f = dir.path().join("2026-01-01T00-00-00Z.json");
         fs::write(&f, "{}").unwrap();
 
-        let err = Trade::save_all_in_dir(&Vec::new(), dir.path())
+        let err = Trade::save_all_in_dir(&Vec::new(), dir.path(), 0)
             .expect_err("empty vec paired with on-disk trade file must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("empty trades vec"));
@@ -452,14 +473,14 @@ mod tests {
         // (i) Missing directory: an empty vec must succeed without creating
         //     the directory (the no-op path returns before `create_dir_all`).
         let missing = parent.path().join("does_not_exist");
-        Trade::save_all_in_dir(&Vec::new(), &missing)
+        Trade::save_all_in_dir(&Vec::new(), &missing, 0)
             .expect("empty vec + missing dir must be a no-op");
         assert!(!missing.exists(), "no-op must not create the dir");
 
         // (ii) Existing but empty directory: also a no-op.
         let empty = parent.path().join("empty_trades");
         fs::create_dir_all(&empty).unwrap();
-        Trade::save_all_in_dir(&Vec::new(), &empty)
+        Trade::save_all_in_dir(&Vec::new(), &empty, 0)
             .expect("empty vec + empty dir must be a no-op");
 
         // (iii) Existing dir with only non-`.json` siblings: still a no-op
@@ -467,7 +488,7 @@ mod tests {
         let with_sibling = parent.path().join("with_sibling");
         fs::create_dir_all(&with_sibling).unwrap();
         fs::write(with_sibling.join("README.txt"), "not a trade file").unwrap();
-        Trade::save_all_in_dir(&Vec::new(), &with_sibling)
+        Trade::save_all_in_dir(&Vec::new(), &with_sibling, 0)
             .expect("empty vec + non-json siblings must be a no-op");
         assert!(with_sibling.join("README.txt").exists(), "non-json sibling must survive");
     }
@@ -521,7 +542,7 @@ mod tests {
         );
         let trades = vec![trade.clone()];
 
-        let result = Trade::save_all_in_dir(&trades, dir.path());
+        let result = Trade::save_all_in_dir(&trades, dir.path(), trades.len());
 
         // Always clean up the canary first to keep the real data dir tidy
         // even if the assertions below fail.
@@ -557,5 +578,77 @@ mod tests {
             canary_still_there,
             "real data/trades/ canary must survive temp-dir save_all_in_dir",
         );
+    }
+
+    #[test]
+    fn save_all_with_dirty_tail_only_rewrites_recent_trades() {
+        // Locks in the append-only autosave contract: when only one trade is
+        // appended since the last save, `save_all_in_dir` MUST rewrite that
+        // single file and leave every prior file's bytes (and mtime) intact.
+        // Otherwise a 50K-trade history pays 50K × {create+write+fsync+rename}
+        // per autosave cycle for a single new entry.
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut trades: Vec<Trade> = Vec::new();
+        for i in 0..3 {
+            // Stagger timestamps so each trade gets a distinct filename.
+            let mut t = Trade::new(
+                TradeType::Buy,
+                ItemId::new("diamond").unwrap(),
+                i + 1,
+                1.0,
+                "u".to_string(),
+            );
+            // Force a known-ordered timestamp so filename comparisons are stable.
+            t.timestamp =
+                DateTime::parse_from_rfc3339(&format!("2020-01-0{}T00:00:00Z", i + 1))
+                    .unwrap()
+                    .with_timezone(&Utc);
+            trades.push(t);
+        }
+
+        // First save: write all three, then capture each file's modification time.
+        Trade::save_all_in_dir(&trades, dir.path(), trades.len())
+            .expect("initial save must succeed");
+        let mtimes_before: Vec<_> = trades
+            .iter()
+            .map(|t| {
+                let p = Trade::get_trade_file_path_in_dir(dir.path(), &t.timestamp);
+                fs::metadata(&p).expect("file exists").modified().unwrap()
+            })
+            .collect();
+
+        // Sleep briefly so a re-write would produce a distinct mtime on
+        // filesystems with second-resolution timestamps (NTFS, ext4 with noatime).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Append one new trade and save with dirty_tail_count = 1.
+        let mut new_trade = Trade::new(
+            TradeType::Buy,
+            ItemId::new("diamond").unwrap(),
+            42,
+            1.0,
+            "u".to_string(),
+        );
+        new_trade.timestamp = DateTime::parse_from_rfc3339("2020-01-04T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        trades.push(new_trade.clone());
+
+        Trade::save_all_in_dir(&trades, dir.path(), 1)
+            .expect("append-only save must succeed");
+
+        // (i) Every prior file's mtime is unchanged.
+        for (idx, t) in trades.iter().take(3).enumerate() {
+            let p = Trade::get_trade_file_path_in_dir(dir.path(), &t.timestamp);
+            let mtime_now = fs::metadata(&p).expect("file exists").modified().unwrap();
+            assert_eq!(
+                mtime_now, mtimes_before[idx],
+                "trade {idx}'s file must not be rewritten on append-only autosave"
+            );
+        }
+        // (ii) The newly-appended trade is on disk.
+        let new_path = Trade::get_trade_file_path_in_dir(dir.path(), &new_trade.timestamp);
+        assert!(new_path.exists(), "newly-appended trade file must exist");
     }
 }

@@ -292,15 +292,34 @@ impl OrderQueue {
         // Persist on every mutation so an unexpected shutdown never loses a
         // queued order. If the save fails, roll back the in-memory push so we
         // don't return a "queued" confirmation for an order that won't survive
-        // a restart. We deliberately do NOT decrement `next_id`: the ID may
-        // already have been emitted in info!() logs / quoted to the player on
-        // a prior attempt, and burning the ID is safer than reusing it.
+        // a restart.
+        //
+        // Also decrement `next_id` on rollback. Prior policy was to "burn" the
+        // ID on save failure (treat the ID as already-emitted, safer than
+        // reuse), but a flapping permission / disk-full failure can cycle this
+        // path arbitrarily many times — `next_id` then grows unboundedly even
+        // though no order has ever been persisted. The user-visible failure
+        // surface is `Err("…please retry.")`, and we have NOT yet emitted an
+        // `info!()` line for this ID (that comes AFTER the successful save
+        // below), so no log/player surface has been told about it. Decrement
+        // the counter so a future successful add reuses the slot. The only
+        // way the ID could have been quoted externally is a prior attempt at
+        // the same ID that already failed and rolled back; in that case the
+        // counter sat at this value before, so re-issuing it is a no-op.
         if let Err(e) = self.save_to(path) {
             error!(
                 "[Queue] Failed to persist after adding order #{}: {} (rolling back)",
                 id, e
             );
             self.orders.pop_back();
+            // Decrement only if it still matches what we set — defensive
+            // against a hypothetical concurrent mutation that bumped the
+            // counter again before we got here (today: not possible because
+            // `add_at_path` takes `&mut self`, but cheap to make the rollback
+            // safe-by-construction).
+            if self.next_id == id + 1 {
+                self.next_id = id;
+            }
             return Err("Queue temporarily unavailable, please retry.".to_string());
         }
 
@@ -886,14 +905,16 @@ mod tests {
         // rolled back via pop_back).
         assert_eq!(queue.len(), len_before, "len must roll back on save failure");
 
-        // (c) queue.next_id is NOT rolled back: the ID may already have
-        // appeared in info!() logs / been quoted to the player on a prior
-        // attempt, so burning the ID (advancing once, then never reusing) is
-        // safer than reusing it for a future order.
+        // (c) queue.next_id IS rolled back on save failure. The success-path
+        // `info!()` line never ran (it's printed AFTER `save_to` returns Ok)
+        // and no player-visible surface has been told the ID, so the safer
+        // policy is to release the slot for reuse. Otherwise a flapping
+        // permission / disk-full failure would unbound `next_id` even though
+        // no order was ever persisted.
         assert_eq!(
             queue.next_id,
-            next_id_before + 1,
-            "next_id must NOT be decremented on save failure (burned ID is safer than reuse)"
+            next_id_before,
+            "next_id must be decremented on save failure (no log/player surface saw the ID yet)"
         );
     }
 

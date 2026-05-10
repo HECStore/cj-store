@@ -639,6 +639,15 @@ impl Store {
         }
 
         self.processing_order = false;
+        if let Some(ref t) = self.current_trade {
+            if !t.is_terminal() {
+                error!(
+                    order_id = %t.order().id,
+                    phase = %t.phase(),
+                    "process_next_order clearing non-terminal trade state — handler did not drive state machine to completion"
+                );
+            }
+        }
         self.current_trade = None;
         // Trade reached a terminal state (either committed or failed with
         // rollback already run) - clear the on-disk mirror so a restart

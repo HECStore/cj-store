@@ -760,26 +760,32 @@ is written. See [src/store/rollback.rs](src/store/rollback.rs).
 
 ### Sell order failures
 
-| Failure point                | Rollback action                                 |
-| ---------------------------- | ----------------------------------------------- |
-| Before trade                 | None needed — order cancelled                   |
-| Trade rejected by player     | None — player kept items                        |
-| Trade timeout (45 s)         | None — player kept items                        |
-| Storage deposit fails after trade | Player NOT paid; bot attempts trade-back   |
+| Failure point                     | Rollback action                                                  |
+| --------------------------------- | ---------------------------------------------------------------- |
+| Before trade                      | None needed — order cancelled                                    |
+| Insufficient physical diamonds    | Order rejected before trade; no payout                           |
+| Trade rejected by player          | Diamonds returned to storage; no payout                          |
+| Trade timeout (45 s)              | Diamonds returned to storage; no payout                          |
+| Item-count mismatch after trade   | Diamonds returned to storage; bot attempts item-return trade     |
+| Storage deposit fails after trade | Diamonds already paid; ledger debited; bot attempts item-return trade |
 
 > [!WARNING]
-> If a sell deposit fails, the **player does not receive payment** but the
-> items are in the bot's inventory. The bot attempts a trade-back; this is
-> best-effort. See [RECOVERY.md](RECOVERY.md) section 4 for manual recovery.
+> If a sell **deposit** fails (the trade GUI completed and the bot paid the player
+> whole diamonds, but then couldn't write the player's items into storage), the
+> diamonds are **already in the player's hands**. The code debits `pair.currency_stock`
+> and credits any fractional remainder to the player's balance immediately, then
+> attempts a best-effort item-return trade. If the return trade also fails, the
+> player keeps the items AND the diamonds. See [RECOVERY.md](RECOVERY.md) section 4
+> for manual recovery.
 
 ### Data consistency guarantees
 
-| Property        | Guarantee                                               |
-| --------------- | ------------------------------------------------------- |
-| Ledger updates  | Only committed after successful trade + storage sync    |
-| Storage state   | Synced from real chest contents after each operation    |
-| Balance changes | Applied atomically with trade completion                |
-| Pair reserves   | Updated only after full transaction success            |
+| Property        | Guarantee                                                                          |
+| --------------- | ---------------------------------------------------------------------------------- |
+| Ledger updates  | Committed after successful trade + storage sync; sell deposit-failure is an exception (see WARNING above) |
+| Storage state   | Synced from real chest contents after each operation                               |
+| Balance changes | Applied atomically with trade completion; fractional sell credit applied on deposit failure |
+| Pair reserves   | Updated after full transaction success; sell `currency_stock` debited even on deposit failure when diamonds were physically paid |
 
 ## Where to start reading
 

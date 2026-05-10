@@ -373,13 +373,17 @@ trade GUI. No player-side effect yet.
      cleared by the previous successful op): the journal can't tell you
      what to fix, but the saved copy of `data/current_trade.json` can.
      The `Withdrawing` variant carries a `plan: Vec<ChestTransfer>` (the
-     full list of chest→shulker transfers the bot was about to execute —
-     see [src/store/trade_state.rs](src/store/trade_state.rs)). Walk
-     each entry in `plan`, decode its `chest_id`/`slot_index` via the
+     list of chest→shulker transfers the bot was about to execute —
+     see [src/store/trade_state.rs](src/store/trade_state.rs)). **Note:
+     for sell orders the plan is always `[]`** because sell's diamond
+     withdrawal is computed inline at runtime rather than stored here.
+     For buy orders the plan is the full item-withdrawal list. Walk each
+     entry in `plan`, decode its `chest_id`/`slot_index` via the
      [Terminology & decoding](#terminology--decoding) table, and
      physically reseat any shulker from those slots that's now on the
      station, in the bot's inventory, or on the floor — putting it back
-     into the slot the plan entry names.
+     into the slot the plan entry names. For sell orders with a journal
+     entry, that entry names the specific diamond-chest slot to reseat.
 4. Restart the bot and run `audit-state` from the CLI to verify pair
    `item_stock` matches chest sums; if it doesn't, drop down to
    [§ 2 Option B](#2-stuck-datajournaljson-entry) for the affected pair.

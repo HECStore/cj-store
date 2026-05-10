@@ -157,7 +157,10 @@ pub async fn handle_deposit_balance_queued(
             );
             return utils::whisper_action_aborted(store, player_name, "Deposit", &err, None).await;
         }
-        Err(other) => return Err(other),
+        Err(other) => {
+            store.advance_trade(|s| s.rollback("deposit/trade-error".to_string()));
+            return Err(other);
+        }
     };
 
     let diamonds_actually_received: i32 = actual_received
@@ -172,6 +175,7 @@ pub async fn handle_deposit_balance_queued(
             uuid = %user_uuid,
             "Deposit aborted: trade completed but zero diamonds received"
         );
+        store.advance_trade(|s| s.rollback("deposit/zero-diamonds".to_string()));
         return utils::send_message_to_player(
             store,
             player_name,

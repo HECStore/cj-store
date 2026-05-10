@@ -144,9 +144,15 @@ pub async fn place_shulker_in_chest_slot_verified(
             let slots_retry = container.slots().ok_or_else(|| "Container closed".to_string())?;
             if let Some(slot_item) = slots_retry.get(container_slot) {
                 debug!(
-                    "place_shulker_in_chest_slot_verified: Source slot {} AFTER retry pickup: {} x{}", 
+                    "place_shulker_in_chest_slot_verified: Source slot {} AFTER retry pickup: {} x{}",
                     container_slot, slot_item.kind(), slot_item.count()
                 );
+                if slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
+                    return Err(format!(
+                        "Shulker still in container slot {} after retry pickup — cannot safely place into chest slot {}",
+                        container_slot, chest_slot
+                    ));
+                }
             }
         }
     }
@@ -1468,10 +1474,10 @@ async fn finish_shulker_round_trip(
     if let Some(container_slot) = shulker_in_container_view {
         place_shulker_in_chest_slot_verified(&container, container_slot, slot_idx).await?;
     } else {
-        warn!(
-            "finish_shulker_round_trip: Could not find shulker in inventory view to place back in chest at ({}, {}, {}) slot {}",
+        return Err(format!(
+            "finish_shulker_round_trip: shulker not found in inventory view for chest ({}, {}, {}) slot {} — shulker may be stranded",
             chest_pos.x, chest_pos.y, chest_pos.z, slot_idx
-        );
+        ));
     }
 
     // Optionally close and reopen the chest so the next iteration starts with a
@@ -1858,12 +1864,13 @@ async fn deposit_shulkers(
                 "deposit_shulkers: Bot has no items of {} in inventory while depositing at chest {} slot {} (remaining {}/{} to move)",
                 target_id, chest_id, slot_idx, remaining, amount
             );
-            // Release container before returning error.
-            drop(shulker_container);
-            return Err(format!(
+            let err_msg = format!(
                 "Bot inventory is empty - no items of {} to deposit at chest {} slot {}",
                 target_id, chest_id, slot_idx
-            ));
+            );
+            // Put the shulker back before returning so it isn't stranded on the station.
+            finish_shulker_round_trip(bot, chest_pos, slot_idx, station_pos, node_position, shulker_container, false).await?;
+            return Err(err_msg);
         } else if total_space == 0 {
             // Shulker is full or contains a different item type — skip it.
             debug!(
@@ -1893,11 +1900,13 @@ async fn deposit_shulkers(
                     chest_id, slot_idx, target_id, total_space, bot_item_count
                 );
                 if total_space > 0 && bot_item_count > 0 {
-                    drop(shulker_container);
-                    return Err(format!(
+                    let err_msg = format!(
                         "Failed to transfer {} to shulker at chest {} slot {} despite {} space and {} items in inventory",
                         target_id, chest_id, slot_idx, total_space, bot_item_count
-                    ));
+                    );
+                    // Put the shulker back before returning so it isn't stranded on the station.
+                    finish_shulker_round_trip(bot, chest_pos, slot_idx, station_pos, node_position, shulker_container, false).await?;
+                    return Err(err_msg);
                 }
             }
             slot_counts[slot_idx] = initial_item_count + moved;

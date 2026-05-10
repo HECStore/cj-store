@@ -183,6 +183,7 @@ pub async fn handle_withdraw_balance_queued(
                 available = preview_withdrawn,
                 "Withdraw blocked: insufficient physical diamonds in storage"
             );
+            store.advance_trade(|s| s.rollback("withdraw/insufficient-physical-diamonds".to_string()));
             return utils::send_message_to_player(
                 store,
                 player_name,

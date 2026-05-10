@@ -425,6 +425,7 @@ pub async fn handle_buy_order(
     )
     .await
     {
+        store.advance_trade(|s| s.rollback("buy/chest-withdrawal-failed".to_string()));
         return utils::send_message_to_player(
             store,
             player_name,
@@ -498,6 +499,7 @@ pub async fn handle_buy_order(
                 ),
                 None => format!("Buy aborted: trade failed: {} (items rolled back to storage)", err.user_message()),
             };
+            store.advance_trade(|s| s.rollback("buy/trade-failed".to_string()));
             return utils::send_message_to_player(store, player_name, &rollback_msg).await;
         }
         Ok(r) => r,
@@ -582,6 +584,7 @@ pub async fn handle_buy_order(
         } else {
             String::new()
         };
+        store.advance_trade(|s| s.rollback("buy/insufficient-payment".to_string()));
         return utils::send_message_to_player(
             store,
             player_name,
@@ -865,8 +868,11 @@ pub async fn handle_sell_order(
         None => return Ok(()),
     };
 
-    // Advance: Queued -> Withdrawing (diamonds for payout)
-    store.advance_trade(|s| s.begin_withdrawal(plan.deposit_plan.clone()));
+    // Advance: Queued -> Withdrawing (diamonds for payout). The diamond
+    // withdrawal plan is not yet known at this point; vec![] is an honest
+    // "plan not yet determined" placeholder (same pattern as deposit/withdraw
+    // handlers) and avoids persisting the unrelated deposit_plan here.
+    store.advance_trade(|s| s.begin_withdrawal(vec![]));
 
     let trade_info_msg = if plan.whole_diamonds > 0 && plan.fractional_diamonds > 0.001 {
         format!(
@@ -899,6 +905,7 @@ pub async fn handle_sell_order(
                 available = planned_total,
                 "Insufficient physical diamonds for sell payout"
             );
+            store.advance_trade(|s| s.rollback("sell/insufficient-physical-diamonds".to_string()));
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -920,6 +927,7 @@ pub async fn handle_sell_order(
         )
         .await
         {
+            store.advance_trade(|s| s.rollback("sell/diamond-withdrawal-failed".to_string()));
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -983,6 +991,7 @@ pub async fn handle_sell_order(
                     err.user_message()
                 ),
             };
+            store.advance_trade(|s| s.rollback("sell/trade-failed".to_string()));
             return utils::send_message_to_player(store, player_name, &msg).await;
         }
         Ok(r) => r,
@@ -1039,6 +1048,7 @@ pub async fn handle_sell_order(
             )
             .await;
         }
+        store.advance_trade(|s| s.rollback("sell/item-count-mismatch".to_string()));
         return utils::send_message_to_player(
             store,
             player_name,
@@ -1082,13 +1092,26 @@ pub async fn handle_sell_order(
             "[Sell] deposit-failed",
         )
         .await;
+        // Diamonds physically left storage and were handed to the player in the
+        // trade; update ledgers regardless of what the item return-trade does.
+        if let Some(pair) = store.pairs.get_mut(item) {
+            pair.currency_stock -= plan.total_payout;
+        }
+        if plan.fractional_diamonds > 0.0 {
+            if let Some(u) = store.users.get_mut(&plan.user_uuid) {
+                u.balance += plan.fractional_diamonds;
+            }
+            store.dirty_users.insert(plan.user_uuid.clone());
+        }
+        store.dirty = true;
+        store.advance_trade(|s| s.rollback("sell/deposit-failed".to_string()));
         let msg = match return_trade_result {
             Ok(_) => format!(
-                "Sell aborted: failed to deposit into storage: {}. You were NOT paid. Items have been returned via trade.",
+                "Sell aborted: failed to deposit items into storage: {}. Diamonds paid; items returned via trade. Contact an operator.",
                 err.user_message()
             ),
             Err(rerr) => format!(
-                "Sell aborted: failed to deposit into storage: {}. You were NOT paid. Return-trade ALSO failed: {}. Contact an operator.",
+                "Sell aborted: failed to deposit items into storage: {}. Diamonds paid; return-trade also failed ({}). Contact an operator.",
                 err.user_message(), rerr.user_message()
             ),
         };
@@ -1882,5 +1905,166 @@ mod tests {
         let result = player::handle_withdraw_balance_queued(&mut store, "Empty", &test_uuid("Empty"), None).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_insufficient_physical_diamonds_rejected() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("RichPlayer", 100.0);
+        users.insert(uuid.clone(), user);
+
+        // No diamond chests — storage has 0 physical diamonds.
+        let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
+
+        let result = player::handle_withdraw_balance_queued(&mut store, "RichPlayer", &test_uuid("RichPlayer"), Some(10.0)).await;
+        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        // Balance must be unchanged — no diamonds were paid out.
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
+        // Trade state machine must have reached a terminal state, not left stuck.
+        assert!(store.current_trade.is_none(), "current_trade must be None after rejection");
+    }
+
+    /// Mock bot that succeeds on `TradeWithPlayer` and `Withdraw` but fails
+    /// every `InteractWithChestAndSync` that has a `Deposit` direction.
+    fn spawn_mock_bot_deposit_fail(mut rx: mpsc::Receiver<BotInstruction>) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BotInstruction::Whisper { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    BotInstruction::InteractWithChestAndSync {
+                        target_chest,
+                        action,
+                        respond_to,
+                        ..
+                    } => {
+                        match &action {
+                            crate::messages::ChestAction::Deposit { .. } => {
+                                // Simulate a bot-reported failure on every deposit.
+                                let _ = respond_to.send(Err("simulated deposit failure".to_string()));
+                            }
+                            crate::messages::ChestAction::Withdraw { item, amount, .. } => {
+                                // Succeed on withdrawals: compute new slot-0 value.
+                                let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                                let prior = target_chest.amounts.first().copied().unwrap_or(0);
+                                amounts[0] = (prior - amount).max(0);
+                                let _ = respond_to.send(Ok(ChestSyncReport {
+                                    chest_id: target_chest.id,
+                                    item: item.clone(),
+                                    amounts,
+                                }));
+                            }
+                        }
+                    }
+                    BotInstruction::TradeWithPlayer {
+                        player_offers: items_player_must_give,
+                        respond_to,
+                        ..
+                    } => {
+                        // Always succeed: player delivers exactly what was requested.
+                        let _ = respond_to.send(Ok(items_player_must_give));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Sell where the trade succeeds but every deposit chest operation fails.
+    ///
+    /// The handler must still debit `currency_stock` (diamonds physically left
+    /// storage and were handed to the player) and must reach a terminal state.
+    #[tokio::test]
+    async fn test_sell_deposit_failure_returns_items_to_player() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot_deposit_fail(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("DepFail", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        // currency_stock ample; item_stock matches physical storage.
+        let (k, p) = make_pair("cobblestone", 64, 5_000.0);
+        pairs.insert(k, p);
+
+        // Storage: cobblestone in chest 2, diamonds in chest 3 for payout.
+        let mut storage = make_storage("cobblestone", 64);
+        let diamond_chest = &mut storage.nodes[0].chests[3];
+        diamond_chest.item = ItemId::from_normalized("diamond".to_string());
+        diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
+        diamond_chest.amounts[0] = 640; // 10 stacks, enough for payout
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
+
+        // Sell 10 units; payout will be some positive amount of diamonds.
+        let result = handle_sell_order(&mut store, "DepFail", &test_uuid("DepFail"), "cobblestone", 10).await;
+        assert!(result.is_ok(), "handler must not propagate error: {:?}", result);
+
+        // currency_stock must be debited — diamonds physically left storage.
+        let currency_after = store.pairs.get("cobblestone").unwrap().currency_stock;
+        assert!(
+            currency_after < currency_before,
+            "currency_stock must be debited by the payout amount when deposit fails (got before={}, after={})",
+            currency_before,
+            currency_after,
+        );
+
+        // State machine must have reached a terminal state (advance_trade is a
+        // no-op in direct handler tests so current_trade remains None).
+        assert!(
+            store.current_trade.is_none(),
+            "current_trade must be None after handler returns"
+        );
+    }
+
+    /// Sell where `currency_stock` is sufficient but the storage holds no
+    /// physical diamonds, so the withdrawal plan comes up short.
+    ///
+    /// The handler must reject early (before the trade GUI), leave the player
+    /// balance unchanged, and reach a terminal state.
+    #[tokio::test]
+    async fn test_sell_insufficient_physical_diamonds() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("NoDiamonds", 0.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        // Reserves are large enough to pass the currency_stock check.
+        let (k, p) = make_pair("cobblestone", 64, 5_000.0);
+        pairs.insert(k, p);
+
+        // Storage: cobblestone present for deposit planning, but NO diamond
+        // chests registered at all, so simulate_withdraw_plan("diamond", …)
+        // returns planned_total == 0.
+        let storage = make_storage("cobblestone", 64);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let balance_before = store.users.get(&uuid).unwrap().balance;
+
+        let result = handle_sell_order(&mut store, "NoDiamonds", &test_uuid("NoDiamonds"), "cobblestone", 10).await;
+        assert!(result.is_ok(), "handler must not propagate error: {:?}", result);
+
+        // Player balance must be unchanged — no payout occurred.
+        assert_eq!(
+            store.users.get(&uuid).unwrap().balance,
+            balance_before,
+            "player balance must be unchanged when physical diamonds are absent"
+        );
+
+        // State machine must have reached a terminal state.
+        assert!(
+            store.current_trade.is_none(),
+            "current_trade must be None after handler returns"
+        );
     }
 }

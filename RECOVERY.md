@@ -238,20 +238,27 @@ state has been reconciled.
 > (`begin_recovery` / startup handler) only calls
 > `Journal::restore_leftover` when *both* `fs::rename` *and* the
 > copy+remove fallback fail to move the file aside. In that exotic case
-> the leftover stays at `data/journal.json` and the next `begin()` will
-> overwrite the only forensic copy. Grep `data/logs/store.log` for
-> `[Bot] Failed to archive leftover journal:` after every startup that
-> reported a leftover entry; if you see it, **snapshot
-> `data/journal.json` manually** (e.g. `cp data/journal.json
-> data/journal.json.bak.$(date -u +%s)`) *before* the next chest
-> operation, otherwise the forensic record is gone the moment the bot
-> starts a new shulker op. Same caveat applies to
-> `data/current_trade.json` via `trade_state::clear_persisted()`'s
+> the leftover stays at `data/journal.json`, but the in-memory entry
+> is re-attached with `restored_leftover = true` so the next `begin()`
+> archives the on-disk file to a
+> `data/journal.begin-replaces-restored-<unix-millis>-<seq>.json`
+> sibling *before* persisting the new entry. The forensic record
+> therefore survives the next chest operation. Grep
+> `data/logs/store.log` for `[Bot] Failed to archive leftover journal:`
+> after every startup that reported a leftover entry, and also for
+> `[Journal] archived restored-leftover at` to confirm the next
+> `begin()` did move the file aside; if the second line is missing
+> (e.g. because the bot was stopped before any new chest op ran), the
+> only forensic copy is still at `data/journal.json` — snapshot it
+> manually (e.g. `cp data/journal.json data/journal.json.bak.$(date -u
+> +%s)`) before resuming. **The same caveat does NOT auto-recover for
+> `data/current_trade.json`**: `trade_state::clear_persisted()`'s
 > fallback in `store/mod.rs` (`Store::new` — the auto-archive path
-> documented in §4's WARNING falls back to delete-and-continue when
-> rename + copy+remove both fail, so the file is gone with no archive).
-> In both exotic failure modes the **only** surviving copy lives in
-> whatever `data.bak.*` snapshot was taken before the failed startup.
+> documented in §4's WARNING) falls back to delete-and-continue when
+> rename + copy+remove both fail, so the file is gone with no archive.
+> In that current_trade.json failure mode the **only** surviving copy
+> lives in whatever `data.bak.*` snapshot was taken before the failed
+> startup.
 
 ---
 

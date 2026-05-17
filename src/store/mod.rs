@@ -108,23 +108,29 @@ impl Store {
             let item_id = match ItemId::new(&pair.item) {
                 Ok(id) => id,
                 Err(_) => {
-                    warn!("Skipping pair with invalid item name '{}' (normalized to empty)", pair.item);
+                    warn!(
+                        "Skipping pair with invalid item name '{}' (normalized to empty)",
+                        pair.item
+                    );
                     needs_save = true;
                     continue;
                 }
             };
             let normalized_item = item_id.to_string();
             if old_key != normalized_item {
-                warn!("Normalizing pair item name from '{}' to '{}'", old_key, normalized_item);
+                warn!(
+                    "Normalizing pair item name from '{}' to '{}'",
+                    old_key, normalized_item
+                );
                 needs_save = true;
             }
             pair.item = item_id;
             normalized_pairs.insert(normalized_item, pair);
         }
         let pairs = normalized_pairs;
-        
+
         let users = User::load_all()?;
-        
+
         // Orders are session-only - start fresh on each restart.
         //
         // Rationale: an Order represents an in-flight user request that is tied to
@@ -163,23 +169,18 @@ impl Store {
                     "Clearing {} pending order(s) from previous session (file last modified {}s ago)",
                     count, secs
                 ),
-                None if was_corrupt => warn!(
-                    "Clearing corrupt orders.json from previous session"
-                ),
-                None => warn!(
-                    "Clearing {} pending order(s) from previous session",
-                    count
-                ),
+                None if was_corrupt => warn!("Clearing corrupt orders.json from previous session"),
+                None => warn!("Clearing {} pending order(s) from previous session", count),
             }
             if let Err(e) = std::fs::remove_file(orders_file) {
                 warn!("Failed to clear orders.json on startup: {}", e);
             }
         }
         let orders = std::collections::VecDeque::new();
-        
+
         let trades = Trade::load_all_with_limit(config.max_trades_in_memory)?;
-        let mut storage = Storage::load(&config.position)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut storage =
+            Storage::load(&config.position).map_err(|e| io::Error::other(e.to_string()))?;
 
         if storage.nodes.is_empty() {
             info!("Storage empty, auto-creating node 0");
@@ -239,13 +240,7 @@ impl Store {
                              order_id={} player={} item={} quantity={} currency_amount={:.2} - \
                              OPERATOR MUST AUDIT LEDGER RECONCILIATION (player may be owed goods/diamonds \
                              or balance update). Full state: {}",
-                            phase,
-                            order.id,
-                            order.username,
-                            item,
-                            quantity,
-                            currency_amount,
-                            state
+                            phase, order.id, order.username, item, quantity, currency_amount, state
                         );
                     }
                     _ => {
@@ -334,7 +329,10 @@ impl Store {
         mut store_rx: mpsc::Receiver<StoreMessage>,
         bot_tx: mpsc::Sender<BotInstruction>,
     ) {
-        info!("Store started (autosave every {}s)", self.config.autosave_interval_secs);
+        info!(
+            "Store started (autosave every {}s)",
+            self.config.autosave_interval_secs
+        );
         let mut last_save = tokio::time::Instant::now();
         let mut last_cleanup = tokio::time::Instant::now();
         // Throttle repeated autosave-failure log lines so a persistent ENOSPC
@@ -343,11 +341,14 @@ impl Store {
         // soon as the condition clears), but only log once per 10 minutes.
         let mut last_save_error_logged: Option<tokio::time::Instant> = None;
         let save_error_log_interval = tokio::time::Duration::from_secs(600);
-        let cleanup_interval = tokio::time::Duration::from_secs(crate::constants::CLEANUP_INTERVAL_SECS);
-        let rate_limit_stale_after = std::time::Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS);
+        let cleanup_interval =
+            tokio::time::Duration::from_secs(crate::constants::CLEANUP_INTERVAL_SECS);
+        let rate_limit_stale_after =
+            std::time::Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS);
         // Re-read each iteration so hot-reload of `autosave_interval_secs`
         // takes effect without restart. See `Store::reload_config`.
-        let mut min_save_interval = tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
+        let mut min_save_interval =
+            tokio::time::Duration::from_secs(self.config.autosave_interval_secs);
 
         // Each iteration either drains one order from the queue OR blocks on
         // one incoming message — never both concurrently. Orders take strict
@@ -358,8 +359,11 @@ impl Store {
         // execution simply accumulates in the channel buffer.
         loop {
             if !self.order_queue.is_empty() || self.processing_order {
-                debug!("[Store] Loop state: processing_order={} queue_len={}",
-                       self.processing_order, self.order_queue.len());
+                debug!(
+                    "[Store] Loop state: processing_order={} queue_len={}",
+                    self.processing_order,
+                    self.order_queue.len()
+                );
                 if let Some(ref trade) = self.current_trade {
                     debug!("[Store] Current trade: {}", trade);
                 }
@@ -388,7 +392,11 @@ impl Store {
                     let should_log = last_save_error_logged
                         .map_or(true, |t| t.elapsed() >= save_error_log_interval);
                     if should_log {
-                        error!("[Store] Autosave failed (will retry every {}s, logging every 10min): {}", min_save_interval.as_secs(), e);
+                        error!(
+                            "[Store] Autosave failed (will retry every {}s, logging every 10min): {}",
+                            min_save_interval.as_secs(),
+                            e
+                        );
                         last_save_error_logged = Some(tokio::time::Instant::now());
                     }
                 } else {
@@ -401,7 +409,10 @@ impl Store {
 
             // PRIORITY 1: drain an order if one is waiting.
             if !self.processing_order && !self.order_queue.is_empty() {
-                debug!("[Store] Starting order processing (queue_len={})", self.order_queue.len());
+                debug!(
+                    "[Store] Starting order processing (queue_len={})",
+                    self.order_queue.len()
+                );
 
                 // Outer watchdog: inner operations have their own timeouts, but
                 // a lost channel response or future-deadlock could still wedge
@@ -409,9 +420,8 @@ impl Store {
                 // which leaves `processing_order = true` and `current_trade`
                 // intact so the operator sees the order as stuck and can
                 // recover via `ClearStuckOrder`.
-                let order_watchdog = tokio::time::Duration::from_secs(
-                    crate::constants::ORDER_HARD_TIMEOUT_SECS,
-                );
+                let order_watchdog =
+                    tokio::time::Duration::from_secs(crate::constants::ORDER_HARD_TIMEOUT_SECS);
                 match tokio::time::timeout(order_watchdog, self.process_next_order()).await {
                     Ok(()) => {}
                     Err(_) => {
@@ -438,7 +448,10 @@ impl Store {
                         let should_log = last_save_error_logged
                             .map_or(true, |t| t.elapsed() >= save_error_log_interval);
                         if should_log {
-                            error!("[Store] Post-order save failed (logging every 10min): {}", e);
+                            error!(
+                                "[Store] Post-order save failed (logging every 10min): {}",
+                                e
+                            );
                             last_save_error_logged = Some(tokio::time::Instant::now());
                         }
                     } else {
@@ -536,7 +549,10 @@ impl Store {
         message: StoreMessage,
         min_save_interval: &mut tokio::time::Duration,
     ) -> bool {
-        debug!("[Store] Received message: {:?}", std::mem::discriminant(&message));
+        debug!(
+            "[Store] Received message: {:?}",
+            std::mem::discriminant(&message)
+        );
         let is_shutdown = matches!(
             &message,
             StoreMessage::FromCli(crate::messages::CliMessage::Shutdown { .. })
@@ -633,7 +649,8 @@ impl Store {
         );
 
         let processing_msg = format!("Now processing: {}...", order.description());
-        if let Err(e) = utils::send_message_to_player(self, &order.username, &processing_msg).await {
+        if let Err(e) = utils::send_message_to_player(self, &order.username, &processing_msg).await
+        {
             warn!(order_id = order.id, player = %order.username, error = %e, "failed to notify user of order start");
         }
 
@@ -659,21 +676,42 @@ impl Store {
         }
 
         self.processing_order = false;
-        if let Some(ref t) = self.current_trade {
-            if !t.is_terminal() {
+        // If the handler returned without driving the trade state machine to
+        // a terminal state, the physical side has unknown status (a panic in
+        // execute_chest_transfers that the try-block swallowed; an early
+        // Ok(()) after a chest mutation but before commit). Clearing the
+        // in-memory state AND the on-disk mirror would erase the only
+        // crash-evidence we have, leaving a clean-looking boot for an
+        // unfinished trade. Leave both intact and force operator
+        // intervention via ClearStuckOrder (cli.rs::handle_clear_stuck_order).
+        let leave_trade_for_operator = self
+            .current_trade
+            .as_ref()
+            .is_some_and(|t| !t.is_terminal());
+        if leave_trade_for_operator {
+            if let Some(ref t) = self.current_trade {
                 error!(
                     order_id = %t.order().id,
                     phase = %t.phase(),
-                    "process_next_order clearing non-terminal trade state — handler did not drive state machine to completion"
+                    "process_next_order returned with non-terminal trade state — preserving in-memory and on-disk record for operator review; use ClearStuckOrder to release"
                 );
             }
-        }
-        self.current_trade = None;
-        // Trade reached a terminal state (either committed or failed with
-        // rollback already run) - clear the on-disk mirror so a restart
-        // doesn't re-detect this completed trade as interrupted.
-        if let Err(e) = trade_state::clear_persisted() {
-            warn!("[Store] Failed to clear persisted trade state: {}", e);
+            // Re-persist defensively in case the trade_state mirror was
+            // cleared mid-handler. assert_invariants is the structural guard
+            // that flags ledger inconsistency.
+            if let Some(ref t) = self.current_trade
+                && let Err(e) = trade_state::persist(t)
+            {
+                warn!("[Store] Failed to re-persist non-terminal trade state: {}", e);
+            }
+        } else {
+            self.current_trade = None;
+            // Trade reached a terminal state (either committed or failed with
+            // rollback already run) - clear the on-disk mirror so a restart
+            // doesn't re-detect this completed trade as interrupted.
+            if let Err(e) = trade_state::clear_persisted() {
+                warn!("[Store] Failed to clear persisted trade state: {}", e);
+            }
         }
         self.dirty = true;
     }
@@ -768,7 +806,10 @@ impl Store {
     /// alert.
     pub(crate) fn advance_trade(
         &mut self,
-        transition: impl FnOnce(trade_state::TradeState) -> Result<trade_state::TradeState, trade_state::TransitionError>,
+        transition: impl FnOnce(
+            trade_state::TradeState,
+        )
+            -> Result<trade_state::TradeState, trade_state::TransitionError>,
     ) {
         if let Some(state) = self.current_trade.take() {
             // Clone before calling the closure so we can restore on Err
@@ -807,7 +848,10 @@ impl Store {
                     // apply. processing_order stays high so ClearStuckOrder
                     // can drain it.
                     if let Err(persist_err) = trade_state::persist(&prev) {
-                        warn!("[Store] Failed to persist trade state after invalid transition: {}", persist_err);
+                        warn!(
+                            "[Store] Failed to persist trade state after invalid transition: {}",
+                            persist_err
+                        );
                     }
                     self.current_trade = Some(prev);
                     self.dirty = true;
@@ -819,7 +863,10 @@ impl Store {
     }
 
     /// Handle messages from the bot
-    async fn handle_bot_message(&mut self, message: BotMessage) -> Result<(), crate::error::StoreError> {
+    async fn handle_bot_message(
+        &mut self,
+        message: BotMessage,
+    ) -> Result<(), crate::error::StoreError> {
         match message {
             BotMessage::PlayerCommand {
                 player_name,
@@ -835,42 +882,73 @@ impl Store {
     ///
     /// Use at call sites where the pair is expected to exist because earlier
     /// code validated it; replaces panic-prone `store.pairs.get(item).unwrap()`.
-    pub(crate) fn expect_pair(&self, item: &str, context: &'static str) -> Result<&crate::types::Pair, crate::error::StoreError> {
+    pub(crate) fn expect_pair(
+        &self,
+        item: &str,
+        context: &'static str,
+    ) -> Result<&crate::types::Pair, crate::error::StoreError> {
         self.pairs.get(item).ok_or_else(|| {
             tracing::error!("Invariant violation at {context}: pair '{item}' missing");
-            crate::error::StoreError::UnknownPair { item: item.to_string(), context }
+            crate::error::StoreError::UnknownPair {
+                item: item.to_string(),
+                context,
+            }
         })
     }
 
-    pub(crate) fn expect_pair_mut(&mut self, item: &str, context: &'static str) -> Result<&mut crate::types::Pair, crate::error::StoreError> {
+    pub(crate) fn expect_pair_mut(
+        &mut self,
+        item: &str,
+        context: &'static str,
+    ) -> Result<&mut crate::types::Pair, crate::error::StoreError> {
         match self.pairs.get_mut(item) {
             Some(p) => Ok(p),
             None => {
                 tracing::error!("Invariant violation at {context}: pair '{item}' missing");
-                Err(crate::error::StoreError::UnknownPair { item: item.to_string(), context })
+                Err(crate::error::StoreError::UnknownPair {
+                    item: item.to_string(),
+                    context,
+                })
             }
         }
     }
 
-    pub(crate) fn expect_user(&self, uuid: &str, context: &'static str) -> Result<&crate::types::User, crate::error::StoreError> {
+    pub(crate) fn expect_user(
+        &self,
+        uuid: &str,
+        context: &'static str,
+    ) -> Result<&crate::types::User, crate::error::StoreError> {
         self.users.get(uuid).ok_or_else(|| {
             tracing::error!("Invariant violation at {context}: user '{uuid}' missing");
-            crate::error::StoreError::UnknownUser { uuid: uuid.to_string(), context }
+            crate::error::StoreError::UnknownUser {
+                uuid: uuid.to_string(),
+                context,
+            }
         })
     }
 
-    pub(crate) fn expect_user_mut(&mut self, uuid: &str, context: &'static str) -> Result<&mut crate::types::User, crate::error::StoreError> {
+    pub(crate) fn expect_user_mut(
+        &mut self,
+        uuid: &str,
+        context: &'static str,
+    ) -> Result<&mut crate::types::User, crate::error::StoreError> {
         match self.users.get_mut(uuid) {
             Some(u) => Ok(u),
             None => {
                 tracing::error!("Invariant violation at {context}: user '{uuid}' missing");
-                Err(crate::error::StoreError::UnknownUser { uuid: uuid.to_string(), context })
+                Err(crate::error::StoreError::UnknownUser {
+                    uuid: uuid.to_string(),
+                    context,
+                })
             }
         }
     }
 
     /// Apply chest sync report from bot (merges bot-reported slot counts into storage)
-    pub(crate) fn apply_chest_sync(&mut self, report: ChestSyncReport) -> Result<(), crate::error::StoreError> {
+    pub(crate) fn apply_chest_sync(
+        &mut self,
+        report: ChestSyncReport,
+    ) -> Result<(), crate::error::StoreError> {
         state::apply_chest_sync(self, report)
     }
 
@@ -963,7 +1041,12 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             "u1".to_string(),
-            User { uuid: "u1".to_string(), username: "alice".to_string(), balance: 10.0, operator: false },
+            User {
+                uuid: "u1".to_string(),
+                username: "alice".to_string(),
+                balance: 10.0,
+                operator: false,
+            },
         );
 
         let store = make_store(pairs, users);
@@ -993,7 +1076,9 @@ mod tests {
             },
         );
         let store = make_store(pairs, HashMap::new());
-        let p = store.expect_pair("iron_ingot", "test").expect("pair should exist");
+        let p = store
+            .expect_pair("iron_ingot", "test")
+            .expect("pair should exist");
         assert_eq!(p.item_stock, 7);
     }
 
@@ -1039,10 +1124,17 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             "u1".to_string(),
-            User { uuid: "u1".to_string(), username: "alice".to_string(), balance: 5.0, operator: false },
+            User {
+                uuid: "u1".to_string(),
+                username: "alice".to_string(),
+                balance: 5.0,
+                operator: false,
+            },
         );
         let mut store = make_store(HashMap::new(), users);
-        let u = store.expect_user_mut("u1", "test").expect("user should exist");
+        let u = store
+            .expect_user_mut("u1", "test")
+            .expect("user should exist");
         u.balance = 99.0;
         assert_eq!(store.users.get("u1").unwrap().balance, 99.0);
     }

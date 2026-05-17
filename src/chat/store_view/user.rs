@@ -62,12 +62,10 @@ fn is_canonical_hyphen_uuid(s: &str) -> bool {
 /// tokio worker pool.
 pub async fn get_by_uuid(uuid: &str) -> Option<UserView> {
     let uuid = uuid.to_string();
-    tokio::task::spawn_blocking(move || {
-        get_by_uuid_in_dir(std::path::Path::new(USERS_DIR), &uuid)
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || get_by_uuid_in_dir(std::path::Path::new(USERS_DIR), &uuid))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Inner sync helper for [`get_by_uuid`] — exposed so tests can target
@@ -85,24 +83,11 @@ pub async fn get_by_uuid(uuid: &str) -> Option<UserView> {
 /// apply the same pattern at their respective storage boundaries.
 pub fn get_by_uuid_in_dir(dir: &std::path::Path, uuid: &str) -> Option<UserView> {
     if !is_canonical_hyphen_uuid(uuid) {
-        tracing::warn!(
-            "[chat/user] rejecting non-canonical uuid at storage boundary: {uuid:?}"
-        );
+        tracing::warn!("[chat/user] rejecting non-canonical uuid at storage boundary: {uuid:?}");
         return None;
     }
     let path = dir.join(format!("{uuid}.json"));
-    for attempt in 0..2 {
-        match std::fs::read_to_string(&path) {
-            Ok(body) => match serde_json::from_str::<UserView>(&body) {
-                Ok(u) => return Some(u),
-                Err(_) if attempt == 0 => continue,
-                Err(_) => return None,
-            },
-            Err(_) if attempt == 0 => continue,
-            Err(_) => return None,
-        }
-    }
-    None
+    super::fsread::read_json_with_atomic_retry::<UserView>(&path)
 }
 
 #[cfg(test)]
@@ -129,8 +114,7 @@ mod tests {
             r#"{"uuid":"11111111-2222-3333-4444-555555555555","username":"alice","balance":42.5,"operator":true}"#,
         )
         .unwrap();
-        let u = get_by_uuid_in_dir(&dir, "11111111-2222-3333-4444-555555555555")
-            .expect("user");
+        let u = get_by_uuid_in_dir(&dir, "11111111-2222-3333-4444-555555555555").expect("user");
         assert_eq!(u.username, "alice");
         assert!((u.balance - 42.5).abs() < 1e-9);
         // The struct has no `operator` field; the JSON had `operator:true`
@@ -153,5 +137,4 @@ mod tests {
         assert!(u.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

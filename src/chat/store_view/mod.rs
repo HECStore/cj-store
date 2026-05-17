@@ -26,6 +26,7 @@
 //! level — even if a future serialization adds new fields, none of them
 //! can be `operator`.
 
+pub(crate) mod fsread;
 pub mod pair;
 pub mod trade;
 pub mod user;

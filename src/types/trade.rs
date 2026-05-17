@@ -10,12 +10,22 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::AtomicU64,
 };
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::write_atomic;
+use crate::fsutil::{archive_aside, pick_archive_path, write_atomic};
+
+/// Per-module monotonic counter appended to quarantine filenames so two
+/// `.json.corrupt-*` archives produced in the same millisecond cannot collide
+/// — the prior `fs::rename` + single `unix_ms` suffix would silently
+/// overwrite the first archive on the second rename, destroying exactly the
+/// forensic evidence quarantine exists to preserve. Mirrors the
+/// `ARCHIVE_SEQ` pattern in `store::queue`, `store::journal`, and
+/// `store::trade_state`.
+static TRADE_ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The category of a recorded trade.
 ///
@@ -121,13 +131,20 @@ impl Trade {
         let path = Self::get_trade_file_path_in_dir(dir_path, &self.timestamp);
 
         if let Some(parent_dir) = path.parent()
-            && !parent_dir.exists() {
-                fs::create_dir_all(parent_dir)?;
-            }
+            && !parent_dir.exists()
+        {
+            fs::create_dir_all(parent_dir)?;
+        }
 
         let json_str = serde_json::to_string_pretty(self)?;
         write_atomic(&path, &json_str)?;
-        tracing::debug!("[Trade] saved {} ({:?} {} x{})", self.timestamp, self.trade_type, self.item.as_str(), self.amount);
+        tracing::debug!(
+            "[Trade] saved {} ({:?} {} x{})",
+            self.timestamp,
+            self.trade_type,
+            self.item.as_str(),
+            self.amount
+        );
         Ok(())
     }
 
@@ -135,7 +152,7 @@ impl Trade {
     /// Files that cannot be deserialized are skipped with a warning.
     /// If the directory does not exist, it returns an empty `Vec<Trade>`.
     /// Returns trades sorted by timestamp (oldest first).
-    /// 
+    ///
     /// **Memory limit**: Only loads the most recent `max_trades` trades.
     /// Older trades remain on disk but aren't loaded into memory.
     pub fn load_all_with_limit(max_trades: usize) -> io::Result<Vec<Self>> {
@@ -197,10 +214,7 @@ impl Trade {
                 },
                 Err(e) => {
                     if let Err(qe) = quarantine_trade_file(path, &format!("unreadable: {e}")) {
-                        tracing::warn!(
-                            "[Trade] quarantine failed for {}: {qe}",
-                            path.display(),
-                        );
+                        tracing::warn!("[Trade] quarantine failed for {}: {qe}", path.display(),);
                         quarantine_failed += 1;
                     } else {
                         quarantined += 1;
@@ -224,7 +238,7 @@ impl Trade {
 
         Ok(trades)
     }
-    
+
     /// Saves a Vec of `Trade`s, where each `Trade` is saved to its own file
     /// in the `data/trades/` directory using the `trade.save()` method.
     /// This method overwrites existing files and then removes any orphaned files.
@@ -249,7 +263,11 @@ impl Trade {
     /// here (not just in the public wrapper) so tests can exercise the
     /// wipe-refusal invariant directly against a temp dir; the public
     /// `save_all` is a thin one-liner over this helper.
-    fn save_all_in_dir(trades: &Vec<Self>, dir_path: &Path, dirty_tail_count: usize) -> io::Result<()> {
+    fn save_all_in_dir(
+        trades: &Vec<Self>,
+        dir_path: &Path,
+        dirty_tail_count: usize,
+    ) -> io::Result<()> {
         // Refuse an empty vec only when there are real `.json` files on disk
         // that the orphan sweep below would actually wipe. A fresh install
         // (no trades dir, or an empty/stub trades dir) is a legitimate no-op:
@@ -262,12 +280,10 @@ impl Trade {
         // an empty in-memory vec is still treated as "refuse to wipe".
         if trades.is_empty() {
             let dir_has_trade_files = match fs::read_dir(dir_path) {
-                Ok(read_dir) => read_dir
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| {
-                        let path = entry.path();
-                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    }),
+                Ok(read_dir) => read_dir.filter_map(|entry| entry.ok()).any(|entry| {
+                    let path = entry.path();
+                    path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                }),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e),
             };
@@ -342,7 +358,8 @@ impl Trade {
                             }
                         };
                         let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                        if path.is_file()
+                            && path.extension().is_some_and(|ext| ext == "json")
                             && let Some(filename) = path.file_name().and_then(|n| n.to_str())
                             && !expected_files.contains(filename)
                         {
@@ -384,23 +401,31 @@ impl Trade {
     }
 }
 
-/// Rename a malformed/unreadable trade file to `*.json.corrupt.<millis>` so
-/// the next `save_all` orphan-cleanup cannot delete it (extension is no
-/// longer `.json`) and subsequent `load_all_with_limit` calls do not retry
-/// deserializing it. Mirrors `quarantine_pair_file` in `types::pair`.
+/// Rename a malformed/unreadable trade file aside so the next `save_all`
+/// orphan-cleanup cannot delete it (extension is no longer `.json`) and
+/// subsequent `load_all_with_limit` calls do not retry deserializing it.
+///
+/// Uses [`pick_archive_path`] + [`archive_aside`] (the same primitives
+/// `store::journal` / `store::queue` / `store::trade_state` use) rather than
+/// a raw `fs::rename` with a single `unix_ms` suffix: two corrupt files in
+/// the same millisecond would otherwise collide and the second `fs::rename`
+/// would silently overwrite the first archive — destroying exactly the
+/// forensic evidence quarantine exists to preserve. `archive_aside` also
+/// supplies a `fs::copy + fs::remove_file` fallback for Windows-AV
+/// held-handle scenarios that `fs::rename` alone cannot handle.
 fn quarantine_trade_file(path: &Path, reason: &str) -> io::Result<()> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let target = path.with_extension(format!("json.corrupt.{ts}"));
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "trade.json".to_string());
+    let archived = pick_archive_path(path.parent(), &base, "corrupt", &TRADE_ARCHIVE_SEQ)?;
     tracing::warn!(
         "[Trade] quarantining {} ({}): renaming to {}",
         path.display(),
         reason,
-        target.display(),
+        archived.display(),
     );
-    fs::rename(path, target)
+    archive_aside(path, &archived)
 }
 
 #[cfg(test)]
@@ -490,7 +515,10 @@ mod tests {
         fs::write(with_sibling.join("README.txt"), "not a trade file").unwrap();
         Trade::save_all_in_dir(&Vec::new(), &with_sibling, 0)
             .expect("empty vec + non-json siblings must be a no-op");
-        assert!(with_sibling.join("README.txt").exists(), "non-json sibling must survive");
+        assert!(
+            with_sibling.join("README.txt").exists(),
+            "non-json sibling must survive"
+        );
     }
 
     #[test]
@@ -498,7 +526,10 @@ mod tests {
         let ts: DateTime<Utc> = "2024-01-02T03:04:05Z".parse().unwrap();
         let p = Trade::get_trade_file_path(&ts);
         let name = p.file_name().unwrap().to_string_lossy();
-        assert!(!name.contains(':'), "file name should have no colons: {name}");
+        assert!(
+            !name.contains(':'),
+            "file name should have no colons: {name}"
+        );
         assert!(name.ends_with(".json"));
     }
 
@@ -525,10 +556,7 @@ mod tests {
         if !real_dir.exists() {
             fs::create_dir_all(real_dir).unwrap();
         }
-        let real_canary_name = format!(
-            "9999-99-99T00-00-00Z-canary-{}.json",
-            std::process::id(),
-        );
+        let real_canary_name = format!("9999-99-99T00-00-00Z-canary-{}.json", std::process::id(),);
         let real_canary = real_dir.join(&real_canary_name);
         fs::write(&real_canary, "{}").unwrap();
 
@@ -552,8 +580,7 @@ mod tests {
         result.expect("save_all_in_dir must succeed");
 
         // (i) The trade file actually lands in `dir`, not in `data/trades/`.
-        let expected_in_temp =
-            Trade::get_trade_file_path_in_dir(dir.path(), &trade.timestamp);
+        let expected_in_temp = Trade::get_trade_file_path_in_dir(dir.path(), &trade.timestamp);
         assert!(
             expected_in_temp.exists(),
             "trade file must be written to temp dir: {}",
@@ -600,10 +627,9 @@ mod tests {
                 "u".to_string(),
             );
             // Force a known-ordered timestamp so filename comparisons are stable.
-            t.timestamp =
-                DateTime::parse_from_rfc3339(&format!("2020-01-0{}T00:00:00Z", i + 1))
-                    .unwrap()
-                    .with_timezone(&Utc);
+            t.timestamp = DateTime::parse_from_rfc3339(&format!("2020-01-0{}T00:00:00Z", i + 1))
+                .unwrap()
+                .with_timezone(&Utc);
             trades.push(t);
         }
 
@@ -635,8 +661,7 @@ mod tests {
             .with_timezone(&Utc);
         trades.push(new_trade.clone());
 
-        Trade::save_all_in_dir(&trades, dir.path(), 1)
-            .expect("append-only save must succeed");
+        Trade::save_all_in_dir(&trades, dir.path(), 1).expect("append-only save must succeed");
 
         // (i) Every prior file's mtime is unchanged.
         for (idx, t) in trades.iter().take(3).enumerate() {

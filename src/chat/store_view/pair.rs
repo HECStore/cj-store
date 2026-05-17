@@ -72,10 +72,7 @@ pub async fn get(item: &str) -> Option<PairView> {
 /// Inner async helper for [`get`], exposed at module scope so tests can
 /// point at a temp dir. `dir` is used both for the single-file fast
 /// path and for the full-catalog fallback scan.
-pub(crate) async fn get_in_dir(
-    item: &str,
-    dir: &std::path::Path,
-) -> Option<PairView> {
+pub(crate) async fn get_in_dir(item: &str, dir: &std::path::Path) -> Option<PairView> {
     // Lowercase up front: on-disk filenames are canonical lowercase
     // (the writer normalizes through `ItemId`), and the in-memory
     // `item` field used by the fallback `map.get(...)` is keyed by the
@@ -129,11 +126,7 @@ fn is_safe_pair_stem(stem: &str) -> bool {
     if stem.is_empty() {
         return false;
     }
-    if stem.contains('/')
-        || stem.contains('\\')
-        || stem.contains("..")
-        || stem.contains('\0')
-    {
+    if stem.contains('/') || stem.contains('\\') || stem.contains("..") || stem.contains('\0') {
         return false;
     }
     stem.bytes()
@@ -146,30 +139,14 @@ fn is_safe_pair_stem(stem: &str) -> bool {
 /// so a chat-side read can land between the unlink and the rename.
 /// The retry is sleepless — by the second attempt the rename has
 /// settled.
-fn read_pair_file_with_retry(
-    dir: &std::path::Path,
-    stem: &str,
-) -> Option<PairView> {
+fn read_pair_file_with_retry(dir: &std::path::Path, stem: &str) -> Option<PairView> {
     let path = dir.join(format!("{stem}.json"));
-    for attempt in 0..2 {
-        match std::fs::read_to_string(&path) {
-            Ok(body) => match serde_json::from_str::<PairView>(&body) {
-                Ok(p) => return Some(p),
-                Err(_) if attempt == 0 => continue,
-                Err(_) => return None,
-            },
-            Err(_) if attempt == 0 => continue,
-            Err(_) => return None,
-        }
-    }
-    None
+    super::fsread::read_json_with_atomic_retry::<PairView>(&path)
 }
 
 /// Inner sync helper, exposed at module scope so tests can point at a
 /// temp dir.
-pub fn load_all_in_dir(
-    dir: &std::path::Path,
-) -> Result<HashMap<String, PairView>, String> {
+pub fn load_all_in_dir(dir: &std::path::Path) -> Result<HashMap<String, PairView>, String> {
     let mut out = HashMap::new();
     if !dir.exists() {
         return Ok(out);
@@ -181,37 +158,9 @@ pub fn load_all_in_dir(
             continue;
         }
         // One retry on NotFound or parse error to absorb the
-        // write_atomic rename window: the trade bot saves a pair via
-        // tmp-file + rename, so a chat-side read can land between the
-        // unlink and the rename. The retry is a sleepless re-read; on
-        // a busy disk the rename has long completed by the second
-        // attempt.
-        let mut attempt = 0;
-        let body = loop {
-            match std::fs::read_to_string(&path) {
-                Ok(b) => break Some(b),
-                Err(_) if attempt == 0 => {
-                    attempt += 1;
-                    continue;
-                }
-                Err(_) => break None,
-            }
-        };
-        let Some(body) = body else { continue };
-        let pair: PairView = match serde_json::from_str(&body) {
-            Ok(p) => p,
-            Err(_) if attempt == 0 => {
-                // Re-read once more in case we caught a half-written
-                // file mid-rename.
-                match std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|b| serde_json::from_str(&b).ok())
-                {
-                    Some(p) => p,
-                    None => continue,
-                }
-            }
-            Err(_) => continue,
+        // write_atomic rename window — centralized in `fsread`.
+        let Some(pair) = super::fsread::read_json_with_atomic_retry::<PairView>(&path) else {
+            continue;
         };
         out.insert(pair.item.clone(), pair);
     }

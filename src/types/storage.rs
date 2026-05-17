@@ -38,14 +38,28 @@
 //! See `src/bot/` for shulker automation implementation.
 
 use std::fs;
+use std::io;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::chest::Chest;
+use crate::fsutil::{archive_aside, pick_archive_path};
 use crate::types::ItemId;
+use crate::types::chest::Chest;
 use crate::types::node::Node;
 use crate::types::position::Position;
+
+/// Per-module monotonic counter appended to quarantine filenames so two
+/// archived node files produced in the same millisecond cannot collide.
+/// Mirrors the `ARCHIVE_SEQ` pattern in `store::queue`, `store::journal`,
+/// `store::trade_state`, and the sibling `types::{user, pair, trade}`
+/// quarantine sites. Node-side is consistency-with-siblings: a
+/// `Node::load` failure (malformed JSON / unreadable file) previously only
+/// `warn!`ed and skipped, leaving a misleading `.json` in place that a
+/// re-run would parse-fail on again. Renaming it aside takes it out of
+/// the live load set and preserves forensic evidence.
+static NODE_ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Planned transfer against one chest, produced by `deposit_plan` /
 /// `withdraw_plan` (and their simulate counterparts) and executed by the bot.
@@ -96,7 +110,8 @@ impl Storage {
     /// Persists every node to `data/storage/{node_id}.json`.
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         for node in &self.nodes {
-            node.save().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            node.save()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         }
         tracing::debug!(nodes = self.nodes.len(), "[Storage] saved all nodes");
         Ok(())
@@ -119,7 +134,10 @@ impl Storage {
 
         if !Path::new(storage_path).exists() {
             fs::create_dir_all(storage_path)?;
-            tracing::info!(path = storage_path, "[Storage] created empty storage directory");
+            tracing::info!(
+                path = storage_path,
+                "[Storage] created empty storage directory"
+            );
             return Ok(Storage {
                 position: *storage_position,
                 nodes: Vec::new(),
@@ -154,8 +172,18 @@ impl Storage {
                         tracing::warn!(
                             node_id,
                             error = %e,
-                            "[Storage] failed to load node; skipping",
+                            "[Storage] failed to load node; quarantining",
                         );
+                        if let Err(qe) =
+                            quarantine_node_file(&path, &format!("Node::load failed: {e}"))
+                        {
+                            tracing::warn!(
+                                node_id,
+                                error = %qe,
+                                "[Storage] quarantine failed for node file {}: {qe}",
+                                path.display(),
+                            );
+                        }
                     }
                 }
             }
@@ -205,7 +233,11 @@ impl Storage {
             node_id += 1;
         }
         let node = Node::new(node_id, &self.position);
-        tracing::info!(node_id, total_nodes = self.nodes.len() + 1, "[Storage] added node");
+        tracing::info!(
+            node_id,
+            total_nodes = self.nodes.len() + 1,
+            "[Storage] added node"
+        );
         self.nodes.push(node);
         // unwrap: pushed on the line above, so `last_mut()` cannot return None.
         self.nodes.last_mut().unwrap()
@@ -224,7 +256,6 @@ impl Storage {
             .filter(|a| *a > 0)
             .sum()
     }
-
 
     /// Returns a mutable reference to the chest with the given `chest_id`,
     /// or `None` if no node contains such a chest.
@@ -310,7 +341,12 @@ impl Storage {
     ///
     /// Returns the plan plus the total amount that could actually be planned
     /// against existing chests.
-    pub fn simulate_deposit_plan(&self, item: &str, qty: i32, stack_size: i32) -> (Vec<ChestTransfer>, i32) {
+    pub fn simulate_deposit_plan(
+        &self,
+        item: &str,
+        qty: i32,
+        stack_size: i32,
+    ) -> (Vec<ChestTransfer>, i32) {
         if qty <= 0 {
             return (Vec::new(), 0);
         }
@@ -330,12 +366,15 @@ impl Storage {
             item: &str,
             amt: i32,
         ) {
-            if amt <= 0 { return; }
+            if amt <= 0 {
+                return;
+            }
             if let Some(last) = plan.last_mut()
-                && last.chest_id == chest_id {
-                    last.amount += amt;
-                    return;
-                }
+                && last.chest_id == chest_id
+            {
+                last.amount += amt;
+                return;
+            }
             plan.push(ChestTransfer {
                 chest_id,
                 position,
@@ -381,9 +420,9 @@ impl Storage {
         let empty_chest_capacity = (Self::SLOTS_PER_CHEST as i32) * shulker_capacity;
 
         let try_claim = |remaining: &mut i32,
-                             plan: &mut Vec<ChestTransfer>,
-                             claimed: &mut std::collections::HashSet<i32>,
-                             chest: &Chest| {
+                         plan: &mut Vec<ChestTransfer>,
+                         claimed: &mut std::collections::HashSet<i32>,
+                         chest: &Chest| {
             if *remaining <= 0 || !chest.item.is_empty() || claimed.contains(&chest.id) {
                 return;
             }
@@ -396,25 +435,44 @@ impl Storage {
         if remaining > 0 && !self.nodes.is_empty() {
             let node_0 = &self.nodes[0];
             if item == "diamond"
-                && let Some(chest) = node_0.chests.get(crate::constants::DIAMOND_CHEST_ID as usize) {
-                    try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
-                }
+                && let Some(chest) = node_0
+                    .chests
+                    .get(crate::constants::DIAMOND_CHEST_ID as usize)
+            {
+                try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
+            }
             if item == crate::constants::OVERFLOW_CHEST_ITEM
-                && let Some(chest) = node_0.chests.get(crate::constants::OVERFLOW_CHEST_ID as usize) {
-                    try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
-                }
+                && let Some(chest) = node_0
+                    .chests
+                    .get(crate::constants::OVERFLOW_CHEST_ID as usize)
+            {
+                try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
+            }
             for ci in 2..node_0.chests.len() {
-                if remaining <= 0 { break; }
-                try_claim(&mut remaining, &mut plan, &mut claimed_empty, &node_0.chests[ci]);
+                if remaining <= 0 {
+                    break;
+                }
+                try_claim(
+                    &mut remaining,
+                    &mut plan,
+                    &mut claimed_empty,
+                    &node_0.chests[ci],
+                );
             }
         }
 
         if remaining > 0 {
             for (ni, node) in self.nodes.iter().enumerate() {
-                if remaining <= 0 { break; }
-                if ni == 0 { continue; }
+                if remaining <= 0 {
+                    break;
+                }
+                if ni == 0 {
+                    continue;
+                }
                 for chest in &node.chests {
-                    if remaining <= 0 { break; }
+                    if remaining <= 0 {
+                        break;
+                    }
                     try_claim(&mut remaining, &mut plan, &mut claimed_empty, chest);
                 }
             }
@@ -526,7 +584,12 @@ impl Storage {
     ///
     /// **Note**: This is a planning function. The actual deposit happens
     /// when the bot executes the plan and syncs chest contents back to storage.
-    pub fn deposit_plan(&mut self, item: &str, mut qty: i32, stack_size: i32) -> Vec<ChestTransfer> {
+    pub fn deposit_plan(
+        &mut self,
+        item: &str,
+        mut qty: i32,
+        stack_size: i32,
+    ) -> Vec<ChestTransfer> {
         if qty <= 0 {
             return Vec::new();
         }
@@ -576,7 +639,8 @@ impl Storage {
                 None => {
                     // expect() is safe because `Node::new` constructs 4 empty chests.
                     self.add_node();
-                    Self::find_empty_chest_index(&self.nodes, item).expect("new node must have chests")
+                    Self::find_empty_chest_index(&self.nodes, item)
+                        .expect("new node must have chests")
                 }
             };
             let chest = &mut self.nodes[node_idx].chests[chest_idx];
@@ -761,6 +825,31 @@ impl Storage {
     }
 }
 
+/// Rename a malformed/unreadable node file aside (extension no longer
+/// `.json`) so a re-run does not parse-fail on it again and forensic
+/// evidence is preserved.
+///
+/// Uses [`pick_archive_path`] + [`archive_aside`] (the same primitives
+/// `store::journal` / `store::queue` / `store::trade_state` use): a raw
+/// `fs::rename` with a single `unix_ms` suffix would let two corrupt
+/// node files in the same millisecond collide, and `archive_aside`'s
+/// `fs::copy + fs::remove_file` fallback covers Windows-AV held-handle
+/// scenarios that `fs::rename` alone cannot handle.
+fn quarantine_node_file(path: &Path, reason: &str) -> io::Result<()> {
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "node.json".to_string());
+    let archived = pick_archive_path(path.parent(), &base, "corrupt", &NODE_ARCHIVE_SEQ)?;
+    tracing::warn!(
+        "[Storage] quarantining {} ({}): renaming to {}",
+        path.display(),
+        reason,
+        archived.display(),
+    );
+    archive_aside(path, &archived)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,7 +863,11 @@ mod tests {
 
     #[test]
     fn new_creates_empty_storage_at_given_origin() {
-        let origin = Position { x: 100, y: 64, z: -200 };
+        let origin = Position {
+            x: 100,
+            y: 64,
+            z: -200,
+        };
         let storage = Storage::new(&origin);
 
         assert_eq!(storage.position.x, 100);
@@ -902,7 +995,10 @@ mod tests {
         // Enough cobble to overflow the first node's 16 general chests (minus
         // reserved) and spill into a second node.
         storage.deposit_plan("cobblestone", 2_000_000, 64);
-        assert!(storage.nodes.len() >= 2, "expected spillover into a second node");
+        assert!(
+            storage.nodes.len() >= 2,
+            "expected spillover into a second node"
+        );
         assert_eq!(storage.total_item_amount("cobblestone"), 2_000_000);
     }
 
@@ -962,7 +1058,10 @@ mod tests {
         let ids: Vec<i32> = plan.iter().map(|t| t.chest_id).collect();
         let mut sorted = ids.clone();
         sorted.sort();
-        assert_eq!(ids, sorted, "withdraw plan must visit chests in ascending id order");
+        assert_eq!(
+            ids, sorted,
+            "withdraw plan must visit chests in ascending id order"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -989,7 +1088,10 @@ mod tests {
             .iter()
             .flat_map(|n| n.chests.iter().map(|c| c.amounts.clone()))
             .collect();
-        assert_eq!(before, after, "simulate_withdraw_plan must not mutate storage");
+        assert_eq!(
+            before, after,
+            "simulate_withdraw_plan must not mutate storage"
+        );
         assert_eq!(storage.total_item_amount("iron_ingot"), 500);
     }
 
@@ -1016,7 +1118,10 @@ mod tests {
             .iter()
             .flat_map(|n| n.chests.iter().map(|c| c.amounts.clone()))
             .collect();
-        assert_eq!(before, after, "simulate_deposit_plan must not mutate storage");
+        assert_eq!(
+            before, after,
+            "simulate_deposit_plan must not mutate storage"
+        );
     }
 
     #[test]
@@ -1083,7 +1188,10 @@ mod tests {
 
         let (plan, planned) = storage.simulate_deposit_plan("iron_ingot", 100, 64);
         assert_eq!(planned, 100);
-        assert!(!plan.is_empty(), "empty node 0 should be claimed for the item");
+        assert!(
+            !plan.is_empty(),
+            "empty node 0 should be claimed for the item"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1093,17 +1201,23 @@ mod tests {
     #[test]
     fn is_reserved_blocks_non_diamond_on_diamond_chest() {
         assert!(Storage::is_reserved_chest_blocked_for(
-            "iron_ingot", 0, crate::constants::DIAMOND_CHEST_ID as usize,
+            "iron_ingot",
+            0,
+            crate::constants::DIAMOND_CHEST_ID as usize,
         ));
         assert!(!Storage::is_reserved_chest_blocked_for(
-            "diamond", 0, crate::constants::DIAMOND_CHEST_ID as usize,
+            "diamond",
+            0,
+            crate::constants::DIAMOND_CHEST_ID as usize,
         ));
     }
 
     #[test]
     fn is_reserved_blocks_non_overflow_on_overflow_chest() {
         assert!(Storage::is_reserved_chest_blocked_for(
-            "iron_ingot", 0, crate::constants::OVERFLOW_CHEST_ID as usize,
+            "iron_ingot",
+            0,
+            crate::constants::OVERFLOW_CHEST_ID as usize,
         ));
         assert!(!Storage::is_reserved_chest_blocked_for(
             crate::constants::OVERFLOW_CHEST_ITEM,
@@ -1142,8 +1256,7 @@ mod tests {
         let mut storage = test_storage();
         storage.deposit_plan("iron_ingot", 100, 64);
 
-        let overflow_chest =
-            &storage.nodes[0].chests[crate::constants::OVERFLOW_CHEST_ID as usize];
+        let overflow_chest = &storage.nodes[0].chests[crate::constants::OVERFLOW_CHEST_ID as usize];
         assert!(
             overflow_chest.item.is_empty()
                 || overflow_chest.item == crate::constants::OVERFLOW_CHEST_ITEM,
@@ -1165,8 +1278,7 @@ mod tests {
         let mut storage = test_storage();
         storage.deposit_plan(crate::constants::OVERFLOW_CHEST_ITEM, 100, 64);
 
-        let overflow_chest =
-            &storage.nodes[0].chests[crate::constants::OVERFLOW_CHEST_ID as usize];
+        let overflow_chest = &storage.nodes[0].chests[crate::constants::OVERFLOW_CHEST_ID as usize];
         assert_eq!(overflow_chest.item, crate::constants::OVERFLOW_CHEST_ITEM);
     }
 
@@ -1176,7 +1288,10 @@ mod tests {
 
     #[test]
     fn overflow_chest_id_matches_constant() {
-        assert_eq!(Storage::overflow_chest_id(), crate::constants::OVERFLOW_CHEST_ID);
+        assert_eq!(
+            Storage::overflow_chest_id(),
+            crate::constants::OVERFLOW_CHEST_ID
+        );
     }
 
     #[test]
@@ -1226,7 +1341,10 @@ mod tests {
 
     #[test]
     fn slots_per_chest_matches_double_chest_constant() {
-        assert_eq!(Storage::SLOTS_PER_CHEST, crate::constants::DOUBLE_CHEST_SLOTS);
+        assert_eq!(
+            Storage::SLOTS_PER_CHEST,
+            crate::constants::DOUBLE_CHEST_SLOTS
+        );
     }
 
     #[test]

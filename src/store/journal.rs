@@ -88,6 +88,11 @@ pub struct JournalEntry {
 pub struct Journal {
     entry: Option<JournalEntry>,
     path: std::path::PathBuf,
+    /// True iff `self.entry` originates from a `restore_leftover` call rather
+    /// than from a `begin` performed by this process. Used by `begin` to
+    /// archive the on-disk leftover forensic record BEFORE the in-memory
+    /// `entry.replace(new_entry)` would persist over it.
+    restored_leftover: bool,
 }
 
 impl Default for Journal {
@@ -95,6 +100,7 @@ impl Default for Journal {
         Self {
             entry: None,
             path: std::path::PathBuf::from(JOURNAL_FILE),
+            restored_leftover: false,
         }
     }
 }
@@ -129,7 +135,11 @@ impl Journal {
     fn load_from(path: &Path) -> io::Result<(Self, Option<JournalEntry>)> {
         if !path.exists() {
             return Ok((
-                Self { entry: None, path: path.to_path_buf() },
+                Self {
+                    entry: None,
+                    path: path.to_path_buf(),
+                    restored_leftover: false,
+                },
                 None,
             ));
         }
@@ -155,7 +165,11 @@ impl Journal {
                             archived
                         );
                         return Ok((
-                            Self { entry: None, path: path.to_path_buf() },
+                            Self {
+                                entry: None,
+                                path: path.to_path_buf(),
+                                restored_leftover: false,
+                            },
                             None,
                         ));
                     }
@@ -189,7 +203,11 @@ impl Journal {
                             archived
                         );
                         return Ok((
-                            Self { entry: None, path: path.to_path_buf() },
+                            Self {
+                                entry: None,
+                                path: path.to_path_buf(),
+                                restored_leftover: false,
+                            },
                             None,
                         ));
                     }
@@ -212,7 +230,8 @@ impl Journal {
         if entries.len() > 1 {
             tracing::warn!(
                 "[Journal] file {:?} contains {} entries; quarantining to preserve all entries before falling back to most-recent",
-                path, entries.len()
+                path,
+                entries.len()
             );
             match Self::quarantine_unreadable(path) {
                 Ok(archived) => tracing::error!(
@@ -229,11 +248,19 @@ impl Journal {
         if let Some(entry) = &leftover {
             tracing::info!(
                 "[Journal] loaded leftover entry: op_id={} type={:?} chest_id={} slot={} state={:?}",
-                entry.operation_id, entry.operation_type, entry.chest_id, entry.slot_index, entry.state
+                entry.operation_id,
+                entry.operation_type,
+                entry.chest_id,
+                entry.slot_index,
+                entry.state
             );
         }
         Ok((
-            Self { entry: None, path: path.to_path_buf() },
+            Self {
+                entry: None,
+                path: path.to_path_buf(),
+                restored_leftover: false,
+            },
             leftover,
         ))
     }
@@ -282,7 +309,8 @@ impl Journal {
                 if let Err(remove_err) = fs::remove_file(&self.path) {
                     tracing::warn!(
                         "[Journal] archived leftover to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                        archived, self.path
+                        archived,
+                        self.path
                     );
                 }
                 Ok(archived)
@@ -299,12 +327,8 @@ impl Journal {
     /// copy+remove fallback for cross-device or held-handle cases. Returns the
     /// archived path on success so callers can log it.
     fn quarantine_unreadable(path: &Path) -> io::Result<PathBuf> {
-        let archived = crate::fsutil::pick_archive_path(
-            path.parent(),
-            "journal",
-            "unreadable",
-            &ARCHIVE_SEQ,
-        )?;
+        let archived =
+            crate::fsutil::pick_archive_path(path.parent(), "journal", "unreadable", &ARCHIVE_SEQ)?;
         match fs::rename(path, &archived) {
             Ok(()) => Ok(archived),
             Err(_) => {
@@ -313,7 +337,8 @@ impl Journal {
                 if let Err(remove_err) = fs::remove_file(path) {
                     tracing::warn!(
                         "[Journal] quarantined unreadable journal to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                        archived, path
+                        archived,
+                        path
                     );
                 }
                 Ok(archived)
@@ -336,8 +361,57 @@ impl Journal {
         if let Some(prev) = &self.entry {
             tracing::warn!(
                 "[Journal] overwriting stale in-memory entry op_id={} type={:?} chest_id={} slot={} state={:?} - previous op did not complete cleanly",
-                prev.operation_id, prev.operation_type, prev.chest_id, prev.slot_index, prev.state
+                prev.operation_id,
+                prev.operation_type,
+                prev.chest_id,
+                prev.slot_index,
+                prev.state
             );
+        }
+        // If the entry was attached via restore_leftover (bot startup
+        // archive failure path), archive the on-disk file BEFORE the
+        // replace below would persist over it. Without this, the very
+        // next begin() destroys the forensic record restore_leftover was
+        // created to preserve.
+        if self.restored_leftover {
+            match crate::fsutil::pick_archive_path(
+                self.path.parent(),
+                "journal",
+                "begin-replaces-restored",
+                &ARCHIVE_SEQ,
+            ) {
+                Ok(archived) => match fs::rename(&self.path, &archived) {
+                    Ok(()) => tracing::error!(
+                        "[Journal] archived restored-leftover at {:?} before replacing with new begin - preserve for operator review",
+                        archived
+                    ),
+                    Err(rename_err) => match fs::copy(&self.path, &archived) {
+                        Ok(_) => {
+                            crate::fsutil::durably_sync_archive(&archived);
+                            if let Err(remove_err) = fs::remove_file(&self.path) {
+                                tracing::warn!(
+                                    "[Journal] archived restored-leftover to {:?} via copy fallback but failed to remove original {:?}: {remove_err}",
+                                    archived,
+                                    self.path
+                                );
+                            } else {
+                                tracing::error!(
+                                    "[Journal] archived restored-leftover at {:?} (via copy fallback after rename err: {rename_err}) before replacing with new begin",
+                                    archived
+                                );
+                            }
+                        }
+                        Err(copy_err) => tracing::warn!(
+                            "[Journal] could not archive restored-leftover at {:?}: rename={rename_err} copy={copy_err} - on-disk evidence may be overwritten on next persist",
+                            self.path
+                        ),
+                    },
+                },
+                Err(pick_err) => tracing::warn!(
+                    "[Journal] could not pick archive path for restored-leftover: {pick_err} - on-disk evidence may be overwritten on next persist"
+                ),
+            }
+            self.restored_leftover = false;
         }
         let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
         let new_entry = JournalEntry {
@@ -406,9 +480,7 @@ impl Journal {
         let op_id = self.entry.as_ref().map(|e| e.operation_id);
         self.entry = None;
         self.persist().inspect_err(|e| {
-            tracing::error!(
-                "[Journal] failed to persist complete: op_id={op_id:?}: {e}"
-            );
+            tracing::error!("[Journal] failed to persist complete: op_id={op_id:?}: {e}");
         })
     }
 
@@ -425,6 +497,12 @@ impl Journal {
     /// correlation in the persist error path; the entry is then cleared and
     /// the empty form (`[]`) is written exactly once.
     pub fn complete_with_state(&mut self, state: JournalState) -> io::Result<()> {
+        // Snapshot the prior state BEFORE the in-memory mutation so a persist
+        // failure can restore it. Without this, `old_entry` would hold the
+        // already-mutated entry with `state` baked in, and `current()` would
+        // report the unreached terminal state — contradicting the docstring
+        // guarantee that callers observe either the prior state or empty.
+        let prior_state = self.entry.as_ref().map(|e| e.state);
         if let Some(entry) = self.entry.as_mut() {
             entry.state = state;
         }
@@ -435,6 +513,9 @@ impl Journal {
                 "[Journal] failed to persist complete_with_state({state:?}): op_id={op_id:?}: {e}"
             );
             self.entry = old_entry;
+            if let (Some(entry), Some(prior)) = (self.entry.as_mut(), prior_state) {
+                entry.state = prior;
+            }
             return Err(e);
         }
         Ok(())
@@ -444,13 +525,14 @@ impl Journal {
     ///
     /// Used by the bot startup path when [`archive_leftover`](Self::archive_leftover)
     /// fails: the loader unconditionally clears `self.entry`, so without this
-    /// the next `begin()` would silently overwrite the on-disk forensic record
-    /// (the empty in-memory entry → empty `[]` persist → operator evidence
-    /// gone). Restoring the entry means the next `begin()` instead triggers
-    /// the existing "overwriting stale entry" warning and re-persists the
-    /// same single-entry payload, preserving the operation_id/state.
+    /// the next `begin()` would silently overwrite the on-disk forensic record.
+    /// Setting `restored_leftover = true` directs the next `begin()` to first
+    /// archive the on-disk file to a `journal.begin-replaces-restored-*.json`
+    /// sibling, then proceed normally — the bot is not bricked, and the
+    /// operator-review artifact survives.
     pub(crate) fn restore_leftover(&mut self, e: JournalEntry) {
         self.entry = Some(e);
+        self.restored_leftover = true;
     }
 
     /// View the currently-active entry, if any.
@@ -491,12 +573,19 @@ mod tests {
     use super::*;
 
     fn temp_journal(suffix: &str) -> (Journal, std::path::PathBuf) {
-        let dir = std::env::temp_dir()
-            .join(format!("cj-store-journal-{}-{}", suffix, std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "cj-store-journal-{}-{}",
+            suffix,
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("journal.json");
-        let j = Journal { entry: None, path: path.clone() };
+        let j = Journal {
+            entry: None,
+            path: path.clone(),
+            restored_leftover: false,
+        };
         (j, dir)
     }
 
@@ -553,10 +642,8 @@ mod tests {
 
     #[test]
     fn load_from_returns_none_when_file_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "cj-store-journal-missing-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cj-store-journal-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("journal.json");
@@ -658,12 +745,20 @@ mod tests {
 
         // First archive: distinct payload "alpha".
         std::fs::write(&path, "alpha").unwrap();
-        let j1 = Journal { entry: None, path: path.clone() };
+        let j1 = Journal {
+            entry: None,
+            path: path.clone(),
+            restored_leftover: false,
+        };
         let archived1 = j1.archive_leftover().expect("first archive");
 
         // Second archive: distinct payload "beta", in rapid succession.
         std::fs::write(&path, "beta").unwrap();
-        let j2 = Journal { entry: None, path: path.clone() };
+        let j2 = Journal {
+            entry: None,
+            path: path.clone(),
+            restored_leftover: false,
+        };
         let archived2 = j2.archive_leftover().expect("second archive");
 
         assert_ne!(archived1, archived2, "archive paths must differ");
@@ -696,8 +791,14 @@ mod tests {
         assert_ne!(archived1, archived2, "quarantine paths must differ");
         assert!(archived1.exists(), "first quarantine must still exist");
         assert!(archived2.exists(), "second quarantine must exist");
-        assert_eq!(std::fs::read_to_string(&archived1).unwrap(), "first-unreadable");
-        assert_eq!(std::fs::read_to_string(&archived2).unwrap(), "second-unreadable");
+        assert_eq!(
+            std::fs::read_to_string(&archived1).unwrap(),
+            "first-unreadable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&archived2).unwrap(),
+            "second-unreadable"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -735,7 +836,8 @@ mod tests {
 
         // Fused advance+complete: the intermediate `ShulkerReplaced` state
         // must never appear on disk. Only the terminal empty array.
-        j.complete_with_state(JournalState::ShulkerReplaced).unwrap();
+        j.complete_with_state(JournalState::ShulkerReplaced)
+            .unwrap();
 
         // In-memory entry cleared.
         assert!(j.current().is_none());
@@ -777,7 +879,10 @@ mod tests {
         let (mut next_j, leftover) = Journal::load_from(&path).unwrap();
         let leftover = leftover.expect("leftover entry must be present after restart");
         assert_eq!(leftover.operation_id, prev_op_id);
-        assert!(next_j.current().is_none(), "loader must hand back an empty journal");
+        assert!(
+            next_j.current().is_none(),
+            "loader must hand back an empty journal"
+        );
 
         // Imagine `archive_leftover` failed: re-attach the entry to the
         // in-memory state so the next `begin()` preserves it.

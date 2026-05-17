@@ -72,8 +72,12 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         shell: bash
         run: |
-          parent_rev=$(grep -oE 'rev = "[0-9a-f]{40}"' Cargo.toml | head -n1)
-          vendor_rev=$(grep -oE 'rev = "[0-9a-f]{40}"' vendor/azalea-viaversion/Cargo.toml | head -n1)
+          # Anchor the match to the `azalea = ...` dependency line so a
+          # future second git-pinned dep (e.g. a forked simdnbt per the
+          # TODO in the parent Cargo.toml) can't silently invalidate the
+          # parity guard by appearing earlier in the file than azalea.
+          parent_rev=$(grep -nE '^[[:space:]]*azalea[[:space:]]*=.*rev[[:space:]]*=' Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | head -n1)
+          vendor_rev=$(grep -nE '^[[:space:]]*azalea[[:space:]]*=.*rev[[:space:]]*=' vendor/azalea-viaversion/Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | head -n1)
           echo "parent: $parent_rev"
           echo "vendor: $vendor_rev"
           if [ -z "$parent_rev" ] || [ -z "$vendor_rev" ]; then
@@ -135,7 +139,7 @@ jobs:
   # Kept as a separate job so a slow advisory database fetch can't slow the
   # main matrix and so its failure mode is distinct from a code regression.
   security-audit:
-    name: cargo audit + cargo deny
+    name: cargo deny
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -151,17 +155,22 @@ jobs:
           # artifacts don't collide with the build matrix cache.
           shared-key: security-audit
 
-      # `--locked` keeps the installed tool versions reproducible against
-      # whatever Cargo.lock currently records inside each tool's own crate.
-      - name: Install cargo-audit and cargo-deny
-        run: cargo install --locked cargo-audit cargo-deny
+      # Pin tool version explicitly: unpinned `cargo install` would let a
+      # fresh release change CI behavior overnight, the same silent-upgrade
+      # risk SHA-pinning addresses for third-party Actions.
+      # `--locked` keeps the installed tool version reproducible against
+      # whatever Cargo.lock currently records inside cargo-deny's own crate.
+      # cargo-deny's `advisories` check is a superset of cargo-audit, so the
+      # deny step alone is what gates merges — cargo-audit is intentionally
+      # not installed here.
+      - name: Install cargo-deny
+        run: cargo install --locked --version 0.16.4 cargo-deny
 
-      # `--deny warnings` upgrades yanked-crate warnings to errors —
-      # matches `clippy -D warnings` posture for the rest of CI.
-      - name: cargo audit
-        run: cargo audit --deny warnings
-
-      # Full sweep: advisories, banned crates / duplicate versions,
-      # license allowlist, and source registry/git allowlist.
+      # Full sweep: advisories (RustSec), banned crates / duplicate
+      # versions, license allowlist, and source registry/git allowlist.
+      # cargo-deny's `advisories` check supersedes a standalone
+      # `cargo audit` run against the same lockfile, so we don't install
+      # cargo-audit separately — one less tool fetched and one less PR
+      # comment per advisory.
       - name: cargo deny
         run: cargo deny check advisories bans licenses sources

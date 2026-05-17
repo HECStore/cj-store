@@ -31,9 +31,7 @@ const INITIAL_LIMITS_CAPACITY: usize = 256;
 use tracing::{debug, warn};
 
 use crate::constants::{
-    RATE_LIMIT_BASE_COOLDOWN_MS,
-    RATE_LIMIT_MAX_COOLDOWN_MS,
-    RATE_LIMIT_RESET_AFTER_MS,
+    RATE_LIMIT_BASE_COOLDOWN_MS, RATE_LIMIT_MAX_COOLDOWN_MS, RATE_LIMIT_RESET_AFTER_MS,
 };
 
 /// Smallest violation count at which `calculate_cooldown` is already pinned at
@@ -210,9 +208,7 @@ impl RateLimiter {
     fn clamp_stale_threshold(&self, stale_threshold: Duration) -> Duration {
         let floor = Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS);
         let clamped = stale_threshold.max(floor);
-        if stale_threshold < clamped
-            && !self.clamp_warned.swap(true, Ordering::Relaxed)
-        {
+        if stale_threshold < clamped && !self.clamp_warned.swap(true, Ordering::Relaxed) {
             warn!(
                 original_threshold_ms = stale_threshold.as_millis() as u64,
                 clamped_threshold_ms = clamped.as_millis() as u64,
@@ -258,9 +254,9 @@ impl RateLimiter {
         // `cleanup_stale` (300s loop) still preserves correctness; the
         // throttle just bounds adversarial worst-case inline work.
         if !self.limits.contains_key(user_uuid) && self.limits.len() >= MAX_RATE_LIMIT_ENTRIES {
-            let sweep_due = self
-                .last_inline_sweep
-                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS));
+            let sweep_due = self.last_inline_sweep.is_none_or(|t| {
+                now.duration_since(t) >= Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS)
+            });
             if sweep_due {
                 self.cleanup_stale(Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS));
                 self.last_inline_sweep = Some(now);
@@ -270,9 +266,9 @@ impl RateLimiter {
                 // globally instead so a Sybil-style flood at cap cannot
                 // turn each inbound junk message into an outbound whisper.
                 // One whisper per RATE_LIMIT_RESET_AFTER_MS window.
-                let should_whisper = self
-                    .cap_refusal_last_whisper
-                    .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS));
+                let should_whisper = self.cap_refusal_last_whisper.is_none_or(|t| {
+                    now.duration_since(t) >= Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS)
+                });
                 if should_whisper {
                     self.cap_refusal_last_whisper = Some(now);
                 }
@@ -300,29 +296,26 @@ impl RateLimiter {
         // guarantee and the existing closure body unchanged.
         let user_limit = match self.limits.get_mut(user_uuid) {
             Some(e) => e,
-            None => self
-                .limits
-                .entry(user_uuid.to_owned())
-                .or_insert_with(|| {
-                    // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
-                    // so the `elapsed >= required_cooldown` check below always passes on
-                    // the very first message; without this, a new user would be treated
-                    // as having "just messaged" at entry creation and be rejected.
-                    // `checked_sub` guards against the (Windows/Linux-impossible but
-                    // platform-allowed) case of `Instant` subtraction underflowing near
-                    // process start; falling back to `now` means the first message would
-                    // be rejected, which is preferable to a panic.
-                    let mut limit = UserRateLimit::new();
-                    let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
-                    limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
-                    // `last_attempt_time` is initialized to `now` by
-                    // `UserRateLimit::new`. The post-insert block below
-                    // (`user_limit.last_attempt_time = now;`) is the canonical
-                    // site that stamps every call's attempt timestamp; do not
-                    // re-assign here. Avoiding the double-write makes it
-                    // unambiguous which write a future test would pin.
-                    limit
-                }),
+            None => self.limits.entry(user_uuid.to_owned()).or_insert_with(|| {
+                // For a brand new user, backdate `last_message_time` past MAX_COOLDOWN
+                // so the `elapsed >= required_cooldown` check below always passes on
+                // the very first message; without this, a new user would be treated
+                // as having "just messaged" at entry creation and be rejected.
+                // `checked_sub` guards against the (Windows/Linux-impossible but
+                // platform-allowed) case of `Instant` subtraction underflowing near
+                // process start; falling back to `now` means the first message would
+                // be rejected, which is preferable to a panic.
+                let mut limit = UserRateLimit::new();
+                let backdate = Duration::from_millis(RATE_LIMIT_MAX_COOLDOWN_MS + 1);
+                limit.last_message_time = now.checked_sub(backdate).unwrap_or(now);
+                // `last_attempt_time` is initialized to `now` by
+                // `UserRateLimit::new`. The post-insert block below
+                // (`user_limit.last_attempt_time = now;`) is the canonical
+                // site that stamps every call's attempt timestamp; do not
+                // re-assign here. Avoiding the double-write makes it
+                // unambiguous which write a future test would pin.
+                limit
+            }),
         };
 
         let elapsed = now.duration_since(user_limit.last_message_time);
@@ -477,11 +470,19 @@ impl RateLimiter {
         // A continuously-rejected spammer otherwise has `last_message_time`
         // frozen at their last accept and could be evicted at the boundary
         // even while still actively throttled.
-        self.limits.retain(|_, limit| {
-            now.duration_since(limit.last_attempt_time) < stale_threshold
-        });
+        self.limits
+            .retain(|_, limit| now.duration_since(limit.last_attempt_time) < stale_threshold);
         let dropped = before - self.limits.len();
         if dropped > 0 {
+            // Natural-reset path for the limiter-level cap-refusal whisper
+            // gate: once entries have been freed, the map is no longer at
+            // cap and the operator-facing cap-pressure signal must be
+            // allowed to fire again on the next genuine cap-pressure event.
+            // Without this, a stale stamp from a prior unrelated incident
+            // can silence the signal for up to RATE_LIMIT_RESET_AFTER_MS.
+            // Mirrors the per-user `last_whisper_time = None` reset that
+            // `check()` already performs on natural idle-reset.
+            self.cap_refusal_last_whisper = None;
             debug!(
                 dropped = dropped,
                 remaining = self.limits.len(),
@@ -535,6 +536,46 @@ impl RateLimiter {
     #[cfg(test)]
     fn last_inline_sweep_for_test(&self) -> Option<Instant> {
         self.last_inline_sweep
+    }
+
+    /// Test-only: backdate the limiter-level `last_inline_sweep` stamp by
+    /// `by`. The per-user `backdate` cannot reach this field, so a test that
+    /// wants to cross the inline-sweep throttle window without real sleeps
+    /// must shift this stamp directly.
+    #[cfg(test)]
+    fn backdate_last_inline_sweep(&mut self, by: Duration) {
+        if let Some(t) = self.last_inline_sweep.as_mut() {
+            *t -= by;
+        }
+    }
+
+    /// Test-only: backdate the limiter-level `cap_refusal_last_whisper` stamp
+    /// by `by`. The per-user `backdate` cannot reach this field, so a test
+    /// that wants to cross the cap-refusal whisper-gate reset window without
+    /// real sleeps must shift this stamp directly.
+    #[cfg(test)]
+    fn backdate_cap_refusal_last_whisper(&mut self, by: Duration) {
+        if let Some(t) = self.cap_refusal_last_whisper.as_mut() {
+            *t -= by;
+        }
+    }
+
+    /// Test-only: backdate ONLY the per-user `last_attempt_time` by `by`,
+    /// leaving `last_whisper_time` (and other fields) untouched. Lets a test
+    /// cross the attempt-reset window without also crossing the
+    /// whisper-suppression window, pinning that the explicit
+    /// `last_whisper_time = None` reset inside `check()` is load-bearing
+    /// rather than coincidentally equivalent to the suppression-window
+    /// reopen.
+    /// Returns false if the user has no entry yet.
+    #[cfg(test)]
+    fn backdate_attempt_only(&mut self, user_uuid: &str, by: Duration) -> bool {
+        if let Some(limit) = self.limits.get_mut(user_uuid) {
+            limit.last_attempt_time -= by;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -747,7 +788,9 @@ mod tests {
         assert_eq!(limiter.len(), 2);
 
         assert!(limiter.backdate("old_user", Duration::from_secs(600)));
-        limiter.cleanup_stale(Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS));
+        limiter.cleanup_stale(Duration::from_secs(
+            crate::constants::RATE_LIMIT_STALE_AFTER_SECS,
+        ));
         assert_eq!(limiter.len(), 1);
         assert_eq!(limiter.violations_for("old_user"), None);
         assert_eq!(limiter.violations_for("recent_user"), Some(0));
@@ -758,7 +801,9 @@ mod tests {
         let mut limiter = RateLimiter::new();
         let _ = limiter.check("user1");
         let _ = limiter.check("user2");
-        limiter.cleanup_stale(Duration::from_secs(crate::constants::RATE_LIMIT_STALE_AFTER_SECS));
+        limiter.cleanup_stale(Duration::from_secs(
+            crate::constants::RATE_LIMIT_STALE_AFTER_SECS,
+        ));
         assert_eq!(limiter.len(), 2);
     }
 
@@ -1033,7 +1078,11 @@ mod tests {
             let name = format!("flood_newcomer_{i}");
             match limiter.check(&name) {
                 Ok(()) => panic!("expected refusal under cap pressure (i={i})"),
-                Err(Throttled { should_whisper, reason, .. }) => {
+                Err(Throttled {
+                    should_whisper,
+                    reason,
+                    ..
+                }) => {
                     assert_eq!(reason, ThrottleReason::GlobalCap);
                     if should_whisper {
                         whisper_count += 1;
@@ -1130,10 +1179,9 @@ mod tests {
         let mut limiter = RateLimiter::new();
         assert!(limiter.check("user1").is_ok());
         match limiter.check("user1") {
-            Err(Throttled { should_whisper, .. }) => assert!(
-                should_whisper,
-                "first whisper after a rejection must fire"
-            ),
+            Err(Throttled { should_whisper, .. }) => {
+                assert!(should_whisper, "first whisper after a rejection must fire")
+            }
             Ok(()) => panic!("precondition: second check must produce Err"),
         }
     }
@@ -1251,6 +1299,137 @@ mod tests {
             saw_saturation_whisper,
             "loop must reach the SATURATION_THRESHOLD crossing"
         );
+    }
+
+    #[test]
+    fn cap_overflow_inline_sweep_reopens_after_throttle_window() {
+        // The `last_inline_sweep` field throttles the O(MAX_RATE_LIMIT_ENTRIES)
+        // `HashMap::retain` work to once per RATE_LIMIT_BASE_COOLDOWN_MS under
+        // sustained cap pressure. The throttle MUST reopen after the window
+        // elapses so a real long-running flood does eventually get its periodic
+        // sweep — otherwise a single early stamp could silence the inline
+        // sweep for the rest of the process lifetime. Per-user `backdate`
+        // cannot reach the limiter-level stamp, hence the dedicated helper.
+        let mut limiter = RateLimiter::new();
+        fill_to_cap(&mut limiter);
+
+        // First refusal seeds the sweep stamp.
+        let _ = limiter.check("flood_first");
+        let first_sweep = limiter
+            .last_inline_sweep_for_test()
+            .expect("first cap-overflow refusal must run the inline sweep");
+
+        // Cross the inline-sweep throttle window via the limiter-level
+        // helper so we do NOT touch any per-user state.
+        let bump =
+            Duration::from_millis(RATE_LIMIT_BASE_COOLDOWN_MS) + Duration::from_millis(100);
+        limiter.backdate_last_inline_sweep(bump);
+
+        // Trigger another cap-overflow refusal; the sweep must run again
+        // and re-stamp the field to a strictly-later instant.
+        let _ = limiter.check("flood_second");
+        let second_sweep = limiter
+            .last_inline_sweep_for_test()
+            .expect("sweep stamp must remain set");
+        assert!(
+            second_sweep > first_sweep,
+            "inline sweep must re-run after the throttle window elapses: \
+             first={first_sweep:?}, second={second_sweep:?}"
+        );
+    }
+
+    #[test]
+    fn cap_overflow_whisper_gate_reopens_after_reset_window() {
+        // The `cap_refusal_last_whisper` field throttles cap-overflow whispers
+        // to once per RATE_LIMIT_RESET_AFTER_MS. The gate MUST reopen after
+        // the window elapses; without this, a sustained cap-pressure
+        // condition would silently silence the player-facing notice forever.
+        // Per-user `backdate` cannot reach the limiter-level stamp, hence the
+        // dedicated helper.
+        let mut limiter = RateLimiter::new();
+        fill_to_cap(&mut limiter);
+
+        // First refusal must whisper.
+        match limiter.check("flood_first") {
+            Err(Throttled { should_whisper, reason, .. }) => {
+                assert_eq!(reason, ThrottleReason::GlobalCap);
+                assert!(should_whisper, "first cap-overflow refusal must whisper");
+            }
+            Ok(()) => panic!("expected cap-overflow refusal"),
+        }
+
+        // Cross the cap-refusal whisper-gate reset window via the
+        // limiter-level helper.
+        let bump =
+            Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) + Duration::from_millis(100);
+        limiter.backdate_cap_refusal_last_whisper(bump);
+
+        // Next cap-overflow refusal must whisper again.
+        match limiter.check("flood_second") {
+            Err(Throttled { should_whisper, reason, .. }) => {
+                assert_eq!(reason, ThrottleReason::GlobalCap);
+                assert!(
+                    should_whisper,
+                    "cap-overflow whisper gate must reopen after \
+                     RATE_LIMIT_RESET_AFTER_MS elapses"
+                );
+            }
+            Ok(()) => panic!("expected cap-overflow refusal"),
+        }
+    }
+
+    #[test]
+    fn whisper_gate_reopens_after_natural_violation_reset() {
+        // Pins that the explicit `last_whisper_time = None` reset inside the
+        // natural-idle-reset branch of `check()` is load-bearing. By shifting
+        // ONLY `last_attempt_time` (via the dedicated helper), we cross the
+        // attempt-reset window WITHOUT crossing the whisper-suppression
+        // window — so the suppression window has NOT elapsed naturally, and
+        // the only path that can re-fire the whisper is the explicit reset.
+        let mut limiter = RateLimiter::new();
+        assert!(limiter.check("user1").is_ok());
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => {
+                assert!(should_whisper, "first whisper after rejection must fire")
+            }
+            Ok(()) => panic!("precondition: second check must produce Err"),
+        }
+
+        // Cross ONLY the attempt-reset window; leave `last_whisper_time`
+        // untouched (so it remains inside its suppression window).
+        let bump =
+            Duration::from_millis(RATE_LIMIT_RESET_AFTER_MS) + Duration::from_millis(100);
+        assert!(limiter.backdate_attempt_only("user1", bump));
+
+        // The next check sees `attempt_elapsed >= RESET_AFTER_MS` and clears
+        // violations AND `last_whisper_time` via the explicit reset. The
+        // "honest wait" invariant means the cooldown branch is not crossed
+        // by this helper, so the next check is still rejected against
+        // `last_message_time` — but the violation-reset branch has already
+        // cleared `last_whisper_time`, so the rejection's whisper fires.
+        match limiter.check("user1") {
+            Err(Throttled { should_whisper, .. }) => assert!(
+                should_whisper,
+                "the explicit last_whisper_time=None reset on natural \
+                 violation reset must be load-bearing: without it, the \
+                 suppression window has NOT elapsed (we only backdated \
+                 attempt time), so the whisper would stay suppressed"
+            ),
+            Ok(()) => {
+                // If the implementation ever changes so the post-reset
+                // check is accepted, drive one more rejection to observe
+                // the whisper gate — the property under test (the explicit
+                // reset re-fires the whisper) still must hold.
+                match limiter.check("user1") {
+                    Err(Throttled { should_whisper, .. }) => assert!(
+                        should_whisper,
+                        "whisper must re-fire on first rejection after \
+                         the explicit natural-reset clears last_whisper_time"
+                    ),
+                    Ok(()) => panic!("expected a rejection to observe whisper gate"),
+                }
+            }
+        }
     }
 
     #[test]

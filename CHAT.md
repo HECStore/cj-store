@@ -1053,7 +1053,21 @@ incomplete; defenses cover:
   otherwise pad into a loopback/private address.
 - **Redirects disabled**: `redirect::Policy::none()`. 3xx responses
   are followed manually after re-running the parse + resolve +
-  deny-list path; capped at 3 hops.
+  deny-list path; capped at 3 hops. A redirect from `https://` to
+  `http://` is rejected at the next hop's validation so a hostile
+  upstream cannot downgrade a vetted secure fetch into plaintext
+  mid-chain (the operator is still allowed to opt into plaintext on
+  the *initial* hop).
+- **No ambient proxy**: the per-hop `reqwest::ClientBuilder` calls
+  `.no_proxy()`. Without it, reqwest honors `HTTP_PROXY` /
+  `HTTPS_PROXY` env vars and a proxy hop would punt the connection
+  *before* `resolve_to_addrs` can pin the vetted IPs — defeating the
+  DNS-rebinding guarantee.
+- **IPv6 literals stay bracketed end-to-end**: the `resolve_to_addrs`
+  override key for an IPv6 literal is the bracketed form `[2001:db8::1]`
+  (matching what `reqwest`'s URL parser registers per RFC 3986 §3.2.2).
+  A bare unbracketed key would silently not match the URL host and
+  the IP pin would be bypassed on the connect.
 - **Streaming size enforcement**: response body read with
   `Response::chunk()` in a loop with a running byte counter; the
   connection aborts as soon as the total exceeds `web_fetch_max_bytes`.

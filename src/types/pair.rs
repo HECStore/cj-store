@@ -15,14 +15,24 @@ use std::{
     collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
+    sync::atomic::AtomicU64,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::write_atomic;
+use crate::fsutil::{archive_aside, pick_archive_path, write_atomic};
 use crate::types::ItemId;
 
 use tracing::{info, warn};
+
+/// Per-module monotonic counter appended to quarantine filenames so two
+/// `.json.corrupt-*` archives produced in the same millisecond cannot collide
+/// — the prior `fs::rename` + single `unix_ms` suffix would silently
+/// overwrite the first archive on the second rename, destroying exactly the
+/// forensic evidence quarantine exists to preserve. Mirrors the
+/// `ARCHIVE_SEQ` pattern in `store::queue`, `store::journal`, and
+/// `store::trade_state`.
+static PAIR_ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Represents a trading pair: item <-> diamonds (currency).
 ///
@@ -145,15 +155,19 @@ impl Pair {
         let path = Self::get_pair_file_path_in_dir(dir_path, &self.item);
 
         if let Some(parent_dir) = path.parent()
-            && !parent_dir.exists() {
-                fs::create_dir_all(parent_dir)?;
-            }
+            && !parent_dir.exists()
+        {
+            fs::create_dir_all(parent_dir)?;
+        }
 
         let json_str = serde_json::to_string_pretty(self)?;
         write_atomic(&path, &json_str)?;
         tracing::debug!(
             "[Pair] saved '{}' (stack={}, item_stock={}, currency_stock={})",
-            self.item.as_str(), self.stack_size, self.item_stock, self.currency_stock,
+            self.item.as_str(),
+            self.stack_size,
+            self.item_stock,
+            self.currency_stock,
         );
         Ok(())
     }
@@ -169,7 +183,10 @@ impl Pair {
         let mut pairs = HashMap::new();
 
         if !dir_path.exists() {
-            info!("[Pair] pairs directory not found at {}, starting empty", dir_path.display());
+            info!(
+                "[Pair] pairs directory not found at {}, starting empty",
+                dir_path.display()
+            );
             return Ok(HashMap::new());
         }
 
@@ -242,7 +259,8 @@ impl Pair {
                             }
                         }
                         Err(e) => {
-                            if let Err(qe) = quarantine_pair_file(&path, &format!("malformed: {e}")) {
+                            if let Err(qe) = quarantine_pair_file(&path, &format!("malformed: {e}"))
+                            {
                                 warn!(
                                     "[Pair] quarantine rename failed for {} (malformed): {qe}",
                                     path.display()
@@ -263,7 +281,11 @@ impl Pair {
                 }
             }
         }
-        info!("[Pair] loaded {} pairs (quarantined {})", pairs.len(), quarantined);
+        info!(
+            "[Pair] loaded {} pairs (quarantined {})",
+            pairs.len(),
+            quarantined
+        );
         Ok(pairs)
     }
 
@@ -291,12 +313,10 @@ impl Pair {
         // in-memory map is still treated as "refuse to wipe".
         if pairs.is_empty() {
             let dir_has_pair_files = match fs::read_dir(dir_path) {
-                Ok(read_dir) => read_dir
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| {
-                        let path = entry.path();
-                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    }),
+                Ok(read_dir) => read_dir.filter_map(|entry| entry.ok()).any(|entry| {
+                    let path = entry.path();
+                    path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                }),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e),
             };
@@ -359,12 +379,16 @@ impl Pair {
                             }
                         };
                         let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                        if path.is_file()
+                            && path.extension().is_some_and(|ext| ext == "json")
                             && let Some(filename) = path.file_name().and_then(|n| n.to_str())
                             && !expected_files.contains(filename)
                         {
                             if let Err(e) = fs::remove_file(&path) {
-                                warn!("[Pair] orphan sweep: remove_file({}) failed: {e}", path.display());
+                                warn!(
+                                    "[Pair] orphan sweep: remove_file({}) failed: {e}",
+                                    path.display()
+                                );
                                 first_sweep_err.get_or_insert(e);
                             } else {
                                 removed += 1;
@@ -373,7 +397,10 @@ impl Pair {
                     }
                 }
                 Err(e) => {
-                    warn!("[Pair] orphan sweep: read_dir({}) failed: {e}", dir_path.display());
+                    warn!(
+                        "[Pair] orphan sweep: read_dir({}) failed: {e}",
+                        dir_path.display()
+                    );
                     first_sweep_err = Some(e);
                 }
             }
@@ -381,7 +408,10 @@ impl Pair {
 
         info!(
             "[Pair] save_all: wrote {} of {} pairs (failed {}), cleaned {} orphan files",
-            written, pairs.len(), pairs.len() - written, removed
+            written,
+            pairs.len(),
+            pairs.len() - written,
+            removed
         );
         match first_save_err.or(first_sweep_err) {
             Some(e) => Err(e),
@@ -390,24 +420,31 @@ impl Pair {
     }
 }
 
-/// Rename a malformed/unreadable pair file to `*.json.corrupt.<millis>` so the
-/// next `save_all` orphan-cleanup cannot delete it (extension is no longer
-/// `.json`) and subsequent `load_all` calls do not retry deserializing it.
-/// The millisecond timestamp suffix avoids collisions if quarantine fires
-/// repeatedly for the same path.
+/// Rename a malformed/unreadable pair file aside so the next `save_all`
+/// orphan-cleanup cannot delete it (extension is no longer `.json`) and
+/// subsequent `load_all` calls do not retry deserializing it.
+///
+/// Uses [`pick_archive_path`] + [`archive_aside`] (the same primitives
+/// `store::journal` / `store::queue` / `store::trade_state` use) rather than
+/// a raw `fs::rename` with a single `unix_ms` suffix: two corrupt files in
+/// the same millisecond would otherwise collide and the second `fs::rename`
+/// would silently overwrite the first archive — destroying exactly the
+/// forensic evidence quarantine exists to preserve. `archive_aside` also
+/// supplies a `fs::copy + fs::remove_file` fallback for Windows-AV
+/// held-handle scenarios that `fs::rename` alone cannot handle.
 fn quarantine_pair_file(path: &Path, reason: &str) -> io::Result<()> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let target = path.with_extension(format!("json.corrupt.{ts}"));
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pair.json".to_string());
+    let archived = pick_archive_path(path.parent(), &base, "corrupt", &PAIR_ARCHIVE_SEQ)?;
     warn!(
         "[Pair] quarantining {} ({}): renaming to {}",
         path.display(),
         reason,
-        target.display(),
+        archived.display(),
     );
-    fs::rename(path, target)
+    archive_aside(path, &archived)
 }
 
 #[cfg(test)]
@@ -425,13 +462,19 @@ mod tests {
 
     #[test]
     fn sanitize_strips_minecraft_prefix() {
-        assert_eq!(Pair::sanitize_item_name_for_filename("minecraft:diamond"), "diamond");
+        assert_eq!(
+            Pair::sanitize_item_name_for_filename("minecraft:diamond"),
+            "diamond"
+        );
     }
 
     #[test]
     fn sanitize_replaces_remaining_colons_after_prefix_strip() {
         // "minecraft:something:odd" -> strip "minecraft:" -> "something:odd" -> "something_odd"
-        assert_eq!(Pair::sanitize_item_name_for_filename("minecraft:something:odd"), "something_odd");
+        assert_eq!(
+            Pair::sanitize_item_name_for_filename("minecraft:something:odd"),
+            "something_odd"
+        );
     }
 
     #[test]
@@ -442,7 +485,10 @@ mod tests {
 
     #[test]
     fn sanitize_plain_name_passes_through() {
-        assert_eq!(Pair::sanitize_item_name_for_filename("cobblestone"), "cobblestone");
+        assert_eq!(
+            Pair::sanitize_item_name_for_filename("cobblestone"),
+            "cobblestone"
+        );
     }
 
     #[test]
@@ -505,7 +551,10 @@ mod tests {
         fs::write(with_sibling.join("README.txt"), "not a pair file").unwrap();
         Pair::save_all_in_dir(&HashMap::new(), &with_sibling)
             .expect("empty map + non-json siblings must be a no-op");
-        assert!(with_sibling.join("README.txt").exists(), "non-json sibling must survive");
+        assert!(
+            with_sibling.join("README.txt").exists(),
+            "non-json sibling must survive"
+        );
     }
 
     #[test]
@@ -535,9 +584,7 @@ mod tests {
         if real_pairs_existed {
             // Skip seeding if the guard somehow already exists from a prior
             // crashed run — leave it alone rather than racing.
-            if !real_guard.exists()
-                && fs::write(&real_guard, "{}").is_ok()
-            {
+            if !real_guard.exists() && fs::write(&real_guard, "{}").is_ok() {
                 real_guard_seeded = true;
             }
         }
@@ -548,7 +595,12 @@ mod tests {
         let item = ItemId::new("cobblestone").expect("valid item id");
         pairs.insert(
             item.to_string(),
-            Pair { item: item.clone(), stack_size: 64, item_stock: 1, currency_stock: 0.0 },
+            Pair {
+                item: item.clone(),
+                stack_size: 64,
+                item_stock: 1,
+                currency_stock: 0.0,
+            },
         );
 
         Pair::save_all_in_dir(&pairs, dir.path()).expect("save_all_in_dir must succeed");
@@ -565,7 +617,10 @@ mod tests {
         }
 
         // The orphan sweep removed the temp-dir stale file …
-        assert!(!stale.exists(), "orphan sweep must remove stale .json from threaded dir");
+        assert!(
+            !stale.exists(),
+            "orphan sweep must remove stale .json from threaded dir"
+        );
 
         // … but did NOT touch the real `data/pairs/` guard file.
         if real_guard_seeded {

@@ -84,7 +84,10 @@ impl std::fmt::Display for UrlError {
             UrlError::BadHost => write!(f, "hostname is empty or malformed"),
             UrlError::BadFormat => write!(f, "URL is malformed"),
             UrlError::DisallowedPort(p) => {
-                write!(f, "port {p} is not in the allow-list (only 80, 443 permitted)")
+                write!(
+                    f,
+                    "port {p} is not in the allow-list (only 80, 443 permitted)"
+                )
             }
         }
     }
@@ -118,8 +121,14 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
             || c == '\t'
             || matches!(
                 c,
-                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{200E}' | '\u{200F}'
-                    | '\u{2028}' | '\u{2029}' | '\u{FEFF}'
+                '\u{200B}'
+                    | '\u{200C}'
+                    | '\u{200D}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{FEFF}'
             )
     }) {
         return Err(UrlError::BadFormat);
@@ -130,13 +139,9 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
     // length-based slice and panic. The first 7-8 bytes of any valid
     // http(s) URL are ASCII, so slicing at byte 7/8 is char-aligned.
     let bytes = input.as_bytes();
-    let (scheme, rest) = if bytes.len() >= 8
-        && bytes[..8].eq_ignore_ascii_case(b"https://")
-    {
+    let (scheme, rest) = if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
         (Scheme::Https, &input[8..])
-    } else if bytes.len() >= 7
-        && bytes[..7].eq_ignore_ascii_case(b"http://")
-    {
+    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
         (Scheme::Http, &input[7..])
     } else {
         return Err(UrlError::BadScheme);
@@ -171,7 +176,8 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
         let after = &rest[close + 1..];
         // After the bracket there may be `:port` or nothing.
         if !after.is_empty()
-            && (!after.starts_with(':') || after[1..].is_empty()
+            && (!after.starts_with(':')
+                || after[1..].is_empty()
                 || !after[1..].bytes().all(|b| b.is_ascii_digit()))
         {
             return Err(UrlError::BadHost);
@@ -199,9 +205,7 @@ pub fn validate_url(input: &str) -> Result<SafeUrl, UrlError> {
 
     // Strip optional `:port` (single trailing colon-decimal).
     let (host_str, explicit_port) = match authority.rsplit_once(':') {
-        Some((h, port))
-            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
-        {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
             let p: u16 = port.parse().map_err(|_| UrlError::BadHost)?;
             (h, Some(p))
         }
@@ -274,7 +278,9 @@ fn looks_obfuscated_dotted_quad(s: &str) -> bool {
         return false;
     }
     parts.iter().all(|p| {
-        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit() || b == b'x' || b == b'X')
+        !p.is_empty()
+            && p.bytes()
+                .all(|b| b.is_ascii_digit() || b == b'x' || b == b'X')
     })
 }
 
@@ -482,7 +488,13 @@ fn is_denied_ipv6(ip: Ipv6Addr) -> bool {
         return true;
     }
     // 64:ff9b::/96 — IPv4/IPv6 well-known prefix; treat conservatively.
-    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0 {
+    if segs[0] == 0x0064
+        && segs[1] == 0xff9b
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0
+    {
         return true;
     }
     // ::ffff:0:0/96 — IPv4-mapped IPv6: validate the embedded IPv4.
@@ -650,11 +662,24 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(FETCH_TIMEOUT_SECS);
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let mut current = url.to_string();
+    // Track the scheme of the previous hop so we can reject an
+    // HTTPS→HTTP downgrade on redirect. The `resolve_to_addrs` IP-pin
+    // layer is keyed by host string, not by scheme: a server's
+    // `Location: http://same-host/…` would bypass TLS hostname
+    // verification entirely and silently strip transport encryption.
+    // `None` on the initial hop (operator-chosen entry URL — the
+    // operator is allowed to opt into plaintext explicitly).
+    let mut prev_scheme: Option<Scheme> = None;
     for hop in 0..=MAX_REDIRECTS {
         if remaining().is_zero() {
             return Err("fetch deadline exceeded".to_string());
         }
         let safe = validate_url(&current).map_err(|e| format!("url rejected: {e:?}"))?;
+        if let Some(Scheme::Https) = prev_scheme
+            && safe.scheme == Scheme::Http
+        {
+            return Err("redirect downgrade from https to http rejected".to_string());
+        }
         let host_for_check = match &safe.host {
             Host::Name(n) => n.clone(),
             Host::Ip(_) => String::new(),
@@ -705,10 +730,21 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
 
         // Build a fresh reqwest client per call: we pin the resolver
         // to the validated IPs, which is a per-host config.
+        //
+        // `.no_proxy()` is critical: without it, reqwest honors the
+        // ambient HTTP_PROXY / HTTPS_PROXY env vars and a proxy hop
+        // would punt the connection BEFORE `resolve_to_addrs` can pin
+        // the destination IP — bypassing the entire SSRF gate. We must
+        // talk directly to the IPs we vetted, not to whatever a
+        // (potentially attacker-influenced) proxy decides to route to.
+        // Cookie store is already off (Cargo.toml builds reqwest with
+        // `default-features = false`), so no separate `.cookie_store(false)`
+        // is needed.
         let mut builder = reqwest::Client::builder()
             .timeout(remaining().min(Duration::from_secs(FETCH_TIMEOUT_SECS)))
             .connect_timeout(remaining().min(Duration::from_secs(2)))
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .https_only(false); // operator may explicitly fetch http URLs
         // Pin the full vetted IP set in ONE `resolve_to_addrs` call.
         // reqwest's `resolve_to_addrs` overwrites any prior override for
@@ -727,7 +763,14 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         let host_key = match &safe.host {
             Host::Name(n) => n.clone(),
             Host::Ip(IpAddr::V4(v4)) => v4.to_string(),
-            Host::Ip(IpAddr::V6(v6)) => v6.to_string(),
+            // IPv6 literals MUST be bracketed for the resolver override
+            // key: reqwest's URL parser registers the host component as
+            // `[2001:db8::1]` (the bracketed registry-name form per
+            // RFC 3986 §3.2.2), so a bare `2001:db8::1` key would NOT
+            // match the URL host and the `resolve_to_addrs` pin would
+            // silently fall through to the system DNS path — a quiet
+            // SSRF-gate bypass for IPv6 literal targets.
+            Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
         };
         builder = builder.resolve_to_addrs(&host_key, &resolved_addrs);
         let client = builder
@@ -745,10 +788,11 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         let send_result = client.get(&safe.url).send().await;
         let resp = match send_result {
             Ok(r) => r,
-            Err(e) if hop == 0
-                && (e.is_connect() || e.is_timeout())
-                && !e.is_body()
-                && remaining() >= std::time::Duration::from_secs(1) =>
+            Err(e)
+                if hop == 0
+                    && (e.is_connect() || e.is_timeout())
+                    && !e.is_body()
+                    && remaining() >= std::time::Duration::from_secs(1) =>
             {
                 tracing::debug!(
                     host = %match &safe.host {
@@ -796,6 +840,7 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
             }
             // Resolve relative redirect against current URL.
             current = resolve_relative(&safe.url, &loc)?;
+            prev_scheme = Some(safe.scheme);
             continue;
         }
         if !status.is_success() {
@@ -811,7 +856,12 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         if let Some(ct_hdr) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
             let raw = ct_hdr.to_str().unwrap_or("");
             // Strip `; charset=…` (and any other parameters) and normalize.
-            let ct = raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            let ct = raw
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
             let allowed = ct.starts_with("text/")
                 || ct == "application/json"
                 || ct == "application/xml"
@@ -863,25 +913,22 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         let mut total = 0usize;
         let mut stream = resp;
         loop {
-            let chunk_res =
-                match tokio::time::timeout(remaining(), stream.chunk()).await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        tracing::warn!(
-                            host = %host_str,
-                            partial_bytes = total,
-                            "[Chat] web_fetch body read timed out"
-                        );
-                        return Err("body read deadline exceeded".to_string());
-                    }
-                };
+            let chunk_res = match tokio::time::timeout(remaining(), stream.chunk()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::warn!(
+                        host = %host_str,
+                        partial_bytes = total,
+                        "[Chat] web_fetch body read timed out"
+                    );
+                    return Err("body read deadline exceeded".to_string());
+                }
+            };
             match chunk_res {
                 Ok(Some(chunk)) => {
                     total = total.saturating_add(chunk.len());
                     if total > max_bytes {
-                        return Err(format!(
-                            "response body exceeded {max_bytes} bytes"
-                        ));
+                        return Err(format!("response body exceeded {max_bytes} bytes"));
                     }
                     body_bytes.extend_from_slice(&chunk);
                 }
@@ -939,8 +986,7 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
     // Absolute URL — pass through; will be re-validated. Match
     // case-insensitively because validate_url accepts mixed-case schemes.
     let loc_bytes = location.as_bytes();
-    let loc_is_absolute = (loc_bytes.len() >= 7
-        && loc_bytes[..7].eq_ignore_ascii_case(b"http://"))
+    let loc_is_absolute = (loc_bytes.len() >= 7 && loc_bytes[..7].eq_ignore_ascii_case(b"http://"))
         || (loc_bytes.len() >= 8 && loc_bytes[..8].eq_ignore_ascii_case(b"https://"));
     if loc_is_absolute {
         return Ok(location.to_string());
@@ -948,13 +994,9 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
     // Compute the base scheme; needed both for splicing and for resolving
     // protocol-relative redirects below.
     let base_bytes = base.as_bytes();
-    let scheme_len = if base_bytes.len() >= 8
-        && base_bytes[..8].eq_ignore_ascii_case(b"https://")
-    {
+    let scheme_len = if base_bytes.len() >= 8 && base_bytes[..8].eq_ignore_ascii_case(b"https://") {
         8
-    } else if base_bytes.len() >= 7
-        && base_bytes[..7].eq_ignore_ascii_case(b"http://")
-    {
+    } else if base_bytes.len() >= 7 && base_bytes[..7].eq_ignore_ascii_case(b"http://") {
         7
     } else {
         return Err("base URL has no http(s) scheme".to_string());
@@ -988,7 +1030,11 @@ fn resolve_relative(base: &str, location: &str) -> Result<String, String> {
     } else {
         // Path-relative — resolve against last `/` of the base path.
         let base_path = &after[path_start..];
-        let prefix = if let Some(idx) = base_path.rfind('/') { &base_path[..=idx] } else { "/" };
+        let prefix = if let Some(idx) = base_path.rfind('/') {
+            &base_path[..=idx]
+        } else {
+            "/"
+        };
         Ok(format!("{scheme}{authority}{prefix}{location}"))
     }
 }
@@ -1135,9 +1181,7 @@ fn finalize_strip(stripped: &str) -> String {
 }
 
 fn is_skip_block(name: &[u8]) -> bool {
-    SKIP_BLOCK_TAGS
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(name))
+    SKIP_BLOCK_TAGS.iter().any(|t| t.eq_ignore_ascii_case(name))
 }
 
 /// Find a closing `</name>` starting at `from`, case-insensitive, where
@@ -1189,9 +1233,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
@@ -1338,10 +1380,22 @@ mod tests {
 
     #[test]
     fn rejects_non_http_scheme() {
-        assert_eq!(validate_url("ftp://example.com/").unwrap_err(), UrlError::BadScheme);
-        assert_eq!(validate_url("file:///etc/passwd").unwrap_err(), UrlError::BadScheme);
-        assert_eq!(validate_url("javascript:alert(1)").unwrap_err(), UrlError::BadScheme);
-        assert_eq!(validate_url("gopher://example.com/").unwrap_err(), UrlError::BadScheme);
+        assert_eq!(
+            validate_url("ftp://example.com/").unwrap_err(),
+            UrlError::BadScheme
+        );
+        assert_eq!(
+            validate_url("file:///etc/passwd").unwrap_err(),
+            UrlError::BadScheme
+        );
+        assert_eq!(
+            validate_url("javascript:alert(1)").unwrap_err(),
+            UrlError::BadScheme
+        );
+        assert_eq!(
+            validate_url("gopher://example.com/").unwrap_err(),
+            UrlError::BadScheme
+        );
     }
 
     #[test]
@@ -1447,8 +1501,14 @@ mod tests {
 
     #[test]
     fn rejects_url_with_whitespace() {
-        assert_eq!(validate_url("http://exa mple.com/").unwrap_err(), UrlError::BadFormat);
-        assert_eq!(validate_url("http://example.com/\nfoo").unwrap_err(), UrlError::BadFormat);
+        assert_eq!(
+            validate_url("http://exa mple.com/").unwrap_err(),
+            UrlError::BadFormat
+        );
+        assert_eq!(
+            validate_url("http://example.com/\nfoo").unwrap_err(),
+            UrlError::BadFormat
+        );
     }
 
     #[test]
@@ -1562,7 +1622,13 @@ mod tests {
 
     #[test]
     fn rfc1918_v4_denied() {
-        for s in ["10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.255", "192.168.1.1"] {
+        for s in [
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+        ] {
             assert!(is_denied_ip(s.parse().unwrap()), "should be denied: {s}");
         }
     }
@@ -1669,11 +1735,15 @@ mod tests {
     fn teredo_v6_consults_v4_denylist() {
         // 2001:0:102:304:0:0:f5ff:fffe — Teredo with embedded client v4
         // ~0xf5fffffe = 10.0.0.1 (private RFC 1918).
-        assert!(is_denied_ip("2001:0:102:304:0:0:f5ff:fffe".parse().unwrap()));
+        assert!(is_denied_ip(
+            "2001:0:102:304:0:0:f5ff:fffe".parse().unwrap()
+        ));
         // 2001:0:102:304:0:0:f7f7:f7f7 — Teredo with embedded client v4
         // ~0xf7f7f7f7 = 8.8.8.8, public, allowed (no false positive on
         // every 2001::/32 address).
-        assert!(!is_denied_ip("2001:0:102:304:0:0:f7f7:f7f7".parse().unwrap()));
+        assert!(!is_denied_ip(
+            "2001:0:102:304:0:0:f7f7:f7f7".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -1771,13 +1841,19 @@ mod tests {
     #[test]
     fn strip_html_tags_drops_script_body() {
         let s = strip_html_tags("<script>alert(1)</script>");
-        assert!(s.is_empty() || s.chars().all(char::is_whitespace), "got {s:?}");
+        assert!(
+            s.is_empty() || s.chars().all(char::is_whitespace),
+            "got {s:?}"
+        );
     }
 
     #[test]
     fn strip_html_tags_script_case_insensitive() {
         let s = strip_html_tags("<SCRIPT>x</SCRIPT>");
-        assert!(s.is_empty() || s.chars().all(char::is_whitespace), "got {s:?}");
+        assert!(
+            s.is_empty() || s.chars().all(char::is_whitespace),
+            "got {s:?}"
+        );
     }
 
     #[test]
@@ -1802,7 +1878,10 @@ mod tests {
         // recognises `<!--` and scans for `-->`, so the whole thing dies.
         let html = "<!-- <script>x</script> --&gt;";
         let s = strip_html_tags(html);
-        assert!(s.is_empty() || s.chars().all(char::is_whitespace), "got {s:?}");
+        assert!(
+            s.is_empty() || s.chars().all(char::is_whitespace),
+            "got {s:?}"
+        );
     }
 
     #[test]
@@ -2097,8 +2176,7 @@ mod tests {
         // output. The URL gate must refuse them up front so an injected
         // ZWSP-bearing URL doesn't sneak past a casual reviewer.
         for c in [
-            '\u{200B}', '\u{200E}', '\u{200F}',
-            '\u{2028}', '\u{2029}', '\u{FEFF}',
+            '\u{200B}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{FEFF}',
         ] {
             let url = format!("http://example{c}.com/");
             assert_eq!(

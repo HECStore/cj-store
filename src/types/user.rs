@@ -13,21 +13,36 @@
 //! - Returns hyphenated UUID format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
 //! - Caching (TTL = `UUID_CACHE_TTL_SECS`) is handled in `crate::mojang::resolve_user_uuid`
 
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::Path,
     sync::OnceLock,
+    sync::atomic::AtomicU64,
     time::Duration,
 };
-#[cfg(test)]
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use tracing::{debug, info, warn};
 
-use crate::fsutil::write_atomic;
+use crate::fsutil::{archive_aside, pick_archive_path, write_atomic};
+
+/// Per-module monotonic counter appended to quarantine filenames so two
+/// archived user files produced in the same millisecond cannot collide.
+///
+/// Mirrors the `ARCHIVE_SEQ` pattern in `store::queue`, `store::journal`,
+/// and `store::trade_state`. The user-side stake is the highest of any
+/// quarantine site in the codebase: `save_dirty`'s orphan sweep builds
+/// `expected_files` from the in-memory `users` map and unconditionally
+/// `fs::remove_file`s every `.json` not in that set, so a parse-failed
+/// (or unreadable / shape-failed / stem-mismatched) user file that is
+/// only `warn!`-and-skipped here gets ACTIVELY DESTROYED on the next
+/// dirty save. Renaming it aside under a non-`.json` extension takes
+/// it out of the sweep's target set and preserves the forensic evidence.
+static USER_ARCHIVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // The Mojang lookup path is gated behind `#[cfg(not(test))]` so tests don't
 // issue real HTTP requests. The supporting HTTP client, the request struct,
@@ -235,7 +250,8 @@ fn parse_retry_after(value: &reqwest::header::HeaderValue) -> Option<Duration> {
     if std_delta.as_secs() > RETRY_AFTER_MAX_SECS {
         warn!(
             "[Mojang] Retry-After HTTP-date delta {}s clamped to {}",
-            std_delta.as_secs(), RETRY_AFTER_MAX_SECS
+            std_delta.as_secs(),
+            RETRY_AFTER_MAX_SECS
         );
         return Some(Duration::from_secs(RETRY_AFTER_MAX_SECS));
     }
@@ -286,8 +302,7 @@ fn canonicalize_mojang_id(raw: &str) -> Result<String, MojangResolveError> {
 /// chat tool layer is the first perimeter but the storage boundary is
 /// the last one.
 pub(crate) fn is_valid_uuid_shape(uuid: &str) -> bool {
-    if uuid == "00000000-0000-0000-0000-000000000000"
-        || uuid == "00000000000000000000000000000000"
+    if uuid == "00000000-0000-0000-0000-000000000000" || uuid == "00000000000000000000000000000000"
     {
         return false;
     }
@@ -438,29 +453,50 @@ impl User {
         // body read that fails the subsequent JSON parse is truly "malformed
         // response" — i.e. Mojang spoke 2xx, gave us bytes, and the bytes
         // weren't decodable.
-        let body_bytes = response.bytes().await.map_err(|e| {
-            if e.is_timeout() {
-                warn!(
-                    "[Mojang] timeout reading body for '{username}' (after status 2xx): {e}"
-                );
-                MojangResolveError::NetworkTimeout
-            } else if e.is_connect() || e.is_body() {
-                warn!(
-                    "[Mojang] transport error reading body for '{username}': {e}"
-                );
-                MojangResolveError::NetworkError
-            } else {
-                warn!(
-                    "[Mojang] body read failed for '{username}': {e}"
-                );
-                MojangResolveError::NetworkError
+        //
+        // Body is read via `.chunk()` with a hard 4 KiB cap. Mojang's real
+        // response is `{"id":"<32-hex>","name":"<≤16 ASCII>"}` — well under
+        // 100 bytes. A hostile / compromised upstream serving a multi-MB
+        // body would otherwise be an OOM / context-exfiltration surface
+        // through this codepath (we accept any 2xx body shape and feed it
+        // to `serde_json::from_slice`, which is happy to spend the whole
+        // buffer on its parse).
+        const MOJANG_BODY_CAP: usize = 4 * 1024;
+        let mut response = response;
+        let mut body_bytes: Vec<u8> = Vec::with_capacity(128);
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body_bytes.len().saturating_add(chunk.len()) > MOJANG_BODY_CAP {
+                        warn!(
+                            "[Mojang] body exceeded {MOJANG_BODY_CAP}B for '{username}' \
+                             (cap; legitimate response is < 100B)"
+                        );
+                        return Err(MojangResolveError::MalformedResponse);
+                    }
+                    body_bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    if e.is_timeout() {
+                        warn!(
+                            "[Mojang] timeout reading body for '{username}' (after status 2xx): {e}"
+                        );
+                        return Err(MojangResolveError::NetworkTimeout);
+                    } else if e.is_connect() || e.is_body() {
+                        warn!("[Mojang] transport error reading body for '{username}': {e}");
+                        return Err(MojangResolveError::NetworkError);
+                    } else {
+                        warn!("[Mojang] body read failed for '{username}': {e}");
+                        return Err(MojangResolveError::NetworkError);
+                    }
+                }
             }
+        }
+        let mojang_response: MojangResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            warn!("[Mojang] malformed response for '{username}': {e}");
+            MojangResolveError::MalformedResponse
         })?;
-        let mojang_response: MojangResponse =
-            serde_json::from_slice(&body_bytes).map_err(|e| {
-                warn!("[Mojang] malformed response for '{username}': {e}");
-                MojangResolveError::MalformedResponse
-            })?;
 
         // Mojang returns a bare-hex UUID; canonicalize to the hyphenated
         // lowercase xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx form. The helper
@@ -539,7 +575,10 @@ impl User {
 
         let json_str = serde_json::to_string_pretty(self)?;
         write_atomic(&path, &json_str)?;
-        debug!("[User] saved {} (balance={}, operator={})", self.uuid, self.balance, self.operator);
+        debug!(
+            "[User] saved {} (balance={}, operator={})",
+            self.uuid, self.balance, self.operator
+        );
         Ok(())
     }
 
@@ -556,7 +595,10 @@ impl User {
         let mut users = HashMap::new();
 
         if !dir_path.exists() {
-            info!("[User] users directory not found at {}, starting empty", dir_path.display());
+            info!(
+                "[User] users directory not found at {}, starting empty",
+                dir_path.display()
+            );
             return Ok(HashMap::new());
         }
 
@@ -590,22 +632,31 @@ impl User {
                             // match the malformed `expected_files` set).
                             if !is_valid_uuid_shape(&user.uuid) {
                                 skipped += 1;
-                                warn!(
-                                    "[User] skipping {}: embedded uuid {:?} fails shape check",
-                                    path.display(), user.uuid
+                                let reason = format!(
+                                    "embedded uuid {:?} fails shape check",
+                                    user.uuid
                                 );
+                                if let Err(qe) = quarantine_user_file(&path, &reason) {
+                                    warn!(
+                                        "[User] quarantine failed for {} ({reason}): {qe}",
+                                        path.display()
+                                    );
+                                }
                                 continue;
                             }
-                            let stem = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("");
+                            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                             if stem != user.uuid {
                                 skipped += 1;
-                                warn!(
-                                    "[User] skipping {}: filename stem {:?} does not match embedded uuid {:?}",
-                                    path.display(), stem, user.uuid
+                                let reason = format!(
+                                    "filename stem {stem:?} does not match embedded uuid {:?}",
+                                    user.uuid
                                 );
+                                if let Err(qe) = quarantine_user_file(&path, &reason) {
+                                    warn!(
+                                        "[User] quarantine failed for {} ({reason}): {qe}",
+                                        path.display()
+                                    );
+                                }
                                 continue;
                             }
                             let uuid = user.uuid.clone();
@@ -613,12 +664,24 @@ impl User {
                         }
                         Err(e) => {
                             skipped += 1;
-                            warn!("[User] skipping malformed {}: {e}", path.display());
+                            let reason = format!("malformed: {e}");
+                            if let Err(qe) = quarantine_user_file(&path, &reason) {
+                                warn!(
+                                    "[User] quarantine failed for {} ({reason}): {qe}",
+                                    path.display()
+                                );
+                            }
                         }
                     },
                     Err(e) => {
                         skipped += 1;
-                        warn!("[User] skipping unreadable {}: {e}", path.display());
+                        let reason = format!("unreadable: {e}");
+                        if let Err(qe) = quarantine_user_file(&path, &reason) {
+                            warn!(
+                                "[User] quarantine failed for {} ({reason}): {qe}",
+                                path.display()
+                            );
+                        }
                     }
                 }
             }
@@ -694,12 +757,10 @@ impl User {
         // "refuse to wipe".
         if users.is_empty() {
             let dir_has_user_files = match fs::read_dir(dir_path) {
-                Ok(read_dir) => read_dir
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| {
-                        let path = entry.path();
-                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    }),
+                Ok(read_dir) => read_dir.filter_map(|entry| entry.ok()).any(|entry| {
+                    let path = entry.path();
+                    path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                }),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e),
             };
@@ -764,12 +825,10 @@ impl User {
         // chain isn't broken by an all-shape-invalid in-memory map.
         if expected_files.is_empty() {
             let dir_has_user_files = match fs::read_dir(dir_path) {
-                Ok(read_dir) => read_dir
-                    .filter_map(|entry| entry.ok())
-                    .any(|entry| {
-                        let path = entry.path();
-                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
-                    }),
+                Ok(read_dir) => read_dir.filter_map(|entry| entry.ok()).any(|entry| {
+                    let path = entry.path();
+                    path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                }),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
                 Err(e) => return Err(e),
             };
@@ -804,12 +863,16 @@ impl User {
                             }
                         };
                         let path = entry.path();
-                        if path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                        if path.is_file()
+                            && path.extension().is_some_and(|ext| ext == "json")
                             && let Some(filename) = path.file_name().and_then(|n| n.to_str())
                             && !expected_files.contains(filename)
                         {
                             if let Err(e) = fs::remove_file(&path) {
-                                warn!("[User] orphan sweep: remove_file({}) failed: {e}", path.display());
+                                warn!(
+                                    "[User] orphan sweep: remove_file({}) failed: {e}",
+                                    path.display()
+                                );
                                 if first_sweep_err.is_none() {
                                     first_sweep_err = Some(e);
                                 }
@@ -820,7 +883,10 @@ impl User {
                     }
                 }
                 Err(e) => {
-                    warn!("[User] orphan sweep: read_dir({}) failed: {e}", dir_path.display());
+                    warn!(
+                        "[User] orphan sweep: read_dir({}) failed: {e}",
+                        dir_path.display()
+                    );
                     first_sweep_err = Some(e);
                 }
             }
@@ -828,13 +894,51 @@ impl User {
 
         info!(
             "[User] save_dirty: wrote {} of {} attempted (failed {}), cleaned {} orphan files, skipped {} with invalid uuid shape ({} users in map)",
-            written, attempted, attempted - written, removed, skipped_invalid, users.len()
+            written,
+            attempted,
+            attempted - written,
+            removed,
+            skipped_invalid,
+            users.len()
         );
         match first_save_err.or(first_sweep_err) {
             Some(e) => Err(e),
             None => Ok(()),
         }
     }
+}
+
+/// Rename a malformed/unreadable/shape-failed/stem-mismatched user file
+/// aside so the next `save_dirty` orphan-cleanup cannot delete it (extension
+/// is no longer `.json`) and subsequent `load_all_in_dir` calls do not retry
+/// deserializing it.
+///
+/// Uses [`pick_archive_path`] + [`archive_aside`] (the same primitives
+/// `store::journal` / `store::queue` / `store::trade_state` use) rather than
+/// a raw `fs::rename` with a single `unix_ms` suffix: two corrupt files in
+/// the same millisecond would otherwise collide and the second `fs::rename`
+/// would silently overwrite the first archive — destroying exactly the
+/// forensic evidence quarantine exists to preserve. `archive_aside` also
+/// supplies a `fs::copy + fs::remove_file` fallback for Windows-AV
+/// held-handle scenarios that `fs::rename` alone cannot handle.
+///
+/// Critical for user files in particular because `save_dirty`'s orphan
+/// sweep would otherwise actively `fs::remove_file` any skipped-but-still-
+/// `.json` evidence on the very next dirty save (the in-memory `users` map
+/// did not load it, so its filename is absent from `expected_files`).
+fn quarantine_user_file(path: &Path, reason: &str) -> io::Result<()> {
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "user.json".to_string());
+    let archived = pick_archive_path(path.parent(), &base, "corrupt", &USER_ARCHIVE_SEQ)?;
+    warn!(
+        "[User] quarantining {} ({}): renaming to {}",
+        path.display(),
+        reason,
+        archived.display(),
+    );
+    archive_aside(path, &archived)
 }
 
 #[cfg(test)]
@@ -945,7 +1049,18 @@ mod tests {
 
         let users = User::load_all_in_dir(dir.path()).unwrap();
         assert!(users.is_empty(), "tampered file must be dropped");
-        assert!(path.exists(), "load_all does NOT delete; file must remain");
+        // Quarantine must move the file aside (extension no longer `.json`)
+        // so the next `save_dirty` orphan sweep cannot delete the forensic
+        // evidence. The original path must not still exist as a `.json`.
+        assert!(!path.exists(), "tampered file must be renamed aside");
+        let mut found_archive = false;
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.contains(".json.corrupt-") {
+                found_archive = true;
+            }
+        }
+        assert!(found_archive, "quarantine archive must exist in dir");
     }
 
     #[test]
@@ -953,11 +1068,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json");
         // Embedded uuid is a different valid canonical UUID than the stem.
-        let json = r#"{"uuid":"11111111-2222-3333-4444-555555555555","username":"alice","balance":1.0}"#;
+        let json =
+            r#"{"uuid":"11111111-2222-3333-4444-555555555555","username":"alice","balance":1.0}"#;
         fs::write(&path, json).unwrap();
 
         let users = User::load_all_in_dir(dir.path()).unwrap();
         assert!(users.is_empty(), "stem-mismatched file must be dropped");
+        // Quarantine: stem-mismatched file is renamed aside so the orphan
+        // sweep doesn't delete it next cycle.
+        assert!(!path.exists(), "stem-mismatched file must be renamed aside");
     }
 
     #[test]
@@ -1014,7 +1133,8 @@ mod tests {
         // (i) only the valid user's `.json` exists in `dir`.
         let valid_path = dir.join(format!("{valid_uuid}.json"));
         assert!(valid_path.exists(), "valid user must be persisted");
-        let entries: Vec<_> = fs::read_dir(&dir).unwrap()
+        let entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .collect();
@@ -1139,14 +1259,7 @@ mod tests {
 
     #[test]
     fn is_valid_uuid_shape_rejects_path_traversal() {
-        for bad in [
-            "../foo",
-            "..\\foo",
-            "foo/bar",
-            "foo\\bar",
-            ".",
-            "..",
-        ] {
+        for bad in ["../foo", "..\\foo", "foo/bar", "foo\\bar", ".", ".."] {
             assert!(!is_valid_uuid_shape(bad), "must reject {bad:?}");
         }
     }
@@ -1168,7 +1281,9 @@ mod tests {
         // Missing one hyphen (length 35).
         assert!(!is_valid_uuid_shape("550e8400e29b-41d4-a716-446655440000"));
         // Extra hyphen makes length 37.
-        assert!(!is_valid_uuid_shape("550e8400--e29b-41d4-a716-446655440000"));
+        assert!(!is_valid_uuid_shape(
+            "550e8400--e29b-41d4-a716-446655440000"
+        ));
         // All-hyphen length 36.
         assert!(!is_valid_uuid_shape(&"-".repeat(36)));
     }
@@ -1233,13 +1348,7 @@ mod tests {
 
     #[test]
     fn is_valid_username_shape_rejects_disallowed_bytes() {
-        for bad in [
-            "ab-cd",
-            "ab cd",
-            "ab.cd",
-            "ab:cd",
-            "ab\0cd",
-        ] {
+        for bad in ["ab-cd", "ab cd", "ab.cd", "ab:cd", "ab\0cd"] {
             assert!(!is_valid_username_shape(bad), "must reject {bad:?}");
         }
     }

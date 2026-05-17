@@ -521,8 +521,7 @@ struct TrustCacheEntry {
 }
 
 fn trust_cache() -> &'static Mutex<HashMap<TrustCacheKey, TrustCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<TrustCacheKey, TrustCacheEntry>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<TrustCacheKey, TrustCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -559,12 +558,8 @@ pub fn count_interactions_for_uuid_cached(
             guard.remove(&key);
         }
     }
-    let (interactions, distinct_days) = count_interactions_for_uuid(
-        history_dir,
-        target_uuid,
-        partner_username_lc,
-        days_back,
-    );
+    let (interactions, distinct_days) =
+        count_interactions_for_uuid(history_dir, target_uuid, partner_username_lc, days_back);
     let mut guard = trust_cache().lock();
     if guard.len() >= TRUST_CACHE_MAX_ENTRIES {
         // Cap reached — drop the oldest entry by `inserted_at` to make
@@ -895,12 +890,8 @@ mod tests {
         // Use a directory we just created and leave empty.
         let scratch = Scratch::new("count-empty");
         let dir = scratch.0.join("missing-history");
-        let (i, d) = count_interactions_for_uuid(
-            &dir,
-            "11111111-2222-3333-4444-555555555555",
-            "steve",
-            7,
-        );
+        let (i, d) =
+            count_interactions_for_uuid(&dir, "11111111-2222-3333-4444-555555555555", "steve", 7);
         assert_eq!((i, d), (0, 0));
     }
 
@@ -959,8 +950,7 @@ mod tests {
         );
         fs::write(&yest_path, yest_body).unwrap();
 
-        let (i, d) =
-            count_interactions_for_uuid(&history, target_uuid, "steve", 7);
+        let (i, d) = count_interactions_for_uuid(&history, target_uuid, "steve", 7);
         assert_eq!(i, 2);
         assert_eq!(d, 2);
     }
@@ -1045,8 +1035,7 @@ mod tests {
         assert_eq!(removed, 0);
         let removed = forget_index_entry("").unwrap();
         assert_eq!(removed, 0);
-        let removed =
-            forget_index_entry("DEADBEEF-CAFE-1234-5678-90ABCDEF0123").unwrap();
+        let removed = forget_index_entry("DEADBEEF-CAFE-1234-5678-90ABCDEF0123").unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -1066,7 +1055,7 @@ mod tests {
             "../evil",
             "_index",
             "deadbeef-uuid",
-            "00000000-0000-0000-0000-00000000000",  // 35 chars
+            "00000000-0000-0000-0000-00000000000",   // 35 chars
             "00000000-0000-0000-0000-0000000000000", // 37 chars
             "DEADBEEF-CAFE-1234-5678-90ABCDEF0123",
         ];

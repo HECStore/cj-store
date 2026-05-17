@@ -177,7 +177,15 @@ pub async fn chat_task(
         Ok(Some(b)) => b,
         Ok(None) => {
             info!("[Chat] persona.md missing, generating from seed");
-            match persona::generate(&api_key, &config.persona_seed, &config.composer_model, config.composer_temperature, &[]).await {
+            match persona::generate(
+                &api_key,
+                &config.persona_seed,
+                &config.composer_model,
+                config.composer_temperature,
+                &[],
+            )
+            .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     error!(error = %e, "[Chat] persona generation failed; chat self-disabling");
@@ -205,7 +213,10 @@ pub async fn chat_task(
 
     // CHAT.md: print the daily ceiling at startup so operators can
     // see what they're spending without doing the math from token rates.
-    info!("[Chat] {}", client::format_daily_ceiling_log_line(&config, &pricing));
+    info!(
+        "[Chat] {}",
+        client::format_daily_ceiling_log_line(&config, &pricing)
+    );
 
     // Operator-managed dictionaries / filters loaded once at startup.
     // Hot-reload is not implemented; restart the process to pick up
@@ -214,12 +225,10 @@ pub async fn chat_task(
         conversation::load_lines_or_empty(&format!("{}/common_words.txt", memory::CHAT_DIR));
     let blocklist: std::collections::HashSet<String> =
         conversation::load_blocklist(&format!("{}/blocklist.txt", memory::CHAT_DIR));
-    let system_senders_re: Vec<String> = conversation::load_lines_or_empty(
-        &format!("{}/system_senders_re.txt", memory::CHAT_DIR),
-    );
-    let system_senders_exact: Vec<String> = conversation::load_lines_or_empty(
-        &format!("{}/system_senders.txt", memory::CHAT_DIR),
-    );
+    let system_senders_re: Vec<String> =
+        conversation::load_lines_or_empty(&format!("{}/system_senders_re.txt", memory::CHAT_DIR));
+    let system_senders_exact: Vec<String> =
+        conversation::load_lines_or_empty(&format!("{}/system_senders.txt", memory::CHAT_DIR));
     let moderation_patterns = conversation::ModerationPatterns::load_with_defaults(
         &format!("{}/moderation_patterns.txt", memory::CHAT_DIR),
         &persona_name,
@@ -1606,7 +1615,8 @@ async fn process_event(
     // when they arrive in the post-disconnect/pre-Init window. These
     // events never produce a response anyway — they only need to feed
     // the moderation-pattern detector, which works on content alone.
-    if conversation::is_system_pseudo_sender(&event.sender, system_senders_re, system_senders_exact) {
+    if conversation::is_system_pseudo_sender(&event.sender, system_senders_re, system_senders_exact)
+    {
         if moderation_patterns.is_moderation_event(&event.content) {
             let until = state::iso_utc(
                 chrono::Utc::now()
@@ -1727,7 +1737,9 @@ async fn process_event(
     // active-hours gate (public events only — DMs are always
     // answered when the bot is connected and the operator hasn't
     // paused).
-    if event.kind == ChatEventKind::Public && !pacing::within_active_hours_now(config.active_hours_utc) {
+    if event.kind == ChatEventKind::Public
+        && !pacing::within_active_hours_now(config.active_hours_utc)
+    {
         info!(
             sender = %event.sender,
             "[Chat] skipping public event — outside configured active hours"
@@ -1869,8 +1881,12 @@ async fn process_event(
     let estimated_classifier_input = 1500u64;
     let estimated_usd =
         pricing_table.usd_for_tokens(&config.classifier_model, estimated_classifier_input, 100);
-    let cap_v =
-        runtime_state.would_exceed_caps_classifier(estimated_classifier_input, 100, estimated_usd, config);
+    let cap_v = runtime_state.would_exceed_caps_classifier(
+        estimated_classifier_input,
+        100,
+        estimated_usd,
+        config,
+    );
     if !matches!(cap_v, state::CapVerdict::Ok) {
         decisions::write(
             &decisions::DecisionRecord::new("cap_tripped")
@@ -1961,7 +1977,12 @@ async fn process_event(
         resp.usage.cache_creation_input_tokens,
         resp.usage.cache_read_input_tokens,
     );
-    runtime_state.record_classifier(&started_day, resp.usage.input_tokens, resp.usage.output_tokens, usd);
+    runtime_state.record_classifier(
+        &started_day,
+        resp.usage.input_tokens,
+        resp.usage.output_tokens,
+        usd,
+    );
 
     let mut text_buf = String::new();
     for b in &resp.content {
@@ -2088,7 +2109,10 @@ async fn process_event(
     let player_memory_block = match crate::mojang::resolve_user_uuid(&event.sender).await {
         Ok(uuid) => {
             let _ = memory::ensure_player_file(&uuid, &event.sender);
-            let file = memory::read_player(&uuid).ok().flatten().unwrap_or_default();
+            let file = memory::read_player(&uuid)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             // count_interactions_for_uuid does a multi-MB read_to_string +
             // per-line JSON parse over `days_back` history files; offload
             // it from the chat runtime worker. Mirrors the pattern used
@@ -2247,9 +2271,7 @@ async fn process_event(
             if config.composer_throttle_backoff_secs > 0 && e.contains("upstream-throttled") {
                 let until = state::iso_utc(
                     chrono::Utc::now()
-                        + chrono::Duration::seconds(
-                            config.composer_throttle_backoff_secs as i64,
-                        ),
+                        + chrono::Duration::seconds(config.composer_throttle_backoff_secs as i64),
                 );
                 warn!(
                     until = %until,
@@ -2274,7 +2296,12 @@ async fn process_event(
         run.cache_creation_input_tokens,
         run.cache_read_input_tokens,
     );
-    runtime_state.record_composer(&started_day, run.input_tokens, run.output_tokens, composer_usd);
+    runtime_state.record_composer(
+        &started_day,
+        run.input_tokens,
+        run.output_tokens,
+        composer_usd,
+    );
 
     // Update Chat: status surfacing of the latest call.
     runtime_state.last_composer_call = Some(state::LastCallSummary {
@@ -2290,16 +2317,19 @@ async fn process_event(
     // directly so the orchestrator sums them after the fact. `run`
     // carries the counts.
     if run.update_self_memory_calls > 0 {
-        runtime_state.update_self_memory_today =
-            runtime_state.update_self_memory_today.saturating_add(run.update_self_memory_calls);
+        runtime_state.update_self_memory_today = runtime_state
+            .update_self_memory_today
+            .saturating_add(run.update_self_memory_calls);
     }
     if run.update_player_memory_calls > 0 {
-        runtime_state.update_player_memory_today =
-            runtime_state.update_player_memory_today.saturating_add(run.update_player_memory_calls);
+        runtime_state.update_player_memory_today = runtime_state
+            .update_player_memory_today
+            .saturating_add(run.update_player_memory_calls);
     }
     if run.web_fetch_calls > 0 {
-        runtime_state.web_fetches_today =
-            runtime_state.web_fetches_today.saturating_add(run.web_fetch_calls);
+        runtime_state.web_fetches_today = runtime_state
+            .web_fetches_today
+            .saturating_add(run.web_fetch_calls);
     }
 
     decisions::write(
@@ -2311,7 +2341,10 @@ async fn process_event(
             .with_cache_tokens(run.cache_creation_input_tokens, run.cache_read_input_tokens)
             .extra("iterations", serde_json::Value::from(run.iterations))
             .extra("hit_cap", serde_json::Value::from(run.hit_cap))
-            .extra("had_text_reply", serde_json::Value::from(run.reply.is_some()))
+            .extra(
+                "had_text_reply",
+                serde_json::Value::from(run.reply.is_some()),
+            )
             .extra(
                 "nudged_for_silence",
                 serde_json::Value::from(run.nudged_for_silence),
@@ -2384,7 +2417,7 @@ async fn process_event(
                 })
                 .sum::<u64>())
             / 4)
-            .max(1) as u32;
+        .max(1) as u32;
         // Cap check: the filter records into the classifier daily token /
         // USD bucket (`record_classifier` below), so once the operator's
         // ceiling is hit the filter must stop too — otherwise the cap
@@ -2394,13 +2427,8 @@ async fn process_event(
         // the gate admit calls that genuinely breach the daily ceiling.
         let cap_in = filter_input_estimate as u64;
         let cap_out = reasoning_filter::MAX_VERDICT_TOKENS as u64;
-        let cap_usd = pricing_table.usd_for_tokens(
-            &config.reasoning_filter_model,
-            cap_in,
-            cap_out,
-        );
-        let cap_v = runtime_state
-            .would_exceed_caps_classifier(cap_in, cap_out, cap_usd, config);
+        let cap_usd = pricing_table.usd_for_tokens(&config.reasoning_filter_model, cap_in, cap_out);
+        let cap_v = runtime_state.would_exceed_caps_classifier(cap_in, cap_out, cap_usd, config);
         let cap_ok = matches!(cap_v, state::CapVerdict::Ok);
         if !cap_ok {
             decisions::write(
@@ -2546,7 +2574,7 @@ async fn process_event(
                             })
                             .sum::<u64>())
                         / 4)
-                        .max(1) as u32;
+                    .max(1) as u32;
                     let s_cap_in = shorten_in_est as u64;
                     let s_cap_out = reasoning_filter::MAX_VERDICT_TOKENS as u64;
                     let s_cap_usd = pricing_table.usd_for_tokens(
@@ -2554,20 +2582,14 @@ async fn process_event(
                         s_cap_in,
                         s_cap_out,
                     );
-                    let s_cap_v = runtime_state.would_exceed_caps_classifier(
-                        s_cap_in,
-                        s_cap_out,
-                        s_cap_usd,
-                        config,
-                    );
+                    let s_cap_v = runtime_state
+                        .would_exceed_caps_classifier(s_cap_in, s_cap_out, s_cap_usd, config);
                     if !matches!(s_cap_v, state::CapVerdict::Ok) {
                         decisions::write(
                             &decisions::DecisionRecord::new("cap_tripped")
                                 .with_sender(&event.sender)
                                 .with_event_ts(event.recv_at)
-                                .with_reason(format!(
-                                    "reasoning_filter_shorten {s_cap_v:?}"
-                                ))
+                                .with_reason(format!("reasoning_filter_shorten {s_cap_v:?}"))
                                 .extra(
                                     "source",
                                     serde_json::Value::from("reasoning_filter_shorten"),
@@ -2575,11 +2597,7 @@ async fn process_event(
                         );
                         break;
                     }
-                    if classifier_limiter
-                        .acquire(shorten_in_est)
-                        .await
-                        .is_err()
-                    {
+                    if classifier_limiter.acquire(shorten_in_est).await.is_err() {
                         decisions::write(
                             &decisions::DecisionRecord::new("reasoning_filter_skip")
                                 .with_sender(&event.sender)
@@ -2648,7 +2666,7 @@ async fn process_event(
                                             .with_sender(&event.sender)
                                             .with_event_ts(event.recv_at)
                                             .with_latency(
-                                                shorten_started.elapsed().as_millis() as u64,
+                                                shorten_started.elapsed().as_millis() as u64
                                             )
                                             .with_tokens(
                                                 resp.usage.input_tokens,
@@ -2687,36 +2705,28 @@ async fn process_event(
                                     let before = m.chars().count() as u64;
                                     let after = new_m.chars().count() as u64;
                                     decisions::write(
-                                        &decisions::DecisionRecord::new(
-                                            "reasoning_filter_shorten",
-                                        )
-                                        .with_sender(&event.sender)
-                                        .with_event_ts(event.recv_at)
-                                        .with_latency(
-                                            shorten_started.elapsed().as_millis() as u64,
-                                        )
-                                        .with_tokens(
-                                            resp.usage.input_tokens,
-                                            resp.usage.output_tokens,
-                                            usd,
-                                        )
-                                        .with_cache_tokens(
-                                            resp.usage.cache_creation_input_tokens,
-                                            resp.usage.cache_read_input_tokens,
-                                        )
-                                        .extra("iter", serde_json::Value::from(iters))
-                                        .extra(
-                                            "before_chars",
-                                            serde_json::Value::from(before),
-                                        )
-                                        .extra(
-                                            "after_chars",
-                                            serde_json::Value::from(after),
-                                        )
-                                        .extra(
-                                            "reason",
-                                            serde_json::Value::from(verdict.reason),
-                                        ),
+                                        &decisions::DecisionRecord::new("reasoning_filter_shorten")
+                                            .with_sender(&event.sender)
+                                            .with_event_ts(event.recv_at)
+                                            .with_latency(
+                                                shorten_started.elapsed().as_millis() as u64
+                                            )
+                                            .with_tokens(
+                                                resp.usage.input_tokens,
+                                                resp.usage.output_tokens,
+                                                usd,
+                                            )
+                                            .with_cache_tokens(
+                                                resp.usage.cache_creation_input_tokens,
+                                                resp.usage.cache_read_input_tokens,
+                                            )
+                                            .extra("iter", serde_json::Value::from(iters))
+                                            .extra("before_chars", serde_json::Value::from(before))
+                                            .extra("after_chars", serde_json::Value::from(after))
+                                            .extra(
+                                                "reason",
+                                                serde_json::Value::from(verdict.reason),
+                                            ),
                                     );
                                     if new_m.is_empty() {
                                         // Empty rewrite means the model
@@ -2742,7 +2752,7 @@ async fn process_event(
                                             .with_sender(&event.sender)
                                             .with_event_ts(event.recv_at)
                                             .with_latency(
-                                                shorten_started.elapsed().as_millis() as u64,
+                                                shorten_started.elapsed().as_millis() as u64
                                             )
                                             .with_tokens(
                                                 resp.usage.input_tokens,
@@ -2754,14 +2764,8 @@ async fn process_event(
                                                 resp.usage.cache_read_input_tokens,
                                             )
                                             .extra("iter", serde_json::Value::from(iters))
-                                            .extra(
-                                                "before_chars",
-                                                serde_json::Value::from(before),
-                                            )
-                                            .extra(
-                                                "after_chars",
-                                                serde_json::Value::from(after),
-                                            ),
+                                            .extra("before_chars", serde_json::Value::from(before))
+                                            .extra("after_chars", serde_json::Value::from(after)),
                                         );
                                         break;
                                     }
@@ -2777,9 +2781,7 @@ async fn process_event(
                                         .with_reason(e)
                                         .extra(
                                             "source",
-                                            serde_json::Value::from(
-                                                "reasoning_filter_shorten",
-                                            ),
+                                            serde_json::Value::from("reasoning_filter_shorten"),
                                         ),
                                     );
                                     break;
@@ -2794,9 +2796,7 @@ async fn process_event(
                                     .with_reason(e.to_string())
                                     .extra(
                                         "source",
-                                        serde_json::Value::from(
-                                            "reasoning_filter_shorten",
-                                        ),
+                                        serde_json::Value::from("reasoning_filter_shorten"),
                                     ),
                             );
                             break;
@@ -2813,22 +2813,20 @@ async fn process_event(
                     && !shorten_force_reject
                 {
                     decisions::write(
-                        &decisions::DecisionRecord::new(
-                            "reasoning_filter_shorten_exhausted",
-                        )
-                        .with_sender(&event.sender)
-                        .with_event_ts(event.recv_at)
-                        .extra("iters", serde_json::Value::from(iters))
-                        .extra(
-                            "final_chars",
-                            serde_json::Value::from(m.chars().count() as u64),
-                        )
-                        .extra(
-                            "limit_chars",
-                            serde_json::Value::from(
-                                reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT as u64,
+                        &decisions::DecisionRecord::new("reasoning_filter_shorten_exhausted")
+                            .with_sender(&event.sender)
+                            .with_event_ts(event.recv_at)
+                            .extra("iters", serde_json::Value::from(iters))
+                            .extra(
+                                "final_chars",
+                                serde_json::Value::from(m.chars().count() as u64),
+                            )
+                            .extra(
+                                "limit_chars",
+                                serde_json::Value::from(
+                                    reasoning_filter::FILTER_MESSAGE_CHAR_LIMIT as u64,
+                                ),
                             ),
-                        ),
                     );
                 }
                 if shorten_force_reject {
@@ -3278,9 +3276,7 @@ async fn process_proactive_tick(
             if config.composer_throttle_backoff_secs > 0 && e.contains("upstream-throttled") {
                 let until = state::iso_utc(
                     chrono::Utc::now()
-                        + chrono::Duration::seconds(
-                            config.composer_throttle_backoff_secs as i64,
-                        ),
+                        + chrono::Duration::seconds(config.composer_throttle_backoff_secs as i64),
                 );
                 runtime_state.composer_throttle_backoff_until = Some(until);
             }
@@ -3299,7 +3295,12 @@ async fn process_proactive_tick(
         run.cache_creation_input_tokens,
         run.cache_read_input_tokens,
     );
-    runtime_state.record_composer(&started_day, run.input_tokens, run.output_tokens, composer_usd);
+    runtime_state.record_composer(
+        &started_day,
+        run.input_tokens,
+        run.output_tokens,
+        composer_usd,
+    );
     runtime_state.last_composer_call = Some(state::LastCallSummary {
         at_utc: state::iso_utc(chrono::Utc::now()),
         usd: composer_usd,
@@ -3307,16 +3308,19 @@ async fn process_proactive_tick(
         output_tokens: run.output_tokens,
     });
     if run.update_self_memory_calls > 0 {
-        runtime_state.update_self_memory_today =
-            runtime_state.update_self_memory_today.saturating_add(run.update_self_memory_calls);
+        runtime_state.update_self_memory_today = runtime_state
+            .update_self_memory_today
+            .saturating_add(run.update_self_memory_calls);
     }
     if run.update_player_memory_calls > 0 {
-        runtime_state.update_player_memory_today =
-            runtime_state.update_player_memory_today.saturating_add(run.update_player_memory_calls);
+        runtime_state.update_player_memory_today = runtime_state
+            .update_player_memory_today
+            .saturating_add(run.update_player_memory_calls);
     }
     if run.web_fetch_calls > 0 {
-        runtime_state.web_fetches_today =
-            runtime_state.web_fetches_today.saturating_add(run.web_fetch_calls);
+        runtime_state.web_fetches_today = runtime_state
+            .web_fetches_today
+            .saturating_add(run.web_fetch_calls);
     }
     decisions::write(
         &decisions::DecisionRecord::new("composer")
@@ -3326,7 +3330,10 @@ async fn process_proactive_tick(
             .with_cache_tokens(run.cache_creation_input_tokens, run.cache_read_input_tokens)
             .extra("iterations", serde_json::Value::from(run.iterations))
             .extra("hit_cap", serde_json::Value::from(run.hit_cap))
-            .extra("had_text_reply", serde_json::Value::from(run.reply.is_some()))
+            .extra(
+                "had_text_reply",
+                serde_json::Value::from(run.reply.is_some()),
+            )
             .extra(
                 "nudged_for_silence",
                 serde_json::Value::from(run.nudged_for_silence),
@@ -3425,9 +3432,9 @@ async fn process_proactive_tick(
     }
     let secs_since_last = last_bot_send_at.map(|t| now_post_sleep.duration_since(t).as_secs());
     let decision = pacing::recheck_after_sleep(
-        false,                             // never directly addressed (self-initiated)
+        false, // never directly addressed (self-initiated)
         in_critical_section.load(Ordering::Acquire),
-        true,                              // public-channel send
+        true, // public-channel send
         recent_bot_send_times.len() as u32,
         config.max_replies_per_minute,
         secs_since_last,
@@ -3563,9 +3570,7 @@ async fn scrub_history_for_player(
             .await
             .is_err()
         {
-            warn!(
-                "[Chat] scrub: history channel closed; cannot coordinate drop-cache-and-ack"
-            );
+            warn!("[Chat] scrub: history channel closed; cannot coordinate drop-cache-and-ack");
             return;
         }
         if ack_rx.await.is_err() {
@@ -3587,8 +3592,7 @@ async fn scrub_history_for_player(
         if kind == "history" {
             drop_cache_and_ack(history_tx).await;
         }
-        let entries = std::fs::read_dir(path)
-            .map_err(|e| format!("read_dir({dir}): {e}"))?;
+        let entries = std::fs::read_dir(path).map_err(|e| format!("read_dir({dir}): {e}"))?;
         for ent in entries.flatten() {
             let p = ent.path();
             if !p.is_file() {
@@ -3603,39 +3607,34 @@ async fn scrub_history_for_player(
                 // history of overlay sidecars.
                 let p_blk = p.clone();
                 let uuid_lc_blk = uuid_lc.clone();
-                let removed = tokio::task::spawn_blocking(
-                    move || -> Result<u64, String> {
-                        let Ok(body) = std::fs::read_to_string(&p_blk) else {
-                            return Ok(0);
-                        };
-                        let Ok(mut v) =
-                            serde_json::from_str::<serde_json::Value>(&body)
-                        else {
-                            return Ok(0);
-                        };
-                        let Some(obj) = v.as_object_mut() else {
-                            return Ok(0);
-                        };
-                        let before = obj.len();
-                        obj.retain(|_, val| {
-                            val.as_str()
-                                .is_none_or(|s| !s.eq_ignore_ascii_case(&uuid_lc_blk))
-                        });
-                        let removed = before.saturating_sub(obj.len()) as u64;
-                        if removed > 0 {
-                            let new = serde_json::to_string_pretty(&v)
-                                .map_err(|e| format!("overlay re-serialize: {e}"))?;
-                            crate::fsutil::write_atomic(&p_blk, &new)
-                                .map_err(|e| format!("overlay rewrite: {e}"))?;
-                        }
-                        Ok(removed)
-                    },
-                )
+                let removed = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+                    let Ok(body) = std::fs::read_to_string(&p_blk) else {
+                        return Ok(0);
+                    };
+                    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) else {
+                        return Ok(0);
+                    };
+                    let Some(obj) = v.as_object_mut() else {
+                        return Ok(0);
+                    };
+                    let before = obj.len();
+                    obj.retain(|_, val| {
+                        val.as_str()
+                            .is_none_or(|s| !s.eq_ignore_ascii_case(&uuid_lc_blk))
+                    });
+                    let removed = before.saturating_sub(obj.len()) as u64;
+                    if removed > 0 {
+                        let new = serde_json::to_string_pretty(&v)
+                            .map_err(|e| format!("overlay re-serialize: {e}"))?;
+                        crate::fsutil::write_atomic(&p_blk, &new)
+                            .map_err(|e| format!("overlay rewrite: {e}"))?;
+                    }
+                    Ok(removed)
+                })
                 .await
                 .expect("scrub overlay blocking task panicked")?;
                 if removed > 0 {
-                    stats.overlay_entries =
-                        stats.overlay_entries.saturating_add(removed);
+                    stats.overlay_entries = stats.overlay_entries.saturating_add(removed);
                 }
                 continue;
             }
@@ -3651,8 +3650,8 @@ async fn scrub_history_for_player(
             let uuid_lc_blk = uuid_lc.clone();
             let username_lc_blk = username_lc.clone();
             let kind_blk = kind;
-            let (removed, malformed) = tokio::task::spawn_blocking(
-                move || -> Result<(u64, u64), String> {
+            let (removed, malformed) =
+                tokio::task::spawn_blocking(move || -> Result<(u64, u64), String> {
                     let body = match std::fs::read_to_string(&p_blk) {
                         Ok(b) => b,
                         Err(_) => return Ok((0, 0)),
@@ -3661,22 +3660,17 @@ async fn scrub_history_for_player(
                     let mut removed = 0u64;
                     let mut malformed = 0u64;
                     for line in body.lines() {
-                        let drop_it =
-                            match serde_json::from_str::<serde_json::Value>(line) {
-                                Ok(v) => record_matches_player(
-                                    &v,
-                                    &uuid_lc_blk,
-                                    &username_lc_blk,
-                                ),
-                                Err(_) => {
-                                    // Torn / malformed JSONL: drop rather than
-                                    // keep. Keeping a line that fails parse but
-                                    // textually contains the forgotten player's
-                                    // name is a privacy/compliance hole.
-                                    malformed = malformed.saturating_add(1);
-                                    true
-                                }
-                            };
+                        let drop_it = match serde_json::from_str::<serde_json::Value>(line) {
+                            Ok(v) => record_matches_player(&v, &uuid_lc_blk, &username_lc_blk),
+                            Err(_) => {
+                                // Torn / malformed JSONL: drop rather than
+                                // keep. Keeping a line that fails parse but
+                                // textually contains the forgotten player's
+                                // name is a privacy/compliance hole.
+                                malformed = malformed.saturating_add(1);
+                                true
+                            }
+                        };
                         if drop_it {
                             removed = removed.saturating_add(1);
                             continue;
@@ -3685,15 +3679,13 @@ async fn scrub_history_for_player(
                         kept.push('\n');
                     }
                     if removed > 0 {
-                        crate::fsutil::write_atomic(&p_blk, &kept).map_err(|e| {
-                            format!("rewrite {kind_blk} {}: {e}", p_blk.display())
-                        })?;
+                        crate::fsutil::write_atomic(&p_blk, &kept)
+                            .map_err(|e| format!("rewrite {kind_blk} {}: {e}", p_blk.display()))?;
                     }
                     Ok((removed, malformed))
-                },
-            )
-            .await
-            .expect("scrub jsonl blocking task panicked")?;
+                })
+                .await
+                .expect("scrub jsonl blocking task panicked")?;
             stats.malformed_dropped = stats.malformed_dropped.saturating_add(malformed);
             if removed > 0 {
                 if kind == "history" {
@@ -3704,8 +3696,7 @@ async fn scrub_history_for_player(
                     // by path against the new inode.
                     drop_cache_and_ack(history_tx).await;
                 } else {
-                    stats.decisions_lines =
-                        stats.decisions_lines.saturating_add(removed);
+                    stats.decisions_lines = stats.decisions_lines.saturating_add(removed);
                     // Same orphan-handle hazard as history above: the
                     // decisions writer caches a `File` clone keyed by
                     // path, which survives the `write_atomic` rename
@@ -3733,8 +3724,8 @@ async fn scrub_history_for_player(
         let p_blk = live_pending.clone();
         let uuid_lc_blk = uuid_lc.clone();
         let username_lc_blk = username_lc.clone();
-        let (removed, malformed) = tokio::task::spawn_blocking(
-            move || -> Result<(u64, u64), String> {
+        let (removed, malformed) =
+            tokio::task::spawn_blocking(move || -> Result<(u64, u64), String> {
                 let body = match std::fs::read_to_string(&p_blk) {
                     Ok(b) => b,
                     Err(_) => return Ok((0, 0)),
@@ -3743,18 +3734,13 @@ async fn scrub_history_for_player(
                 let mut removed = 0u64;
                 let mut malformed = 0u64;
                 for line in body.lines() {
-                    let drop_it =
-                        match serde_json::from_str::<serde_json::Value>(line) {
-                            Ok(v) => record_matches_player(
-                                &v,
-                                &uuid_lc_blk,
-                                &username_lc_blk,
-                            ),
-                            Err(_) => {
-                                malformed = malformed.saturating_add(1);
-                                true
-                            }
-                        };
+                    let drop_it = match serde_json::from_str::<serde_json::Value>(line) {
+                        Ok(v) => record_matches_player(&v, &uuid_lc_blk, &username_lc_blk),
+                        Err(_) => {
+                            malformed = malformed.saturating_add(1);
+                            true
+                        }
+                    };
                     if drop_it {
                         removed = removed.saturating_add(1);
                         continue;
@@ -3768,13 +3754,11 @@ async fn scrub_history_for_player(
                     })?;
                 }
                 Ok((removed, malformed))
-            },
-        )
-        .await
-        .expect("scrub pending live blocking task panicked")?;
+            })
+            .await
+            .expect("scrub pending live blocking task panicked")?;
         stats.malformed_dropped = stats.malformed_dropped.saturating_add(malformed);
-        stats.pending_adjustments_lines =
-            stats.pending_adjustments_lines.saturating_add(removed);
+        stats.pending_adjustments_lines = stats.pending_adjustments_lines.saturating_add(removed);
     }
 
     // (2) Rotated archives in `data/chat/`:
@@ -3794,9 +3778,7 @@ async fn scrub_history_for_player(
                 && name != "pending_adjustments.jsonl"
             {
                 Some("pending_adjustments")
-            } else if name.starts_with("pending_self_memory.")
-                && name.ends_with(".jsonl")
-            {
+            } else if name.starts_with("pending_self_memory.") && name.ends_with(".jsonl") {
                 Some("pending_self_memory")
             } else {
                 None
@@ -3808,8 +3790,8 @@ async fn scrub_history_for_player(
             let uuid_lc_blk = uuid_lc.clone();
             let username_lc_blk = username_lc.clone();
             let bucket_blk = bucket;
-            let (removed, malformed) = tokio::task::spawn_blocking(
-                move || -> Result<(u64, u64), String> {
+            let (removed, malformed) =
+                tokio::task::spawn_blocking(move || -> Result<(u64, u64), String> {
                     let body = match std::fs::read_to_string(&p_blk) {
                         Ok(b) => b,
                         Err(_) => return Ok((0, 0)),
@@ -3818,18 +3800,13 @@ async fn scrub_history_for_player(
                     let mut removed = 0u64;
                     let mut malformed = 0u64;
                     for line in body.lines() {
-                        let drop_it =
-                            match serde_json::from_str::<serde_json::Value>(line) {
-                                Ok(v) => record_matches_player(
-                                    &v,
-                                    &uuid_lc_blk,
-                                    &username_lc_blk,
-                                ),
-                                Err(_) => {
-                                    malformed = malformed.saturating_add(1);
-                                    true
-                                }
-                            };
+                        let drop_it = match serde_json::from_str::<serde_json::Value>(line) {
+                            Ok(v) => record_matches_player(&v, &uuid_lc_blk, &username_lc_blk),
+                            Err(_) => {
+                                malformed = malformed.saturating_add(1);
+                                true
+                            }
+                        };
                         if drop_it {
                             removed = removed.saturating_add(1);
                             continue;
@@ -3843,18 +3820,15 @@ async fn scrub_history_for_player(
                         })?;
                     }
                     Ok((removed, malformed))
-                },
-            )
-            .await
-            .expect("scrub pending archive blocking task panicked")?;
-            stats.malformed_dropped =
-                stats.malformed_dropped.saturating_add(malformed);
+                })
+                .await
+                .expect("scrub pending archive blocking task panicked")?;
+            stats.malformed_dropped = stats.malformed_dropped.saturating_add(malformed);
             if removed > 0 {
                 match bucket {
                     "pending_adjustments" => {
-                        stats.pending_adjustments_lines = stats
-                            .pending_adjustments_lines
-                            .saturating_add(removed);
+                        stats.pending_adjustments_lines =
+                            stats.pending_adjustments_lines.saturating_add(removed);
                     }
                     "pending_self_memory" => {
                         stats.pending_self_memory_archive_lines = stats
@@ -3872,12 +3846,11 @@ async fn scrub_history_for_player(
     // + UUID survive in cleartext in the index until the next full
     // rebuild — same compliance gap as the JSONL pending-streams scrub.
     let uuid_owned = uuid.to_string();
-    let index_entries = tokio::task::spawn_blocking(move || {
-        memory::forget_index_entry(&uuid_owned)
-    })
-    .await
-    .expect("scrub index blocking task panicked")
-    .map_err(|e| format!("forget_index_entry: {e}"))?;
+    let index_entries =
+        tokio::task::spawn_blocking(move || memory::forget_index_entry(&uuid_owned))
+            .await
+            .expect("scrub index blocking task panicked")
+            .map_err(|e| format!("forget_index_entry: {e}"))?;
     stats.index_entries = stats.index_entries.saturating_add(index_entries);
 
     // Drop any cached `(interactions, distinct_days)` for this UUID
@@ -3903,19 +3876,13 @@ fn record_matches_player(v: &serde_json::Value, uuid_lc: &str, username_lc: &str
 /// `event_ts` (string-equal, RFC3339), reconstructs a [`PromptSnapshot`]
 /// from the live persona / memory / adjustments, and renders the system
 /// prompt that the composer would have built.
-async fn build_replay_prompt(
-    event_ts: &str,
-    persona_body: &str,
-) -> Result<String, String> {
+async fn build_replay_prompt(event_ts: &str, persona_body: &str) -> Result<String, String> {
     // Walk recent history files newest-first looking for the record.
     let event_ts_owned = event_ts.to_string();
     let found_line = tokio::task::spawn_blocking(move || -> Option<String> {
         for d in 0..7i64 {
             let day = (chrono::Utc::now() - chrono::Duration::days(d)).date_naive();
-            let path = jsonl::day_file_for_date(
-                std::path::Path::new(history::HISTORY_DIR),
-                day,
-            );
+            let path = jsonl::day_file_for_date(std::path::Path::new(history::HISTORY_DIR), day);
             let body = match std::fs::read_to_string(&path) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -3935,9 +3902,7 @@ async fn build_replay_prompt(
     })
     .await
     .map_err(|e| format!("history scan join: {e}"))?;
-    let line = found_line.ok_or_else(|| {
-        format!("no history record found for ts={event_ts}")
-    })?;
+    let line = found_line.ok_or_else(|| format!("no history record found for ts={event_ts}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&line).map_err(|e| format!("history line parse: {e}"))?;
     let sender = v
@@ -3964,7 +3929,9 @@ async fn build_replay_prompt(
     };
     let mut out = String::new();
     out.push_str("=== REPLAY ===\n");
-    out.push_str(&format!("event_ts: {event_ts}\nsender: {sender}\ncontent: {content}\n"));
+    out.push_str(&format!(
+        "event_ts: {event_ts}\nsender: {sender}\ncontent: {content}\n"
+    ));
     out.push_str("\n--- system blocks ---\n\n");
     for (i, block) in [
         ("static_rules", snapshot.static_rules.as_str()),
@@ -4046,9 +4013,8 @@ async fn resolve_username_via_index_or_mojang(username: &str) -> Result<String, 
             .await
             .map_err(|e| format!("{e}"))?
     };
-    crate::chat::tools::validate_uuid(&uuid).map_err(|e| {
-        format!("resolved uuid for {username:?} failed shape check: {e}")
-    })?;
+    crate::chat::tools::validate_uuid(&uuid)
+        .map_err(|e| format!("resolved uuid for {username:?} failed shape check: {e}"))?;
     Ok(uuid)
 }
 
@@ -4239,9 +4205,7 @@ fn read_adjustments_or_empty() -> String {
 /// for this cluster) or a stable snapshot helper — the cache plus the
 /// short per-player file size keeps the runtime-worker latency cost
 /// bounded.
-fn build_online_players_block(
-    roster: &online_players::OnlinePlayers,
-) -> String {
+fn build_online_players_block(roster: &online_players::OnlinePlayers) -> String {
     roster.format_for_composer(|username| memory_one_liner_for_cached(username))
 }
 
@@ -4261,8 +4225,8 @@ struct MemoryOneLinerCacheEntry {
     value: Option<String>,
 }
 
-fn memory_oneliner_cache(
-) -> &'static parking_lot::Mutex<HashMap<String, MemoryOneLinerCacheEntry>> {
+fn memory_oneliner_cache() -> &'static parking_lot::Mutex<HashMap<String, MemoryOneLinerCacheEntry>>
+{
     static CACHE: std::sync::OnceLock<
         parking_lot::Mutex<HashMap<String, MemoryOneLinerCacheEntry>>,
     > = std::sync::OnceLock::new();
@@ -4275,8 +4239,7 @@ fn memory_one_liner_for_cached(username: &str) -> Option<String> {
     {
         let guard = memory_oneliner_cache().lock();
         if let Some(entry) = guard.get(&key)
-            && now.saturating_duration_since(entry.inserted_at)
-                < MEMORY_ONELINER_CACHE_TTL
+            && now.saturating_duration_since(entry.inserted_at) < MEMORY_ONELINER_CACHE_TTL
         {
             return entry.value.clone();
         }
@@ -4363,10 +4326,7 @@ fn memory_one_liner_for(username: &str) -> Option<String> {
 /// switches to `chars()` would still be correct but slower; switching
 /// to a per-byte match on a non-UTF-8 wire format would break this
 /// invariant — see the multi-byte test below.
-pub(super) fn extract_first_json_object<'a>(
-    text: &'a str,
-    ctx: &str,
-) -> Result<&'a str, String> {
+pub(super) fn extract_first_json_object<'a>(text: &'a str, ctx: &str) -> Result<&'a str, String> {
     let bytes = text.as_bytes();
     let start = bytes
         .iter()
@@ -4418,10 +4378,7 @@ async fn recent_history_slice_blocking(n: usize) -> String {
     let today = chrono::Utc::now().date_naive();
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Seek, SeekFrom};
-        let p = jsonl::day_file_for_date(
-            std::path::Path::new(history::HISTORY_DIR),
-            today,
-        );
+        let p = jsonl::day_file_for_date(std::path::Path::new(history::HISTORY_DIR), today);
         // Heuristic: average history line is well under 4 KB. Read a
         // generous tail window so a few oversized lines don't cause us
         // to come up short. n + 1 line of slack covers the partial-

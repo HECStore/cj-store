@@ -82,7 +82,9 @@ pub enum LessonVerdict {
     /// Fewer than `min_distinct_senders` distinct senders cited.
     NotEnoughDistinctSenders,
     /// At least one contributing sender has Trust < 1.
-    LowTrustSender { sender: String },
+    LowTrustSender {
+        sender: String,
+    },
 }
 
 /// Multi-axis lesson validator.
@@ -198,10 +200,7 @@ fn longest_common_substring_len(a: &str, b: &str) -> usize {
 ///
 /// Unparseable timestamps are also treated as "elapsed" so a corrupt
 /// state file can't permanently lock the reflection pass off.
-pub fn min_interval_elapsed(
-    last_reflection_at: Option<&str>,
-    min_interval_secs: u32,
-) -> bool {
+pub fn min_interval_elapsed(last_reflection_at: Option<&str>, min_interval_secs: u32) -> bool {
     let Some(s) = last_reflection_at else {
         return true;
     };
@@ -372,7 +371,9 @@ fn rotate_pending_failed_from(rotated: &std::path::Path) -> std::io::Result<std:
         .strip_suffix(".jsonl")
         .ok_or_else(|| std::io::Error::other("rotated path missing .jsonl suffix"))?
         .to_string();
-    let parent = rotated.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = rotated
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let primary = parent.join(format!("{file_stem}.failed.jsonl"));
     let mut candidate = primary;
     let mut bump: u32 = 0;
@@ -589,12 +590,8 @@ pub async fn run_pass(
                 ));
             }
             LessonVerdict::SubstringOverlap => outcome.rejected_substring += 1,
-            LessonVerdict::NotEnoughDistinctTriggers => {
-                outcome.rejected_distinct_triggers += 1
-            }
-            LessonVerdict::NotEnoughDistinctSenders => {
-                outcome.rejected_distinct_senders += 1
-            }
+            LessonVerdict::NotEnoughDistinctTriggers => outcome.rejected_distinct_triggers += 1,
+            LessonVerdict::NotEnoughDistinctSenders => outcome.rejected_distinct_senders += 1,
             LessonVerdict::LowTrustSender { .. } => outcome.rejected_low_trust += 1,
         }
     }
@@ -636,8 +633,8 @@ fn parse_lessons(text: &str) -> Result<Vec<String>, String> {
         lessons: Vec<String>,
     }
     let json = super::extract_first_json_object(text, "reflection")?;
-    let body: LessonsBody = serde_json::from_str(json)
-        .map_err(|e| format!("reflection lessons parse: {e}"))?;
+    let body: LessonsBody =
+        serde_json::from_str(json).map_err(|e| format!("reflection lessons parse: {e}"))?;
     Ok(body.lessons)
 }
 
@@ -868,8 +865,7 @@ mod tests {
 
     #[test]
     fn min_interval_elapsed_recent_returns_false() {
-        let now = chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         assert!(!min_interval_elapsed(Some(&now), 3600));
     }
 
@@ -938,8 +934,7 @@ mod tests {
             pending("a", "Alice", "2026-01-01"),
             pending("b", "Bob", "2026-01-02"),
         ];
-        let now = chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         assert!(!should_trigger_idle(&entries, Some(&now), 600, 2));
     }
 
@@ -956,7 +951,10 @@ mod tests {
 
     #[test]
     fn longest_common_substring_basic() {
-        assert_eq!(longest_common_substring_len("hello world", "world peace"), 5);
+        assert_eq!(
+            longest_common_substring_len("hello world", "world peace"),
+            5
+        );
         assert_eq!(longest_common_substring_len("abc", "xyz"), 0);
         assert_eq!(longest_common_substring_len("", "abc"), 0);
         assert_eq!(longest_common_substring_len("identical", "identical"), 9);

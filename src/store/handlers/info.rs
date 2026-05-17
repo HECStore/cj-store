@@ -6,8 +6,8 @@
 
 use tracing::{info, warn};
 
-use super::super::{Store, state, utils};
 use super::super::pricing;
+use super::super::{Store, state, utils};
 use crate::error::StoreError;
 use crate::types::ItemId;
 
@@ -95,10 +95,7 @@ pub(super) async fn handle_pay(
                 "Payment completed"
             );
 
-            let payee_message = format!(
-                "You received {:.2} diamonds from {}",
-                amount, player_name
-            );
+            let payee_message = format!("You received {:.2} diamonds from {}", amount, player_name);
             let _ = utils::send_message_to_player(store, recipient, &payee_message).await;
 
             let payer_message = format!("Paid {:.2} diamonds to {}", amount, recipient);
@@ -199,18 +196,19 @@ pub(super) async fn handle_cancel(
     order_id: u64,
 ) -> Result<(), StoreError> {
     if let Some(ref trade) = store.current_trade
-        && trade.order().id == order_id {
-            return utils::send_message_to_player(
-                store,
-                player_name,
-                &format!(
-                    "Order #{} is currently being processed ({}) and cannot be cancelled.",
-                    order_id,
-                    trade.phase()
-                ),
-            )
-            .await;
-        }
+        && trade.order().id == order_id
+    {
+        return utils::send_message_to_player(
+            store,
+            player_name,
+            &format!(
+                "Order #{} is currently being processed ({}) and cannot be cancelled.",
+                order_id,
+                trade.phase()
+            ),
+        )
+        .await;
+    }
 
     match store.order_queue.cancel(user_uuid, order_id) {
         Ok(()) => {
@@ -221,10 +219,7 @@ pub(super) async fn handle_cancel(
     }
 }
 
-pub(super) async fn handle_status(
-    store: &mut Store,
-    player_name: &str,
-) -> Result<(), StoreError> {
+pub(super) async fn handle_status(store: &mut Store, player_name: &str) -> Result<(), StoreError> {
     handle_status_command(store, player_name).await
 }
 
@@ -304,10 +299,7 @@ async fn handle_price_command(
     }
 }
 
-async fn handle_status_command(
-    store: &mut Store,
-    player_name: &str,
-) -> Result<(), StoreError> {
+async fn handle_status_command(store: &mut Store, player_name: &str) -> Result<(), StoreError> {
     let queue_len = store.order_queue.len();
 
     let status_msg = if store.processing_order {
@@ -598,7 +590,9 @@ pub async fn pay_async(
             amount,
             "Rejected payment: amount must be finite and positive"
         );
-        return Err(StoreError::ValidationError("Amount must be positive".to_string()));
+        return Err(StoreError::ValidationError(
+            "Amount must be positive".to_string(),
+        ));
     }
 
     // Convert the typed `MojangResolveError` to a sanitized `StoreError` via
@@ -694,7 +688,13 @@ mod tests {
             autosave_interval_secs: 10,
             chat: crate::config::ChatConfig::default(),
         };
-        Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), Storage::default())
+        Store::new_for_test(
+            tx,
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            Storage::default(),
+        )
     }
 
     /// Mirrors the `test_uuid` convention used in `store::orders::tests` and
@@ -708,7 +708,9 @@ mod tests {
     #[tokio::test]
     async fn pay_async_rejects_zero_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", 0.0).await.unwrap_err();
+        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", 0.0)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(ref m) if m.contains("positive")),
             "expected ValidationError(positive), got {err:?}"
@@ -718,7 +720,9 @@ mod tests {
     #[tokio::test]
     async fn pay_async_rejects_negative_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", -1.0).await.unwrap_err();
+        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", -1.0)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(ref m) if m.contains("positive")),
             "expected ValidationError(positive), got {err:?}"
@@ -740,9 +744,15 @@ mod tests {
     #[tokio::test]
     async fn pay_async_rejects_infinite_amount() {
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Alice", &test_uuid("Alice"), "Bob", f64::INFINITY)
-            .await
-            .unwrap_err();
+        let err = pay_async(
+            &mut store,
+            "Alice",
+            &test_uuid("Alice"),
+            "Bob",
+            f64::INFINITY,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(_)),
             "expected ValidationError for infinity, got {err:?}"
@@ -754,7 +764,9 @@ mod tests {
         // No users in the store: the payer-not-found branch fires after the
         // amount guard passes.
         let mut store = empty_store();
-        let err = pay_async(&mut store, "Ghost", &test_uuid("Ghost"), "Bob", 5.0).await.unwrap_err();
+        let err = pay_async(&mut store, "Ghost", &test_uuid("Ghost"), "Bob", 5.0)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, StoreError::ValidationError(ref m) if m.contains("not found")),
             "expected ValidationError(not found), got {err:?}"

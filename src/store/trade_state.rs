@@ -40,12 +40,16 @@ use crate::types::storage::ChestTransfer;
 #[derive(Debug, Clone)]
 pub struct TransitionError {
     pub from: &'static str,
-    pub to:   &'static str,
+    pub to: &'static str,
 }
 
 impl fmt::Display for TransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TradeState::{} called from invalid state: {}", self.to, self.from)
+        write!(
+            f,
+            "TradeState::{} called from invalid state: {}",
+            self.to, self.from
+        )
     }
 }
 
@@ -164,7 +168,11 @@ impl TradeState {
     }
 
     /// Trading -> Depositing.
-    pub fn begin_depositing(self, trade_result: TradeResult, deposit_plan: Vec<ChestTransfer>) -> Result<TradeState, TransitionError> {
+    pub fn begin_depositing(
+        self,
+        trade_result: TradeResult,
+        deposit_plan: Vec<ChestTransfer>,
+    ) -> Result<TradeState, TransitionError> {
         match self {
             TradeState::Trading { order, .. } => {
                 tracing::debug!(
@@ -190,10 +198,14 @@ impl TradeState {
     ///
     /// Accepts `Trading` directly (payout-to-balance trades have no deposit
     /// phase) and `Depositing` (normal case).
-    pub fn commit(self, item: String, quantity: i32, currency_amount: f64) -> Result<TradeState, TransitionError> {
+    pub fn commit(
+        self,
+        item: String,
+        quantity: i32,
+        currency_amount: f64,
+    ) -> Result<TradeState, TransitionError> {
         match self {
-            TradeState::Trading { order, .. }
-            | TradeState::Depositing { order, .. } => {
+            TradeState::Trading { order, .. } | TradeState::Depositing { order, .. } => {
                 tracing::debug!(
                     order_id = order.id,
                     player = %order.username,
@@ -268,7 +280,10 @@ impl TradeState {
 
     #[allow(dead_code)] // API surface; used in tests
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TradeState::Committed(_) | TradeState::RolledBack { .. })
+        matches!(
+            self,
+            TradeState::Committed(_) | TradeState::RolledBack { .. }
+        )
     }
 
     /// The underlying order, regardless of phase.
@@ -298,7 +313,11 @@ impl fmt::Display for TradeState {
                 write!(f, "Depositing after: {}", order.description())
             }
             TradeState::Committed(c) => {
-                write!(f, "Committed: {}x {} ({:.2} diamonds)", c.quantity, c.item, c.currency_amount)
+                write!(
+                    f,
+                    "Committed: {}x {} ({:.2} diamonds)",
+                    c.quantity, c.item, c.currency_amount
+                )
             }
             TradeState::RolledBack { order, reason } => {
                 write!(f, "Rolled back {}: {}", order.description(), reason)
@@ -349,8 +368,7 @@ pub fn archive_persisted() -> io::Result<std::path::PathBuf> {
 /// Path-parameterized persist, separated so tests can round-trip without
 /// touching the production `TRADE_STATE_FILE`.
 fn persist_to(path: &Path, state: &TradeState) -> io::Result<()> {
-    let json = serde_json::to_string_pretty(state)
-        .map_err(io::Error::other)?;
+    let json = serde_json::to_string_pretty(state).map_err(io::Error::other)?;
     crate::fsutil::write_atomic(path, &json)
 }
 
@@ -479,12 +497,8 @@ fn clear_persisted_from(path: &Path) -> io::Result<()> {
 /// touching the production `TRADE_STATE_FILE`. Mirrors
 /// `Journal::archive_leftover`'s rename → copy+remove fallback.
 pub fn archive_persisted_to(path: &Path) -> io::Result<std::path::PathBuf> {
-    let archived = crate::fsutil::pick_archive_path(
-        path.parent(),
-        "current_trade",
-        "leftover",
-        &ARCHIVE_SEQ,
-    )?;
+    let archived =
+        crate::fsutil::pick_archive_path(path.parent(), "current_trade", "leftover", &ARCHIVE_SEQ)?;
     crate::fsutil::archive_aside(path, &archived)?;
     Ok(archived)
 }
@@ -558,9 +572,12 @@ mod tests {
     fn depositing_commits_after_post_trade_chest_work() {
         // Queued -> Withdrawing -> Trading -> Depositing -> Committed.
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap()
-            .begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap()
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap();
         assert_eq!(state.phase(), "depositing");
         assert!(!state.is_terminal());
 
@@ -571,7 +588,9 @@ mod tests {
 
     #[test]
     fn withdrawing_preserves_order_and_plan() {
-        let state = TradeState::new(sample_order()).begin_withdrawal(sample_transfers()).unwrap();
+        let state = TradeState::new(sample_order())
+            .begin_withdrawal(sample_transfers())
+            .unwrap();
         if let TradeState::Withdrawing { order, plan } = &state {
             assert_eq!(order.id, 1);
             assert_eq!(order.username, "TestPlayer");
@@ -585,10 +604,16 @@ mod tests {
     #[test]
     fn trading_carries_withdrawn_plan_for_rollback() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap();
         if let TradeState::Trading { withdrawn, .. } = &state {
-            assert_eq!(withdrawn.len(), 1, "withdrawn plan must survive into Trading so rollback can reverse it");
+            assert_eq!(
+                withdrawn.len(),
+                1,
+                "withdrawn plan must survive into Trading so rollback can reverse it"
+            );
         } else {
             panic!("Expected Trading");
         }
@@ -598,7 +623,9 @@ mod tests {
 
     #[test]
     fn rollback_from_queued_captures_reason() {
-        let state = TradeState::new(sample_order()).rollback("cancelled before withdraw".to_string()).unwrap();
+        let state = TradeState::new(sample_order())
+            .rollback("cancelled before withdraw".to_string())
+            .unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert!(state.is_terminal());
         if let TradeState::RolledBack { reason, order } = &state {
@@ -612,8 +639,10 @@ mod tests {
     #[test]
     fn rollback_from_withdrawing_preserves_order() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .rollback("chest timeout".to_string()).unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .rollback("chest timeout".to_string())
+            .unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert_eq!(state.order().id, 1);
         if let TradeState::RolledBack { reason, .. } = &state {
@@ -624,9 +653,12 @@ mod tests {
     #[test]
     fn rollback_from_trading_preserves_order() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap()
-            .rollback("trade rejected by player".to_string()).unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap()
+            .rollback("trade rejected by player".to_string())
+            .unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert_eq!(state.order().id, 1);
     }
@@ -634,10 +666,14 @@ mod tests {
     #[test]
     fn rollback_from_depositing_preserves_order() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap()
-            .begin_depositing(sample_trade_result(), sample_transfers()).unwrap()
-            .rollback("deposit failed".to_string()).unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap()
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap()
+            .rollback("deposit failed".to_string())
+            .unwrap();
         assert_eq!(state.phase(), "rolled_back");
         assert_eq!(state.order().id, 1);
     }
@@ -663,7 +699,8 @@ mod tests {
     #[test]
     fn cannot_deposit_from_withdrawing() {
         let err = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
             .begin_depositing(sample_trade_result(), sample_transfers())
             .unwrap_err();
         assert_eq!(err.from, "withdrawing");
@@ -682,7 +719,8 @@ mod tests {
     #[test]
     fn cannot_commit_from_withdrawing() {
         let err = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
             .commit("x".to_string(), 1, 1.0)
             .unwrap_err();
         assert_eq!(err.from, "withdrawing");
@@ -692,7 +730,8 @@ mod tests {
     #[test]
     fn cannot_re_enter_withdrawing() {
         let err = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
             .begin_withdrawal(sample_transfers())
             .unwrap_err();
         assert_eq!(err.from, "withdrawing");
@@ -702,9 +741,12 @@ mod tests {
     #[test]
     fn cannot_rollback_committed() {
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap()
-            .commit("cobblestone".to_string(), 64, 10.0).unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap()
+            .commit("cobblestone".to_string(), 64, 10.0)
+            .unwrap();
         let err = state.rollback("oops".to_string()).unwrap_err();
         assert_eq!(err.from, "committed");
         assert_eq!(err.to, "rollback");
@@ -712,7 +754,9 @@ mod tests {
 
     #[test]
     fn cannot_double_rollback() {
-        let state = TradeState::new(sample_order()).rollback("first".to_string()).unwrap();
+        let state = TradeState::new(sample_order())
+            .rollback("first".to_string())
+            .unwrap();
         let err = state.rollback("second".to_string()).unwrap_err();
         assert_eq!(err.from, "rolled_back");
         assert_eq!(err.to, "rollback");
@@ -721,7 +765,9 @@ mod tests {
     #[test]
     fn commit_with_invalid_state_returns_err() {
         // From rolled_back: cannot commit.
-        let state = TradeState::new(sample_order()).rollback("cancelled".to_string()).unwrap();
+        let state = TradeState::new(sample_order())
+            .rollback("cancelled".to_string())
+            .unwrap();
         let err = state.commit("x".to_string(), 1, 1.0).unwrap_err();
         assert_eq!(err.from, "rolled_back");
         assert_eq!(err.to, "commit");
@@ -741,19 +787,31 @@ mod tests {
         let order = sample_order();
         assert_eq!(TradeState::Queued(order.clone()).phase(), "queued");
         assert_eq!(
-            TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).unwrap().phase(),
+            TradeState::new(order.clone())
+                .begin_withdrawal(sample_transfers())
+                .unwrap()
+                .phase(),
             "withdrawing"
         );
         let trading = TradeState::new(order.clone())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap();
         assert_eq!(trading.phase(), "trading");
-        let depositing = trading.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
+        let depositing = trading
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap();
         assert_eq!(depositing.phase(), "depositing");
-        let committed = depositing.commit("cobblestone".to_string(), 64, 1.0).unwrap();
+        let committed = depositing
+            .commit("cobblestone".to_string(), 64, 1.0)
+            .unwrap();
         assert_eq!(committed.phase(), "committed");
         assert_eq!(
-            TradeState::new(order).rollback("r".to_string()).unwrap().phase(),
+            TradeState::new(order)
+                .rollback("r".to_string())
+                .unwrap()
+                .phase(),
             "rolled_back"
         );
     }
@@ -762,14 +820,27 @@ mod tests {
     fn is_terminal_only_for_committed_and_rolled_back() {
         let order = sample_order();
         assert!(!TradeState::Queued(order.clone()).is_terminal());
-        let w = TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).unwrap();
+        let w = TradeState::new(order.clone())
+            .begin_withdrawal(sample_transfers())
+            .unwrap();
         assert!(!w.is_terminal());
         let t = w.begin_trading().unwrap();
         assert!(!t.is_terminal());
-        let d = t.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
+        let d = t
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap();
         assert!(!d.is_terminal());
-        assert!(d.commit("cobblestone".to_string(), 64, 1.0).unwrap().is_terminal());
-        assert!(TradeState::new(order).rollback("r".to_string()).unwrap().is_terminal());
+        assert!(
+            d.commit("cobblestone".to_string(), 64, 1.0)
+                .unwrap()
+                .is_terminal()
+        );
+        assert!(
+            TradeState::new(order)
+                .rollback("r".to_string())
+                .unwrap()
+                .is_terminal()
+        );
     }
 
     #[test]
@@ -784,7 +855,9 @@ mod tests {
         let state = state.begin_trading().unwrap();
         assert_eq!(state.order().username, "TestPlayer");
 
-        let state = state.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
+        let state = state
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap();
         assert_eq!(state.order().id, 1);
 
         let state = state.commit("cobblestone".to_string(), 64, 10.0).unwrap();
@@ -793,7 +866,9 @@ mod tests {
 
     #[test]
     fn order_accessor_returns_order_from_rolled_back() {
-        let state = TradeState::new(sample_order()).rollback("x".to_string()).unwrap();
+        let state = TradeState::new(sample_order())
+            .rollback("x".to_string())
+            .unwrap();
         assert_eq!(state.order().id, 1);
         assert_eq!(state.order().username, "TestPlayer");
     }
@@ -813,9 +888,14 @@ mod tests {
 
         let state = state.begin_trading().unwrap();
         let rendered = state.to_string();
-        assert!(rendered.starts_with("Trading with player:"), "got {rendered}");
+        assert!(
+            rendered.starts_with("Trading with player:"),
+            "got {rendered}"
+        );
 
-        let state = state.begin_depositing(sample_trade_result(), sample_transfers()).unwrap();
+        let state = state
+            .begin_depositing(sample_trade_result(), sample_transfers())
+            .unwrap();
         assert!(state.to_string().starts_with("Depositing after:"));
 
         let state = state.commit("cobblestone".to_string(), 64, 12.5).unwrap();
@@ -827,7 +907,8 @@ mod tests {
     #[test]
     fn display_rolled_back_includes_reason() {
         let rendered = TradeState::new(sample_order())
-            .rollback("timeout".to_string()).unwrap()
+            .rollback("timeout".to_string())
+            .unwrap()
             .to_string();
         assert!(rendered.starts_with("Rolled back"), "got {rendered}");
         assert!(rendered.contains("timeout"));
@@ -840,24 +921,39 @@ mod tests {
         let order = sample_order();
         let states = vec![
             TradeState::new(order.clone()),
-            TradeState::new(order.clone()).begin_withdrawal(sample_transfers()).unwrap(),
             TradeState::new(order.clone())
-                .begin_withdrawal(sample_transfers()).unwrap()
-                .begin_trading().unwrap(),
+                .begin_withdrawal(sample_transfers())
+                .unwrap(),
             TradeState::new(order.clone())
-                .begin_withdrawal(sample_transfers()).unwrap()
-                .begin_trading().unwrap()
-                .begin_depositing(sample_trade_result(), sample_transfers()).unwrap(),
+                .begin_withdrawal(sample_transfers())
+                .unwrap()
+                .begin_trading()
+                .unwrap(),
             TradeState::new(order.clone())
-                .begin_withdrawal(sample_transfers()).unwrap()
-                .begin_trading().unwrap()
-                .commit("cobblestone".to_string(), 64, 5.0).unwrap(),
+                .begin_withdrawal(sample_transfers())
+                .unwrap()
+                .begin_trading()
+                .unwrap()
+                .begin_depositing(sample_trade_result(), sample_transfers())
+                .unwrap(),
+            TradeState::new(order.clone())
+                .begin_withdrawal(sample_transfers())
+                .unwrap()
+                .begin_trading()
+                .unwrap()
+                .commit("cobblestone".to_string(), 64, 5.0)
+                .unwrap(),
             TradeState::new(order).rollback("boom".to_string()).unwrap(),
         ];
         for state in &states {
             let json = serde_json::to_string(state).expect("serialize");
             let decoded: TradeState = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(decoded.phase(), state.phase(), "phase mismatch for {}", state.phase());
+            assert_eq!(
+                decoded.phase(),
+                state.phase(),
+                "phase mismatch for {}",
+                state.phase()
+            );
             assert_eq!(decoded.order().id, state.order().id);
             assert_eq!(decoded.order().username, state.order().username);
         }
@@ -902,8 +998,10 @@ mod tests {
         let path = dir.path("current_trade.json");
 
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap();
 
         persist_to(&path, &state).expect("persist must succeed");
 
@@ -917,7 +1015,9 @@ mod tests {
 
         clear_persisted_from(&path).expect("clear must succeed");
         assert!(
-            load_persisted_from(&path).expect("load after clear").is_none(),
+            load_persisted_from(&path)
+                .expect("load after clear")
+                .is_none(),
             "second load after clear must return Ok(None)"
         );
     }
@@ -933,8 +1033,10 @@ mod tests {
         let path = dir.path("current_trade.json");
 
         let state = TradeState::new(sample_order())
-            .begin_withdrawal(sample_transfers()).unwrap()
-            .begin_trading().unwrap();
+            .begin_withdrawal(sample_transfers())
+            .unwrap()
+            .begin_trading()
+            .unwrap();
 
         persist_to(&path, &state).expect("persist must succeed");
         let original_payload = std::fs::read_to_string(&path).expect("read original");
@@ -943,14 +1045,22 @@ mod tests {
 
         // Original active path is now free.
         assert!(
-            load_persisted_from(&path).expect("load after archive").is_none(),
+            load_persisted_from(&path)
+                .expect("load after archive")
+                .is_none(),
             "after archive, load on original path must return Ok(None)"
         );
 
         // Archived sibling exists and carries the original payload.
-        assert!(archived.exists(), "archived sibling must exist at {archived:?}");
+        assert!(
+            archived.exists(),
+            "archived sibling must exist at {archived:?}"
+        );
         let archived_payload = std::fs::read_to_string(&archived).expect("read archived");
-        assert_eq!(archived_payload, original_payload, "archived payload must match original");
+        assert_eq!(
+            archived_payload, original_payload,
+            "archived payload must match original"
+        );
 
         // Sanity: the archived file is in the same directory and follows the
         // expected naming pattern.
@@ -997,15 +1107,25 @@ mod tests {
         assert_ne!(archived1, archived2, "quarantine paths must differ");
         assert!(archived1.exists(), "first quarantine must still exist");
         assert!(archived2.exists(), "second quarantine must exist");
-        assert_eq!(std::fs::read_to_string(&archived1).unwrap(), "first-unreadable");
-        assert_eq!(std::fs::read_to_string(&archived2).unwrap(), "second-unreadable");
+        assert_eq!(
+            std::fs::read_to_string(&archived1).unwrap(),
+            "first-unreadable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&archived2).unwrap(),
+            "second-unreadable"
+        );
     }
 
     #[test]
     fn load_from_missing_file_returns_none() {
         let dir = TmpDir::new("missing");
         let path = dir.path("absent.json");
-        assert!(load_persisted_from(&path).expect("missing file is not an error").is_none());
+        assert!(
+            load_persisted_from(&path)
+                .expect("missing file is not an error")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1031,10 +1151,7 @@ mod tests {
         );
 
         // (b) The active path is gone (the next persist gets a clean slate).
-        assert!(
-            !path.exists(),
-            "active path must be freed after quarantine"
-        );
+        assert!(!path.exists(), "active path must be freed after quarantine");
 
         // (c) A sibling current_trade.unreadable-*.json exists with the
         //     original payload byte-for-byte.
@@ -1048,9 +1165,8 @@ mod tests {
                 break;
             }
         }
-        let quarantined = quarantined.expect(
-            "a sibling current_trade.unreadable-*.json must exist after quarantine",
-        );
+        let quarantined = quarantined
+            .expect("a sibling current_trade.unreadable-*.json must exist after quarantine");
         let archived_payload = std::fs::read_to_string(&quarantined).expect("read archived");
         assert_eq!(
             archived_payload, payload,

@@ -231,7 +231,9 @@ pub fn strip_reasoning(reply: &str) -> String {
             }
         }
 
-        let Some((start, body_start, tag)) = earliest else { break };
+        let Some((start, body_start, tag)) = earliest else {
+            break;
+        };
         // Close-tag detection: `</{tag}` followed by optional ASCII
         // whitespace and then `>`. Scan from body_start forward.
         let close_prefix = format!("</{tag}");
@@ -334,8 +336,7 @@ fn code_fence_ranges(s: &str) -> Vec<(usize, usize)> {
     // treating an unclosed single tick as covering the rest of the
     // input is anti-defensive for this function's actual job (CoT
     // suppression).
-    let triple_covered =
-        |pos: usize| triples.iter().any(|&(a, b)| a <= pos && pos < b);
+    let triple_covered = |pos: usize| triples.iter().any(|&(a, b)| a <= pos && pos < b);
     let mut singles: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -635,11 +636,7 @@ pub fn within_active_hours_now(active_hours_utc: Option<(u32, u32)>) -> bool {
 /// caller adds this to the deterministic base+per_char delay before
 /// clamping to the floor/max. Uniform RNG is supplied by the caller so
 /// tests can pin determinism.
-pub fn gaussian_jitter_ms(
-    mean_ms: i32,
-    sigma_ms: u32,
-    rng_unit: &mut impl FnMut() -> f32,
-) -> i32 {
+pub fn gaussian_jitter_ms(mean_ms: i32, sigma_ms: u32, rng_unit: &mut impl FnMut() -> f32) -> i32 {
     let u1 = (rng_unit)().clamp(1e-6, 1.0);
     let u2 = (rng_unit)().clamp(0.0, 1.0);
     let z = (-2.0_f32 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
@@ -688,7 +685,13 @@ mod tests {
     #[test]
     fn recheck_drops_when_rate_limit_exhausted() {
         let v = recheck_after_sleep(
-            false, false, true, /* recent */ 4, /* max */ 4, Some(60), 6,
+            false,
+            false,
+            true,
+            /* recent */ 4,
+            /* max */ 4,
+            Some(60),
+            6,
         );
         assert_eq!(v, SendDecision::DropRateLimited);
     }

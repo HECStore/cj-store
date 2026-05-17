@@ -12,7 +12,7 @@
 //! every fee-bearing trade — that is how fee revenue accrues in the pool.
 
 use super::Store;
-use crate::constants::{FEE_MIN, FEE_MAX, MIN_RESERVE_FOR_PRICE};
+use crate::constants::{FEE_MAX, FEE_MIN, MIN_RESERVE_FOR_PRICE};
 
 /// Returns `true` iff `fee` is finite and within `[FEE_MIN, FEE_MAX]`.
 pub fn validate_fee(fee: f64) -> bool {
@@ -37,7 +37,12 @@ pub fn reserves_sufficient(item_stock: i32, currency_stock: f64) -> bool {
 /// See [`buy_cost_pure`] for the math.
 pub fn calculate_buy_cost(store: &Store, item: &str, amount: i32) -> Option<f64> {
     let pair = store.pairs.get(item)?;
-    buy_cost_pure(pair.item_stock, pair.currency_stock, amount, store.config.fee)
+    buy_cost_pure(
+        pair.item_stock,
+        pair.currency_stock,
+        amount,
+        store.config.fee,
+    )
 }
 
 /// Pure AMM buy-cost math: `y * dx / (x - dx) * (1 + fee)`.
@@ -73,7 +78,11 @@ pub fn buy_cost_pure(item_stock: i32, currency_stock: f64, amount: i32, fee: f64
     let base_cost = y * dx / (x - dx);
     let cost = base_cost * (1.0 + fee);
 
-    if cost.is_finite() && cost > 0.0 { Some(cost) } else { None }
+    if cost.is_finite() && cost > 0.0 {
+        Some(cost)
+    } else {
+        None
+    }
 }
 
 /// Indicative spot buy price (currency per 1 item) for chat lookups.
@@ -107,7 +116,12 @@ pub fn indicative_spot_sell_price(item_stock: i32, currency_stock: f64, fee: f64
 /// finite number. See [`sell_payout_pure`] for the math.
 pub fn calculate_sell_payout(store: &Store, item: &str, amount: i32) -> Option<f64> {
     let pair = store.pairs.get(item)?;
-    sell_payout_pure(pair.item_stock, pair.currency_stock, amount, store.config.fee)
+    sell_payout_pure(
+        pair.item_stock,
+        pair.currency_stock,
+        amount,
+        store.config.fee,
+    )
 }
 
 /// Pure AMM sell-payout math: `y * dx / (x + dx) * (1 - fee)`.
@@ -117,7 +131,12 @@ pub fn calculate_sell_payout(store: &Store, item: &str, amount: i32) -> Option<f
 /// exhibits diminishing returns as trade size grows (slippage against the
 /// seller). The fee is subtracted from the payout, so the pool retains
 /// extra `y` and `k` grows.
-pub fn sell_payout_pure(item_stock: i32, currency_stock: f64, amount: i32, fee: f64) -> Option<f64> {
+pub fn sell_payout_pure(
+    item_stock: i32,
+    currency_stock: f64,
+    amount: i32,
+    fee: f64,
+) -> Option<f64> {
     if !validate_fee(fee) {
         tracing::warn!("Invalid fee rate: {}", fee);
         return None;
@@ -136,7 +155,11 @@ pub fn sell_payout_pure(item_stock: i32, currency_stock: f64, amount: i32, fee: 
     let base_payout = y * dx / (x + dx);
     let payout = base_payout * (1.0 - fee);
 
-    if payout.is_finite() && payout > 0.0 { Some(payout) } else { None }
+    if payout.is_finite() && payout > 0.0 {
+        Some(payout)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -317,7 +340,12 @@ mod tests {
         let cost = buy_cost_pure(x, y, dx, 0.0).expect("cost");
         let k_old = x as f64 * y;
         let k_new = (x - dx) as f64 * (y + cost);
-        assert!((k_new - k_old).abs() < 1e-9, "k shifted: {} -> {}", k_old, k_new);
+        assert!(
+            (k_new - k_old).abs() < 1e-9,
+            "k shifted: {} -> {}",
+            k_old,
+            k_new
+        );
     }
 
     #[test]
@@ -328,7 +356,12 @@ mod tests {
         let payout = sell_payout_pure(x, y, dx, 0.0).expect("payout");
         let k_old = x as f64 * y;
         let k_new = (x + dx) as f64 * (y - payout);
-        assert!((k_new - k_old).abs() < 1e-9, "k shifted: {} -> {}", k_old, k_new);
+        assert!(
+            (k_new - k_old).abs() < 1e-9,
+            "k shifted: {} -> {}",
+            k_old,
+            k_new
+        );
     }
 
     #[test]
@@ -387,8 +420,8 @@ mod tests {
     /// and empty storage/users are fine.
     fn build_store_with(pairs_spec: Vec<(&str, i32, f64)>) -> Store {
         use crate::config::Config;
-        use crate::types::{Pair, Position, Storage};
         use crate::types::item_id::ItemId;
+        use crate::types::{Pair, Position, Storage};
         use std::collections::HashMap;
         use tokio::sync::mpsc;
 

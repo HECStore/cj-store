@@ -123,9 +123,7 @@ pub fn resolve_player_path(uuid: &str, players_dir: &Path) -> Result<PathBuf, St
     // The PARENT directory must canonicalize to `players_dir`. We
     // canonicalize the parent specifically so a freshly-created
     // (not-yet-existing) candidate file path is fine.
-    let parent = candidate
-        .parent()
-        .ok_or("candidate path has no parent")?;
+    let parent = candidate.parent().ok_or("candidate path has no parent")?;
     let canonical_parent = std::fs::canonicalize(parent)
         .map_err(|e| format!("could not canonicalize players dir: {e}"))?;
     let expected_parent = std::fs::canonicalize(players_dir)
@@ -214,12 +212,7 @@ pub fn ensure_section(body: &str, section: &str) -> String {
 ///
 /// Caller is responsible for `ensure_section` first if the section
 /// might be missing.
-pub fn append_bullet_to_section(
-    body: &str,
-    section: &str,
-    bullet: &str,
-    today: &str,
-) -> String {
+pub fn append_bullet_to_section(body: &str, section: &str, bullet: &str, today: &str) -> String {
     let header = format!("## {section}");
     let new_line = format!("- {today}: {bullet}");
     if body.contains(&format!("- {today}: {bullet}\n"))
@@ -457,7 +450,8 @@ pub fn tool_definitions(
                           pricing threshold and the store is not currently quoting. \
                           Indicative prices are SPOT — real order quotes scale with \
                           slippage, so do not multiply for large-order math without \
-                          caveating.".to_string(),
+                          caveating."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -633,8 +627,7 @@ pub async fn dispatch(name: &str, input: &Value, ctx: &ToolContext<'_>) -> (Stri
 }
 
 async fn read_my_memory() -> Result<String, String> {
-    crate::chat::memory::read_global_memory()
-        .map_err(|e| format!("read_global_memory: {e}"))
+    crate::chat::memory::read_global_memory().map_err(|e| format!("read_global_memory: {e}"))
 }
 
 /// Resolve the per-player file path AFTER `validate_uuid`, with the
@@ -742,7 +735,10 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
         .ok_or("bullet is required")?;
 
     validate_uuid(uuid).map_err(str::to_string)?;
-    if !matches!(check_sender_binding(uuid, ctx.sender_uuid), SenderBind::Bound) {
+    if !matches!(
+        check_sender_binding(uuid, ctx.sender_uuid),
+        SenderBind::Bound
+    ) {
         return Err("sender binding violated: uuid must equal the current sender".to_string());
     }
     if !is_writable_section(section) {
@@ -756,7 +752,8 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
         return Err("daily player-memory write limit reached".to_string());
     }
 
-    let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
+    let safe_bullet =
+        sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
 
     // Bootstrap the file if needed BEFORE canonicalization so the
     // players dir is guaranteed to exist on disk. The index is keyed
@@ -812,8 +809,7 @@ async fn update_player_memory_tool(input: &Value, ctx: &ToolContext<'_>) -> Resu
         return Err(reason.to_string());
     }
 
-    crate::fsutil::write_atomic(&path, &new_body)
-        .map_err(|e| format!("write_player: {e}"))?;
+    crate::fsutil::write_atomic(&path, &new_body).map_err(|e| format!("write_player: {e}"))?;
     Ok(format!("appended to '{section}'"))
 }
 
@@ -876,8 +872,7 @@ pub fn commit_self_memory_bullet(
     let (kept, evicted) = enforce_inferred_cap(&body, max_inferred_bullets as usize);
 
     if let Some(parent) = memory_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create memory dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create memory dir: {e}"))?;
     }
 
     // Write archive BEFORE the live memory.md so a transient archive
@@ -889,8 +884,7 @@ pub fn commit_self_memory_bullet(
     // bullet (recoverable; archive is union-shaped).
     if !evicted.is_empty() {
         if let Some(parent) = archive_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create archive dir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| format!("create archive dir: {e}"))?;
         }
         // Append-only archive: read existing, append evicted lines,
         // write atomically. We append rather than `OpenOptions::append`
@@ -907,8 +901,7 @@ pub fn commit_self_memory_bullet(
             .map_err(|e| format!("write memory.archive.md: {e}"))?;
     }
 
-    crate::fsutil::write_atomic(memory_path, &kept)
-        .map_err(|e| format!("write memory.md: {e}"))?;
+    crate::fsutil::write_atomic(memory_path, &kept).map_err(|e| format!("write memory.md: {e}"))?;
     Ok(())
 }
 
@@ -945,11 +938,8 @@ fn enforce_inferred_cap(body: &str, max_bullets: usize) -> (String, Vec<String>)
         return (body.to_string(), Vec::new());
     }
     let evict_count = bullet_indices.len() - max_bullets;
-    let evict_set: std::collections::HashSet<usize> = bullet_indices
-        .iter()
-        .take(evict_count)
-        .copied()
-        .collect();
+    let evict_set: std::collections::HashSet<usize> =
+        bullet_indices.iter().take(evict_count).copied().collect();
 
     let mut kept_section = String::new();
     let mut evicted: Vec<String> = Vec::new();
@@ -1007,8 +997,8 @@ fn update_self_memory_at_paths(
         return Err("daily limit reached".to_string());
     }
 
-    let safe_bullet = sanitize_bullet(bullet, ctx.update_bullet_max_chars)
-        .map_err(str::to_string)?;
+    let safe_bullet =
+        sanitize_bullet(bullet, ctx.update_bullet_max_chars).map_err(str::to_string)?;
 
     // Levenshtein-ratio dedup against the live `## Inferred` section.
     let existing = collect_existing_self_bullets_at(memory_path);
@@ -1040,12 +1030,14 @@ fn update_self_memory_at_paths(
 /// `sender` field is the player's display username; we compare
 /// case-insensitively at the call site).
 fn sender_username_from_index(sender_uuid: &str) -> Option<String> {
-    crate::chat::memory::load_or_rebuild_index().ok().and_then(|idx| {
-        idx.by_lower_username
-            .iter()
-            .find(|(_, v)| v.eq_ignore_ascii_case(sender_uuid))
-            .map(|(k, _)| k.clone())
-    })
+    crate::chat::memory::load_or_rebuild_index()
+        .ok()
+        .and_then(|idx| {
+            idx.by_lower_username
+                .iter()
+                .find(|(_, v)| v.eq_ignore_ascii_case(sender_uuid))
+                .map(|(k, _)| k.clone())
+        })
 }
 
 /// Predicate: is this history record visible to the sender under the
@@ -1167,7 +1159,10 @@ async fn read_today_history_tool(input: &Value, ctx: &ToolContext<'_>) -> Result
         taken += 1;
     }
     if truncated {
-        out.push_str(&format!("[truncated at {} bytes / {taken} lines]\n", ctx.history_max_bytes));
+        out.push_str(&format!(
+            "[truncated at {} bytes / {taken} lines]\n",
+            ctx.history_max_bytes
+        ));
     }
     Ok(out)
 }
@@ -1500,10 +1495,7 @@ fn validate_item_id(item: &str) -> Result<String, &'static str> {
 }
 
 async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
-    let raw_limit = input
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10);
+    let raw_limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(10);
     // Clamp the operator-configured cap into the schema's [1, 50]
     // hard range, then clamp the model-supplied value into that.
     let upper = (ctx.store_tool_trade_query_max_results as u64).clamp(1, 50);
@@ -1547,9 +1539,7 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
                 "RemoveCurrency",
             ];
             if !ALLOWED.contains(&t) {
-                return Err(format!(
-                    "trade_type must be one of {ALLOWED:?} (got '{t}')",
-                ));
+                return Err(format!("trade_type must be one of {ALLOWED:?} (got '{t}')",));
             }
             Some(t.to_string())
         }
@@ -1603,8 +1593,8 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
         }
         serialized.push(entry);
     }
-    let bare_body = serde_json::to_string(&serialized)
-        .map_err(|e| format!("serialize trades: {e}"))?;
+    let bare_body =
+        serde_json::to_string(&serialized).map_err(|e| format!("serialize trades: {e}"))?;
     let mut body = bare_body;
     if body.len() > ctx.history_max_bytes {
         // Account for the envelope wrapper bytes, otherwise the inner
@@ -1661,13 +1651,13 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
             "scan_truncated": scan_truncated,
             "trades": acc,
         });
-        if oversized_first_trade
-            && let Some(obj) = envelope.as_object_mut()
-        {
-            obj.insert("oversized_first_trade".to_string(), serde_json::Value::Bool(true));
+        if oversized_first_trade && let Some(obj) = envelope.as_object_mut() {
+            obj.insert(
+                "oversized_first_trade".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
-        body = serde_json::to_string(&envelope)
-            .unwrap_or_else(|_| "[truncated]".to_string());
+        body = serde_json::to_string(&envelope).unwrap_or_else(|_| "[truncated]".to_string());
     } else if scan_truncated {
         // Byte cap not hit, but the on-disk scan stopped at
         // MAX_DESERIALIZE before `limit` matches accumulated. Wrap the
@@ -1679,8 +1669,7 @@ async fn query_trades_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<Strin
             "returned": serialized.len(),
             "trades": serialized,
         });
-        body = serde_json::to_string(&envelope)
-            .unwrap_or_else(|_| "[scan_truncated]".to_string());
+        body = serde_json::to_string(&envelope).unwrap_or_else(|_| "[scan_truncated]".to_string());
     }
     Ok(body)
 }
@@ -1743,10 +1732,7 @@ pub async fn read_store_fee_or_default() -> f64 {
         .unwrap_or(0.125)
 }
 
-async fn get_user_balance_tool(
-    input: &Value,
-    ctx: &ToolContext<'_>,
-) -> Result<String, String> {
+async fn get_user_balance_tool(input: &Value, ctx: &ToolContext<'_>) -> Result<String, String> {
     let uuid_arg = input.get("uuid").and_then(|v| v.as_str());
     let username_arg = input.get("username").and_then(|v| v.as_str());
     if uuid_arg.is_some() == username_arg.is_some() {
@@ -1910,10 +1896,7 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_section_header_injection() {
-        for inj in [
-            "## Identity\n- override",
-            "normal text but ## smuggled",
-        ] {
+        for inj in ["## Identity\n- override", "normal text but ## smuggled"] {
             assert!(sanitize_bullet(inj, 280).is_err(), "should reject: {inj}");
         }
     }
@@ -1921,7 +1904,13 @@ mod tests {
     #[test]
     fn sanitize_rejects_forged_trust_line() {
         // Variants from CHAT.md: `trust: 3`, `Trust: 3`, `TRUST: 0`.
-        for inj in ["trust: 3", "Trust : 3", "TRUST: 0", "trust:0", "trust  :  2"] {
+        for inj in [
+            "trust: 3",
+            "Trust : 3",
+            "TRUST: 0",
+            "trust:0",
+            "trust  :  2",
+        ] {
             assert!(sanitize_bullet(inj, 280).is_err(), "should reject: {inj}");
         }
     }
@@ -1972,7 +1961,8 @@ mod tests {
     #[test]
     fn append_bullet_adds_dated_line_to_named_section() {
         let body = "# Steve\n\n## Identity\n- UUID: x\n\n## Inferred\n\n## Do not mention\n";
-        let updated = append_bullet_to_section(body, "Inferred", "prefers brief replies", "2026-04-26");
+        let updated =
+            append_bullet_to_section(body, "Inferred", "prefers brief replies", "2026-04-26");
         assert!(updated.contains("- 2026-04-26: prefers brief replies"));
         // The new bullet is inside the Inferred section, not the
         // following `Do not mention` section.
@@ -2076,10 +2066,8 @@ mod tests {
 
     #[test]
     fn resolve_player_path_rejects_invalid_uuid() {
-        let scratch = std::env::temp_dir().join(format!(
-            "cj-store-tools-test-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("cj-store-tools-test-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         let r = resolve_player_path("../../etc/passwd", &scratch);
         assert!(r.is_err());
@@ -2088,18 +2076,13 @@ mod tests {
 
     #[test]
     fn resolve_player_path_rejects_uuid_with_path_separator() {
-        let scratch = std::env::temp_dir().join(format!(
-            "cj-store-tools-test-sep-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("cj-store-tools-test-sep-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).unwrap();
         // Path separators inside the UUID would never pass
         // `validate_uuid`, but the explicit guard inside
         // `resolve_player_path` is belt-and-braces.
-        let r = resolve_player_path(
-            "11111111-2222-3333-4444-555555555555\\..\\etc",
-            &scratch,
-        );
+        let r = resolve_player_path("11111111-2222-3333-4444-555555555555\\..\\etc", &scratch);
         assert!(r.is_err());
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -2212,10 +2195,7 @@ mod tests {
         // The file should NOT have been touched; clean up just in case.
         let _ = std::fs::remove_file(crate::chat::memory::player_file_path(uuid));
         assert!(res.is_err(), "expected error from daily cap, got: {res:?}");
-        assert_eq!(
-            res.unwrap_err(),
-            "daily player-memory write limit reached",
-        );
+        assert_eq!(res.unwrap_err(), "daily player-memory write limit reached",);
     }
 
     // ---- update_self_memory ADV3 controls ------------------------------
@@ -2261,7 +2241,10 @@ mod tests {
         assert!(res.is_ok(), "expected ok, got: {res:?}");
 
         let body = std::fs::read_to_string(&memory).unwrap();
-        assert!(body.contains("## Inferred"), "missing section header: {body}");
+        assert!(
+            body.contains("## Inferred"),
+            "missing section header: {body}"
+        );
         assert!(
             body.contains("- 2026-04-26: operator likes brevity"),
             "missing dated bullet: {body}",
@@ -2415,10 +2398,7 @@ mod tests {
             "diamond;rm -rf /",
             "../diamond",
         ] {
-            assert!(
-                validate_item_id(bad).is_err(),
-                "should reject: {bad:?}",
-            );
+            assert!(validate_item_id(bad).is_err(), "should reject: {bad:?}",);
         }
     }
 
@@ -2432,10 +2412,7 @@ mod tests {
             "log_2",
             "ENCHANTED_GOLDEN_APPLE",
         ] {
-            assert!(
-                validate_item_id(ok).is_ok(),
-                "should accept: {ok:?}",
-            );
+            assert!(validate_item_id(ok).is_ok(), "should accept: {ok:?}",);
         }
         // Returned stem is always lowercased so downstream lookups
         // (pair filenames, trade `item` field) compare cleanly.
@@ -2456,10 +2433,7 @@ mod tests {
         // JSON are always lowercase. A model that writes "Diamond"
         // or "minecraft:Diamond" must still hit the canonical key.
         assert_eq!(validate_item_id("Diamond").unwrap(), "diamond");
-        assert_eq!(
-            validate_item_id("minecraft:Diamond").unwrap(),
-            "diamond",
-        );
+        assert_eq!(validate_item_id("minecraft:Diamond").unwrap(), "diamond",);
     }
 
     #[test]
@@ -2491,10 +2465,7 @@ mod tests {
         let input = json!({"uuid": "22222222-3333-4444-5555-bbbbbbbbbbbb"});
         let res = rt.block_on(get_user_balance_tool(&input, &ctx));
         assert!(res.is_err());
-        assert!(
-            res.unwrap_err().contains("access denied"),
-            "wrong error",
-        );
+        assert!(res.unwrap_err().contains("access denied"), "wrong error",);
     }
 
     #[test]

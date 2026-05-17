@@ -35,7 +35,11 @@ mod tests {
 
     #[test]
     fn serde_round_trip_preserves_negative_and_extreme_coords() {
-        let p = Position { x: -1_234, y: -64, z: i32::MAX };
+        let p = Position {
+            x: -1_234,
+            y: -64,
+            z: i32::MAX,
+        };
         let json = serde_json::to_string(&p).unwrap();
         let back: Position = serde_json::from_str(&json).unwrap();
         assert_eq!(back, p);

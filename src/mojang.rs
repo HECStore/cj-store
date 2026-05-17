@@ -56,11 +56,11 @@
 //! across an `.await`.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::OnceLock;
 #[cfg(not(test))]
 use std::sync::{Arc, LazyLock};
-#[cfg(test)]
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -68,9 +68,9 @@ use tokio::sync::Notify;
 use tracing::debug;
 
 use crate::constants::UUID_CACHE_TTL_SECS;
-use crate::types::user::MojangResolveError;
 #[cfg(not(test))]
 use crate::types::User;
+use crate::types::user::MojangResolveError;
 
 /// TTL for negative-cache (`NotFound`) entries. Short enough that a player
 /// who legitimately registers a Mojang account after a typo-driven miss can
@@ -401,7 +401,10 @@ where
                 return result;
             }
 
-            debug!(username = username, "UUID coalesced behind in-flight resolve");
+            debug!(
+                username = username,
+                "UUID coalesced behind in-flight resolve"
+            );
             notified.await;
 
             // Re-read the cache on wake. With change #3 the leader always
@@ -507,7 +510,9 @@ fn check_cache(
                 username: username.to_string(),
             }))
         }
-        CachedEntry::RateLimited { until, retry_after, .. } => {
+        CachedEntry::RateLimited {
+            until, retry_after, ..
+        } => {
             let remaining = until.saturating_duration_since(now);
             debug!(
                 username = username,
@@ -649,7 +654,12 @@ pub fn lookup_cached_uuid(username: &str) -> Option<String> {
     let now = Instant::now();
     let mut cache = uuid_cache().lock();
     let entry = cache.get_mut(&key)?;
-    if let CachedEntry::Found { uuid, fetched_at, last_access } = entry {
+    if let CachedEntry::Found {
+        uuid,
+        fetched_at,
+        last_access,
+    } = entry
+    {
         if now.duration_since(*fetched_at) < ttl {
             *last_access = now;
             return Some(uuid.clone());
@@ -687,7 +697,10 @@ pub fn cleanup_uuid_cache() {
                 "Evicted stale UUID cache entries"
             );
         } else {
-            debug!(remaining = cache.len(), "UUID cache cleanup: no stale entries");
+            debug!(
+                remaining = cache.len(),
+                "UUID cache cleanup: no stale entries"
+            );
         }
     }
     cleanup_in_flight();
@@ -844,8 +857,14 @@ mod tests {
         cleanup_uuid_cache();
 
         let guard = uuid_cache().lock();
-        assert!(guard.contains_key("fresh"), "fresh entry should be retained");
-        assert!(!guard.contains_key("stale"), "stale entry should be dropped");
+        assert!(
+            guard.contains_key("fresh"),
+            "fresh entry should be retained"
+        );
+        assert!(
+            !guard.contains_key("stale"),
+            "stale entry should be dropped"
+        );
     }
 
     #[test]
@@ -897,7 +916,10 @@ mod tests {
             format!("00000000-0000-0000-0000-{:0>12}", trimmed)
         }
         let abc = "abc";
-        assert_eq!(resolve_user_uuid(abc).await.unwrap(), expected_test_uuid(abc));
+        assert_eq!(
+            resolve_user_uuid(abc).await.unwrap(),
+            expected_test_uuid(abc)
+        );
         let sixteen = "abcdefghijklmnop";
         assert_eq!(
             resolve_user_uuid(sixteen).await.unwrap(),
@@ -907,7 +929,13 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_user_uuid_cfg_test_branch_rejects_out_of_shape_usernames() {
-        for bad in ["ab", "averylongusername", "has space", "has-dash", "has.dot"] {
+        for bad in [
+            "ab",
+            "averylongusername",
+            "has space",
+            "has-dash",
+            "has.dot",
+        ] {
             assert!(resolve_user_uuid(bad).await.is_err());
         }
     }
@@ -986,9 +1014,8 @@ mod tests {
 
         // Spawn a leader that we'll abort mid-await.
         let r = resolver.clone();
-        let leader_handle = tokio::spawn(async move {
-            resolve_user_uuid_with_resolver("bravo", r).await
-        });
+        let leader_handle =
+            tokio::spawn(async move { resolve_user_uuid_with_resolver("bravo", r).await });
 
         // Wait until the leader has registered IN_FLIGHT and is inside
         // the resolver (counter incremented).
@@ -1020,12 +1047,14 @@ mod tests {
         let resolver2 = counted_blocking_resolver(
             counter2.clone(),
             gate2.clone(),
-            Ok("00000000-0000-0000-0000-000000fffffff".chars().take(36).collect()),
+            Ok("00000000-0000-0000-0000-000000fffffff"
+                .chars()
+                .take(36)
+                .collect()),
         );
         let r2 = resolver2.clone();
-        let new_handle = tokio::spawn(async move {
-            resolve_user_uuid_with_resolver("bravo", r2).await
-        });
+        let new_handle =
+            tokio::spawn(async move { resolve_user_uuid_with_resolver("bravo", r2).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         gate2.notify_waiters();
         let _ = new_handle.await.unwrap();
@@ -1052,9 +1081,8 @@ mod tests {
 
         // Leader spawned first.
         let r1 = resolver.clone();
-        let leader = tokio::spawn(async move {
-            resolve_user_uuid_with_resolver("charlie", r1).await
-        });
+        let leader =
+            tokio::spawn(async move { resolve_user_uuid_with_resolver("charlie", r1).await });
         // Wait for leader to enter the resolver.
         for _ in 0..50 {
             if counter.load(Ordering::SeqCst) == 1 {
@@ -1064,9 +1092,8 @@ mod tests {
         }
         // Spawn follower while leader is still parked inside the resolver.
         let r2 = resolver.clone();
-        let follower = tokio::spawn(async move {
-            resolve_user_uuid_with_resolver("charlie", r2).await
-        });
+        let follower =
+            tokio::spawn(async move { resolve_user_uuid_with_resolver("charlie", r2).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         // Release the leader. The follower must wake without firing a
         // second backend call.
@@ -1081,7 +1108,10 @@ mod tests {
             .expect("follower must not hang")
             .unwrap();
         assert_eq!(leader_res.unwrap(), "00000000-0000-0000-0000-000000aaaaaa");
-        assert_eq!(follower_res.unwrap(), "00000000-0000-0000-0000-000000aaaaaa");
+        assert_eq!(
+            follower_res.unwrap(),
+            "00000000-0000-0000-0000-000000aaaaaa"
+        );
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
@@ -1101,9 +1131,7 @@ mod tests {
         );
 
         let r = resolver.clone();
-        let leader = tokio::spawn(async move {
-            resolve_user_uuid_with_resolver("delta", r).await
-        });
+        let leader = tokio::spawn(async move { resolve_user_uuid_with_resolver("delta", r).await });
         // Let leader enter the resolver.
         for _ in 0..50 {
             if counter.load(Ordering::SeqCst) == 1 {
@@ -1147,9 +1175,7 @@ mod tests {
         );
 
         let r = resolver.clone();
-        let leader = tokio::spawn(async move {
-            resolve_user_uuid_with_resolver("echo", r).await
-        });
+        let leader = tokio::spawn(async move { resolve_user_uuid_with_resolver("echo", r).await });
         for _ in 0..50 {
             if counter.load(Ordering::SeqCst) == 1 {
                 break;
@@ -1162,7 +1188,10 @@ mod tests {
         // Follower must short-circuit.
         let r2 = resolver.clone();
         let follower_res = resolve_user_uuid_with_resolver("echo", r2).await;
-        assert!(matches!(follower_res, Err(MojangResolveError::RateLimited { .. })));
+        assert!(matches!(
+            follower_res,
+            Err(MojangResolveError::RateLimited { .. })
+        ));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 

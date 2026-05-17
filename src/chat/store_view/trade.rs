@@ -82,9 +82,11 @@ pub async fn scan_filtered(
     filter: TradeFilter,
     limit: usize,
 ) -> Result<(Vec<TradeView>, bool), String> {
-    tokio::task::spawn_blocking(move || scan_filtered_in_dir(std::path::Path::new(TRADES_DIR), filter, limit))
-        .await
-        .map_err(|e| format!("scan_filtered join: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        scan_filtered_in_dir(std::path::Path::new(TRADES_DIR), filter, limit)
+    })
+    .await
+    .map_err(|e| format!("scan_filtered join: {e}"))?
 }
 
 /// Inner sync helper, exposed at module scope so tests can point at a
@@ -137,8 +139,7 @@ pub fn scan_filtered_in_dir(
         .map(|t| t.to_rfc3339().replace(':', "-"));
 
     let mut filename_paths: Vec<std::path::PathBuf> = Vec::new();
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("read_dir trades: {e}"))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir trades: {e}"))?;
     for ent in entries.flatten() {
         let path = ent.path();
         if !path.is_file() {
@@ -173,7 +174,9 @@ pub fn scan_filtered_in_dir(
     // the user-uuid filter and resilient to future callers that haven't
     // already normalized via `validate_item_id`.
     let item_filter = filter.item.as_ref().map(|s| {
-        s.strip_prefix("minecraft:").unwrap_or(s.as_str()).to_ascii_lowercase()
+        s.strip_prefix("minecraft:")
+            .unwrap_or(s.as_str())
+            .to_ascii_lowercase()
     });
     let user_uuid_filter_lc = filter.user_uuid.as_ref().map(|s| s.to_lowercase());
     let trade_type_filter = filter.trade_type.clone();
@@ -214,10 +217,7 @@ pub fn scan_filtered_in_dir(
         let trade: TradeView = match serde_json::from_str(&body) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(
-                    "[chat/trade] parse failed for {}: {e}",
-                    path.display()
-                );
+                tracing::warn!("[chat/trade] parse failed for {}: {e}", path.display());
                 continue;
             }
         };
@@ -270,9 +270,21 @@ mod tests {
         let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 0).unwrap();
         let t3 = Utc.with_ymd_and_hms(2026, 1, 3, 10, 0, 0).unwrap();
-        write_trade(&dir, t1, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#);
-        write_trade(&dir, t2, r#"{"trade_type":"Buy","item":"diamond","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#);
-        write_trade(&dir, t3, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-03T10:00:00Z"}"#);
+        write_trade(
+            &dir,
+            t1,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t2,
+            r#"{"trade_type":"Buy","item":"diamond","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t3,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-03T10:00:00Z"}"#,
+        );
         let f = TradeFilter {
             item: Some("iron_ingot".to_string()),
             ..Default::default()
@@ -294,7 +306,11 @@ mod tests {
         // user-uuid filter, which is already case-insensitive.
         let dir = fixture_dir("item-case");
         let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
-        write_trade(&dir, t1, r#"{"trade_type":"Buy","item":"diamond","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#);
+        write_trade(
+            &dir,
+            t1,
+            r#"{"trade_type":"Buy","item":"diamond","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#,
+        );
         let f = TradeFilter {
             item: Some("DIAMOND".to_string()),
             ..Default::default()
@@ -312,9 +328,21 @@ mod tests {
         let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 0).unwrap();
         let t3 = Utc.with_ymd_and_hms(2026, 1, 3, 10, 0, 0).unwrap();
-        write_trade(&dir, t1, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#);
-        write_trade(&dir, t2, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#);
-        write_trade(&dir, t3, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-03T10:00:00Z"}"#);
+        write_trade(
+            &dir,
+            t1,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t2,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t3,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-03T10:00:00Z"}"#,
+        );
         let f = TradeFilter {
             since: Some(t1),
             ..Default::default()
@@ -342,7 +370,11 @@ mod tests {
             .unwrap()
             .with_nanosecond(123_456_789)
             .unwrap();
-        write_trade(&dir, ts, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.123456789Z"}"#);
+        write_trade(
+            &dir,
+            ts,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.123456789Z"}"#,
+        );
         let since = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let f = TradeFilter {
             since: Some(since),
@@ -371,8 +403,16 @@ mod tests {
             .unwrap()
             .with_nanosecond(999_999_000)
             .unwrap();
-        write_trade(&dir, early, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.000001Z"}"#);
-        write_trade(&dir, late, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.999999Z"}"#);
+        write_trade(
+            &dir,
+            early,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.000001Z"}"#,
+        );
+        write_trade(
+            &dir,
+            late,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00.999999Z"}"#,
+        );
         let f = TradeFilter {
             since: Some(early),
             ..Default::default()
@@ -400,9 +440,21 @@ mod tests {
             .with_nanosecond(500_000_000)
             .unwrap();
         let t_whole_late = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 1).unwrap();
-        write_trade(&dir, t_whole_early, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#);
-        write_trade(&dir, t_frac, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00.500000000Z"}"#);
-        write_trade(&dir, t_whole_late, r#"{"trade_type":"Buy","item":"iron_ingot","amount":3,"amount_currency":6.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:01Z"}"#);
+        write_trade(
+            &dir,
+            t_whole_early,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t_frac,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00.500000000Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t_whole_late,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":3,"amount_currency":6.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:01Z"}"#,
+        );
         let (out, truncated) = scan_filtered_in_dir(&dir, TradeFilter::default(), 10).unwrap();
         assert!(!truncated);
         assert_eq!(out.len(), 3);
@@ -426,9 +478,21 @@ mod tests {
             .with_nanosecond(500_000_000)
             .unwrap();
         let t_whole_late = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 1).unwrap();
-        write_trade(&dir, t_whole_early, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#);
-        write_trade(&dir, t_frac, r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00.500000000Z"}"#);
-        write_trade(&dir, t_whole_late, r#"{"trade_type":"Buy","item":"iron_ingot","amount":3,"amount_currency":6.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:01Z"}"#);
+        write_trade(
+            &dir,
+            t_whole_early,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t_frac,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":2,"amount_currency":4.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:00.500000000Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t_whole_late,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":3,"amount_currency":6.0,"user_uuid":"u","timestamp":"2026-01-02T10:00:01Z"}"#,
+        );
         let f = TradeFilter {
             since: Some(t_frac),
             ..Default::default()
@@ -446,9 +510,21 @@ mod tests {
         let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 0).unwrap();
         let t3 = Utc.with_ymd_and_hms(2026, 1, 3, 10, 0, 0).unwrap();
-        write_trade(&dir, t1, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"AAAA","timestamp":"2026-01-01T10:00:00Z"}"#);
-        write_trade(&dir, t2, r#"{"trade_type":"Sell","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"BBBB","timestamp":"2026-01-02T10:00:00Z"}"#);
-        write_trade(&dir, t3, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"BBBB","timestamp":"2026-01-03T10:00:00Z"}"#);
+        write_trade(
+            &dir,
+            t1,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"AAAA","timestamp":"2026-01-01T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t2,
+            r#"{"trade_type":"Sell","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"BBBB","timestamp":"2026-01-02T10:00:00Z"}"#,
+        );
+        write_trade(
+            &dir,
+            t3,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"BBBB","timestamp":"2026-01-03T10:00:00Z"}"#,
+        );
         let f = TradeFilter {
             trade_type: Some("Buy".to_string()),
             user_uuid: Some("bbbb".to_string()), // case-insensitive
@@ -485,7 +561,11 @@ mod tests {
     fn scan_strips_minecraft_prefix_from_item_filter() {
         let dir = fixture_dir("prefix-item");
         let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
-        write_trade(&dir, t1, r#"{"trade_type":"Buy","item":"diamond","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#);
+        write_trade(
+            &dir,
+            t1,
+            r#"{"trade_type":"Buy","item":"diamond","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#,
+        );
         let f = TradeFilter {
             item: Some("minecraft:diamond".to_string()),
             ..Default::default()
@@ -501,7 +581,11 @@ mod tests {
         let dir = fixture_dir("malformed");
         let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 10, 0, 0).unwrap();
-        write_trade(&dir, t1, r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#);
+        write_trade(
+            &dir,
+            t1,
+            r#"{"trade_type":"Buy","item":"iron_ingot","amount":1,"amount_currency":2.0,"user_uuid":"u","timestamp":"2026-01-01T10:00:00Z"}"#,
+        );
         write_trade(&dir, t2, "not json");
         let (out, truncated) = scan_filtered_in_dir(&dir, TradeFilter::default(), 10).unwrap();
         assert!(!truncated);

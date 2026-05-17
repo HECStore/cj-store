@@ -4,9 +4,9 @@ use azalea::inventory::operations::PickupClick;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+use super::Bot;
 use crate::constants::{DELAY_CONTAINER_SYNC_MS, DOUBLE_CHEST_SLOTS, SHULKER_BOX_SLOTS};
 use crate::messages::TradeItem;
-use super::Bot;
 
 /// Trade slot helper functions
 ///
@@ -79,7 +79,9 @@ pub async fn wait_for_trade_menu_or_failure(
                 if msg_l.contains("not been accepted") {
                     return Err("Your trade request has not been accepted!".to_string());
                 }
-                if msg_l.contains("aborted the trade") || msg_l.contains("aborted the trade message") {
+                if msg_l.contains("aborted the trade")
+                    || msg_l.contains("aborted the trade message")
+                {
                     return Err("You aborted the trade.".to_string());
                 }
             }
@@ -171,22 +173,25 @@ pub async fn place_items_from_inventory_into_trade(
     if cursor_before.count() > 0 {
         warn!(
             "place_items_from_inventory_into_trade: Cursor has {}x {} - clearing it first",
-            cursor_before.count(), cursor_before.kind()
+            cursor_before.count(),
+            cursor_before.kind()
         );
         // Click outside to drop cursor items (they'll go back to inventory if possible)
         inv.click(PickupClick::LeftOutside);
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        
+
         // Verify cursor is now empty
         let cursor_after = super::inventory::carried_item(&client);
         if cursor_after.count() > 0 {
             error!(
                 "place_items_from_inventory_into_trade: Failed to clear cursor - still has {}x {}",
-                cursor_after.count(), cursor_after.kind()
+                cursor_after.count(),
+                cursor_after.kind()
             );
             return Err(format!(
                 "Failed to clear cursor before trade placement - cursor has {}x {}",
-                cursor_after.count(), cursor_after.kind()
+                cursor_after.count(),
+                cursor_after.kind()
             ));
         }
         debug!("place_items_from_inventory_into_trade: Cursor cleared successfully");
@@ -205,20 +210,28 @@ pub async fn place_items_from_inventory_into_trade(
         let mut total_count = 0i32;
         for (i, stack) in slots_all.iter().enumerate().skip(contents_len) {
             if stack.count() > 0 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id {
-                let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inventory" };
+                let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS {
+                    "hotbar"
+                } else {
+                    "inventory"
+                };
                 found_items.push(format!("slot {} ({}): {}x", i, slot_type, stack.count()));
                 total_count += stack.count();
             }
         }
         debug!(
             "Trade placement: need {}x {}, found {} total in {} stacks: {:?}",
-            amount, item, total_count, found_items.len(), found_items
+            amount,
+            item,
+            total_count,
+            found_items.len(),
+            found_items
         );
     }
 
     let mut remaining = amount;
     let mut placed_count = 0i32;
-    
+
     while remaining > 0 {
         // Wait for inventory state to sync from server
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -259,25 +272,52 @@ pub async fn place_items_from_inventory_into_trade(
             let mut inventory_contents = Vec::new();
             for (i, stack) in slots_all.iter().enumerate().skip(contents_len) {
                 if stack.count() > 0 {
-                    let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inv" };
-                    inventory_contents.push(format!("slot {} ({}): {}x {}", i, slot_type, stack.count(), stack.kind()));
+                    let slot_type = if i >= contents_len + SHULKER_BOX_SLOTS {
+                        "hotbar"
+                    } else {
+                        "inv"
+                    };
+                    inventory_contents.push(format!(
+                        "slot {} ({}): {}x {}",
+                        i,
+                        slot_type,
+                        stack.count(),
+                        stack.kind()
+                    ));
                 }
             }
             warn!(
                 "Failed to find {} in inventory (searched slots {}-{}, need {} more, placed {} so far). Inventory contents: {:?}",
-                target_id, contents_len, slots_all.len(), remaining, placed_count, inventory_contents
+                target_id,
+                contents_len,
+                slots_all.len(),
+                remaining,
+                placed_count,
+                inventory_contents
             );
             return Err(format!(
                 "Bot inventory lacks required items: missing {}x {} (searched {} slots, placed {} so far)",
-                remaining, item, slots_all.len() - contents_len, placed_count
+                remaining,
+                item,
+                slots_all.len() - contents_len,
+                placed_count
             ));
         };
 
-        let slot_type = if inv_slot >= contents_len + SHULKER_BOX_SLOTS { "hotbar" } else { "inventory" };
-        debug!("Found {}x {} in slot {} ({})", stack_count, target_id, inv_slot, slot_type);
+        let slot_type = if inv_slot >= contents_len + SHULKER_BOX_SLOTS {
+            "hotbar"
+        } else {
+            "inventory"
+        };
+        debug!(
+            "Found {}x {} in slot {} ({})",
+            stack_count, target_id, inv_slot, slot_type
+        );
 
         // Find an empty offer slot (or a slot with same item and room).
-        let contents = inv.contents().ok_or_else(|| "Trade menu closed".to_string())?;
+        let contents = inv
+            .contents()
+            .ok_or_else(|| "Trade menu closed".to_string())?;
         let mut target_offer: Option<usize> = None;
         for &s in &offer_slots {
             let st = contents.get(s);
@@ -292,7 +332,8 @@ pub async fn place_items_from_inventory_into_trade(
                 break;
             }
         }
-        let target_offer = target_offer.ok_or_else(|| "Bot trade offer slots are full".to_string())?;
+        let target_offer =
+            target_offer.ok_or_else(|| "Bot trade offer slots are full".to_string())?;
 
         debug!("Picking up from slot {}", inv_slot);
         inv.click(PickupClick::Left {
@@ -307,19 +348,28 @@ pub async fn place_items_from_inventory_into_trade(
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             let carried_retry = super::inventory::carried_item(&client);
             let carried_retry_count = carried_retry.count();
-            
-            if carried_retry_count <= 0 || Bot::normalize_item_id(&carried_retry.kind().to_string()) != target_id {
+
+            if carried_retry_count <= 0
+                || Bot::normalize_item_id(&carried_retry.kind().to_string()) != target_id
+            {
                 // Put back if something weird happened.
-                warn!("Failed to pick up item from slot {} - carried: {}x {}", 
-                    inv_slot, carried_retry_count, carried_retry.kind());
+                warn!(
+                    "Failed to pick up item from slot {} - carried: {}x {}",
+                    inv_slot,
+                    carried_retry_count,
+                    carried_retry.kind()
+                );
                 inv.click(PickupClick::Left {
                     slot: Some(inv_slot as u16),
                 });
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                return Err(format!("Failed to pick up the expected item stack from slot {}", inv_slot));
+                return Err(format!(
+                    "Failed to pick up the expected item stack from slot {}",
+                    inv_slot
+                ));
             }
         }
-        
+
         // Re-check carried count after potential retry
         let carried = super::inventory::carried_item(&client);
         let carried_count = carried.count();
@@ -328,13 +378,16 @@ pub async fn place_items_from_inventory_into_trade(
             // Fast path: the whole picked-up stack fits into what we still need, so
             // deposit it with a single left-click. This avoids N right-clicks (one per
             // item) and is the common case thanks to the best-fit selection above.
-            debug!("Placing {}x into offer slot {}", carried_count, target_offer);
+            debug!(
+                "Placing {}x into offer slot {}",
+                carried_count, target_offer
+            );
             inv.click(PickupClick::Left {
                 slot: Some(target_offer as u16),
             });
             // Wait longer for server to process the placement
             tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
-            
+
             // CRITICAL: Verify placement by checking if cursor is NOW EMPTY.
             // Checking the slot contents can give stale data due to server sync delay.
             // If cursor is empty after placing, the items went somewhere (the slot).
@@ -342,7 +395,10 @@ pub async fn place_items_from_inventory_into_trade(
             let carried_after = super::inventory::carried_item(&client);
             if carried_after.count() == 0 {
                 // Cursor is empty - items were successfully placed
-                debug!("Placement verified: cursor is now empty after placing {}x", carried_count);
+                debug!(
+                    "Placement verified: cursor is now empty after placing {}x",
+                    carried_count
+                );
                 remaining -= carried_count;
                 placed_count += carried_count;
             } else if Bot::normalize_item_id(&carried_after.kind().to_string()) == target_id {
@@ -358,17 +414,27 @@ pub async fn place_items_from_inventory_into_trade(
                 } else {
                     // Placement truly failed - cursor still has items
                     // Put items back in original slot instead of dropping
-                    warn!("Placement to slot {} may have failed - cursor still has {}x. Putting back in inventory slot {}",
-                        target_offer, carried_recheck.count(), inv_slot);
+                    warn!(
+                        "Placement to slot {} may have failed - cursor still has {}x. Putting back in inventory slot {}",
+                        target_offer,
+                        carried_recheck.count(),
+                        inv_slot
+                    );
                     inv.click(PickupClick::Left {
                         slot: Some(inv_slot as u16),
                     });
                     tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-                    return Err(format!("Failed to place items in trade slot {} - items returned to inventory", target_offer));
+                    return Err(format!(
+                        "Failed to place items in trade slot {} - items returned to inventory",
+                        target_offer
+                    ));
                 }
             } else {
                 // Cursor has different item type (unusual) - count original as placed
-                debug!("Cursor has different item after placement, assuming {}x were placed", carried_count);
+                debug!(
+                    "Cursor has different item after placement, assuming {}x were placed",
+                    carried_count
+                );
                 remaining -= carried_count;
                 placed_count += carried_count;
             }
@@ -376,10 +442,13 @@ pub async fn place_items_from_inventory_into_trade(
             // Slow path: picked stack is larger than we need, so we can't dump the whole
             // thing. Right-click places exactly one item per click, then the surplus on
             // cursor is returned to the original inventory slot.
-            debug!("Placing {} items (partial) into offer slot {}", remaining, target_offer);
+            debug!(
+                "Placing {} items (partial) into offer slot {}",
+                remaining, target_offer
+            );
             let items_to_place = remaining;
             let cursor_before = carried_count;
-            
+
             for _ in 0..items_to_place {
                 inv.click(PickupClick::Right {
                     slot: Some(target_offer as u16),
@@ -389,12 +458,12 @@ pub async fn place_items_from_inventory_into_trade(
             }
             // Wait for all placements to sync
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            
+
             // Check how many items remain on cursor to determine how many were placed
             let carried_after_partial = super::inventory::carried_item(&client);
             let cursor_after = carried_after_partial.count();
             let items_actually_placed = cursor_before - cursor_after;
-            
+
             // Put remainder back in inventory.
             if cursor_after > 0 {
                 inv.click(PickupClick::Left {
@@ -402,15 +471,23 @@ pub async fn place_items_from_inventory_into_trade(
                 });
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
             }
-            
+
             if items_actually_placed > 0 {
-                debug!("Partial placement: placed {} items (cursor went from {} to {})",
-                    items_actually_placed, cursor_before, cursor_after);
+                debug!(
+                    "Partial placement: placed {} items (cursor went from {} to {})",
+                    items_actually_placed, cursor_before, cursor_after
+                );
                 placed_count += items_actually_placed;
                 remaining -= items_actually_placed;
             } else {
-                warn!("Partial placement failed: cursor still has {} items", cursor_after);
-                return Err(format!("Failed to place items via right-click in trade slot {}", target_offer));
+                warn!(
+                    "Partial placement failed: cursor still has {} items",
+                    cursor_after
+                );
+                return Err(format!(
+                    "Failed to place items via right-click in trade slot {}",
+                    target_offer
+                ));
             }
         }
 
@@ -420,9 +497,12 @@ pub async fn place_items_from_inventory_into_trade(
         if carried_now.is_present() {
             // DO NOT drop outside - that causes items on the floor!
             // Instead, try to put items back into inventory
-            warn!("Cursor still has {}x {} after placement - attempting to return to inventory",
-                carried_now.count(), carried_now.kind());
-            
+            warn!(
+                "Cursor still has {}x {} after placement - attempting to return to inventory",
+                carried_now.count(),
+                carried_now.kind()
+            );
+
             // Find an empty inventory slot to put the items back
             let slots_all = inv.slots().ok_or_else(|| "Trade menu closed".to_string())?;
             let mut found_empty = false;
@@ -436,23 +516,27 @@ pub async fn place_items_from_inventory_into_trade(
                     break;
                 }
             }
-            
+
             if !found_empty {
                 // No empty slot found - try the original slot as last resort
-                warn!("No empty slot found, trying to place back in slot {}", inv_slot);
+                warn!(
+                    "No empty slot found, trying to place back in slot {}",
+                    inv_slot
+                );
                 inv.click(PickupClick::Left {
                     slot: Some(inv_slot as u16),
                 });
                 tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
             }
-            
+
             // Verify cursor is now empty
             let carried_final = super::inventory::carried_item(&client);
             if carried_final.is_present() {
                 // Still has items - this is a serious issue
                 return Err(format!(
                     "Failed to clear cursor - {}x {} still on cursor after trade placement attempt",
-                    carried_final.count(), carried_final.kind()
+                    carried_final.count(),
+                    carried_final.kind()
                 ));
             }
         }
@@ -487,15 +571,16 @@ fn validate_player_items(
 ) -> (std::collections::HashMap<String, i32>, Vec<String>) {
     let mut validation_errors = Vec::new();
     let mut found_items: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    
+
     // If no player offers expected, all slots must be empty
     if player_offers.is_empty() {
         for &slot_idx in player_slots {
             if let Some(stack) = contents.get(slot_idx)
-                && stack.count() > 0 {
-                    let item_id = Bot::normalize_item_id(&stack.kind().to_string());
-                    validation_errors.push(format!("Unexpected item: {} (no items expected)", item_id));
-                }
+                && stack.count() > 0
+            {
+                let item_id = Bot::normalize_item_id(&stack.kind().to_string());
+                validation_errors.push(format!("Unexpected item: {} (no items expected)", item_id));
+            }
         }
     } else {
         // Build normalized expected item IDs for quick lookup
@@ -503,25 +588,29 @@ fn validate_player_items(
             .iter()
             .map(|ti| (Bot::normalize_item_id(&ti.item), ti.amount))
             .collect();
-        
+
         // Scan all player slots for items
         for &slot_idx in player_slots {
             if let Some(stack) = contents.get(slot_idx)
-                && stack.count() > 0 {
-                    let item_id = Bot::normalize_item_id(&stack.kind().to_string());
-                    *found_items.entry(item_id.clone()).or_insert(0) += stack.count();
-                    
-                    // Check if this item is expected
-                    if !expected_items.contains_key(&item_id) {
-                        validation_errors.push(format!("Unexpected item type: {} (not in expected list)", item_id));
-                    }
+                && stack.count() > 0
+            {
+                let item_id = Bot::normalize_item_id(&stack.kind().to_string());
+                *found_items.entry(item_id.clone()).or_insert(0) += stack.count();
+
+                // Check if this item is expected
+                if !expected_items.contains_key(&item_id) {
+                    validation_errors.push(format!(
+                        "Unexpected item type: {} (not in expected list)",
+                        item_id
+                    ));
                 }
+            }
         }
-        
+
         // Validate expected items based on validation mode
         for (expected_id, expected_amount) in &expected_items {
             let got = found_items.get(expected_id).copied().unwrap_or(0);
-            
+
             if flexible_validation {
                 // FLEXIBLE MODE: Accept any amount >= 1 (for deposit without specified amount)
                 // Only check that at least 1 of the expected item type was provided
@@ -551,15 +640,15 @@ fn validate_player_items(
             }
         }
     }
-    
+
     (found_items, validation_errors)
 }
 
 /// Execute a full trade with a player via the trade GUI
-/// 
+///
 /// Returns the actual items received from the player (may differ from player_offers
 /// if player offers fewer items - useful for partial payment with balance).
-/// 
+///
 /// **Validation modes**:
 /// - `require_exact_amount`: If true, reject trades where player offers MORE than expected.
 ///   Use for sell orders where exact quantity is required.
@@ -583,18 +672,24 @@ pub async fn execute_trade_with_player(
     // Azalea panics with "Our client is missing a required component: Inventory"
     // if we touch inventory before the entity has spawned into the world.
     if !super::inventory::is_entity_ready(&client) {
-        warn!("Entity not ready for trade with {}, waiting for initialization", target_username);
+        warn!(
+            "Entity not ready for trade with {}, waiting for initialization",
+            target_username
+        );
         super::inventory::wait_for_entity_ready(&client).await?;
         debug!("Entity now ready for trade with {}", target_username);
     }
 
     // Inventory hygiene: clear inventory into buffer chest if configured.
     super::inventory::ensure_inventory_empty(bot).await?;
-    
+
     // Hotbar slot 0 must be free so a failed trade's rollback path (shulker ops)
     // has somewhere to put the currently-held shulker.
     if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-        warn!("Trade with {}: failed to clear hotbar before trade: {} - proceeding anyway", target_username, e);
+        warn!(
+            "Trade with {}: failed to clear hotbar before trade: {} - proceeding anyway",
+            target_username, e
+        );
     }
 
     // Close any open container first (avoids accidental interactions).
@@ -604,7 +699,8 @@ pub async fn execute_trade_with_player(
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     }
 
-    bot.send_chat_message(&format!("/trade {}", target_username)).await?;
+    bot.send_chat_message(&format!("/trade {}", target_username))
+        .await?;
 
     let chat_rx = bot.chat_subscribe();
     let inv = wait_for_trade_menu_or_failure(
@@ -615,24 +711,27 @@ pub async fn execute_trade_with_player(
     .await?;
 
     for ti in bot_offers {
-        place_items_from_inventory_into_trade(bot, &inv, &ti.item, ti.amount)
-            .await?;
+        place_items_from_inventory_into_trade(bot, &inv, &ti.item, ti.amount).await?;
     }
 
     // Verify bot offers were placed correctly
     {
-        let contents = inv.contents().ok_or_else(|| "Trade menu closed".to_string())?;
+        let contents = inv
+            .contents()
+            .ok_or_else(|| "Trade menu closed".to_string())?;
         let bot_slots = trade_bot_offer_slots();
-        let mut total_offered: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-        
+        let mut total_offered: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+
         for &slot_idx in &bot_slots {
             if let Some(stack) = contents.get(slot_idx)
-                && stack.count() > 0 {
-                    let item_id = Bot::normalize_item_id(&stack.kind().to_string());
-                    *total_offered.entry(item_id).or_insert(0) += stack.count();
-                }
+                && stack.count() > 0
+            {
+                let item_id = Bot::normalize_item_id(&stack.kind().to_string());
+                *total_offered.entry(item_id).or_insert(0) += stack.count();
+            }
         }
-        
+
         // Check each expected offer
         for ti in bot_offers {
             let expected_id = Bot::normalize_item_id(&ti.item);
@@ -646,7 +745,10 @@ pub async fn execute_trade_with_player(
                 inv.close();
                 return Err(error_msg);
             }
-            debug!("Bot offer verified for trade with {}: {}x {} in trade GUI", target_username, actual, ti.item);
+            debug!(
+                "Bot offer verified for trade with {}: {}x {} in trade GUI",
+                target_username, actual, ti.item
+            );
         }
     }
 
@@ -685,7 +787,7 @@ pub async fn execute_trade_with_player(
             amount: ti.amount,
         });
     }
-    
+
     while start.elapsed() < tokio::time::Duration::from_millis(bot.trade_timeout_ms) {
         // Check if trade menu is still open before trying to get contents
         let current = client.get_inventory();
@@ -695,10 +797,10 @@ pub async fn execute_trade_with_player(
                 // Bot clicked accept and items were validated at some point
                 // BUT the trade could have been REJECTED by server if player modified items after we accepted
                 // CRITICAL: Verify trade success by checking if bot still has the items it was supposed to give away
-                
+
                 // Wait a moment for inventory to sync after trade closes
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                
+
                 // Check if bot still has the items it placed in the trade
                 // If bot still has them, trade was REJECTED (items returned)
                 let inv_handle = client.open_inventory();
@@ -709,18 +811,19 @@ pub async fn execute_trade_with_player(
                             if placed_item.amount <= 0 {
                                 continue;
                             }
-                            
+
                             // Count how many of this item the bot currently has in inventory
                             let mut found_in_inv = 0i32;
                             for slot in all_slots.iter() {
                                 if slot.count() > 0 {
-                                    let slot_item = Bot::normalize_item_id(&slot.kind().to_string());
+                                    let slot_item =
+                                        Bot::normalize_item_id(&slot.kind().to_string());
                                     if slot_item == placed_item.item {
                                         found_in_inv += slot.count();
                                     }
                                 }
                             }
-                            
+
                             // If bot still has most of the items it was supposed to give away,
                             // the trade was likely REJECTED
                             // Use 80% threshold to account for possible rounding/partial issues
@@ -730,12 +833,20 @@ pub async fn execute_trade_with_player(
                             if found_in_inv >= threshold {
                                 warn!(
                                     "Trade with {} REJECTED: Bot still has {}x {} in inventory (placed {}x in trade). Items were NOT exchanged!",
-                                    target_username, found_in_inv, placed_item.item, placed_item.amount
+                                    target_username,
+                                    found_in_inv,
+                                    placed_item.item,
+                                    placed_item.amount
                                 );
                                 drop(inv);
 
-                                if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                                    warn!("Failed to consolidate hotbar items after rejected trade with {}: {}", target_username, e);
+                                if let Err(e) =
+                                    super::inventory::move_hotbar_to_inventory(bot).await
+                                {
+                                    warn!(
+                                        "Failed to consolidate hotbar items after rejected trade with {}: {}",
+                                        target_username, e
+                                    );
                                 }
 
                                 return Err(format!(
@@ -749,16 +860,28 @@ pub async fn execute_trade_with_player(
                 }
 
                 // Items not found in bot inventory = trade completed successfully
-                info!("Trade with {} completed (menu closed after accept)", target_username);
+                info!(
+                    "Trade with {} completed (menu closed after accept)",
+                    target_username
+                );
                 if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                    warn!("Failed to move hotbar items to inventory after trade with {}: {}", target_username, e);
+                    warn!(
+                        "Failed to move hotbar items to inventory after trade with {}: {}",
+                        target_username, e
+                    );
                 }
                 return Ok(actual_received);
             } else if ever_validated {
-                warn!("Trade with {} cancelled by player before bot could accept (items were validated)", target_username);
+                warn!(
+                    "Trade with {} cancelled by player before bot could accept (items were validated)",
+                    target_username
+                );
                 return Err("Trade cancelled by player before completion".to_string());
             } else {
-                warn!("Trade with {} menu closed before bot could validate items", target_username);
+                warn!(
+                    "Trade with {} menu closed before bot could validate items",
+                    target_username
+                );
                 return Err("Trade closed before items could be validated".to_string());
             }
         }
@@ -772,7 +895,7 @@ pub async fn execute_trade_with_player(
                     if bot_accepted && ever_validated {
                         // Need to verify trade actually succeeded (same logic as above)
                         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                        
+
                         let inv_handle = client.open_inventory();
                         if let Some(inv_check) = inv_handle {
                             if let Some(all_slots) = inv_check.slots() {
@@ -783,14 +906,16 @@ pub async fn execute_trade_with_player(
                                     let mut found_in_inv = 0i32;
                                     for slot in all_slots.iter() {
                                         if slot.count() > 0 {
-                                            let slot_item = Bot::normalize_item_id(&slot.kind().to_string());
+                                            let slot_item =
+                                                Bot::normalize_item_id(&slot.kind().to_string());
                                             if slot_item == placed_item.item {
                                                 found_in_inv += slot.count();
                                             }
                                         }
                                     }
                                     // CRITICAL: Threshold must be at least 1 (see main check for explanation)
-                                    let threshold = ((placed_item.amount as f64 * 0.8) as i32).max(1);
+                                    let threshold =
+                                        ((placed_item.amount as f64 * 0.8) as i32).max(1);
                                     if found_in_inv >= threshold {
                                         warn!(
                                             "Trade with {} REJECTED (content check): Bot still has {}x {} in inventory",
@@ -798,8 +923,13 @@ pub async fn execute_trade_with_player(
                                         );
                                         drop(inv_check);
 
-                                        if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                                            warn!("Failed to consolidate hotbar items after rejected trade with {}: {}", target_username, e);
+                                        if let Err(e) =
+                                            super::inventory::move_hotbar_to_inventory(bot).await
+                                        {
+                                            warn!(
+                                                "Failed to consolidate hotbar items after rejected trade with {}: {}",
+                                                target_username, e
+                                            );
                                         }
 
                                         return Err(format!(
@@ -812,13 +942,22 @@ pub async fn execute_trade_with_player(
                             drop(inv_check);
                         }
 
-                        info!("Trade with {} completed (verified during content check)", target_username);
+                        info!(
+                            "Trade with {} completed (verified during content check)",
+                            target_username
+                        );
                         if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                            warn!("Failed to move hotbar items to inventory after trade with {}: {}", target_username, e);
+                            warn!(
+                                "Failed to move hotbar items to inventory after trade with {}: {}",
+                                target_username, e
+                            );
                         }
                         return Ok(actual_received);
                     } else {
-                        warn!("Trade with {} menu closed during content check before bot accepted", target_username);
+                        warn!(
+                            "Trade with {} menu closed during content check before bot accepted",
+                            target_username
+                        );
                         return Err("Trade closed before items could be validated".to_string());
                     }
                 }
@@ -827,7 +966,7 @@ pub async fn execute_trade_with_player(
                 continue;
             }
         };
-        
+
         // Check if there's no gray_dye (meaning ready: either magenta or lime_dye)
         let mut no_gray_dye = true;
         for &s in &status_slots {
@@ -856,11 +995,18 @@ pub async fn execute_trade_with_player(
                 require_exact_amount,
                 flexible_validation,
             );
-            
+
             if !validation_errors.is_empty() {
-                error!("Trade with {} validation failed: {}", target_username, validation_errors.join("; "));
+                error!(
+                    "Trade with {} validation failed: {}",
+                    target_username,
+                    validation_errors.join("; ")
+                );
                 inv.close();
-                return Err(format!("Trade validation failed: {}", validation_errors.join("; ")));
+                return Err(format!(
+                    "Trade validation failed: {}",
+                    validation_errors.join("; ")
+                ));
             }
 
             actual_received = found_items
@@ -874,19 +1020,26 @@ pub async fn execute_trade_with_player(
                     .iter()
                     .map(|t| format!("{}x {}", t.amount, t.item))
                     .collect();
-                info!("Trade with {}: items validated, received [{}] - accepting trade now", target_username, received_summary.join(", "));
+                info!(
+                    "Trade with {}: items validated, received [{}] - accepting trade now",
+                    target_username,
+                    received_summary.join(", ")
+                );
             }
 
             // Rate-limit accept to once per 250ms - a second click on lime wool
             // toggles us back to "not ready" and can unaccept a just-accepted trade.
             if last_click_time.elapsed() >= tokio::time::Duration::from_millis(250) {
-                debug!("Trade with {}: clicking lime wool accept button (no gray_dye detected)", target_username);
+                debug!(
+                    "Trade with {}: clicking lime wool accept button (no gray_dye detected)",
+                    target_username
+                );
                 inv.click(PickupClick::Left {
                     slot: Some(accept_slots[0] as u16),
                 });
                 last_click_time = tokio::time::Instant::now();
                 bot_accepted = true; // Mark that bot has clicked accept after validation
-                
+
                 // Check if trade completed after clicking
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let current_after = client.get_inventory();
@@ -894,7 +1047,7 @@ pub async fn execute_trade_with_player(
                     // Trade menu closed - need to verify trade actually succeeded
                     // Wait a moment for inventory to sync
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    
+
                     let inv_handle = client.open_inventory();
                     if let Some(inv_check) = inv_handle {
                         if let Some(all_slots) = inv_check.slots() {
@@ -905,7 +1058,8 @@ pub async fn execute_trade_with_player(
                                 let mut found_in_inv = 0i32;
                                 for slot in all_slots.iter() {
                                     if slot.count() > 0 {
-                                        let slot_item = Bot::normalize_item_id(&slot.kind().to_string());
+                                        let slot_item =
+                                            Bot::normalize_item_id(&slot.kind().to_string());
                                         if slot_item == placed_item.item {
                                             found_in_inv += slot.count();
                                         }
@@ -920,8 +1074,13 @@ pub async fn execute_trade_with_player(
                                     );
                                     drop(inv_check);
 
-                                    if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                                        warn!("Failed to consolidate hotbar items after rejected trade with {}: {}", target_username, e);
+                                    if let Err(e) =
+                                        super::inventory::move_hotbar_to_inventory(bot).await
+                                    {
+                                        warn!(
+                                            "Failed to consolidate hotbar items after rejected trade with {}: {}",
+                                            target_username, e
+                                        );
                                     }
 
                                     return Err(format!(
@@ -934,9 +1093,15 @@ pub async fn execute_trade_with_player(
                         drop(inv_check);
                     }
 
-                    info!("Trade with {} completed (after accept click)", target_username);
+                    info!(
+                        "Trade with {} completed (after accept click)",
+                        target_username
+                    );
                     if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                        warn!("Failed to move hotbar items to inventory after trade with {}: {}", target_username, e);
+                        warn!(
+                            "Failed to move hotbar items to inventory after trade with {}: {}",
+                            target_username, e
+                        );
                     }
                     return Ok(actual_received);
                 }
@@ -944,7 +1109,10 @@ pub async fn execute_trade_with_player(
         } else if ever_validated {
             // Dye went back to gray after we'd already validated -
             // player is swapping items; we'll re-validate next tick.
-            debug!("Trade with {}: gray dye detected again, player may be modifying items", target_username);
+            debug!(
+                "Trade with {}: gray dye detected again, player may be modifying items",
+                target_username
+            );
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -956,7 +1124,7 @@ pub async fn execute_trade_with_player(
         if bot_accepted && ever_validated {
             // Need to verify trade actually succeeded
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-            
+
             let inv_handle = client.open_inventory();
             if let Some(inv_check) = inv_handle {
                 if let Some(all_slots) = inv_check.slots() {
@@ -983,7 +1151,10 @@ pub async fn execute_trade_with_player(
                             drop(inv_check);
 
                             if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                                warn!("Failed to consolidate hotbar items after rejected trade with {}: {}", target_username, e);
+                                warn!(
+                                    "Failed to consolidate hotbar items after rejected trade with {}: {}",
+                                    target_username, e
+                                );
                             }
 
                             return Err(format!(
@@ -996,18 +1167,30 @@ pub async fn execute_trade_with_player(
                 drop(inv_check);
             }
 
-            info!("Trade with {} completed (verified at timeout)", target_username);
+            info!(
+                "Trade with {} completed (verified at timeout)",
+                target_username
+            );
             if let Err(e) = super::inventory::move_hotbar_to_inventory(bot).await {
-                warn!("Failed to move hotbar items to inventory after trade with {}: {}", target_username, e);
+                warn!(
+                    "Failed to move hotbar items to inventory after trade with {}: {}",
+                    target_username, e
+                );
             }
             return Ok(actual_received);
         } else {
-            warn!("Trade with {} menu closed at timeout but bot had not accepted (validated: {}, accepted: {})", target_username, ever_validated, bot_accepted);
+            warn!(
+                "Trade with {} menu closed at timeout but bot had not accepted (validated: {}, accepted: {})",
+                target_username, ever_validated, bot_accepted
+            );
             return Err("Trade closed unexpectedly before bot could accept".to_string());
         }
     }
 
-    warn!("Trade with {} timed out after {}ms without player confirmation", target_username, bot.trade_timeout_ms);
+    warn!(
+        "Trade with {} timed out after {}ms without player confirmation",
+        target_username, bot.trade_timeout_ms
+    );
     inv.close();
     Err("Trade not ready: player did not confirm or items incorrect within timeout".to_string())
 }
@@ -1060,7 +1243,11 @@ mod tests {
         ] {
             for slot in set {
                 assert!(seen.insert(slot), "slot {} appears in multiple sets", slot);
-                assert!(slot < crate::constants::DOUBLE_CHEST_SLOTS, "slot {} out of double-chest range", slot);
+                assert!(
+                    slot < crate::constants::DOUBLE_CHEST_SLOTS,
+                    "slot {} out of double-chest range",
+                    slot
+                );
             }
         }
     }
@@ -1098,7 +1285,11 @@ mod tests {
         place(&mut contents, player_slots[0], ItemKind::Diamond, 1);
         let (_found, errors) = validate_player_items(&contents, &player_slots, &[], false, false);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("Unexpected"), "unexpected item should be flagged: {}", errors[0]);
+        assert!(
+            errors[0].contains("Unexpected"),
+            "unexpected item should be flagged: {}",
+            errors[0]
+        );
         assert!(errors[0].contains("diamond"));
     }
 
@@ -1107,8 +1298,12 @@ mod tests {
         let mut contents = empty_contents();
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 5);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 5 }];
-        let (found, errors) = validate_player_items(&contents, &player_slots, &offers, false, false);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 5,
+        }];
+        let (found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, false, false);
         assert!(errors.is_empty(), "exact match should pass: {:?}", errors);
         assert_eq!(found.get("diamond").copied(), Some(5));
     }
@@ -1118,9 +1313,17 @@ mod tests {
         let mut contents = empty_contents();
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 7);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 5 }];
-        let (found, errors) = validate_player_items(&contents, &player_slots, &offers, false, false);
-        assert!(errors.is_empty(), "surplus is allowed by default: {:?}", errors);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 5,
+        }];
+        let (found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, false, false);
+        assert!(
+            errors.is_empty(),
+            "surplus is allowed by default: {:?}",
+            errors
+        );
         assert_eq!(found.get("diamond").copied(), Some(7));
     }
 
@@ -1129,10 +1332,18 @@ mod tests {
         let mut contents = empty_contents();
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 3);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 5 }];
-        let (_found, errors) = validate_player_items(&contents, &player_slots, &offers, false, false);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 5,
+        }];
+        let (_found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, false, false);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("Insufficient"), "should flag insufficient: {}", errors[0]);
+        assert!(
+            errors[0].contains("Insufficient"),
+            "should flag insufficient: {}",
+            errors[0]
+        );
     }
 
     #[test]
@@ -1140,10 +1351,18 @@ mod tests {
         let mut contents = empty_contents();
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 6);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 5 }];
-        let (_found, errors) = validate_player_items(&contents, &player_slots, &offers, true, false);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 5,
+        }];
+        let (_found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, true, false);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("Too many"), "should flag excess: {}", errors[0]);
+        assert!(
+            errors[0].contains("Too many"),
+            "should flag excess: {}",
+            errors[0]
+        );
     }
 
     #[test]
@@ -1151,9 +1370,16 @@ mod tests {
         let mut contents = empty_contents();
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 1);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 64 }];
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 64,
+        }];
         let (found, errors) = validate_player_items(&contents, &player_slots, &offers, false, true);
-        assert!(errors.is_empty(), "flexible mode should accept any >=1: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "flexible mode should accept any >=1: {:?}",
+            errors
+        );
         assert_eq!(found.get("diamond").copied(), Some(1));
     }
 
@@ -1161,10 +1387,18 @@ mod tests {
     fn validate_player_items_flexible_rejects_when_expected_type_missing() {
         let contents = empty_contents();
         let player_slots = trade_player_offer_slots();
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 1 }];
-        let (_found, errors) = validate_player_items(&contents, &player_slots, &offers, false, true);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 1,
+        }];
+        let (_found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, false, true);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("Expected at least 1"), "msg: {}", errors[0]);
+        assert!(
+            errors[0].contains("Expected at least 1"),
+            "msg: {}",
+            errors[0]
+        );
     }
 
     #[test]
@@ -1173,10 +1407,19 @@ mod tests {
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 5);
         place(&mut contents, player_slots[1], ItemKind::GoldIngot, 2);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 5 }];
-        let (_found, errors) = validate_player_items(&contents, &player_slots, &offers, false, false);
-        assert!(errors.iter().any(|e| e.contains("Unexpected") && e.contains("gold_ingot")),
-            "should flag unexpected gold_ingot: {:?}", errors);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 5,
+        }];
+        let (_found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, false, false);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Unexpected") && e.contains("gold_ingot")),
+            "should flag unexpected gold_ingot: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -1185,9 +1428,17 @@ mod tests {
         let player_slots = trade_player_offer_slots();
         place(&mut contents, player_slots[0], ItemKind::Diamond, 4);
         place(&mut contents, player_slots[1], ItemKind::Diamond, 3);
-        let offers = vec![TradeItem { item: "minecraft:diamond".into(), amount: 7 }];
-        let (found, errors) = validate_player_items(&contents, &player_slots, &offers, false, false);
-        assert!(errors.is_empty(), "summed stacks should validate: {:?}", errors);
+        let offers = vec![TradeItem {
+            item: "minecraft:diamond".into(),
+            amount: 7,
+        }];
+        let (found, errors) =
+            validate_player_items(&contents, &player_slots, &offers, false, false);
+        assert!(
+            errors.is_empty(),
+            "summed stacks should validate: {:?}",
+            errors
+        );
         assert_eq!(found.get("diamond").copied(), Some(7));
     }
 
@@ -1199,6 +1450,10 @@ mod tests {
         let player_slots = trade_player_offer_slots();
         contents[player_slots[0]] = ItemStack::new(ItemKind::Diamond, 0);
         let (_found, errors) = validate_player_items(&contents, &player_slots, &[], false, false);
-        assert!(errors.is_empty(), "zero-count stack must not count as present: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "zero-count stack must not count as present: {:?}",
+            errors
+        );
     }
 }

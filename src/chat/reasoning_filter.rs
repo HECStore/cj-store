@@ -307,8 +307,7 @@ pub fn build_shorten_request(
 /// the single task of making an already-vetted-clean message fit the
 /// chat-line cap, while still requiring the existing JSON verdict
 /// shape so the caller can reuse [`parse_verdict`].
-const SHORTEN_SYSTEM_PROMPT: &str =
-    "You are tightening a chat-line draft for a Minecraft store-running \
+const SHORTEN_SYSTEM_PROMPT: &str = "You are tightening a chat-line draft for a Minecraft store-running \
      player chat bot. The bot's outbound chat is hard-capped at \
      a small character budget; the draft you receive is currently over \
      it. Your job is to rewrite the draft shorter so it fits, preserving \
@@ -335,8 +334,7 @@ const SHORTEN_SYSTEM_PROMPT: &str =
 
 /// The single, fixed system prompt for the filter. Kept as a `&'static
 /// str` so the per-call allocation is just the user-side wrapper text.
-const SYSTEM_PROMPT: &str =
-    "You are a strict reasoning-leak filter for a chat bot. The bot plays \
+const SYSTEM_PROMPT: &str = "You are a strict reasoning-leak filter for a chat bot. The bot plays \
      Minecraft as a friendly store-running player. A separate model (the \
      \"composer\") produced a candidate chat line, and you decide whether \
      that line is safe to ship to public Minecraft chat AS-IS, needs \
@@ -510,8 +508,15 @@ pub fn looks_like_reasoning_leak(s: &str) -> bool {
     // not match `thinking`. Kept inline rather than re-exporting the
     // pacing constant so the two helpers stay independently
     // grep-auditable; the test below pins the overlap.
-    const REASONING_TAGS: &[&str] =
-        &["thinking", "think", "reasoning", "reason", "analysis", "scratchpad", "monologue"];
+    const REASONING_TAGS: &[&str] = &[
+        "thinking",
+        "think",
+        "reasoning",
+        "reason",
+        "analysis",
+        "scratchpad",
+        "monologue",
+    ];
     for tag in REASONING_TAGS {
         let prefix = format!("<{tag}");
         let mut from = 0usize;
@@ -543,7 +548,10 @@ pub fn looks_like_reasoning_leak(s: &str) -> bool {
     ];
     for line in lower.lines() {
         let trimmed = line.trim_start();
-        if REASONING_LINE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        if REASONING_LINE_PREFIXES
+            .iter()
+            .any(|p| trimmed.starts_with(p))
+        {
             return true;
         }
     }
@@ -682,7 +690,8 @@ mod tests {
 
     #[test]
     fn parse_verdict_strip_carries_extracted_message() {
-        let raw = r#"{"action":"strip","message":"hey, welcome","reason":"reasoning prefix detected"}"#;
+        let raw =
+            r#"{"action":"strip","message":"hey, welcome","reason":"reasoning prefix detected"}"#;
         let v = parse_verdict(raw).unwrap();
         assert_eq!(v.action, VerdictAction::Strip);
         assert_eq!(v.message, "hey, welcome");
@@ -785,9 +794,7 @@ mod tests {
         // (in `crate::chat::mod`) is responsible for re-running Haiku
         // via [`build_shorten_request`] until the message fits.
         let oversized = "x".repeat(FILTER_MESSAGE_CHAR_LIMIT + 100);
-        let raw = format!(
-            r#"{{"action":"rewrite","message":"{oversized}","reason":"too long"}}"#
-        );
+        let raw = format!(r#"{{"action":"rewrite","message":"{oversized}","reason":"too long"}}"#);
         let v = parse_verdict(&raw).unwrap();
         assert_eq!(v.action, VerdictAction::Rewrite);
         assert_eq!(v.message.chars().count(), FILTER_MESSAGE_CHAR_LIMIT + 100);
@@ -971,11 +978,7 @@ mod tests {
         // so a regression that stuffed the candidate into the system
         // prompt instead would silently break caching shape (and the
         // prompt-injection isolation we get from <candidate> tags).
-        let req = build_request(
-            "claude-haiku-4-5-20251001",
-            "CANDIDATE_MARKER",
-            Some(0.0),
-        );
+        let req = build_request("claude-haiku-4-5-20251001", "CANDIDATE_MARKER", Some(0.0));
         assert_eq!(req.system.len(), 1);
         // Candidate must NOT appear in the system block.
         match &req.system[0] {
@@ -1003,11 +1006,7 @@ mod tests {
         // rate-limit input estimate, and audit-log records all stay
         // bounded.
         let candidate = "x".repeat(MAX_CANDIDATE_CHARS + 500);
-        let req = build_request(
-            "claude-haiku-4-5-20251001",
-            &candidate,
-            Some(0.0),
-        );
+        let req = build_request("claude-haiku-4-5-20251001", &candidate, Some(0.0));
         let user_text = match &req.messages[0].content[0] {
             crate::chat::client::ContentBlock::Text { text, .. } => text.clone(),
             _ => panic!("user turn must be a Text block"),
@@ -1032,11 +1031,7 @@ mod tests {
         // Defensive pin: the prompt MUST mention each action label so a
         // future tightening that drops one (typo, reordering) is caught
         // by a test rather than silently changing model behavior.
-        let req = build_request(
-            "claude-haiku-4-5-20251001",
-            "x",
-            None,
-        );
+        let req = build_request("claude-haiku-4-5-20251001", "x", None);
         match &req.system[0] {
             crate::chat::client::SystemBlock::Text { text, .. } => {
                 assert!(text.contains("\"send\""));
@@ -1053,11 +1048,7 @@ mod tests {
         // user turn (wrapped in <draft> tags), NOT the system prompt —
         // the system prompt is reusable across calls and should not bake
         // in per-call data.
-        let req = build_shorten_request(
-            "claude-haiku-4-5-20251001",
-            "DRAFT_MARKER",
-            Some(0.0),
-        );
+        let req = build_shorten_request("claude-haiku-4-5-20251001", "DRAFT_MARKER", Some(0.0));
         match &req.system[0] {
             crate::chat::client::SystemBlock::Text { text, .. } => {
                 assert!(!text.contains("DRAFT_MARKER"));
@@ -1160,13 +1151,17 @@ mod tests {
 
     #[test]
     fn looks_like_reasoning_leak_flags_thinking_tag() {
-        assert!(looks_like_reasoning_leak("<thinking>i should be casual</thinking>"));
+        assert!(looks_like_reasoning_leak(
+            "<thinking>i should be casual</thinking>"
+        ));
         assert!(looks_like_reasoning_leak("blah <thinking>x</thinking>"));
         // Case-insensitive — pacing strips both cases.
         assert!(looks_like_reasoning_leak("<THINKING>x</THINKING>"));
         // Tag-shape: name-continuation char after the tag name means it
         // is a different word, not the reasoning tag.
-        assert!(!looks_like_reasoning_leak("<thinking-cap>hello</thinking-cap>"));
+        assert!(!looks_like_reasoning_leak(
+            "<thinking-cap>hello</thinking-cap>"
+        ));
     }
 
     #[test]
@@ -1179,7 +1174,9 @@ mod tests {
     #[test]
     fn looks_like_reasoning_leak_flags_bare_planning_narration() {
         assert!(looks_like_reasoning_leak("i should greet this new player"));
-        assert!(looks_like_reasoning_leak("per my memory, when a new player joins"));
+        assert!(looks_like_reasoning_leak(
+            "per my memory, when a new player joins"
+        ));
         assert!(looks_like_reasoning_leak("my goal is to be helpful"));
         assert!(looks_like_reasoning_leak("Let me think about this"));
     }
@@ -1287,7 +1284,10 @@ mod tests {
         let dirty = "line1\nline2\rline3\tline4\x07line5";
         let cleaned = sanitize_reason(dirty);
         assert!(!cleaned.contains('\n'), "newline must not survive sanitize");
-        assert!(!cleaned.contains('\r'), "carriage return must not survive sanitize");
+        assert!(
+            !cleaned.contains('\r'),
+            "carriage return must not survive sanitize"
+        );
         assert!(!cleaned.contains('\t'), "tab must not survive sanitize");
         assert!(!cleaned.contains('\x07'), "BEL must not survive sanitize");
         assert_eq!(cleaned, "line1 line2 line3 line4 line5");

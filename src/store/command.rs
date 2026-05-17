@@ -57,17 +57,27 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
     };
 
     match verb {
-        "buy" | "b" => parse_item_quantity(&parts, "buy").map(|(item, quantity)| Command::Buy { item, quantity }),
-        "sell" | "s" => parse_item_quantity(&parts, "sell").map(|(item, quantity)| Command::Sell { item, quantity }),
+        "buy" | "b" => parse_item_quantity(&parts, "buy")
+            .map(|(item, quantity)| Command::Buy { item, quantity }),
+        "sell" | "s" => parse_item_quantity(&parts, "sell")
+            .map(|(item, quantity)| Command::Sell { item, quantity }),
 
-        "deposit" | "d" => parse_optional_amount(&parts, "deposit").map(|amount| Command::Deposit { amount }),
-        "withdraw" | "w" => parse_optional_amount(&parts, "withdraw").map(|amount| Command::Withdraw { amount }),
+        "deposit" | "d" => {
+            parse_optional_amount(&parts, "deposit").map(|amount| Command::Deposit { amount })
+        }
+        "withdraw" | "w" => {
+            parse_optional_amount(&parts, "withdraw").map(|amount| Command::Withdraw { amount })
+        }
 
         "price" | "p" => parse_price(&parts),
         "balance" | "bal" => parse_balance(&parts),
         "pay" => parse_pay(&parts),
-        "items" => Ok(Command::Items { page: parse_page(&parts) }),
-        "queue" | "q" => Ok(Command::Queue { page: parse_page(&parts) }),
+        "items" => Ok(Command::Items {
+            page: parse_page(&parts),
+        }),
+        "queue" | "q" => Ok(Command::Queue {
+            page: parse_page(&parts),
+        }),
         "cancel" | "c" => parse_cancel(&parts),
         "status" => Ok(Command::Status),
         "help" | "h" => Ok(Command::Help {
@@ -92,7 +102,10 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
 
 fn parse_item_quantity(parts: &[&str], verb: &str) -> Result<(ItemId, u32), String> {
     if parts.len() < 3 {
-        return Err(format!("Usage: {} <item> <quantity>. Example: {} cobblestone 64", verb, verb));
+        return Err(format!(
+            "Usage: {} <item> <quantity>. Example: {} cobblestone 64",
+            verb, verb
+        ));
     }
     let item = validate_item_name(parts[1])?;
     let quantity = validate_quantity(parts[2], verb)?;
@@ -355,8 +368,14 @@ mod tests {
 
     #[test]
     fn deposit_without_amount_leaves_amount_none() {
-        assert_eq!(parse_command("deposit").unwrap(), Command::Deposit { amount: None });
-        assert_eq!(parse_command("d").unwrap(), Command::Deposit { amount: None });
+        assert_eq!(
+            parse_command("deposit").unwrap(),
+            Command::Deposit { amount: None }
+        );
+        assert_eq!(
+            parse_command("d").unwrap(),
+            Command::Deposit { amount: None }
+        );
     }
 
     #[test]
@@ -396,8 +415,14 @@ mod tests {
 
     #[test]
     fn withdraw_without_amount_leaves_amount_none() {
-        assert_eq!(parse_command("withdraw").unwrap(), Command::Withdraw { amount: None });
-        assert_eq!(parse_command("w").unwrap(), Command::Withdraw { amount: None });
+        assert_eq!(
+            parse_command("withdraw").unwrap(),
+            Command::Withdraw { amount: None }
+        );
+        assert_eq!(
+            parse_command("w").unwrap(),
+            Command::Withdraw { amount: None }
+        );
     }
 
     #[test]
@@ -494,8 +519,14 @@ mod tests {
 
     #[test]
     fn balance_without_target_leaves_target_none() {
-        assert_eq!(parse_command("balance").unwrap(), Command::Balance { target: None });
-        assert_eq!(parse_command("bal").unwrap(), Command::Balance { target: None });
+        assert_eq!(
+            parse_command("balance").unwrap(),
+            Command::Balance { target: None }
+        );
+        assert_eq!(
+            parse_command("bal").unwrap(),
+            Command::Balance { target: None }
+        );
     }
 
     #[test]
@@ -596,20 +627,29 @@ mod tests {
 
     #[test]
     fn items_accepts_explicit_page() {
-        assert_eq!(parse_command("items 3").unwrap(), Command::Items { page: 3 });
+        assert_eq!(
+            parse_command("items 3").unwrap(),
+            Command::Items { page: 3 }
+        );
     }
 
     #[test]
     fn items_non_numeric_page_falls_back_to_one() {
         // `parse_page` swallows malformed input rather than erroring — the list
         // view is low-risk and friendlier to mistype.
-        assert_eq!(parse_command("items abc").unwrap(), Command::Items { page: 1 });
+        assert_eq!(
+            parse_command("items abc").unwrap(),
+            Command::Items { page: 1 }
+        );
     }
 
     #[test]
     fn items_zero_page_is_clamped_to_one() {
         // `.max(1)` guards the 1-indexed pager.
-        assert_eq!(parse_command("items 0").unwrap(), Command::Items { page: 1 });
+        assert_eq!(
+            parse_command("items 0").unwrap(),
+            Command::Items { page: 1 }
+        );
     }
 
     #[test]
@@ -620,25 +660,37 @@ mod tests {
 
     #[test]
     fn queue_accepts_explicit_page() {
-        assert_eq!(parse_command("queue 2").unwrap(), Command::Queue { page: 2 });
+        assert_eq!(
+            parse_command("queue 2").unwrap(),
+            Command::Queue { page: 2 }
+        );
     }
 
     // ---- cancel ------------------------------------------------------------
 
     #[test]
     fn cancel_parses_bare_order_id() {
-        assert_eq!(parse_command("cancel 5").unwrap(), Command::Cancel { order_id: 5 });
+        assert_eq!(
+            parse_command("cancel 5").unwrap(),
+            Command::Cancel { order_id: 5 }
+        );
     }
 
     #[test]
     fn cancel_alias_c_is_equivalent() {
-        assert_eq!(parse_command("c 5").unwrap(), Command::Cancel { order_id: 5 });
+        assert_eq!(
+            parse_command("c 5").unwrap(),
+            Command::Cancel { order_id: 5 }
+        );
     }
 
     #[test]
     fn cancel_strips_leading_hash() {
         // `queue` shows order IDs as `#5`, so accept that form verbatim.
-        assert_eq!(parse_command("c #5").unwrap(), Command::Cancel { order_id: 5 });
+        assert_eq!(
+            parse_command("c #5").unwrap(),
+            Command::Cancel { order_id: 5 }
+        );
     }
 
     #[test]
@@ -674,7 +726,10 @@ mod tests {
 
     #[test]
     fn help_without_topic_leaves_topic_none() {
-        assert_eq!(parse_command("help").unwrap(), Command::Help { topic: None });
+        assert_eq!(
+            parse_command("help").unwrap(),
+            Command::Help { topic: None }
+        );
         assert_eq!(parse_command("h").unwrap(), Command::Help { topic: None });
     }
 
@@ -682,7 +737,9 @@ mod tests {
     fn help_captures_topic_token() {
         assert_eq!(
             parse_command("help buy").unwrap(),
-            Command::Help { topic: Some("buy".to_string()) }
+            Command::Help {
+                topic: Some("buy".to_string())
+            }
         );
     }
 

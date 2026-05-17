@@ -70,8 +70,7 @@ impl Drop for CriticalGuard<'_> {
 /// [`Bot::send_chat_message`] to refuse payloads that would inject newlines or
 /// other control bytes into the raw chat packet.
 fn first_control_char(s: &str) -> Option<usize> {
-    s.bytes()
-        .position(|b| b < 0x20 || b == 0x7F)
+    s.bytes().position(|b| b < 0x20 || b == 0x7F)
 }
 
 /// Returns true when the first non-whitespace byte of `target` is `/`.
@@ -284,7 +283,10 @@ impl Bot {
         // Spawn ViaProxy exactly once for the lifetime of the bot process.
         // See the `via_plugin` field doc for why per-reconnect spawning would
         // leak one Java VM per cycle.
-        info!("[Bot] Starting ViaProxy (one-shot, target version {})", connection::VIA_TARGET_VERSION);
+        info!(
+            "[Bot] Starting ViaProxy (one-shot, target version {})",
+            connection::VIA_TARGET_VERSION
+        );
         let via_plugin = ViaVersionPlugin::start(connection::VIA_TARGET_VERSION).await;
         info!("[Bot] ViaProxy started");
 
@@ -1351,10 +1353,7 @@ struct ParsedChat {
 /// find one we rewrite the event so it looks like a public chat line
 /// from the joining player. Downstream the chat-AI can decide whether
 /// to greet, instead of the line being silently dropped as system noise.
-fn parse_chat_line(
-    message: &azalea::chat::ChatPacket,
-    _message_text: &str,
-) -> Option<ParsedChat> {
+fn parse_chat_line(message: &azalea::chat::ChatPacket, _message_text: &str) -> Option<ParsedChat> {
     let (sender, content) = message.split_sender_and_content();
     let sender = sender?;
     if content.trim().is_empty() {
@@ -1371,7 +1370,9 @@ fn parse_chat_line(
     // candidate (covers literal "1", "[Server]", "+", etc.).
     let mojang_ok = sender.len() >= 3
         && sender.len() <= 16
-        && sender.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        && sender
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
     if !mojang_ok && kind == ChatEventKind::Public {
         if let Some(joiner) = parse_join_broadcast(&content) {
             tracing::info!(
@@ -1459,7 +1460,12 @@ fn parse_join_broadcast(content: &str) -> Option<String> {
     // "continue the journey" legitimately span tokens, so they keep using
     // `lc.contains(...)`.
     const TOKEN_CUES: &[&str] = &[
-        "joined", "joining", "connected", "connecting", "connect", "welcome",
+        "joined",
+        "joining",
+        "connected",
+        "connecting",
+        "connect",
+        "welcome",
     ];
     let has_token_cue = lc
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -1481,12 +1487,41 @@ fn parse_join_broadcast(content: &str) -> Option<String> {
     // joiner at the front of the cue, so first-match is the right
     // heuristic.
     const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "joined", "join", "joins", "joining",
-        "connected", "connect", "connects", "logged", "log", "logs",
-        "welcome", "welcomes", "welcomed", "back", "in", "to", "game",
-        "server", "player", "newbie", "first", "time", "journey",
-        "journeys", "has", "have", "risen", "rises", "rose",
-        "continue", "continues", "continued",
+        "the",
+        "a",
+        "an",
+        "joined",
+        "join",
+        "joins",
+        "joining",
+        "connected",
+        "connect",
+        "connects",
+        "logged",
+        "log",
+        "logs",
+        "welcome",
+        "welcomes",
+        "welcomed",
+        "back",
+        "in",
+        "to",
+        "game",
+        "server",
+        "player",
+        "newbie",
+        "first",
+        "time",
+        "journey",
+        "journeys",
+        "has",
+        "have",
+        "risen",
+        "rises",
+        "rose",
+        "continue",
+        "continues",
+        "continued",
     ];
     for raw in content.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         if raw.len() < 3 || raw.len() > 16 {
@@ -1537,9 +1572,27 @@ fn parse_leave_broadcast(content: &str) -> Option<String> {
         return None;
     }
     const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "left", "leave", "leaves", "disconnected",
-        "disconnect", "disconnects", "timed", "out", "was", "kicked",
-        "logged", "log", "logs", "in", "to", "from", "game", "server",
+        "the",
+        "a",
+        "an",
+        "left",
+        "leave",
+        "leaves",
+        "disconnected",
+        "disconnect",
+        "disconnects",
+        "timed",
+        "out",
+        "was",
+        "kicked",
+        "logged",
+        "log",
+        "logs",
+        "in",
+        "to",
+        "from",
+        "game",
+        "server",
         "player",
     ];
     for raw in content.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
@@ -1585,15 +1638,40 @@ fn parse_death_broadcast(content: &str) -> Option<(String, String)> {
     // synthetic "*just died: …*" content is itself the signal that the
     // chat module looks for.
     const CUES: &[&str] = &[
-        "was slain", "was shot", "was killed", "was blown up",
-        "was burned", "was pricked", "was squashed", "was struck",
-        "was impaled", "was skewered", "was poked", "was doomed",
-        "was stung", "was fireballed", "was roasted", "was frozen",
-        "was crushed", "drowned", "fell from", "fell off", "fell out",
-        "fell into", "tried to swim", "burned to death", "went up in flames",
-        "discovered the floor was lava", "hit the ground too hard",
-        "blew up", "died", "starved to death", "froze to death",
-        "suffocated", "withered away", "got finished off",
+        "was slain",
+        "was shot",
+        "was killed",
+        "was blown up",
+        "was burned",
+        "was pricked",
+        "was squashed",
+        "was struck",
+        "was impaled",
+        "was skewered",
+        "was poked",
+        "was doomed",
+        "was stung",
+        "was fireballed",
+        "was roasted",
+        "was frozen",
+        "was crushed",
+        "drowned",
+        "fell from",
+        "fell off",
+        "fell out",
+        "fell into",
+        "tried to swim",
+        "burned to death",
+        "went up in flames",
+        "discovered the floor was lava",
+        "hit the ground too hard",
+        "blew up",
+        "died",
+        "starved to death",
+        "froze to death",
+        "suffocated",
+        "withered away",
+        "got finished off",
     ];
     let mut cause_start: Option<usize> = None;
     for cue in CUES {
@@ -1610,9 +1688,23 @@ fn parse_death_broadcast(content: &str) -> Option<(String, String)> {
     // before the cue. Walk the content and stop once we cross the cue
     // boundary.
     const STOP_WORDS: &[&str] = &[
-        "the", "a", "an", "was", "fell", "tried", "burned", "blew",
-        "drowned", "died", "hit", "starved", "froze", "suffocated",
-        "withered", "went", "got",
+        "the",
+        "a",
+        "an",
+        "was",
+        "fell",
+        "tried",
+        "burned",
+        "blew",
+        "drowned",
+        "died",
+        "hit",
+        "starved",
+        "froze",
+        "suffocated",
+        "withered",
+        "went",
+        "got",
     ];
     let mut name: Option<String> = None;
     let prefix = &content[..cause_idx];
@@ -1734,7 +1826,10 @@ mod tests {
         for (line, expected) in &[
             ("HECStore joined the journey", "HECStore"),
             ("_itzn7r first time joining the journey", "_itzn7r"),
-            ("SnubMantis82722 has risen to continue the journey", "SnubMantis82722"),
+            (
+                "SnubMantis82722 has risen to continue the journey",
+                "SnubMantis82722",
+            ),
             ("bob4666631 has risen to continue the journey", "bob4666631"),
             ("Alex124323423234 left the game", "Alex124323423234"),
         ] {
@@ -1742,7 +1837,11 @@ mod tests {
             // the join parser does NOT swallow it (it should fall to
             // the leave parser instead).
             if line.contains("left") {
-                assert_eq!(parse_join_broadcast(line), None, "leave line should not match join: {line}");
+                assert_eq!(
+                    parse_join_broadcast(line),
+                    None,
+                    "leave line should not match join: {line}"
+                );
                 assert_eq!(
                     parse_leave_broadcast(line).as_deref(),
                     Some(*expected),
@@ -1868,14 +1967,18 @@ mod tests {
         let cases: &[(&str, &str, &str)] = &[
             ("Foo was slain by Bar", "Foo", "was slain by Bar"),
             ("Foo drowned", "Foo", "drowned"),
-            ("Foo fell from a high place", "Foo", "fell from a high place"),
             (
-                "Foo tried to swim in lava",
+                "Foo fell from a high place",
                 "Foo",
-                "tried to swim in lava",
+                "fell from a high place",
             ),
+            ("Foo tried to swim in lava", "Foo", "tried to swim in lava"),
             ("Foo blew up", "Foo", "blew up"),
-            ("Foo hit the ground too hard", "Foo", "hit the ground too hard"),
+            (
+                "Foo hit the ground too hard",
+                "Foo",
+                "hit the ground too hard",
+            ),
         ];
         for (line, expected_name, expected_detail) in cases {
             let got = parse_death_broadcast(line);

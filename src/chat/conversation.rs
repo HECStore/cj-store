@@ -344,9 +344,7 @@ impl SpamGuard {
             s.last_contents
                 .retain(|(t, _)| now.duration_since(*t) <= max_age);
             // Keep if anything load-bearing remains.
-            s.cooldown_until.is_some()
-                || !s.timestamps.is_empty()
-                || !s.last_contents.is_empty()
+            s.cooldown_until.is_some() || !s.timestamps.is_empty() || !s.last_contents.is_empty()
         });
     }
 
@@ -1204,15 +1202,7 @@ mod tests {
     #[test]
     fn proactive_skips_when_bot_too_recent() {
         // bot spoke 5s ago, threshold 30s → skip
-        let v = evaluate_proactive_tick(
-            Some(5),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v = evaluate_proactive_tick(Some(5), Some(("alice".into(), 30)), 30, 15, 300, 100, 0.0);
         assert_eq!(v, ProactiveDecision::Skip("bot_too_recent"));
     }
 
@@ -1225,90 +1215,44 @@ mod tests {
     #[test]
     fn proactive_skips_when_partner_too_recent() {
         // partner spoke 5s ago, threshold 15s → skip (they may still be typing)
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 5)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v = evaluate_proactive_tick(Some(60), Some(("alice".into(), 5)), 30, 15, 300, 100, 0.0);
         assert_eq!(v, ProactiveDecision::Skip("partner_too_recent"));
     }
 
     #[test]
     fn proactive_skips_when_partner_too_stale() {
         // partner spoke 600s ago, max 300s → conversation is dead
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 600)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(60), Some(("alice".into(), 600)), 30, 15, 300, 100, 0.0);
         assert_eq!(v, ProactiveDecision::Skip("partner_too_stale"));
     }
 
     #[test]
     fn proactive_skips_when_probability_roll_loses() {
         // probability 20%, roll 0.5 (>= 0.2) → skip
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            20,
-            0.5,
-        );
+        let v = evaluate_proactive_tick(Some(60), Some(("alice".into(), 30)), 30, 15, 300, 20, 0.5);
         assert_eq!(v, ProactiveDecision::Skip("probability_roll"));
     }
 
     #[test]
     fn proactive_fires_when_probability_roll_wins() {
         // probability 20%, roll 0.1 (< 0.2) → fire
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            20,
-            0.1,
-        );
+        let v = evaluate_proactive_tick(Some(60), Some(("alice".into(), 30)), 30, 15, 300, 20, 0.1);
         assert!(matches!(v, ProactiveDecision::Fire(_)));
     }
 
     #[test]
     fn proactive_zero_probability_never_fires() {
         // pct=0 means never fire even with roll=0.0
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            0,
-            0.0,
-        );
+        let v = evaluate_proactive_tick(Some(60), Some(("alice".into(), 30)), 30, 15, 300, 0, 0.0);
         assert_eq!(v, ProactiveDecision::Skip("probability_roll"));
     }
 
     #[test]
     fn proactive_clamps_oversized_probability() {
         // pct=200 clamped to 100 — always fires when other gates pass.
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            200,
-            0.99,
-        );
+        let v =
+            evaluate_proactive_tick(Some(60), Some(("alice".into(), 30)), 30, 15, 300, 200, 0.99);
         assert!(matches!(v, ProactiveDecision::Fire(_)));
     }
 
@@ -1316,74 +1260,39 @@ mod tests {
     fn proactive_fires_when_bot_secs_equals_min_exactly() {
         // Boundary: secs_bot == min_secs_since_bot uses non-strict `>=`,
         // so the gate must pass at the exact threshold.
-        let v = evaluate_proactive_tick(
-            Some(30),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(30), Some(("alice".into(), 30)), 30, 15, 300, 100, 0.0);
         assert!(matches!(v, ProactiveDecision::Fire(_)));
     }
 
     #[test]
     fn proactive_fires_when_partner_secs_equals_min_exactly() {
         // Boundary: secs_partner == min_secs_since_partner — non-strict `>=`.
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 15)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(60), Some(("alice".into(), 15)), 30, 15, 300, 100, 0.0);
         assert!(matches!(v, ProactiveDecision::Fire(_)));
     }
 
     #[test]
     fn proactive_fires_when_partner_secs_equals_max_exactly() {
         // Boundary: secs_partner == max_secs_since_partner — non-strict `<=`.
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 300)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(60), Some(("alice".into(), 300)), 30, 15, 300, 100, 0.0);
         assert!(matches!(v, ProactiveDecision::Fire(_)));
     }
 
     #[test]
     fn proactive_skips_when_bot_secs_one_below_min() {
         // The exact-threshold case fires; one second under must skip.
-        let v = evaluate_proactive_tick(
-            Some(29),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(29), Some(("alice".into(), 30)), 30, 15, 300, 100, 0.0);
         assert_eq!(v, ProactiveDecision::Skip("bot_too_recent"));
     }
 
     #[test]
     fn proactive_skips_when_partner_secs_one_above_max() {
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 301)),
-            30,
-            15,
-            300,
-            100,
-            0.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(60), Some(("alice".into(), 301)), 30, 15, 300, 100, 0.0);
         assert_eq!(v, ProactiveDecision::Skip("partner_too_stale"));
     }
 
@@ -1392,15 +1301,7 @@ mod tests {
         // Defensive: a buggy RNG returning < 0.0 must not bypass the
         // threshold at pct=0. Negative rolls clamp to 0.0; with pct=0
         // the threshold is also 0.0, so `0.0 < 0.0` is false → skip.
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            0,
-            -0.5,
-        );
+        let v = evaluate_proactive_tick(Some(60), Some(("alice".into(), 30)), 30, 15, 300, 0, -0.5);
         assert_eq!(v, ProactiveDecision::Skip("probability_roll"));
     }
 
@@ -1425,15 +1326,8 @@ mod tests {
         // An RNG returning > 1.0 should not bypass any threshold — it
         // always skips because clamped to 1.0 which is not < anything
         // up to threshold = 1.0.
-        let v = evaluate_proactive_tick(
-            Some(60),
-            Some(("alice".into(), 30)),
-            30,
-            15,
-            300,
-            100,
-            5.0,
-        );
+        let v =
+            evaluate_proactive_tick(Some(60), Some(("alice".into(), 30)), 30, 15, 300, 100, 5.0);
         assert_eq!(v, ProactiveDecision::Skip("probability_roll"));
     }
 }

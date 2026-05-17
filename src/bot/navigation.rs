@@ -6,16 +6,16 @@
 use std::time::Duration;
 
 use azalea::BlockPos;
-use azalea::pathfinder::goals::BlockPosGoal;
 use azalea::pathfinder::PathfinderClientExt;
+use azalea::pathfinder::goals::BlockPosGoal;
 use tracing::{debug, info, warn};
 
+use super::Bot;
 use crate::constants::{
-    DELAY_MEDIUM_MS, NAVIGATION_MAX_ATTEMPTS,
-    RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, exponential_backoff_delay_jittered,
+    DELAY_MEDIUM_MS, NAVIGATION_MAX_ATTEMPTS, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
+    exponential_backoff_delay_jittered,
 };
 use crate::types::{Chest, Position};
-use super::Bot;
 
 /// Navigate to a position using pathfinding (single attempt).
 /// Uses Azalea's built-in pathfinding to walk to the target position.
@@ -25,15 +25,12 @@ use super::Bot;
 /// * `Ok(false)` if timed out but continued
 /// * `Err` if bot not connected
 async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool, String> {
-    let client = bot
-        .client
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| format!(
+    let client = bot.client.read().await.clone().ok_or_else(|| {
+        format!(
             "Bot not connected - cannot navigate to target ({}, {}, {})",
             target.x, target.y, target.z
-        ))?;
+        )
+    })?;
 
     let target_block = BlockPos::new(target.x, target.y, target.z);
     let current_pos = client.entity().position();
@@ -49,15 +46,24 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
     let dy = (current_block.y - target_block.y).abs();
     let dz = (current_block.z - target_block.z).abs();
     if dx == 0 && dy == 0 && dz == 0 {
-        info!("Already at exact target position ({}, {}, {})", target.x, target.y, target.z);
+        info!(
+            "Already at exact target position ({}, {}, {})",
+            target.x, target.y, target.z
+        );
         return Ok(true);
     }
 
     info!(
         "Pathfinding from ({}, {}, {}) to ({}, {}, {}) - distance: ({}, {}, {})",
-        current_block.x, current_block.y, current_block.z,
-        target_block.x, target_block.y, target_block.z,
-        dx, dy, dz
+        current_block.x,
+        current_block.y,
+        current_block.z,
+        target_block.x,
+        target_block.y,
+        target_block.z,
+        dx,
+        dy,
+        dz
     );
 
     // Bound the goto future with an external deadline. Azalea's
@@ -71,7 +77,8 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
     let goto_result = tokio::time::timeout(
         Duration::from_millis(pathfinding_wait_ms),
         client.goto(BlockPosGoal(target_block)),
-    ).await;
+    )
+    .await;
 
     match goto_result {
         Ok(()) => {
@@ -83,15 +90,18 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
             if final_block == target_block {
                 info!(
                     "Reached exact target ({}, {}, {}) - position: ({}, {}, {})",
-                    target.x, target.y, target.z,
-                    final_block.x, final_block.y, final_block.z
+                    target.x, target.y, target.z, final_block.x, final_block.y, final_block.z
                 );
                 Ok(true)
             } else {
                 warn!(
                     "Pathfinding ended off-target - target: ({}, {}, {}), current: ({}, {}, {})",
-                    target_block.x, target_block.y, target_block.z,
-                    final_block.x, final_block.y, final_block.z
+                    target_block.x,
+                    target_block.y,
+                    target_block.z,
+                    final_block.x,
+                    final_block.y,
+                    final_block.z
                 );
                 Ok(false)
             }
@@ -105,8 +115,12 @@ async fn navigate_to_position_once(bot: &Bot, target: &Position) -> Result<bool,
             warn!(
                 "Pathfinding timeout after {}ms - target: ({}, {}, {}), current: ({}, {}, {})",
                 pathfinding_wait_ms,
-                target_block.x, target_block.y, target_block.z,
-                final_block.x, final_block.y, final_block.z
+                target_block.x,
+                target_block.y,
+                target_block.z,
+                final_block.x,
+                final_block.y,
+                final_block.z
             );
             Ok(false)
         }
@@ -135,11 +149,18 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
             // operations fail simultaneously) gives the world state a chance
             // to settle before we ask Azalea to recompute the path. Capped
             // at RETRY_MAX_DELAY_MS to avoid unbounded stalls.
-            let delay_ms = exponential_backoff_delay_jittered(attempt - 1, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS);
+            let delay_ms = exponential_backoff_delay_jittered(
+                attempt - 1,
+                RETRY_BASE_DELAY_MS,
+                RETRY_MAX_DELAY_MS,
+            );
             info!(
                 "Attempt {}/{} for navigation to ({}, {}, {}) after {}ms delay",
-                attempt + 1, NAVIGATION_MAX_ATTEMPTS,
-                target.x, target.y, target.z,
+                attempt + 1,
+                NAVIGATION_MAX_ATTEMPTS,
+                target.x,
+                target.y,
+                target.z,
                 delay_ms
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
@@ -160,14 +181,22 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
                 match current {
                     Some(cur) => warn!(
                         "Navigation attempt {}/{} timed out - target: ({}, {}, {}), current: ({}, {}, {})",
-                        attempt + 1, NAVIGATION_MAX_ATTEMPTS,
-                        target.x, target.y, target.z,
-                        cur.x, cur.y, cur.z
+                        attempt + 1,
+                        NAVIGATION_MAX_ATTEMPTS,
+                        target.x,
+                        target.y,
+                        target.z,
+                        cur.x,
+                        cur.y,
+                        cur.z
                     ),
                     None => warn!(
                         "Navigation attempt {}/{} timed out - target: ({}, {}, {}), current: unknown (bot disconnected)",
-                        attempt + 1, NAVIGATION_MAX_ATTEMPTS,
-                        target.x, target.y, target.z
+                        attempt + 1,
+                        NAVIGATION_MAX_ATTEMPTS,
+                        target.x,
+                        target.y,
+                        target.z
                     ),
                 }
             }
@@ -188,33 +217,29 @@ pub async fn navigate_to_position(bot: &Bot, target: &Position) -> Result<(), St
     // wrong-chest interaction.
     let final_current = {
         let guard = bot.client.read().await;
-        guard.as_ref().map(|c| BlockPos::from(c.entity().position()))
+        guard
+            .as_ref()
+            .map(|c| BlockPos::from(c.entity().position()))
     };
     match final_current {
         Some(cur) => {
             warn!(
                 "Navigation to ({}, {}, {}) failed after {} attempts - current: ({}, {}, {})",
-                target.x, target.y, target.z,
-                NAVIGATION_MAX_ATTEMPTS,
-                cur.x, cur.y, cur.z
+                target.x, target.y, target.z, NAVIGATION_MAX_ATTEMPTS, cur.x, cur.y, cur.z
             );
             Err(format!(
                 "Navigation failed after {} attempts at ({}, {}, {}); current=({}, {}, {})",
-                NAVIGATION_MAX_ATTEMPTS,
-                target.x, target.y, target.z,
-                cur.x, cur.y, cur.z
+                NAVIGATION_MAX_ATTEMPTS, target.x, target.y, target.z, cur.x, cur.y, cur.z
             ))
         }
         None => {
             warn!(
                 "Navigation to ({}, {}, {}) failed after {} attempts - current: unknown (bot disconnected)",
-                target.x, target.y, target.z,
-                NAVIGATION_MAX_ATTEMPTS
+                target.x, target.y, target.z, NAVIGATION_MAX_ATTEMPTS
             );
             Err(format!(
                 "Navigation failed after {} attempts at ({}, {}, {}); current=unknown (bot disconnected)",
-                NAVIGATION_MAX_ATTEMPTS,
-                target.x, target.y, target.z
+                NAVIGATION_MAX_ATTEMPTS, target.x, target.y, target.z
             ))
         }
     }
@@ -247,26 +272,28 @@ pub async fn go_to_chest(bot: &Bot, chest: &Chest, node_position: &Position) -> 
     go_to_node(bot, node_position).await.map_err(|e| {
         format!(
             "Failed to reach node for chest {} at ({}, {}, {}): {}",
-            chest.id,
-            node_position.x, node_position.y, node_position.z,
-            e
+            chest.id, node_position.x, node_position.y, node_position.z, e
         )
     })?;
-    
+
     // debug! (not info!) because this fires for every trade/chest op; one line
     // per visit would swamp default production logs.
     debug!(
         "At node ({}, {}, {}), chest {} accessible at ({}, {}, {})",
-        node_position.x, node_position.y, node_position.z,
+        node_position.x,
+        node_position.y,
+        node_position.z,
         chest.id,
-        chest.position.x, chest.position.y, chest.position.z
+        chest.position.x,
+        chest.position.y,
+        chest.position.z
     );
-    
+
     // Brief settle delay before the caller opens the chest: Azalea can report
     // arrival a tick before the client-side entity position fully stabilizes,
     // and opening a chest while still in motion occasionally targets the wrong
     // block. DELAY_MEDIUM_MS is short enough to be invisible in aggregate.
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_MEDIUM_MS)).await;
-    
+
     Ok(())
 }

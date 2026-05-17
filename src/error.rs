@@ -198,9 +198,7 @@ impl StoreError {
 impl From<MojangResolveError> for StoreError {
     fn from(err: MojangResolveError) -> Self {
         match err {
-            MojangResolveError::NotFound { username } => {
-                StoreError::UserNotFound { username }
-            }
+            MojangResolveError::NotFound { username } => StoreError::UserNotFound { username },
             MojangResolveError::InvalidShape => {
                 StoreError::ValidationError("Invalid Minecraft username".to_string())
             }
@@ -216,4 +214,3 @@ impl From<MojangResolveError> for StoreError {
         }
     }
 }
-

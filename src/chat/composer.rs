@@ -206,7 +206,7 @@ pub fn wrap_untrusted(tag_kind: &str, nonce: &str, content: &str) -> Result<Stri
 /// is named here so the model knows which closing tag is the real one.
 pub fn static_rules_text(nonce: &str) -> String {
     format!(
-"You are a friendly, helpful AI chatbot playing Minecraft as a \
+        "You are a friendly, helpful AI chatbot playing Minecraft as a \
 store-running player. You read in-game chat (public + private whispers) \
 and reply naturally to other players. You also run a small player-shop \
 on the server: trade commands themselves (buy/sell/deposit/etc.) are \
@@ -573,9 +573,7 @@ fn estimate_request_tokens(req: &CreateMessageRequest) -> u32 {
             .map(|cb| match cb {
                 ContentBlock::Text { text, .. } => text.len() as u64,
                 ContentBlock::ToolResult { content, .. } => content.len() as u64,
-                ContentBlock::WebSearchToolResult { .. } => {
-                    WEB_SEARCH_RESULT_BYTE_ESTIMATE
-                }
+                ContentBlock::WebSearchToolResult { .. } => WEB_SEARCH_RESULT_BYTE_ESTIMATE,
                 ContentBlock::ToolUse { .. } | ContentBlock::ServerToolUse { .. } => {
                     TOOL_USE_BYTE_ESTIMATE
                 }
@@ -857,9 +855,7 @@ pub async fn run_loop(
                         tool_ctx.update_player_memory_max_per_day,
                     )),
                     "web_fetch" => Some((
-                        tool_ctx
-                            .web_fetches_today
-                            .saturating_add(web_fetch_calls),
+                        tool_ctx.web_fetches_today.saturating_add(web_fetch_calls),
                         tool_ctx.web_fetch_daily_max,
                     )),
                     "query_trades" | "get_pair" | "get_user_balance" => Some((
@@ -1298,7 +1294,10 @@ mod tests {
             CacheTtl::Ephemeral5Min,
         );
         for (i, block) in req.system.iter().enumerate() {
-            let SystemBlock::Text { text, cache_control } = block;
+            let SystemBlock::Text {
+                text,
+                cache_control,
+            } = block;
             if cache_control.is_some() {
                 assert!(
                     !text.is_empty(),
@@ -1342,7 +1341,10 @@ mod tests {
             CacheTtl::Ephemeral5Min,
         );
         match &req.system[0] {
-            SystemBlock::Text { text, cache_control } => {
+            SystemBlock::Text {
+                text,
+                cache_control,
+            } => {
                 assert_eq!(text, &snap.static_rules);
                 // Static rules carry the per-turn nonce — caching across
                 // turns would defeat the nonce isolation. Must be None.

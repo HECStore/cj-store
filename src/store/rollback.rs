@@ -14,10 +14,10 @@
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
+use super::Store;
 use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::messages::{BotInstruction, ChestAction};
 use crate::types::storage::ChestTransfer;
-use super::Store;
 
 /// Summary of a rollback attempt across potentially many chest operations.
 ///
@@ -208,11 +208,8 @@ pub async fn deposit_transfers(
             break;
         }
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS),
-            rx,
-        )
-        .await
+        match tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
+            .await
         {
             Ok(Ok(Ok(report))) => {
                 // The bot confirmed the physical transfer, so items ARE back
@@ -243,7 +240,8 @@ pub async fn deposit_transfers(
                     context, step_num, total_steps, chest_id, t.amount, item, e
                 );
                 result.operations_failed += 1;
-                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
+                result.items_stuck_on_bot =
+                    result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             }
             Ok(Err(e)) => {
                 error!(
@@ -251,7 +249,8 @@ pub async fn deposit_transfers(
                     context, step_num, total_steps, chest_id, t.amount, item, e
                 );
                 result.operations_failed += 1;
-                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
+                result.items_stuck_on_bot =
+                    result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             }
             Err(_) => {
                 error!(
@@ -259,7 +258,8 @@ pub async fn deposit_transfers(
                     context, step_num, total_steps, chest_id, CHEST_OP_TIMEOUT_SECS, t.amount, item
                 );
                 result.operations_failed += 1;
-                result.items_stuck_on_bot = result.items_stuck_on_bot.saturating_add(t.amount.max(0));
+                result.items_stuck_on_bot =
+                    result.items_stuck_on_bot.saturating_add(t.amount.max(0));
             }
         }
     }
@@ -316,7 +316,9 @@ pub async fn rollback_amount_to_storage(
     // is allowed to mutate slot counts; the previous mutating-`deposit_plan`
     // fallback would otherwise claim items the bot was still holding if the
     // subsequent `deposit_transfers` failed.
-    let (mut plan, mut planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
+    let (mut plan, mut planned) = store
+        .storage
+        .simulate_deposit_plan(item, amount, stack_size);
     let mut unplanned = (amount - planned).max(0);
     // `simulate_deposit_plan` only walks EXISTING chests — it does NOT model
     // node growth. Order pre-flight callers WANT this so growth becomes an
@@ -346,7 +348,9 @@ pub async fn rollback_amount_to_storage(
             break;
         }
         store.storage.add_node();
-        let (re_plan, re_planned) = store.storage.simulate_deposit_plan(item, amount, stack_size);
+        let (re_plan, re_planned) = store
+            .storage
+            .simulate_deposit_plan(item, amount, stack_size);
         // If a re-simulation didn't pick up MORE than before, growth isn't
         // helping (e.g. reserved-chest rules block this item from new nodes
         // — currently impossible since reservations apply only to node 0).
@@ -414,7 +418,13 @@ mod tests {
     }
 
     fn make_store(bot_tx: mpsc::Sender<BotInstruction>, storage: Storage) -> Store {
-        Store::new_for_test(bot_tx, test_config(), HashMap::new(), HashMap::new(), storage)
+        Store::new_for_test(
+            bot_tx,
+            test_config(),
+            HashMap::new(),
+            HashMap::new(),
+            storage,
+        )
     }
 
     /// Auto-ack every `InteractWithChestAndSync` with a sync report whose
@@ -482,9 +492,7 @@ mod tests {
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let BotInstruction::InteractWithChestAndSync {
-                    action,
-                    respond_to,
-                    ..
+                    action, respond_to, ..
                 } = msg
                 {
                     let item = match action {
@@ -524,7 +532,10 @@ mod tests {
         assert_eq!(c.position, t.position);
         assert_eq!(c.item, t.item);
         assert_eq!(c.amounts.len(), crate::types::Storage::SLOTS_PER_CHEST);
-        assert!(c.amounts.iter().all(|&a| a == 0), "amounts must be zero-filled");
+        assert!(
+            c.amounts.iter().all(|&a| a == 0),
+            "amounts must be zero-filled"
+        );
     }
 
     // --- RollbackResult --------------------------------------------------
@@ -597,7 +608,10 @@ mod tests {
         spawn_auto_ack_bot(rx);
         let mut store = make_store(tx, single_node_storage("cobblestone"));
 
-        let plan = vec![transfer(2, "cobblestone", 30), transfer(2, "cobblestone", 20)];
+        let plan = vec![
+            transfer(2, "cobblestone", 30),
+            transfer(2, "cobblestone", 20),
+        ];
         let result = deposit_transfers(&mut store, &plan, "cobblestone", 64, "[Test]").await;
 
         assert_eq!(result.operations_succeeded, 2);
@@ -684,7 +698,8 @@ mod tests {
                         ChestAction::Withdraw { item, amount, .. } => (item, -amount),
                     };
                     let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
-                    amounts[0] = (target_chest.amounts.first().copied().unwrap_or(0) + delta).max(0);
+                    amounts[0] =
+                        (target_chest.amounts.first().copied().unwrap_or(0) + delta).max(0);
                     let _ = respond_to.send(Ok(ChestSyncReport {
                         chest_id: target_chest.id,
                         item,
@@ -702,7 +717,10 @@ mod tests {
         ];
         let result = deposit_transfers(&mut store, &plan, "cobblestone", 64, "[Test]").await;
 
-        assert_eq!(result.operations_succeeded, 2, "steps 2 and 3 should succeed");
+        assert_eq!(
+            result.operations_succeeded, 2,
+            "steps 2 and 3 should succeed"
+        );
         assert_eq!(result.operations_failed, 1, "step 1 should fail");
         // items_returned only credits acked steps: 7 + 3.
         assert_eq!(result.items_returned, 10);
@@ -778,8 +796,7 @@ mod tests {
         spawn_auto_ack_bot(rx);
         let mut store = make_store(tx, single_node_storage("cobblestone"));
 
-        let result =
-            rollback_amount_to_storage(&mut store, "cobblestone", 50, 64, "[Test]").await;
+        let result = rollback_amount_to_storage(&mut store, "cobblestone", 50, 64, "[Test]").await;
 
         assert!(!result.has_failures());
         assert_eq!(result.items_returned, 50);
@@ -809,18 +826,23 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let mut store = make_store(tx, storage);
 
-        let result =
-            rollback_amount_to_storage(&mut store, "cobblestone", 5, 64, "[Test]").await;
+        let result = rollback_amount_to_storage(&mut store, "cobblestone", 5, 64, "[Test]").await;
 
         // Grow-fallback absorbed the planning shortfall.
-        assert_eq!(result.items_unplanned, 0, "grow-fallback must absorb the shortfall");
+        assert_eq!(
+            result.items_unplanned, 0,
+            "grow-fallback must absorb the shortfall"
+        );
         // No bot to ack the dispatched plan → operations_failed > 0.
         assert!(
             result.operations_failed > 0,
             "dispatch with no live bot must surface as a failed op"
         );
         // Nothing was physically moved; the items are stranded on the bot.
-        assert_eq!(result.items_returned, 0, "no items were physically returned");
+        assert_eq!(
+            result.items_returned, 0,
+            "no items were physically returned"
+        );
         // The combined shape MUST flip has_failures() so callers don't
         // silently report success.
         assert!(
@@ -871,12 +893,18 @@ mod tests {
         };
         let msg = r.partial_message().expect("has failures => Some");
         assert!(msg.contains("5 returned to storage"), "msg was: {msg}");
-        assert!(msg.contains("2 chest operation(s) failed"), "msg was: {msg}");
+        assert!(
+            msg.contains("2 chest operation(s) failed"),
+            "msg was: {msg}"
+        );
         assert!(
             msg.contains("3 item(s) could not be placed"),
             "msg was: {msg}"
         );
-        assert!(msg.contains("; "), "clauses must be joined by '; ' (msg was: {msg})");
+        assert!(
+            msg.contains("; "),
+            "clauses must be joined by '; ' (msg was: {msg})"
+        );
         // Order is fixed in the function: returned, failed, stuck.
         let returned_idx = msg.find("5 returned to storage").unwrap();
         let failed_idx = msg.find("2 chest operation(s) failed").unwrap();

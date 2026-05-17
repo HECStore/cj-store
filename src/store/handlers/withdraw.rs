@@ -68,13 +68,19 @@ pub async fn handle_withdraw_balance_queued(
     utils::ensure_user_exists(store, player_name, user_uuid);
     let user_uuid = user_uuid.to_string();
 
-    let user_balance = store.expect_user(&user_uuid, "withdraw-balance/pre-check")?.balance;
+    let user_balance = store
+        .expect_user(&user_uuid, "withdraw-balance/pre-check")?
+        .balance;
 
     let amount = match amount {
         Some(amt) => {
             if !amt.is_finite() || amt <= 0.0 {
-                return utils::send_message_to_player(store, player_name, "Amount must be positive")
-                    .await;
+                return utils::send_message_to_player(
+                    store,
+                    player_name,
+                    "Amount must be positive",
+                )
+                .await;
             }
             // Snap to whole diamonds up front so the ledger debit equals
             // the physical delivery. Without this, `/withdraw 5.7` would
@@ -106,8 +112,12 @@ pub async fn handle_withdraw_balance_queued(
                 return utils::send_message_to_player(
                     store,
                     player_name,
-                    &format!("No whole diamonds to withdraw. Balance: {:.2} (need at least 1.00)", user_balance),
-                ).await;
+                    &format!(
+                        "No whole diamonds to withdraw. Balance: {:.2} (need at least 1.00)",
+                        user_balance
+                    ),
+                )
+                .await;
             }
             if whole_balance > MAX_TRADE_DIAMONDS as f64 {
                 utils::send_message_to_player(
@@ -141,7 +151,10 @@ pub async fn handle_withdraw_balance_queued(
         return utils::send_message_to_player(
             store,
             player_name,
-            &format!("Amount too large. Maximum withdrawal is {} diamonds (12 stacks) per transaction.", MAX_TRADE_DIAMONDS),
+            &format!(
+                "Amount too large. Maximum withdrawal is {} diamonds (12 stacks) per transaction.",
+                MAX_TRADE_DIAMONDS
+            ),
         )
         .await;
     }
@@ -171,8 +184,9 @@ pub async fn handle_withdraw_balance_queued(
     // the ledger was never touched there is nothing to restore on the balance
     // side.
     {
-        let (withdraw_plan, preview_withdrawn) =
-            store.storage.simulate_withdraw_plan("diamond", whole_diamonds);
+        let (withdraw_plan, preview_withdrawn) = store
+            .storage
+            .simulate_withdraw_plan("diamond", whole_diamonds);
 
         if preview_withdrawn < whole_diamonds {
             error!(
@@ -183,7 +197,9 @@ pub async fn handle_withdraw_balance_queued(
                 available = preview_withdrawn,
                 "Withdraw blocked: insufficient physical diamonds in storage"
             );
-            store.advance_trade(|s| s.rollback("withdraw/insufficient-physical-diamonds".to_string()));
+            store.advance_trade(|s| {
+                s.rollback("withdraw/insufficient-physical-diamonds".to_string())
+            });
             return utils::send_message_to_player(
                 store,
                 player_name,
@@ -242,7 +258,8 @@ pub async fn handle_withdraw_balance_queued(
         "Withdraw: initiating trade"
     );
     let (trade_tx, trade_rx) = tokio::sync::oneshot::channel();
-    let trade_send_result = store.bot_tx
+    let trade_send_result = store
+        .bot_tx
         .send(crate::messages::BotInstruction::TradeWithPlayer {
             target_username: player_name.to_string(),
             bot_offers: vec![crate::messages::TradeItem {
@@ -372,7 +389,9 @@ pub async fn handle_withdraw_balance_queued(
         // The bot's trade response carries an unstructured `String` error;
         // route it through `BotReportedError::user_message()` so any transport
         // detail it picked up never reaches the player.
-        let safe_err = StoreError::BotReportedError(err.clone()).user_message().into_owned();
+        let safe_err = StoreError::BotReportedError(err.clone())
+            .user_message()
+            .into_owned();
         let msg = match rb.partial_message() {
             Some(detail) => format!(
                 "Withdraw aborted: trade failed: {}. Rollback partial: {}.",
@@ -404,10 +423,12 @@ pub async fn handle_withdraw_balance_queued(
         "Withdraw: decremented user balance"
     );
 
-    store.orders.push_back(crate::types::Order::withdraw_balance(
-        whole_diamonds,
-        user_uuid.clone(),
-    ));
+    store
+        .orders
+        .push_back(crate::types::Order::withdraw_balance(
+            whole_diamonds,
+            user_uuid.clone(),
+        ));
 
     store.trades.push(crate::types::Trade::new(
         crate::types::TradeType::WithdrawBalance,
@@ -439,7 +460,9 @@ pub async fn handle_withdraw_balance_queued(
         let _ = state::save(store);
     }
 
-    let remaining_balance = store.expect_user(&user_uuid, "withdraw-balance/post-read")?.balance;
+    let remaining_balance = store
+        .expect_user(&user_uuid, "withdraw-balance/post-read")?
+        .balance;
     utils::send_message_to_player(
         store,
         player_name,

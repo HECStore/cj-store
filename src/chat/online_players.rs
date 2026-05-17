@@ -192,8 +192,7 @@ impl OnlinePlayers {
         let mut out = String::with_capacity(64 + entries.len() * 96);
         out.push_str("Online players (live roster — only these are currently on the server):\n");
         for e in entries {
-            let secs_seen =
-                now.saturating_duration_since(e.last_seen).as_secs();
+            let secs_seen = now.saturating_duration_since(e.last_seen).as_secs();
             let _ = write!(out, "- {} (seen {}s ago", e.username, secs_seen);
             if let Some(note) = note_for(&e.username) {
                 let trimmed = note.trim();

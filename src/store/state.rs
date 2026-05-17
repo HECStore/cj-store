@@ -2,10 +2,10 @@
 
 use tracing::{debug, warn};
 
+use super::Store;
 use crate::error::StoreError;
 use crate::messages::ChestSyncReport;
 use crate::types::{ItemId, Order, Pair, Trade, User};
-use super::Store;
 
 /// Merge a bot-reported [`ChestSyncReport`] into the store's authoritative
 /// storage view.
@@ -29,7 +29,10 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                         .map(|id| id.as_str() == "diamond")
                         .unwrap_or(false);
                     if !reported_matches {
-                        warn!("Attempted to change node 0 chest 0 item from diamond to {}, enforcing diamond", report.item);
+                        warn!(
+                            "Attempted to change node 0 chest 0 item from diamond to {}, enforcing diamond",
+                            report.item
+                        );
                     }
                     chest.item = ItemId::new("diamond").expect("diamond is a valid item ID");
                 } else if chest.id == crate::constants::OVERFLOW_CHEST_ID {
@@ -37,9 +40,13 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
                         .map(|id| id.as_str() == crate::constants::OVERFLOW_CHEST_ITEM)
                         .unwrap_or(false);
                     if !reported_matches {
-                        warn!("Attempted to change node 0 chest 1 item from overflow to {}, enforcing overflow", report.item);
+                        warn!(
+                            "Attempted to change node 0 chest 1 item from overflow to {}, enforcing overflow",
+                            report.item
+                        );
                     }
-                    chest.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM).expect("OVERFLOW_CHEST_ITEM is a valid item ID");
+                    chest.item = ItemId::new(crate::constants::OVERFLOW_CHEST_ITEM)
+                        .expect("OVERFLOW_CHEST_ITEM is a valid item ID");
                 } else {
                     // Refuse a malformed item ID instead of falling back to
                     // EMPTY. Setting `chest.item = EMPTY` while the per-slot
@@ -89,7 +96,10 @@ pub fn apply_chest_sync(store: &mut Store, report: ChestSyncReport) -> Result<()
             }
         }
     }
-    warn!(chest_id = report.chest_id, "chest sync failed: chest id not found in any node");
+    warn!(
+        chest_id = report.chest_id,
+        "chest sync failed: chest id not found in any node"
+    );
     Err(StoreError::ChestOp(format!(
         "Chest {} not found in storage",
         report.chest_id
@@ -141,9 +151,15 @@ pub(crate) fn trim_in_memory_to_caps(store: &mut Store) {
 pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     trim_in_memory_to_caps(store);
 
-    debug!("saving pairs={} users={} (dirty={}) orders={} trades={} nodes={}",
-        store.pairs.len(), store.users.len(), store.dirty_users.len(),
-        store.orders.len(), store.trades.len(), store.storage.nodes.len());
+    debug!(
+        "saving pairs={} users={} (dirty={}) orders={} trades={} nodes={}",
+        store.pairs.len(),
+        store.users.len(),
+        store.dirty_users.len(),
+        store.orders.len(),
+        store.trades.len(),
+        store.storage.nodes.len()
+    );
 
     // First-error-keep-going: attempt all five sub-saves regardless of which
     // one fails first, then surface the first error to the caller. The bare
@@ -162,9 +178,22 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
             }
         }
     };
-    record("pairs", Pair::save_all(&store.pairs).map_err(|e| Box::new(e) as DynErr), &mut first_err);
-    record("users", User::save_dirty(&store.users, &store.dirty_users).map_err(|e| Box::new(e) as DynErr), &mut first_err);
-    record("orders", Order::save_all_with_limit(&store.orders, store.config.max_orders).map_err(|e| Box::new(e) as DynErr), &mut first_err);
+    record(
+        "pairs",
+        Pair::save_all(&store.pairs).map_err(|e| Box::new(e) as DynErr),
+        &mut first_err,
+    );
+    record(
+        "users",
+        User::save_dirty(&store.users, &store.dirty_users).map_err(|e| Box::new(e) as DynErr),
+        &mut first_err,
+    );
+    record(
+        "orders",
+        Order::save_all_with_limit(&store.orders, store.config.max_orders)
+            .map_err(|e| Box::new(e) as DynErr),
+        &mut first_err,
+    );
     // Trade files are immutable after their initial write, so only the tail
     // beyond `saved_trades_count` actually needs new bytes. The orphan sweep
     // inside `Trade::save_all` still runs over the full set, so trim-driven
@@ -177,8 +206,8 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
         store.saved_trades_count = store.trades.len();
     }
     let trades_dirty_tail = store.trades.len().saturating_sub(store.saved_trades_count);
-    let trades_result = Trade::save_all(&store.trades, trades_dirty_tail)
-        .map_err(|e| Box::new(e) as DynErr);
+    let trades_result =
+        Trade::save_all(&store.trades, trades_dirty_tail).map_err(|e| Box::new(e) as DynErr);
     let trades_ok = trades_result.is_ok();
     record("trades", trades_result, &mut first_err);
     if trades_ok {
@@ -188,7 +217,10 @@ pub fn save(store: &mut Store) -> Result<(), Box<dyn std::error::Error + Send + 
     }
     record(
         "storage",
-        store.storage.save().map_err(|e| Box::new(std::io::Error::other(e.to_string())) as DynErr),
+        store
+            .storage
+            .save()
+            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as DynErr),
         &mut first_err,
     );
 
@@ -255,7 +287,10 @@ pub fn audit_state(store: &mut Store, repair: bool) -> AuditReport {
             issues.push(format!("User {} has non-finite balance", user.username));
         }
         if user.balance < 0.0 {
-            issues.push(format!("User {} has negative balance: {}", user.username, user.balance));
+            issues.push(format!(
+                "User {} has negative balance: {}",
+                user.username, user.balance
+            ));
         }
     }
 
@@ -274,7 +309,9 @@ pub fn audit_state(store: &mut Store, repair: bool) -> AuditReport {
             let shulker_capacity = if chest.item.is_empty() {
                 crate::types::Storage::DEFAULT_SHULKER_CAPACITY
             } else {
-                store.pairs.get(chest.item.as_str())
+                store
+                    .pairs
+                    .get(chest.item.as_str())
                     .map(|p| crate::types::Pair::shulker_capacity_for_stack_size(p.stack_size))
                     .unwrap_or(crate::types::Storage::DEFAULT_SHULKER_CAPACITY)
             };
@@ -283,13 +320,20 @@ pub fn audit_state(store: &mut Store, repair: bool) -> AuditReport {
                 // -1 is the legal "unknown/unchecked" sentinel (see
                 // apply_chest_sync); anything more negative is corruption.
                 if *a < -1 {
-                    issues.push(format!("Chest {} slot {} has invalid amount {}", chest.id, i, a));
+                    issues.push(format!(
+                        "Chest {} slot {} has invalid amount {}",
+                        chest.id, i, a
+                    ));
                 }
                 if *a > shulker_capacity {
                     issues.push(format!(
                         "Chest {} (item: {}) slot {} exceeds max capacity ({}): {}",
                         chest.id,
-                        if chest.item.is_empty() { "unassigned" } else { &chest.item },
+                        if chest.item.is_empty() {
+                            "unassigned"
+                        } else {
+                            &chest.item
+                        },
                         i,
                         shulker_capacity,
                         a
@@ -340,7 +384,10 @@ pub fn audit_state(store: &mut Store, repair: bool) -> AuditReport {
         warn!(item = %item, before, after, "audit repaired pair item_stock drift");
     }
 
-    AuditReport { issues, repair_applied: !repairs.is_empty() }
+    AuditReport {
+        issues,
+        repair_applied: !repairs.is_empty(),
+    }
 }
 
 /// Assert store invariants, optionally repairing issues.
@@ -435,7 +482,10 @@ mod tests {
         apply_chest_sync(&mut store, report).expect("sync should succeed");
         let chest = &store.storage.nodes[0].chests[2];
         assert_eq!(chest.amounts[0], 50, "slot 0 should be overwritten");
-        assert_eq!(chest.amounts[1], 200, "slot 1 sentinel (-1) should preserve prior value");
+        assert_eq!(
+            chest.amounts[1], 200,
+            "slot 1 sentinel (-1) should preserve prior value"
+        );
         assert_eq!(chest.amounts[2], 0, "slot 2 zero should overwrite");
         assert_eq!(chest.item.as_str(), "iron_ingot");
         assert!(store.dirty);
@@ -471,8 +521,12 @@ mod tests {
         }
 
         impl Subscriber for CaptureSubscriber {
-            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
-            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
             fn record(&self, _: &Id, _: &Record<'_>) {}
             fn record_follows_from(&self, _: &Id, _: &Id) {}
             fn event(&self, event: &Event<'_>) {
@@ -509,7 +563,8 @@ mod tests {
         // must fire — that's the only operator-visible signal of a misreport.
         let msgs = messages.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("enforcing diamond") && m.contains("iron_ingot")),
+            msgs.iter()
+                .any(|m| m.contains("enforcing diamond") && m.contains("iron_ingot")),
             "expected reserved-chest warning to fire; got {:?}",
             *msgs
         );
@@ -561,7 +616,8 @@ mod tests {
         );
         let msgs = messages.lock().unwrap();
         assert!(
-            msgs.iter().any(|m| m.contains("enforcing overflow") && m.contains("diamond")),
+            msgs.iter()
+                .any(|m| m.contains("enforcing overflow") && m.contains("diamond")),
             "expected reserved-chest warning to fire; got {:?}",
             *msgs
         );
@@ -593,9 +649,8 @@ mod tests {
         };
         let cap = test_capture::CaptureSubscriber::default();
         let messages = cap.messages.clone();
-        let result = tracing::subscriber::with_default(cap, || {
-            apply_chest_sync(&mut store, report)
-        });
+        let result =
+            tracing::subscriber::with_default(cap, || apply_chest_sync(&mut store, report));
         assert!(
             matches!(result, Err(StoreError::ChestOp(_))),
             "invalid item ID must return ChestOp Err, got {:?}",
@@ -611,10 +666,7 @@ mod tests {
             store.storage.nodes[0].chests[2].amounts[0], prior_amount,
             "rejected sync must not mutate chest.amounts",
         );
-        assert!(
-            !store.dirty,
-            "rejected sync must not flip store.dirty",
-        );
+        assert!(!store.dirty, "rejected sync must not flip store.dirty",);
         let msgs = messages.lock().unwrap();
         assert!(
             msgs.iter().any(|m| m.contains("invalid item ID")),
@@ -633,7 +685,10 @@ mod tests {
         };
         let err = apply_chest_sync(&mut store, report).unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("9999"), "error should include the missing chest id: got {msg}");
+        assert!(
+            msg.contains("9999"),
+            "error should include the missing chest id: got {msg}"
+        );
         assert!(!store.dirty, "failed sync must not mark store dirty");
     }
 
@@ -644,7 +699,11 @@ mod tests {
         let store_storage = test_storage();
         let mut store = build_store(HashMap::new(), HashMap::new(), store_storage);
         let report = audit_state(&mut store, false);
-        assert!(report.issues.is_empty(), "clean store should have no issues: {:?}", report.issues);
+        assert!(
+            report.issues.is_empty(),
+            "clean store should have no issues: {:?}",
+            report.issues
+        );
         assert!(!report.repair_applied);
     }
 
@@ -653,16 +712,36 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             "u1".to_string(),
-            User { uuid: "u1".to_string(), username: "alice".to_string(), balance: f64::NAN, operator: false },
+            User {
+                uuid: "u1".to_string(),
+                username: "alice".to_string(),
+                balance: f64::NAN,
+                operator: false,
+            },
         );
         users.insert(
             "u2".to_string(),
-            User { uuid: "u2".to_string(), username: "bob".to_string(), balance: -5.0, operator: false },
+            User {
+                uuid: "u2".to_string(),
+                username: "bob".to_string(),
+                balance: -5.0,
+                operator: false,
+            },
         );
         let mut store = build_store(HashMap::new(), users, test_storage());
         let report = audit_state(&mut store, false);
-        assert!(report.issues.iter().any(|i| i.contains("alice") && i.contains("non-finite")));
-        assert!(report.issues.iter().any(|i| i.contains("bob") && i.contains("negative balance")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("alice") && i.contains("non-finite"))
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("bob") && i.contains("negative balance"))
+        );
     }
 
     #[test]
@@ -672,14 +751,27 @@ mod tests {
         {
             let chest = &mut store.storage.nodes[0].chests[2];
             chest.item = ItemId::new("iron_ingot").unwrap();
-            chest.amounts[0] = -5;      // below -1 sentinel: corruption
-            chest.amounts[1] = 10_000;  // exceeds default shulker capacity (1728)
+            chest.amounts[0] = -5; // below -1 sentinel: corruption
+            chest.amounts[1] = 10_000; // exceeds default shulker capacity (1728)
         }
         let report = audit_state(&mut store, false);
-        let has_invalid = report.issues.iter().any(|i| i.contains(&format!("Chest {}", chest_id)) && i.contains("invalid amount"));
-        let has_capacity = report.issues.iter().any(|i| i.contains(&format!("Chest {}", chest_id)) && i.contains("exceeds max capacity"));
-        assert!(has_invalid, "expected invalid-amount issue, got {:?}", report.issues);
-        assert!(has_capacity, "expected capacity issue, got {:?}", report.issues);
+        let has_invalid = report
+            .issues
+            .iter()
+            .any(|i| i.contains(&format!("Chest {}", chest_id)) && i.contains("invalid amount"));
+        let has_capacity = report.issues.iter().any(|i| {
+            i.contains(&format!("Chest {}", chest_id)) && i.contains("exceeds max capacity")
+        });
+        assert!(
+            has_invalid,
+            "expected invalid-amount issue, got {:?}",
+            report.issues
+        );
+        assert!(
+            has_capacity,
+            "expected capacity issue, got {:?}",
+            report.issues
+        );
     }
 
     #[test]
@@ -703,7 +795,12 @@ mod tests {
 
         // repair = false: drift is reported, not fixed.
         let report = audit_state(&mut store, false);
-        assert!(report.issues.iter().any(|i| i.contains("iron_ingot") && i.contains("42") && i.contains("100")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("iron_ingot") && i.contains("42") && i.contains("100"))
+        );
         assert_eq!(store.pairs["iron_ingot"].item_stock, 42);
         assert!(!report.repair_applied);
 
@@ -711,11 +808,18 @@ mod tests {
         // now-fixed issue is NOT re-reported in issues (so assert_invariants
         // treats a repaired checkpoint as clean).
         let report = audit_state(&mut store, true);
-        assert_eq!(store.pairs["iron_ingot"].item_stock, 100, "repair should rewrite from physical");
+        assert_eq!(
+            store.pairs["iron_ingot"].item_stock, 100,
+            "repair should rewrite from physical"
+        );
         assert!(report.repair_applied);
         assert!(
-            !report.issues.iter().any(|i| i.contains("iron_ingot") && i.contains("!=")),
-            "repaired drift should not be re-listed as an issue: {:?}", report.issues
+            !report
+                .issues
+                .iter()
+                .any(|i| i.contains("iron_ingot") && i.contains("!=")),
+            "repaired drift should not be re-listed as an issue: {:?}",
+            report.issues
         );
     }
 
@@ -739,8 +843,18 @@ mod tests {
         );
         let mut store = build_store(pairs, HashMap::new(), test_storage());
         let report = audit_state(&mut store, false);
-        assert!(report.issues.iter().any(|i| i.contains("negative item_stock")));
-        assert!(report.issues.iter().any(|i| i.contains("negative currency_stock")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("negative item_stock"))
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("negative currency_stock"))
+        );
     }
 
     // ---------- assert_invariants ----------
@@ -756,12 +870,20 @@ mod tests {
         let mut users = HashMap::new();
         users.insert(
             "u".to_string(),
-            User { uuid: "u".to_string(), username: "eve".to_string(), balance: -1.0, operator: false },
+            User {
+                uuid: "u".to_string(),
+                username: "eve".to_string(),
+                balance: -1.0,
+                operator: false,
+            },
         );
         let mut store = build_store(HashMap::new(), users, test_storage());
         let err = assert_invariants(&mut store, "pre-checkpoint", false).unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("pre-checkpoint"), "error message should include context: {msg}");
+        assert!(
+            msg.contains("pre-checkpoint"),
+            "error message should include context: {msg}"
+        );
     }
 
     #[test]

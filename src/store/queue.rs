@@ -234,7 +234,14 @@ impl OrderQueue {
         item: String,
         quantity: u32,
     ) -> Result<(u64, usize), String> {
-        self.add_at_path(user_uuid, username, order_type, item, quantity, Path::new(QUEUE_FILE))
+        self.add_at_path(
+            user_uuid,
+            username,
+            order_type,
+            item,
+            quantity,
+            Path::new(QUEUE_FILE),
+        )
     }
 
     /// Path-parameterized enqueue, separated so tests can simulate a save
@@ -254,7 +261,10 @@ impl OrderQueue {
         if self.orders.len() >= MAX_QUEUE_SIZE {
             warn!(
                 "[Queue] Rejected order from {} ({}): global cap reached ({}/{})",
-                username, user_uuid, self.orders.len(), MAX_QUEUE_SIZE
+                username,
+                user_uuid,
+                self.orders.len(),
+                MAX_QUEUE_SIZE
             );
             return Err(format!(
                 "The store queue is currently full ({} orders). Please try again later.",
@@ -266,7 +276,11 @@ impl OrderQueue {
         if user_count >= MAX_ORDERS_PER_USER {
             warn!(
                 "[Queue] Rejected order from {} ({}): per-user cap reached ({}/{}, queue size {})",
-                username, user_uuid, user_count, MAX_ORDERS_PER_USER, self.orders.len()
+                username,
+                user_uuid,
+                user_count,
+                MAX_ORDERS_PER_USER,
+                self.orders.len()
             );
             return Err(format!(
                 "Queue full. You have {} pending orders (max {}). Wait for some to complete.",
@@ -341,7 +355,10 @@ impl OrderQueue {
         if let Some(ref o) = order {
             debug!(
                 "[Queue] Popped order #{}: {} for {} (remaining: {})",
-                o.id, o.description(), o.username, self.orders.len()
+                o.id,
+                o.description(),
+                o.username,
+                self.orders.len()
             );
         }
 
@@ -372,18 +389,11 @@ impl OrderQueue {
 
     /// Path-parameterized form of [`pop_committed`], separated so tests can
     /// simulate a save failure without touching the production `QUEUE_FILE`.
-    fn pop_committed_at_path(
-        &mut self,
-        order_id: u64,
-        path: &Path,
-    ) -> Result<QueuedOrder, String> {
+    fn pop_committed_at_path(&mut self, order_id: u64, path: &Path) -> Result<QueuedOrder, String> {
         let front = match self.orders.front() {
             Some(o) => o,
             None => {
-                warn!(
-                    "[Queue] pop_committed(#{}) called on empty queue",
-                    order_id
-                );
+                warn!("[Queue] pop_committed(#{}) called on empty queue", order_id);
                 return Err("queue head changed: queue is empty".to_string());
             }
         };
@@ -424,7 +434,10 @@ impl OrderQueue {
         debug_assert_eq!(popped.id, cloned.id);
         debug!(
             "[Queue] Committed pop of order #{}: {} for {} (remaining: {})",
-            popped.id, popped.description(), popped.username, self.orders.len()
+            popped.id,
+            popped.description(),
+            popped.username,
+            self.orders.len()
         );
         Ok(popped)
     }
@@ -454,7 +467,10 @@ impl OrderQueue {
     }
 
     pub fn user_order_count(&self, user_uuid: &str) -> usize {
-        self.orders.iter().filter(|o| o.user_uuid == user_uuid).count()
+        self.orders
+            .iter()
+            .filter(|o| o.user_uuid == user_uuid)
+            .count()
     }
 
     /// All orders for `user_uuid` paired with their 1-indexed queue position.
@@ -510,7 +526,10 @@ impl OrderQueue {
 
                 info!(
                     "[Queue] Order #{} cancelled by uuid={} (was: {}, position {})",
-                    order_id, user_uuid, description, pos + 1
+                    order_id,
+                    user_uuid,
+                    description,
+                    pos + 1
                 );
 
                 Ok(())
@@ -525,7 +544,9 @@ impl OrderQueue {
                 } else {
                     warn!(
                         "[Queue] uuid={} tried to cancel order #{} but it doesn't exist (queue size {})",
-                        user_uuid, order_id, self.orders.len()
+                        user_uuid,
+                        order_id,
+                        self.orders.len()
                     );
                     Err(format!("Order #{} not found in queue.", order_id))
                 }
@@ -620,8 +641,13 @@ mod tests {
         let mut queue = OrderQueue::new();
 
         let (id, pos) = add_to(
-            &mut queue, &path,
-            "uuid1", "player1", QueuedOrderType::Buy, "cobblestone", 64,
+            &mut queue,
+            &path,
+            "uuid1",
+            "player1",
+            QueuedOrderType::Buy,
+            "cobblestone",
+            64,
         )
         .unwrap();
 
@@ -643,24 +669,41 @@ mod tests {
 
         for i in 0..MAX_ORDERS_PER_USER {
             add_to(
-                &mut queue, &path,
-                "uuid1", "player1", QueuedOrderType::Buy, &format!("item{}", i), 64,
+                &mut queue,
+                &path,
+                "uuid1",
+                "player1",
+                QueuedOrderType::Buy,
+                &format!("item{}", i),
+                64,
             )
             .expect("within per-user cap");
         }
 
         let err = add_to(
-            &mut queue, &path,
-            "uuid1", "player1", QueuedOrderType::Buy, "overflow", 64,
+            &mut queue,
+            &path,
+            "uuid1",
+            "player1",
+            QueuedOrderType::Buy,
+            "overflow",
+            64,
         )
         .expect_err("per-user cap must reject");
         assert!(err.contains(&MAX_ORDERS_PER_USER.to_string()));
 
-        assert!(add_to(
-            &mut queue, &path,
-            "uuid2", "player2", QueuedOrderType::Buy, "different_user", 64,
-        )
-        .is_ok());
+        assert!(
+            add_to(
+                &mut queue,
+                &path,
+                "uuid2",
+                "player2",
+                QueuedOrderType::Buy,
+                "different_user",
+                64,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -670,14 +713,24 @@ mod tests {
         let mut queue = OrderQueue::new();
 
         let (id1, _) = add_to(
-            &mut queue, &path,
-            "uuid1", "player1", QueuedOrderType::Buy, "item1", 64,
+            &mut queue,
+            &path,
+            "uuid1",
+            "player1",
+            QueuedOrderType::Buy,
+            "item1",
+            64,
         )
         .unwrap();
 
         let (id2, _) = add_to(
-            &mut queue, &path,
-            "uuid2", "player2", QueuedOrderType::Buy, "item2", 64,
+            &mut queue,
+            &path,
+            "uuid2",
+            "player2",
+            QueuedOrderType::Buy,
+            "item2",
+            64,
         )
         .unwrap();
 
@@ -689,7 +742,9 @@ mod tests {
     #[test]
     fn cancel_missing_order_reports_not_found() {
         let mut queue = OrderQueue::new();
-        let err = queue.cancel("uuid1", 9999).expect_err("missing id must fail");
+        let err = queue
+            .cancel("uuid1", 9999)
+            .expect_err("missing id must fail");
         assert!(err.contains("9999"));
     }
 
@@ -701,16 +756,25 @@ mod tests {
 
         for i in 0..MAX_QUEUE_SIZE {
             add_to(
-                &mut queue, &path,
-                &format!("uuid-{}", i), &format!("player-{}", i),
-                QueuedOrderType::Buy, "cobblestone", 1,
+                &mut queue,
+                &path,
+                &format!("uuid-{}", i),
+                &format!("player-{}", i),
+                QueuedOrderType::Buy,
+                "cobblestone",
+                1,
             )
             .expect("within global cap");
         }
 
         let err = add_to(
-            &mut queue, &path,
-            "uuid-overflow", "overflow-player", QueuedOrderType::Buy, "cobblestone", 1,
+            &mut queue,
+            &path,
+            "uuid-overflow",
+            "overflow-player",
+            QueuedOrderType::Buy,
+            "cobblestone",
+            1,
         )
         .expect_err("global cap must reject");
         assert!(err.contains("full"));
@@ -722,10 +786,36 @@ mod tests {
         let path = dir.path("queue.json");
         let mut queue = OrderQueue::new();
 
-        add_to(&mut queue, &path, "uuid1", "p1", QueuedOrderType::Buy, "a", 1).unwrap();
-        let (id2, _) =
-            add_to(&mut queue, &path, "uuid2", "p2", QueuedOrderType::Buy, "b", 1).unwrap();
-        add_to(&mut queue, &path, "uuid1", "p1", QueuedOrderType::Buy, "c", 1).unwrap();
+        add_to(
+            &mut queue,
+            &path,
+            "uuid1",
+            "p1",
+            QueuedOrderType::Buy,
+            "a",
+            1,
+        )
+        .unwrap();
+        let (id2, _) = add_to(
+            &mut queue,
+            &path,
+            "uuid2",
+            "p2",
+            QueuedOrderType::Buy,
+            "b",
+            1,
+        )
+        .unwrap();
+        add_to(
+            &mut queue,
+            &path,
+            "uuid1",
+            "p1",
+            QueuedOrderType::Buy,
+            "c",
+            1,
+        )
+        .unwrap();
 
         assert_eq!(queue.get_user_position("uuid1"), Some(1));
         assert_eq!(queue.get_user_position("uuid2"), Some(2));
@@ -752,33 +842,63 @@ mod tests {
 
     #[test]
     fn description_renders_every_order_variant() {
-        let buy = QueuedOrder::new(1, "u".into(), "p".into(), QueuedOrderType::Buy, "diamond".into(), 5);
+        let buy = QueuedOrder::new(
+            1,
+            "u".into(),
+            "p".into(),
+            QueuedOrderType::Buy,
+            "diamond".into(),
+            5,
+        );
         assert_eq!(buy.description(), "buy diamond 5");
 
-        let sell = QueuedOrder::new(2, "u".into(), "p".into(), QueuedOrderType::Sell, "iron".into(), 10);
+        let sell = QueuedOrder::new(
+            2,
+            "u".into(),
+            "p".into(),
+            QueuedOrderType::Sell,
+            "iron".into(),
+            10,
+        );
         assert_eq!(sell.description(), "sell iron 10");
 
         let dep_some = QueuedOrder::new(
-            3, "u".into(), "p".into(),
-            QueuedOrderType::Deposit { amount: Some(1.5) }, "diamond".into(), 0,
+            3,
+            "u".into(),
+            "p".into(),
+            QueuedOrderType::Deposit { amount: Some(1.5) },
+            "diamond".into(),
+            0,
         );
         assert_eq!(dep_some.description(), "deposit 1.50");
 
         let dep_flex = QueuedOrder::new(
-            4, "u".into(), "p".into(),
-            QueuedOrderType::Deposit { amount: None }, "diamond".into(), 0,
+            4,
+            "u".into(),
+            "p".into(),
+            QueuedOrderType::Deposit { amount: None },
+            "diamond".into(),
+            0,
         );
         assert_eq!(dep_flex.description(), "deposit (flexible)");
 
         let wd_some = QueuedOrder::new(
-            5, "u".into(), "p".into(),
-            QueuedOrderType::Withdraw { amount: Some(2.25) }, "diamond".into(), 0,
+            5,
+            "u".into(),
+            "p".into(),
+            QueuedOrderType::Withdraw { amount: Some(2.25) },
+            "diamond".into(),
+            0,
         );
         assert_eq!(wd_some.description(), "withdraw 2.25");
 
         let wd_full = QueuedOrder::new(
-            6, "u".into(), "p".into(),
-            QueuedOrderType::Withdraw { amount: None }, "diamond".into(), 0,
+            6,
+            "u".into(),
+            "p".into(),
+            QueuedOrderType::Withdraw { amount: None },
+            "diamond".into(),
+            0,
         );
         assert_eq!(wd_full.description(), "withdraw (full balance)");
     }
@@ -820,15 +940,28 @@ mod tests {
 
         let mut queue = OrderQueue::new();
         queue.orders.push_back(QueuedOrder::new(
-            42, "uuid-a".into(), "alice".into(), QueuedOrderType::Buy, "diamond".into(), 7,
+            42,
+            "uuid-a".into(),
+            "alice".into(),
+            QueuedOrderType::Buy,
+            "diamond".into(),
+            7,
         ));
         queue.orders.push_back(QueuedOrder::new(
-            43, "uuid-b".into(), "bob".into(),
-            QueuedOrderType::Deposit { amount: Some(1.5) }, "diamond".into(), 0,
+            43,
+            "uuid-b".into(),
+            "bob".into(),
+            QueuedOrderType::Deposit { amount: Some(1.5) },
+            "diamond".into(),
+            0,
         ));
         queue.orders.push_back(QueuedOrder::new(
-            44, "uuid-c".into(), "carol".into(),
-            QueuedOrderType::Withdraw { amount: None }, "diamond".into(), 0,
+            44,
+            "uuid-c".into(),
+            "carol".into(),
+            QueuedOrderType::Withdraw { amount: None },
+            "diamond".into(),
+            0,
         ));
         queue.next_id = 45;
 
@@ -903,7 +1036,11 @@ mod tests {
 
         // (b) queue.len() unchanged after the failed call (the push was
         // rolled back via pop_back).
-        assert_eq!(queue.len(), len_before, "len must roll back on save failure");
+        assert_eq!(
+            queue.len(),
+            len_before,
+            "len must roll back on save failure"
+        );
 
         // (c) queue.next_id IS rolled back on save failure. The success-path
         // `info!()` line never ran (it's printed AFTER `save_to` returns Ok)
@@ -912,8 +1049,7 @@ mod tests {
         // permission / disk-full failure would unbound `next_id` even though
         // no order was ever persisted.
         assert_eq!(
-            queue.next_id,
-            next_id_before,
+            queue.next_id, next_id_before,
             "next_id must be decremented on save failure (no log/player surface saw the ID yet)"
         );
     }
@@ -932,8 +1068,13 @@ mod tests {
         let mut queue = OrderQueue::new();
         let writable = dir.path("queue.json");
         let (id, _) = add_to(
-            &mut queue, &writable,
-            "uuid-stay", "stayplayer", QueuedOrderType::Buy, "diamond", 1,
+            &mut queue,
+            &writable,
+            "uuid-stay",
+            "stayplayer",
+            QueuedOrderType::Buy,
+            "diamond",
+            1,
         )
         .unwrap();
 
@@ -968,11 +1109,19 @@ mod tests {
         let mut queue = OrderQueue::new();
 
         let (id, _) = add_to(
-            &mut queue, &path,
-            "uuid-7", "player7", QueuedOrderType::Buy, "diamond", 1,
+            &mut queue,
+            &path,
+            "uuid-7",
+            "player7",
+            QueuedOrderType::Buy,
+            "diamond",
+            1,
         )
         .unwrap();
-        assert_eq!(id, 1, "first add gets id 1; reusing variable name to avoid confusion");
+        assert_eq!(
+            id, 1,
+            "first add gets id 1; reusing variable name to avoid confusion"
+        );
 
         // Pre-load id 7 by burning ids until next_id = 7. Cleanest path: just
         // assert against a wrong id directly.
@@ -1002,8 +1151,13 @@ mod tests {
         assert!(queue.is_empty());
 
         let (id, _) = add_to(
-            &mut queue, &path,
-            "uuid-peek", "peekplayer", QueuedOrderType::Buy, "diamond", 3,
+            &mut queue,
+            &path,
+            "uuid-peek",
+            "peekplayer",
+            QueuedOrderType::Buy,
+            "diamond",
+            3,
         )
         .unwrap();
 
@@ -1033,13 +1187,23 @@ mod tests {
         // Pre-load two orders so we can verify the rollback restores the
         // original front position (not just the count).
         let (id1, _) = add_to(
-            &mut queue, &writable,
-            "uuid-cancel", "cancelplayer", QueuedOrderType::Buy, "diamond", 1,
+            &mut queue,
+            &writable,
+            "uuid-cancel",
+            "cancelplayer",
+            QueuedOrderType::Buy,
+            "diamond",
+            1,
         )
         .unwrap();
         add_to(
-            &mut queue, &writable,
-            "uuid-cancel", "cancelplayer", QueuedOrderType::Sell, "iron", 2,
+            &mut queue,
+            &writable,
+            "uuid-cancel",
+            "cancelplayer",
+            QueuedOrderType::Sell,
+            "iron",
+            2,
         )
         .unwrap();
 
@@ -1057,7 +1221,11 @@ mod tests {
         );
 
         // (b) queue.len() unchanged.
-        assert_eq!(queue.len(), len_before, "len must roll back on save failure");
+        assert_eq!(
+            queue.len(),
+            len_before,
+            "len must roll back on save failure"
+        );
 
         // (c) front order id is the same as before — i.e. the rollback
         // insert restored the original position, not just appended somewhere.
@@ -1080,10 +1248,7 @@ mod tests {
 
         // (a) A `.corrupt-*` sibling exists next to the original path.
         let parent = path.parent().expect("path has parent");
-        let prefix = format!(
-            "{}.corrupt-",
-            path.file_name().unwrap().to_string_lossy()
-        );
+        let prefix = format!("{}.corrupt-", path.file_name().unwrap().to_string_lossy());
         let mut sidecar_found: Option<std::path::PathBuf> = None;
         for entry in fs::read_dir(parent).unwrap() {
             let entry = entry.unwrap();
@@ -1140,8 +1305,15 @@ mod tests {
         let count = fs::read_dir(&parent)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("queue.json.corrupt-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("queue.json.corrupt-")
+            })
             .count();
-        assert_eq!(count, 2, "two rapid quarantines must produce two distinct sibling files");
+        assert_eq!(
+            count, 2,
+            "two rapid quarantines must produce two distinct sibling files"
+        );
     }
 }

@@ -38,7 +38,9 @@ fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result
             Ok(v) => return v,
             Err(e) => {
                 warn!("[CLI] {desc}: {e} — retrying");
-                std::thread::sleep(std::time::Duration::from_millis(crate::constants::DELAY_MEDIUM_MS));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    crate::constants::DELAY_MEDIUM_MS,
+                ));
             }
         }
     }
@@ -53,10 +55,7 @@ fn with_retry<T, E: std::fmt::Display>(desc: &str, mut f: impl FnMut() -> Result
 ///
 /// `chat_tx` is `None` when chat is disabled; chat-related menu entries
 /// are only shown when it is `Some`.
-pub fn cli_task(
-    store_tx: mpsc::Sender<StoreMessage>,
-    chat_tx: Option<mpsc::Sender<ChatCommand>>,
-) {
+pub fn cli_task(store_tx: mpsc::Sender<StoreMessage>, chat_tx: Option<mpsc::Sender<ChatCommand>>) {
     let chat_enabled = chat_tx.is_some();
     loop {
         // Indices in the match below are positional — adding/removing an entry
@@ -142,8 +141,12 @@ pub fn cli_task(
             "Chat: replay event <event_ts>" => chat_replay_event(chat_tx.as_ref()),
             "Chat: reset player memory <username>" => chat_reset_player_memory(chat_tx.as_ref()),
             "Chat: dump player memory <username>" => chat_dump_player_memory(chat_tx.as_ref()),
-            "Chat: set operator trust <username>" => chat_set_operator_trust(chat_tx.as_ref(), true),
-            "Chat: clear operator trust <username>" => chat_set_operator_trust(chat_tx.as_ref(), false),
+            "Chat: set operator trust <username>" => {
+                chat_set_operator_trust(chat_tx.as_ref(), true)
+            }
+            "Chat: clear operator trust <username>" => {
+                chat_set_operator_trust(chat_tx.as_ref(), false)
+            }
             "Chat: regenerate persona" => chat_regenerate_persona(chat_tx.as_ref()),
             "Chat: forget player <username>" => chat_forget_player(chat_tx.as_ref()),
             "Exit" => {
@@ -152,7 +155,10 @@ pub fn cli_task(
                 // (chat may already be down).
                 if let Some(ref ct) = chat_tx {
                     let (ack_tx, ack_rx) = oneshot::channel();
-                    if ct.blocking_send(ChatCommand::Shutdown { ack: ack_tx }).is_ok() {
+                    if ct
+                        .blocking_send(ChatCommand::Shutdown { ack: ack_tx })
+                        .is_ok()
+                    {
                         let _ = ack_rx.blocking_recv();
                     }
                 }
@@ -193,7 +199,12 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
         return;
     };
     let (resp_tx, resp_rx) = oneshot::channel();
-    if ct.blocking_send(ChatCommand::Status { respond_to: resp_tx }).is_err() {
+    if ct
+        .blocking_send(ChatCommand::Status {
+            respond_to: resp_tx,
+        })
+        .is_err()
+    {
         println!("Chat task is not running.");
         return;
     }
@@ -240,11 +251,15 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
             );
             println!(
                 "persona regen cooldown: {}",
-                s.persona_regen_cooldown_until.as_deref().unwrap_or("<none>")
+                s.persona_regen_cooldown_until
+                    .as_deref()
+                    .unwrap_or("<none>")
             );
             println!(
                 "last persona regen: {}",
-                s.last_persona_regenerated_at.as_deref().unwrap_or("<never>")
+                s.last_persona_regenerated_at
+                    .as_deref()
+                    .unwrap_or("<never>")
             );
             println!("pending_adjustments: {}", s.pending_adjustments_count);
             println!("in_critical_section: {}", s.critical_section_active);
@@ -254,10 +269,7 @@ fn chat_status(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
                 s.last_composer_call_usd
             );
             println!("web_fetches today: {}", s.web_fetches_today);
-            println!(
-                "classifier active senders: {}",
-                s.classifier_active_senders
-            );
+            println!("classifier active senders: {}", s.classifier_active_senders);
             println!(
                 "proactive threading: enabled={} dispatch_wired={}",
                 s.proactive_threading_enabled, s.proactive_dispatch_wired
@@ -278,7 +290,12 @@ fn chat_show_token_spend(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
         return;
     };
     let (resp_tx, resp_rx) = oneshot::channel();
-    if ct.blocking_send(ChatCommand::Status { respond_to: resp_tx }).is_err() {
+    if ct
+        .blocking_send(ChatCommand::Status {
+            respond_to: resp_tx,
+        })
+        .is_err()
+    {
         println!("Chat task is not running.");
         return;
     }
@@ -318,7 +335,10 @@ fn chat_show_decision_log(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     });
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::ShowDecisionLog { last_n, respond_to: resp_tx })
+        .blocking_send(ChatCommand::ShowDecisionLog {
+            last_n,
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -356,7 +376,10 @@ fn chat_replay_event(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     });
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::ReplayEvent { event_ts: event_ts.clone(), respond_to: resp_tx })
+        .blocking_send(ChatCommand::ReplayEvent {
+            event_ts: event_ts.clone(),
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -388,7 +411,10 @@ fn chat_reset_player_memory(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     });
     let confirmed = with_retry("Failed to read confirmation", || {
         Confirm::new()
-            .with_prompt(format!("Really reset memory for '{}'? This wipes their per-player memory file.", username))
+            .with_prompt(format!(
+                "Really reset memory for '{}'? This wipes their per-player memory file.",
+                username
+            ))
             .default(false)
             .interact()
     });
@@ -398,7 +424,10 @@ fn chat_reset_player_memory(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     }
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::ResetPlayerMemory { username: username.clone(), respond_to: resp_tx })
+        .blocking_send(ChatCommand::ResetPlayerMemory {
+            username: username.clone(),
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -424,7 +453,10 @@ fn chat_dump_player_memory(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     });
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::DumpPlayerMemory { username: username.clone(), respond_to: resp_tx })
+        .blocking_send(ChatCommand::DumpPlayerMemory {
+            username: username.clone(),
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -503,7 +535,9 @@ fn chat_regenerate_persona(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     };
     let confirmed = with_retry("Failed to read confirmation", || {
         Confirm::new()
-            .with_prompt("Really regenerate the persona? Active persona will be archived and replaced.")
+            .with_prompt(
+                "Really regenerate the persona? Active persona will be archived and replaced.",
+            )
             .default(false)
             .interact()
     });
@@ -513,7 +547,9 @@ fn chat_regenerate_persona(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     }
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::RegeneratePersona { respond_to: resp_tx })
+        .blocking_send(ChatCommand::RegeneratePersona {
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -541,7 +577,10 @@ fn chat_forget_player(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     });
     let confirmed1 = with_retry("Failed to read confirmation", || {
         Confirm::new()
-            .with_prompt(format!("Really forget '{}'? Removes all chat-side traces of this player.", username))
+            .with_prompt(format!(
+                "Really forget '{}'? Removes all chat-side traces of this player.",
+                username
+            ))
             .default(false)
             .interact()
     });
@@ -563,7 +602,10 @@ fn chat_forget_player(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     }
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::ForgetPlayer { username: username.clone(), respond_to: resp_tx })
+        .blocking_send(ChatCommand::ForgetPlayer {
+            username: username.clone(),
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -604,7 +646,10 @@ fn chat_toggle_dry_run(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     // Without snapshotting current state we'd toggle blindly; query
     // status first.
     let (q_tx, q_rx) = oneshot::channel();
-    if ct.blocking_send(ChatCommand::Status { respond_to: q_tx }).is_err() {
+    if ct
+        .blocking_send(ChatCommand::Status { respond_to: q_tx })
+        .is_err()
+    {
         println!("Chat task is not running.");
         return;
     }
@@ -650,7 +695,9 @@ fn chat_clear_moderation(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     };
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::ClearModerationBackoff { respond_to: resp_tx })
+        .blocking_send(ChatCommand::ClearModerationBackoff {
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -667,7 +714,9 @@ fn chat_run_reflection(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     };
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::RunReflection { respond_to: resp_tx })
+        .blocking_send(ChatCommand::RunReflection {
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -696,7 +745,9 @@ fn chat_run_sweep(chat_tx: Option<&mpsc::Sender<ChatCommand>>) {
     };
     let (resp_tx, resp_rx) = oneshot::channel();
     if ct
-        .blocking_send(ChatCommand::RunRetentionSweep { respond_to: resp_tx })
+        .blocking_send(ChatCommand::RunRetentionSweep {
+            respond_to: resp_tx,
+        })
         .is_err()
     {
         println!("Chat task is not running.");
@@ -760,20 +811,24 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
     // prices materially wrong, so the fallback path must warn.
     const DEFAULT_FEE_FALLBACK: f64 = 0.125;
     let (fee_tx, fee_rx) = oneshot::channel();
-    let fee_msg = StoreMessage::FromCli(CliMessage::QueryFee {
-        respond_to: fee_tx,
-    });
+    let fee_msg = StoreMessage::FromCli(CliMessage::QueryFee { respond_to: fee_tx });
 
     let fee = if store_tx.blocking_send(fee_msg).is_ok() {
         match fee_rx.blocking_recv() {
             Ok(f) => f,
             Err(_) => {
-                warn!("[CLI] QueryFee response failed, displaying prices with fallback fee {}", DEFAULT_FEE_FALLBACK);
+                warn!(
+                    "[CLI] QueryFee response failed, displaying prices with fallback fee {}",
+                    DEFAULT_FEE_FALLBACK
+                );
                 DEFAULT_FEE_FALLBACK
             }
         }
     } else {
-        warn!("[CLI] QueryFee send failed, displaying prices with fallback fee {}", DEFAULT_FEE_FALLBACK);
+        warn!(
+            "[CLI] QueryFee send failed, displaying prices with fallback fee {}",
+            DEFAULT_FEE_FALLBACK
+        );
         DEFAULT_FEE_FALLBACK
     };
 
@@ -794,7 +849,8 @@ fn get_pairs(store_tx: &mpsc::Sender<StoreMessage>) {
             } else {
                 println!("\n=== Pairs ===");
                 for pair in pairs {
-                    let (price_buy, price_sell) = quote_prices(pair.item_stock, pair.currency_stock, fee);
+                    let (price_buy, price_sell) =
+                        quote_prices(pair.item_stock, pair.currency_stock, fee);
                     println!(
                         "Item: {}, Stock: {}, Currency: {:.2}",
                         pair.item, pair.item_stock, pair.currency_stock
@@ -849,7 +905,10 @@ fn set_operator(store_tx: &mpsc::Sender<StoreMessage>) {
         return;
     }
 
-    info!("[CLI] Setting operator status for {} to {}", username_or_uuid, is_operator);
+    info!(
+        "[CLI] Setting operator status for {} to {}",
+        username_or_uuid, is_operator
+    );
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::SetOperator {
@@ -965,7 +1024,10 @@ fn remove_node(store_tx: &mpsc::Sender<StoreMessage>) {
 
     let confirmed = with_retry("Failed to read confirmation", || {
         Confirm::new()
-            .with_prompt(format!("Really remove node {}? This deletes data/storage/{}.json from disk.", node_id, node_id))
+            .with_prompt(format!(
+                "Really remove node {}? This deletes data/storage/{}.json from disk.",
+                node_id, node_id
+            ))
             .default(false)
             .interact()
     });
@@ -1012,7 +1074,11 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     let stack_size_selection = with_retry("Failed to read stack size selection", || {
         Select::new()
             .with_prompt("Select stack size")
-            .items(["64 (most items)", "16 (ender pearls, eggs, signs, buckets)", "1 (tools, weapons, armor)"])
+            .items([
+                "64 (most items)",
+                "16 (ender pearls, eggs, signs, buckets)",
+                "1 (tools, weapons, armor)",
+            ])
             .default(0)
             .interact()
     });
@@ -1024,7 +1090,10 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
         _ => unreachable!("Select bounded by items() above"),
     };
 
-    info!("[CLI] Requesting to add pair for {} with stack size {}", item_name, stack_size);
+    info!(
+        "[CLI] Requesting to add pair for {} with stack size {}",
+        item_name, stack_size
+    );
 
     let (response_tx, response_rx) = oneshot::channel();
     let msg = StoreMessage::FromCli(CliMessage::AddPair {
@@ -1039,7 +1108,10 @@ fn add_pair(store_tx: &mpsc::Sender<StoreMessage>) {
     }
 
     match response_rx.blocking_recv() {
-        Ok(Ok(())) => println!("Pair '{}' added successfully (stack size: {}, stocks set to zero).", item_name, stack_size),
+        Ok(Ok(())) => println!(
+            "Pair '{}' added successfully (stack size: {}, stocks set to zero).",
+            item_name, stack_size
+        ),
         Ok(Err(e)) => {
             println!("Failed to add pair: {}", e);
             error!("[CLI] AddPair for {item_name} (stack {stack_size}) failed: {e}");
@@ -1105,21 +1177,34 @@ fn view_storage(store_tx: &mpsc::Sender<StoreMessage>) {
     match response_rx.blocking_recv() {
         Ok(storage) => {
             println!("\n=== Storage State ===");
-            println!("Origin: ({}, {}, {})", storage.position.x, storage.position.y, storage.position.z);
+            println!(
+                "Origin: ({}, {}, {})",
+                storage.position.x, storage.position.y, storage.position.z
+            );
             println!("Total nodes: {}", storage.nodes.len());
             println!();
-            
+
             if storage.nodes.is_empty() {
                 println!("No nodes configured.");
             } else {
                 for node in &storage.nodes {
                     println!("--- Node {} ---", node.id);
-                    println!("  Position: ({}, {}, {})", node.position.x, node.position.y, node.position.z);
+                    println!(
+                        "  Position: ({}, {}, {})",
+                        node.position.x, node.position.y, node.position.z
+                    );
                     println!("  Chests:");
                     for chest in &node.chests {
                         let total_items: i32 = chest.amounts.iter().sum();
-                        let item_display = if chest.item.is_empty() { "(empty)" } else { &chest.item };
-                        println!("    Chest {}: {} - {} items total", chest.id, item_display, total_items);
+                        let item_display = if chest.item.is_empty() {
+                            "(empty)"
+                        } else {
+                            &chest.item
+                        };
+                        println!(
+                            "    Chest {}: {} - {} items total",
+                            chest.id, item_display, total_items
+                        );
                     }
                     println!();
                 }
@@ -1235,7 +1320,10 @@ fn clear_stuck_order(store_tx: &mpsc::Sender<StoreMessage>) {
 /// If `repair` is true, also applies safe automatic repairs (e.g. recomputing pair stock).
 fn audit_state(store_tx: &mpsc::Sender<StoreMessage>, repair: bool) {
     let (response_tx, response_rx) = oneshot::channel();
-    let msg = StoreMessage::FromCli(CliMessage::AuditState { repair, respond_to: response_tx });
+    let msg = StoreMessage::FromCli(CliMessage::AuditState {
+        repair,
+        respond_to: response_tx,
+    });
 
     if store_tx.blocking_send(msg).is_err() {
         error!("[CLI] AuditState send failed: Store channel closed");

@@ -5,10 +5,10 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::debug;
 
+use super::Store;
 use crate::constants::WHISPER_ACK_TIMEOUT_SECS;
 use crate::messages::BotInstruction;
 use crate::types::User;
-use super::Store;
 
 /// Ensure user exists in store, creating if missing.
 ///
@@ -49,34 +49,35 @@ pub fn ensure_user_exists(store: &mut Store, username: &str, uuid: &str) {
         store.dirty_users.insert(uuid.to_string());
         debug!(uuid = uuid, username = username, "Created new user record");
     } else if let Some(user) = store.users.get_mut(uuid)
-        && user.username != username {
-            // Defense-in-depth: enforce the invariant "User.username field is
-            // never UUID-shaped" once for all callers (orders, deposit,
-            // withdraw, operator, info, player). A buggy caller passing
-            // `username == uuid` would otherwise corrupt the stored username
-            // with a 32/36-char hex string and break every downstream code
-            // path that displays or matches by username.
-            if crate::types::user::is_valid_uuid_shape(username) {
-                tracing::warn!(
-                    uuid = uuid,
-                    proposed_username = username,
-                    existing_username = %user.username,
-                    "rejecting UUID-shaped username drift in ensure_user_exists"
-                );
-                return;
-            }
-            let old = std::mem::replace(&mut user.username, username.to_string());
-            store.dirty = true;
-            // Same dirty-tracking obligation as the create branch: the username
-            // mutation must reach disk on the next save.
-            store.dirty_users.insert(uuid.to_string());
-            debug!(
+        && user.username != username
+    {
+        // Defense-in-depth: enforce the invariant "User.username field is
+        // never UUID-shaped" once for all callers (orders, deposit,
+        // withdraw, operator, info, player). A buggy caller passing
+        // `username == uuid` would otherwise corrupt the stored username
+        // with a 32/36-char hex string and break every downstream code
+        // path that displays or matches by username.
+        if crate::types::user::is_valid_uuid_shape(username) {
+            tracing::warn!(
                 uuid = uuid,
-                old_username = %old,
-                new_username = username,
-                "Updated user's changed username"
+                proposed_username = username,
+                existing_username = %user.username,
+                "rejecting UUID-shaped username drift in ensure_user_exists"
             );
+            return;
         }
+        let old = std::mem::replace(&mut user.username, username.to_string());
+        store.dirty = true;
+        // Same dirty-tracking obligation as the create branch: the username
+        // mutation must reach disk on the next save.
+        store.dirty_users.insert(uuid.to_string());
+        debug!(
+            uuid = uuid,
+            old_username = %old,
+            new_username = username,
+            "Updated user's changed username"
+        );
+    }
 }
 
 /// Returns true iff the user with `user_uuid` exists and has the operator flag set.
@@ -92,12 +93,13 @@ pub fn is_operator(store: &Store, user_uuid: &str) -> bool {
 /// storage origin so callers always get a valid location.
 pub fn get_node_position(store: &Store, chest_id: i32) -> crate::types::Position {
     let node_id = chest_id / crate::constants::CHESTS_PER_NODE as i32;
-    store.storage.nodes.iter()
+    store
+        .storage
+        .nodes
+        .iter()
         .find(|n| n.id == node_id)
         .map(|n| n.position)
-        .unwrap_or_else(|| {
-            crate::types::Node::calc_position(node_id, &store.storage.position)
-        })
+        .unwrap_or_else(|| crate::types::Node::calc_position(node_id, &store.storage.position))
 }
 
 /// Send a message to a player via bot whisper.
@@ -113,7 +115,11 @@ pub async fn send_message_to_player(
     player_name: &str,
     message: &str,
 ) -> Result<(), crate::error::StoreError> {
-    debug!(player = player_name, message = message, "Whispering to player");
+    debug!(
+        player = player_name,
+        message = message,
+        "Whispering to player"
+    );
     let (tx, rx) = oneshot::channel();
     store
         .bot_tx
@@ -126,7 +132,9 @@ pub async fn send_message_to_player(
         .map_err(|_| crate::error::StoreError::BotDisconnected)?;
 
     match tokio::time::timeout(Duration::from_secs(WHISPER_ACK_TIMEOUT_SECS), rx).await {
-        Err(_elapsed) => Err(crate::error::StoreError::BotAckTimeout("whisper ack".into())),
+        Err(_elapsed) => Err(crate::error::StoreError::BotAckTimeout(
+            "whisper ack".into(),
+        )),
         Ok(Err(_recv_err)) => Err(crate::error::StoreError::BotDisconnected),
         Ok(Ok(Err(e))) => Err(crate::error::StoreError::BotReportedError(e)),
         Ok(Ok(Ok(()))) => Ok(()),
@@ -171,7 +179,12 @@ pub async fn whisper_action_aborted(
     reason: &str,
     suffix: Option<&str>,
 ) -> Result<(), crate::error::StoreError> {
-    send_message_to_player(store, player_name, &format_action_aborted(action, reason, suffix)).await
+    send_message_to_player(
+        store,
+        player_name,
+        &format_action_aborted(action, reason, suffix),
+    )
+    .await
 }
 
 /// Format-only sibling of [`whisper_action_aborted`]. Use this when the
@@ -191,7 +204,10 @@ pub fn format_action_aborted(action: &str, reason: &str, suffix: Option<&str>) -
 /// let customers (or griefers) locate and bypass the storage system directly.
 /// Only item + amount pairs are included; long lists are truncated with a
 /// "(+N more)" suffix to keep whispers within Minecraft's chat limits.
-pub fn summarize_transfers(transfers: &[crate::types::storage::ChestTransfer], max: usize) -> String {
+pub fn summarize_transfers(
+    transfers: &[crate::types::storage::ChestTransfer],
+    max: usize,
+) -> String {
     if transfers.is_empty() {
         return "none".to_string();
     }
@@ -281,14 +297,18 @@ mod tests {
 
     #[test]
     fn summarize_transfers_formats_single_entry_without_coords() {
-        use crate::types::storage::ChestTransfer;
         use crate::types::Position;
+        use crate::types::storage::ChestTransfer;
 
         let transfers = vec![ChestTransfer {
             chest_id: 0,
             item: crate::types::ItemId::new("diamond").unwrap(),
             amount: 64,
-            position: Position { x: 123, y: 64, z: -456 },
+            position: Position {
+                x: 123,
+                y: 64,
+                z: -456,
+            },
         }];
         let s = summarize_transfers(&transfers, 5);
         assert_eq!(s, "64x diamond");
@@ -299,8 +319,8 @@ mod tests {
 
     #[test]
     fn summarize_transfers_joins_multiple_with_semicolons() {
-        use crate::types::storage::ChestTransfer;
         use crate::types::Position;
+        use crate::types::storage::ChestTransfer;
 
         let transfers = vec![
             ChestTransfer {
@@ -324,8 +344,8 @@ mod tests {
 
     #[test]
     fn summarize_transfers_truncates_above_max_with_more_suffix() {
-        use crate::types::storage::ChestTransfer;
         use crate::types::Position;
+        use crate::types::storage::ChestTransfer;
 
         let transfers: Vec<ChestTransfer> = (0..5)
             .map(|i| ChestTransfer {
@@ -358,7 +378,13 @@ mod tests {
             autosave_interval_secs: 10,
             chat: crate::config::ChatConfig::default(),
         };
-        Store::new_for_test(tx, config, HashMap::new(), HashMap::new(), crate::types::Storage::default())
+        Store::new_for_test(
+            tx,
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            crate::types::Storage::default(),
+        )
     }
 
     /// Canonical 36-char hyphenated UUID used as the test fixture for
@@ -384,7 +410,10 @@ mod tests {
         store.dirty = false;
 
         ensure_user_exists(&mut store, "AliceRenamed", ALICE_UUID);
-        assert_eq!(store.users.get(ALICE_UUID).unwrap().username, "AliceRenamed");
+        assert_eq!(
+            store.users.get(ALICE_UUID).unwrap().username,
+            "AliceRenamed"
+        );
         assert!(store.dirty);
     }
 
@@ -455,7 +484,11 @@ mod tests {
     fn get_node_position_uses_materialized_node_when_present() {
         use crate::types::Position;
         let mut store = test_store();
-        let explicit = Position { x: 999, y: 64, z: -999 };
+        let explicit = Position {
+            x: 999,
+            y: 64,
+            z: -999,
+        };
         store.storage.nodes.push(crate::types::Node {
             id: 1,
             position: explicit,

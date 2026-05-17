@@ -75,9 +75,7 @@ pub enum HistoryItem {
     /// GDPR rewrite-via-`write_atomic` against the live writer cache so
     /// no event lands in an orphaned inode after the rename. This arm
     /// must NOT exit the loop.
-    DropCacheAndAck {
-        ack: oneshot::Sender<()>,
-    },
+    DropCacheAndAck { ack: oneshot::Sender<()> },
 }
 
 /// Root directory of the chat history JSONL files.
@@ -206,7 +204,8 @@ fn encode_with_kind(
             original_kind: kind,
             size: event.content.len(),
         };
-        serde_json::to_string(&drop).unwrap_or_else(|_| "{\"ts\":\"\",\"kind\":\"dropped\"}".to_string())
+        serde_json::to_string(&drop)
+            .unwrap_or_else(|_| "{\"ts\":\"\",\"kind\":\"dropped\"}".to_string())
     });
 
     // Whole-line ceiling — should never trigger in Phase 1 with only the
@@ -220,7 +219,8 @@ fn encode_with_kind(
             original_kind: kind,
             size: line.len(),
         };
-        line = serde_json::to_string(&drop).unwrap_or_else(|_| "{\"ts\":\"\",\"kind\":\"dropped\"}".to_string());
+        line = serde_json::to_string(&drop)
+            .unwrap_or_else(|_| "{\"ts\":\"\",\"kind\":\"dropped\"}".to_string());
     }
 
     line.push('\n');
@@ -250,7 +250,11 @@ pub fn enqueue_bot_output(
     content: &str,
     is_whisper: bool,
 ) -> Result<(), TrySendError<HistoryItem>> {
-    let kind_label = if is_whisper { "bot_whisper" } else { "bot_chat" };
+    let kind_label = if is_whisper {
+        "bot_whisper"
+    } else {
+        "bot_chat"
+    };
     let recv_at: DateTime<Utc> = SystemTime::now().into();
     history_tx.try_send(HistoryItem::BotOut {
         kind_label,
@@ -273,10 +277,7 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(line.as_bytes())?;
     Ok(())
 }
@@ -548,7 +549,10 @@ mod tests {
         // Bound the wait so a regression that hangs the task surfaces as
         // a test timeout rather than a process-wide hang.
         let res = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        assert!(res.is_ok(), "writer_task should exit promptly after sender drop");
+        assert!(
+            res.is_ok(),
+            "writer_task should exit promptly after sender drop"
+        );
         res.unwrap().expect("writer_task should not panic");
     }
 

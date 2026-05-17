@@ -45,12 +45,12 @@ pub fn write_atomic(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
     // `file_name()` returns None for `.` and `..`, and the inner `to_str()` can
     // reject non-UTF-8 names on Unix; both cases produce `InvalidInput` so the
     // caller sees the real reason rather than a confusing later error.
-    let file_name = path.file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| io::Error::new(
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("Invalid file path: {path:?}")
-        ))?;
+            format!("Invalid file path: {path:?}"),
+        )
+    })?;
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     // Stat-then-mkdir on the hot path: a single existence check is much
@@ -242,7 +242,9 @@ fn rename_failed_fallback_copy(
     tmp_path: &Path,
     rename_err: io::Error,
 ) -> io::Result<()> {
-    tracing::warn!("[File] rename {tmp_path:?} -> {path:?} failed: {rename_err} — moving prior file aside and falling back to copy-then-rename");
+    tracing::warn!(
+        "[File] rename {tmp_path:?} -> {path:?} failed: {rename_err} — moving prior file aside and falling back to copy-then-rename"
+    );
 
     // 1. Copy tmp_path to a sibling recovery-temp and fsync. The recovery-temp
     //    is a distinct path so that `fs::copy` cannot truncate the live `path`
@@ -264,7 +266,9 @@ fn rename_failed_fallback_copy(
         // would see misleading evidence. Clear it now so the failure surface
         // is exactly the failed-rename + failed-copy report.
         let _ = fs::remove_file(&recovery_tmp);
-        tracing::error!("[File] cannot save {path:?}: rename={rename_err}, copy-to-recovery-temp={copy_err}; {prior_state}");
+        tracing::error!(
+            "[File] cannot save {path:?}: rename={rename_err}, copy-to-recovery-temp={copy_err}; {prior_state}"
+        );
         return Err(io::Error::other(format!(
             "Failed to save file: rename error: {rename_err}, copy-to-recovery-temp error: {copy_err} (path: {path:?}, {prior_state})"
         )));
@@ -272,7 +276,9 @@ fn rename_failed_fallback_copy(
     match fs::File::open(&recovery_tmp) {
         Ok(file) => {
             if let Err(sync_err) = file.sync_all() {
-                tracing::warn!("[File] sync_all on recovery-temp {recovery_tmp:?} failed: {sync_err} — continuing; rename remains atomic");
+                tracing::warn!(
+                    "[File] sync_all on recovery-temp {recovery_tmp:?} failed: {sync_err} — continuing; rename remains atomic"
+                );
             }
         }
         Err(open_err) => tracing::warn!(
@@ -302,10 +308,14 @@ fn rename_failed_fallback_copy(
                         }
                         Err(e) => {
                             if attempt == 4 {
-                                tracing::debug!("[File] {path:?}: aside-rename to .bak failed after 5 attempts: {e} — final rename below will overwrite path directly");
+                                tracing::debug!(
+                                    "[File] {path:?}: aside-rename to .bak failed after 5 attempts: {e} — final rename below will overwrite path directly"
+                                );
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(10 * (1 << attempt)));
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                10 * (1 << attempt),
+                            ));
                         }
                     }
                 }
@@ -317,7 +327,9 @@ fn rename_failed_fallback_copy(
                         bak = Some(candidate.clone());
                     }
                     Err(e) => {
-                        tracing::debug!("[File] {path:?}: aside-rename to .bak failed: {e} — final rename below will overwrite path directly");
+                        tracing::debug!(
+                            "[File] {path:?}: aside-rename to .bak failed: {e} — final rename below will overwrite path directly"
+                        );
                     }
                 }
             }
@@ -444,12 +456,18 @@ mod tests {
         let dir = TmpDir::new("reject-dir");
         // Target the directory itself, which has a file_name, but use ".." which
         // does not. "." also has no file_name component on Unix.
-        let bad: std::path::PathBuf = dir.path("..").components()
+        let bad: std::path::PathBuf = dir
+            .path("..")
+            .components()
             .take_while(|c| !matches!(c, std::path::Component::ParentDir))
             .collect();
         // If the above didn't produce a bad path for this platform, fall back to
         // an empty path which is explicitly rejected.
-        let bad = if bad.file_name().is_none() { bad } else { std::path::PathBuf::from("") };
+        let bad = if bad.file_name().is_none() {
+            bad
+        } else {
+            std::path::PathBuf::from("")
+        };
         let err = write_atomic(&bad, "x").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
@@ -469,7 +487,10 @@ mod tests {
         write_atomic(&target, "fresh").unwrap();
 
         assert_eq!(read_to_string(&target), "fresh");
-        assert!(!stale_tmp.exists(), "stale .tmp must be gone after successful write");
+        assert!(
+            !stale_tmp.exists(),
+            "stale .tmp must be gone after successful write"
+        );
     }
 
     #[test]
@@ -556,7 +577,10 @@ mod tests {
         assert_eq!(read_to_string(&target), "fresh");
         // Happy-path overwrite: stale recovery-temp is not touched (it
         // would only be cleared if the recovery branch had run).
-        assert!(stale_recovery.exists(), "stale .recovery.tmp left for operator review on happy path");
+        assert!(
+            stale_recovery.exists(),
+            "stale .recovery.tmp left for operator review on happy path"
+        );
     }
 
     #[test]

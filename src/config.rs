@@ -7,9 +7,9 @@ use std::io;
 use std::path::Path;
 use tracing::{info, warn};
 
-use crate::types::Position;
+use crate::constants::{FEE_MAX, FEE_MIN, PATHFINDING_TIMEOUT_MS, TRADE_TIMEOUT_MS};
 use crate::fsutil::write_atomic;
-use crate::constants::{FEE_MIN, FEE_MAX, TRADE_TIMEOUT_MS, PATHFINDING_TIMEOUT_MS};
+use crate::types::Position;
 
 /// Application configuration. See [`Config::validate`] for the invariants
 /// each field must satisfy; missing `#[serde(default = ...)]` fields are
@@ -380,8 +380,7 @@ impl Default for ChatConfig {
             cross_player_reads: false,
             tools_store_enabled: false,
             tools_store_max_calls_per_turn: default_chat_tools_store_max_calls_per_turn(),
-            tools_store_trade_query_max_results:
-                default_chat_tools_store_trade_query_max_results(),
+            tools_store_trade_query_max_results: default_chat_tools_store_trade_query_max_results(),
             tools_store_cross_player_balance_lookups: false,
             reflection_max_pending: default_chat_reflection_max_pending(),
             reflection_idle_trigger_secs: default_chat_reflection_idle_trigger_secs(),
@@ -417,78 +416,222 @@ impl Default for ChatConfig {
     }
 }
 
-fn default_chat_enabled() -> bool { false }
-fn default_chat_dry_run() -> bool { false }
-fn default_chat_api_key_env() -> String { "ANTHROPIC_API_KEY".to_string() }
-fn default_chat_composer_model() -> String { "claude-haiku-4-5-20251001".to_string() }
-fn default_chat_classifier_model() -> String { "claude-haiku-4-5-20251001".to_string() }
-fn default_chat_composer_temperature() -> Option<f32> { Some(0.8) }
-fn default_chat_classifier_temperature() -> Option<f32> { Some(0.0) }
-fn default_chat_reasoning_filter_enabled() -> bool { true }
-fn default_chat_reasoning_filter_model() -> String { "claude-haiku-4-5-20251001".to_string() }
-fn default_chat_reasoning_filter_temperature() -> Option<f32> { Some(0.0) }
-fn default_chat_command_typo_max_distance() -> u32 { 2 }
-fn default_chat_daily_input_token_cap() -> u64 { 2_000_000 }
-fn default_chat_daily_output_token_cap() -> u64 { 200_000 }
-fn default_chat_daily_classifier_token_cap() -> u64 { 500_000 }
-fn default_chat_daily_dollar_cap_usd() -> f64 { 5.00 }
-fn default_chat_recent_speaker_secs() -> u32 { 600 }
-fn default_chat_classifier_sample_rate() -> f32 { 0.5 }
-fn default_chat_classifier_per_sender_per_minute() -> u32 { 3 }
-fn default_chat_classifier_min_confidence() -> f32 { 0.6 }
-fn default_chat_classifier_context_messages() -> u32 { 30 }
-fn default_chat_min_silence_secs() -> u32 { 6 }
-fn default_chat_max_replies_per_minute() -> u32 { 4 }
-fn default_chat_typing_delay_base_ms() -> u32 { 800 }
-fn default_chat_typing_delay_per_char_ms() -> u32 { 60 }
-fn default_chat_typing_delay_jitter_ms() -> u32 { 250 }
-fn default_chat_typing_delay_floor_ms() -> u32 { 400 }
-fn default_chat_typing_delay_max_ms() -> u32 { 12_000 }
-fn default_chat_adjustments_max_bullets() -> u32 { 50 }
-fn default_chat_player_memory_max_bytes() -> u32 { 4096 }
-fn default_chat_update_bullet_max_chars() -> u32 { 280 }
-fn default_chat_update_self_memory_max_per_day() -> u32 { 3 }
-fn default_chat_update_player_memory_max_per_day() -> u32 { 10 }
-fn default_chat_memory_max_inferred_bullets() -> u32 { 30 }
-fn default_chat_composer_rpm_max() -> u32 { 20 }
-fn default_chat_classifier_rpm_max() -> u32 { 40 }
-fn default_chat_composer_itpm_max() -> u32 { 25_000 }
-fn default_chat_classifier_itpm_max() -> u32 { 40_000 }
-fn default_chat_rate_limit_wait_max_secs() -> u32 { 5 }
-fn default_chat_web_fetch_max_bytes() -> u32 { 262_144 }
-fn default_chat_web_fetch_daily_max() -> u32 { 50 }
-fn default_chat_web_search_enabled() -> bool { true }
-fn default_chat_reflection_max_pending() -> u32 { 5 }
-fn default_chat_reflection_idle_trigger_secs() -> u32 { 900 }
-fn default_chat_reflection_min_interval_secs() -> u32 { 3600 }
-fn default_chat_reflection_min_distinct_senders() -> u32 { 3 }
-fn default_chat_reflection_min_distinct_triggers() -> u32 { 3 }
-fn default_chat_tools_history_max_bytes() -> u32 { 32_768 }
-fn default_chat_history_max_line_bytes() -> u32 { 65_536 }
-fn default_chat_trust3_max_days() -> u32 { 30 }
-fn default_chat_persona_archive_max() -> u32 { 10 }
-fn default_chat_archive_max_bytes() -> u32 { 1_048_576 }
-fn default_chat_uuid_resolve_queue_max() -> u32 { 1024 }
-fn default_chat_composer_context_messages() -> u32 { 60 }
-fn default_chat_composer_max_tool_iterations() -> u32 { 5 }
-fn default_chat_composer_max_chars() -> u32 { 240 }
-fn default_chat_spam_msgs_per_window() -> u32 { 5 }
-fn default_chat_spam_window_secs() -> u32 { 30 }
-fn default_chat_spam_cooldown_secs() -> u32 { 300 }
-fn default_chat_history_search_max_days() -> u32 { 14 }
-fn default_chat_history_retention_days() -> u32 { 30 }
-fn default_chat_decisions_retention_days() -> u32 { 30 }
-fn default_chat_hash_uuids_in_decisions() -> bool { true }
-fn default_chat_moderation_backoff_secs() -> u32 { 86_400 }
-fn default_chat_persona_regen_cooldown_secs() -> u32 { 86_400 }
-fn default_chat_composer_throttle_backoff_secs() -> u32 { 60 }
-fn default_chat_proactive_tick_secs() -> u32 { 30 }
-fn default_chat_proactive_min_secs_since_bot() -> u32 { 30 }
-fn default_chat_proactive_min_secs_since_partner() -> u32 { 15 }
-fn default_chat_proactive_max_secs_since_partner() -> u32 { 300 }
-fn default_chat_proactive_probability_pct() -> u32 { 20 }
-fn default_chat_tools_store_max_calls_per_turn() -> u32 { 4 }
-fn default_chat_tools_store_trade_query_max_results() -> u32 { 50 }
+fn default_chat_enabled() -> bool {
+    false
+}
+fn default_chat_dry_run() -> bool {
+    false
+}
+fn default_chat_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+fn default_chat_composer_model() -> String {
+    "claude-haiku-4-5-20251001".to_string()
+}
+fn default_chat_classifier_model() -> String {
+    "claude-haiku-4-5-20251001".to_string()
+}
+fn default_chat_composer_temperature() -> Option<f32> {
+    Some(0.8)
+}
+fn default_chat_classifier_temperature() -> Option<f32> {
+    Some(0.0)
+}
+fn default_chat_reasoning_filter_enabled() -> bool {
+    true
+}
+fn default_chat_reasoning_filter_model() -> String {
+    "claude-haiku-4-5-20251001".to_string()
+}
+fn default_chat_reasoning_filter_temperature() -> Option<f32> {
+    Some(0.0)
+}
+fn default_chat_command_typo_max_distance() -> u32 {
+    2
+}
+fn default_chat_daily_input_token_cap() -> u64 {
+    2_000_000
+}
+fn default_chat_daily_output_token_cap() -> u64 {
+    200_000
+}
+fn default_chat_daily_classifier_token_cap() -> u64 {
+    500_000
+}
+fn default_chat_daily_dollar_cap_usd() -> f64 {
+    5.00
+}
+fn default_chat_recent_speaker_secs() -> u32 {
+    600
+}
+fn default_chat_classifier_sample_rate() -> f32 {
+    0.5
+}
+fn default_chat_classifier_per_sender_per_minute() -> u32 {
+    3
+}
+fn default_chat_classifier_min_confidence() -> f32 {
+    0.6
+}
+fn default_chat_classifier_context_messages() -> u32 {
+    30
+}
+fn default_chat_min_silence_secs() -> u32 {
+    6
+}
+fn default_chat_max_replies_per_minute() -> u32 {
+    4
+}
+fn default_chat_typing_delay_base_ms() -> u32 {
+    800
+}
+fn default_chat_typing_delay_per_char_ms() -> u32 {
+    60
+}
+fn default_chat_typing_delay_jitter_ms() -> u32 {
+    250
+}
+fn default_chat_typing_delay_floor_ms() -> u32 {
+    400
+}
+fn default_chat_typing_delay_max_ms() -> u32 {
+    12_000
+}
+fn default_chat_adjustments_max_bullets() -> u32 {
+    50
+}
+fn default_chat_player_memory_max_bytes() -> u32 {
+    4096
+}
+fn default_chat_update_bullet_max_chars() -> u32 {
+    280
+}
+fn default_chat_update_self_memory_max_per_day() -> u32 {
+    3
+}
+fn default_chat_update_player_memory_max_per_day() -> u32 {
+    10
+}
+fn default_chat_memory_max_inferred_bullets() -> u32 {
+    30
+}
+fn default_chat_composer_rpm_max() -> u32 {
+    20
+}
+fn default_chat_classifier_rpm_max() -> u32 {
+    40
+}
+fn default_chat_composer_itpm_max() -> u32 {
+    25_000
+}
+fn default_chat_classifier_itpm_max() -> u32 {
+    40_000
+}
+fn default_chat_rate_limit_wait_max_secs() -> u32 {
+    5
+}
+fn default_chat_web_fetch_max_bytes() -> u32 {
+    262_144
+}
+fn default_chat_web_fetch_daily_max() -> u32 {
+    50
+}
+fn default_chat_web_search_enabled() -> bool {
+    true
+}
+fn default_chat_reflection_max_pending() -> u32 {
+    5
+}
+fn default_chat_reflection_idle_trigger_secs() -> u32 {
+    900
+}
+fn default_chat_reflection_min_interval_secs() -> u32 {
+    3600
+}
+fn default_chat_reflection_min_distinct_senders() -> u32 {
+    3
+}
+fn default_chat_reflection_min_distinct_triggers() -> u32 {
+    3
+}
+fn default_chat_tools_history_max_bytes() -> u32 {
+    32_768
+}
+fn default_chat_history_max_line_bytes() -> u32 {
+    65_536
+}
+fn default_chat_trust3_max_days() -> u32 {
+    30
+}
+fn default_chat_persona_archive_max() -> u32 {
+    10
+}
+fn default_chat_archive_max_bytes() -> u32 {
+    1_048_576
+}
+fn default_chat_uuid_resolve_queue_max() -> u32 {
+    1024
+}
+fn default_chat_composer_context_messages() -> u32 {
+    60
+}
+fn default_chat_composer_max_tool_iterations() -> u32 {
+    5
+}
+fn default_chat_composer_max_chars() -> u32 {
+    240
+}
+fn default_chat_spam_msgs_per_window() -> u32 {
+    5
+}
+fn default_chat_spam_window_secs() -> u32 {
+    30
+}
+fn default_chat_spam_cooldown_secs() -> u32 {
+    300
+}
+fn default_chat_history_search_max_days() -> u32 {
+    14
+}
+fn default_chat_history_retention_days() -> u32 {
+    30
+}
+fn default_chat_decisions_retention_days() -> u32 {
+    30
+}
+fn default_chat_hash_uuids_in_decisions() -> bool {
+    true
+}
+fn default_chat_moderation_backoff_secs() -> u32 {
+    86_400
+}
+fn default_chat_persona_regen_cooldown_secs() -> u32 {
+    86_400
+}
+fn default_chat_composer_throttle_backoff_secs() -> u32 {
+    60
+}
+fn default_chat_proactive_tick_secs() -> u32 {
+    30
+}
+fn default_chat_proactive_min_secs_since_bot() -> u32 {
+    30
+}
+fn default_chat_proactive_min_secs_since_partner() -> u32 {
+    15
+}
+fn default_chat_proactive_max_secs_since_partner() -> u32 {
+    300
+}
+fn default_chat_proactive_probability_pct() -> u32 {
+    20
+}
+fn default_chat_tools_store_max_calls_per_turn() -> u32 {
+    4
+}
+fn default_chat_tools_store_trade_query_max_results() -> u32 {
+    50
+}
 
 impl ChatConfig {
     /// Validate the chat-config invariants. Returns a single human-readable
@@ -574,7 +717,9 @@ impl ChatConfig {
             errors.push("rate_limit_wait_max_secs must be > 0".to_string());
         }
         if self.composer_max_tool_iterations < 2 {
-            errors.push("composer_max_tool_iterations must be >= 2 (1 disables tool dispatch)".to_string());
+            errors.push(
+                "composer_max_tool_iterations must be >= 2 (1 disables tool dispatch)".to_string(),
+            );
         }
         if self.daily_input_token_cap == 0 {
             errors.push("daily_input_token_cap must be > 0".to_string());
@@ -586,7 +731,8 @@ impl ChatConfig {
             errors.push("daily_classifier_token_cap must be > 0".to_string());
         }
         if let Some((start, end)) = self.active_hours_utc
-            && (start >= 24 || end >= 24) {
+            && (start >= 24 || end >= 24)
+        {
             errors.push(format!(
                 "active_hours_utc components must be in [0, 24) (got {start}, {end})"
             ));
@@ -598,10 +744,16 @@ impl ChatConfig {
         // gets a confusing "cap reached (0/0)" on every attempt.
         if self.tools_store_enabled {
             if self.tools_store_max_calls_per_turn == 0 {
-                errors.push("tools_store_max_calls_per_turn must be > 0 when tools_store_enabled".to_string());
+                errors.push(
+                    "tools_store_max_calls_per_turn must be > 0 when tools_store_enabled"
+                        .to_string(),
+                );
             }
             if self.tools_store_trade_query_max_results == 0 {
-                errors.push("tools_store_trade_query_max_results must be > 0 when tools_store_enabled".to_string());
+                errors.push(
+                    "tools_store_trade_query_max_results must be > 0 when tools_store_enabled"
+                        .to_string(),
+                );
             }
             if self.tools_store_trade_query_max_results > 50 {
                 errors.push(format!(
@@ -617,7 +769,9 @@ impl ChatConfig {
         // should surface at config-load time instead of becoming a
         // silent always-skip or always-fire.
         if self.proactive_threading_enabled && self.proactive_tick_secs == 0 {
-            errors.push("proactive_tick_secs must be > 0 when proactive_threading_enabled".to_string());
+            errors.push(
+                "proactive_tick_secs must be > 0 when proactive_threading_enabled".to_string(),
+            );
         }
         if self.proactive_probability_pct > 100 {
             errors.push(format!(
@@ -635,7 +789,10 @@ impl ChatConfig {
         for (name, val) in [
             ("composer_temperature", self.composer_temperature),
             ("classifier_temperature", self.classifier_temperature),
-            ("reasoning_filter_temperature", self.reasoning_filter_temperature),
+            (
+                "reasoning_filter_temperature",
+                self.reasoning_filter_temperature,
+            ),
         ] {
             if let Some(t) = val
                 && (!t.is_finite() || !(0.0..=1.0).contains(&t))
@@ -713,17 +870,39 @@ fn default_chat_command_prefixes() -> Vec<String> {
     // shadowing of the new command.
     [
         // Order commands + aliases
-        "buy", "b", "sell", "s",
-        "deposit", "d", "withdraw", "w",
+        "buy",
+        "b",
+        "sell",
+        "s",
+        "deposit",
+        "d",
+        "withdraw",
+        "w",
         // Quick commands + aliases
-        "price", "p", "balance", "bal", "pay",
-        "items", "queue", "q", "cancel", "c",
-        "status", "help", "h",
+        "price",
+        "p",
+        "balance",
+        "bal",
+        "pay",
+        "items",
+        "queue",
+        "q",
+        "cancel",
+        "c",
+        "status",
+        "help",
+        "h",
         // Operator commands + aliases (operator-only at dispatch, but still
         // reach the Store rather than chat — operators expect their typos to
         // get a hint, not an AI reply).
-        "additem", "ai", "removeitem", "ri",
-        "addcurrency", "ac", "removecurrency", "rc",
+        "additem",
+        "ai",
+        "removeitem",
+        "ri",
+        "addcurrency",
+        "ac",
+        "removecurrency",
+        "rc",
     ]
     .into_iter()
     .map(str::to_string)
@@ -733,11 +912,21 @@ fn default_chat_command_prefixes() -> Vec<String> {
 // Timeout defaults defer to the canonical constants so the value lives in
 // exactly one place; the `max_*` and `autosave_*` defaults have no
 // corresponding constant and are hard-coded here.
-fn default_trade_timeout_ms() -> u64 { TRADE_TIMEOUT_MS }
-fn default_pathfinding_timeout_ms() -> u64 { PATHFINDING_TIMEOUT_MS }
-fn default_max_orders() -> usize { 10_000 }
-fn default_max_trades_in_memory() -> usize { 50_000 }
-fn default_autosave_interval_secs() -> u64 { 2 }
+fn default_trade_timeout_ms() -> u64 {
+    TRADE_TIMEOUT_MS
+}
+fn default_pathfinding_timeout_ms() -> u64 {
+    PATHFINDING_TIMEOUT_MS
+}
+fn default_max_orders() -> usize {
+    10_000
+}
+fn default_max_trades_in_memory() -> usize {
+    50_000
+}
+fn default_autosave_interval_secs() -> u64 {
+    2
+}
 
 impl Config {
     /// Validates every field and returns a single error message listing
@@ -769,7 +958,7 @@ impl Config {
                 self.account_email
             ));
         }
-        
+
         // Accept a bare hostname / IPv4 or `host:port` using only characters
         // legal in a Minecraft server address (alnum, '.', '-', ':'). Rejects
         // whitespace, `scheme://`, and trailing paths — all common copy-paste
@@ -788,7 +977,10 @@ impl Config {
                 "server_address must not contain whitespace: {:?}",
                 self.server_address
             ));
-        } else if !addr.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':') {
+        } else if !addr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+        {
             errors.push(format!(
                 "server_address contains unsupported characters: {}",
                 self.server_address
@@ -809,7 +1001,7 @@ impl Config {
                 ));
             }
         }
-        
+
         // Vanilla world border maximum; values beyond it almost certainly
         // indicate a config typo rather than a legitimate location.
         const COORD_LIMIT: i32 = 30_000_000;
@@ -832,12 +1024,13 @@ impl Config {
         }
 
         if let Some(ref buffer_pos) = self.buffer_chest_position
-            && (buffer_pos.x.abs() > COORD_LIMIT || buffer_pos.z.abs() > COORD_LIMIT) {
-                errors.push(format!(
-                    "buffer_chest_position coordinates exceed limits: ({}, {}, {})",
-                    buffer_pos.x, buffer_pos.y, buffer_pos.z
-                ));
-            }
+            && (buffer_pos.x.abs() > COORD_LIMIT || buffer_pos.z.abs() > COORD_LIMIT)
+        {
+            errors.push(format!(
+                "buffer_chest_position coordinates exceed limits: ({}, {}, {})",
+                buffer_pos.x, buffer_pos.y, buffer_pos.z
+            ));
+        }
 
         if self.trade_timeout_ms == 0 {
             errors.push("trade_timeout_ms must be greater than 0".to_string());
@@ -864,10 +1057,13 @@ impl Config {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(format!("Config validation failed:\n  - {}", errors.join("\n  - ")))
+            Err(format!(
+                "Config validation failed:\n  - {}",
+                errors.join("\n  - ")
+            ))
         }
     }
-    
+
     /// Loads configuration from `data/config.json`, creating it with
     /// defaults if missing, and validates the result.
     ///
@@ -905,9 +1101,10 @@ impl Config {
             };
 
             if let Some(parent_dir) = config_path.parent()
-                && !parent_dir.exists() {
-                    fs::create_dir_all(parent_dir)?;
-                }
+                && !parent_dir.exists()
+            {
+                fs::create_dir_all(parent_dir)?;
+            }
 
             let json_str = serde_json::to_string_pretty(&default_config)?;
             write_atomic(config_path, &json_str)?;
@@ -1083,14 +1280,22 @@ mod tests {
     #[test]
     fn position_at_world_border_is_accepted() {
         let mut c = valid_config();
-        c.position = Position { x: 30_000_000, y: 64, z: -30_000_000 };
+        c.position = Position {
+            x: 30_000_000,
+            y: 64,
+            z: -30_000_000,
+        };
         assert!(c.validate().is_ok());
     }
 
     #[test]
     fn position_one_beyond_world_border_is_rejected() {
         let mut c = valid_config();
-        c.position = Position { x: 30_000_001, y: 64, z: 0 };
+        c.position = Position {
+            x: 30_000_001,
+            y: 64,
+            z: 0,
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("position coordinates"), "got: {err}");
     }
@@ -1098,7 +1303,11 @@ mod tests {
     #[test]
     fn position_z_beyond_negative_world_border_is_rejected() {
         let mut c = valid_config();
-        c.position = Position { x: 0, y: 64, z: -30_000_001 };
+        c.position = Position {
+            x: 0,
+            y: 64,
+            z: -30_000_001,
+        };
         let err = c.validate().unwrap_err();
         assert!(err.contains("position coordinates"), "got: {err}");
     }
@@ -1109,14 +1318,22 @@ mod tests {
         let mut c = valid_config();
         c.position = Position { x: 0, y: 500, z: 0 };
         assert!(c.validate().is_ok());
-        c.position = Position { x: 0, y: -200, z: 0 };
+        c.position = Position {
+            x: 0,
+            y: -200,
+            z: 0,
+        };
         assert!(c.validate().is_ok());
     }
 
     #[test]
     fn buffer_chest_beyond_world_border_is_rejected() {
         let mut c = valid_config();
-        c.buffer_chest_position = Some(Position { x: 40_000_000, y: 64, z: 0 });
+        c.buffer_chest_position = Some(Position {
+            x: 40_000_000,
+            y: 64,
+            z: 0,
+        });
         let err = c.validate().unwrap_err();
         assert!(err.contains("buffer_chest_position"), "got: {err}");
     }
@@ -1124,7 +1341,11 @@ mod tests {
     #[test]
     fn buffer_chest_inside_world_border_is_accepted() {
         let mut c = valid_config();
-        c.buffer_chest_position = Some(Position { x: 100, y: 70, z: -200 });
+        c.buffer_chest_position = Some(Position {
+            x: 100,
+            y: 70,
+            z: -200,
+        });
         assert!(c.validate().is_ok());
     }
 
@@ -1217,10 +1438,7 @@ mod tests {
         let mut c = valid_config();
         c.chat.reasoning_filter_temperature = Some(1.5);
         let err = c.validate().unwrap_err();
-        assert!(
-            err.contains("reasoning_filter_temperature"),
-            "got: {err}"
-        );
+        assert!(err.contains("reasoning_filter_temperature"), "got: {err}");
     }
 
     #[test]
@@ -1228,10 +1446,7 @@ mod tests {
         let mut c = valid_config();
         c.chat.reasoning_filter_temperature = Some(-0.1);
         let err = c.validate().unwrap_err();
-        assert!(
-            err.contains("reasoning_filter_temperature"),
-            "got: {err}"
-        );
+        assert!(err.contains("reasoning_filter_temperature"), "got: {err}");
     }
 
     #[test]
@@ -1239,10 +1454,7 @@ mod tests {
         let mut c = valid_config();
         c.chat.reasoning_filter_temperature = Some(f32::NAN);
         let err = c.validate().unwrap_err();
-        assert!(
-            err.contains("reasoning_filter_temperature"),
-            "got: {err}"
-        );
+        assert!(err.contains("reasoning_filter_temperature"), "got: {err}");
     }
 
     #[test]

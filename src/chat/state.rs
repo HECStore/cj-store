@@ -318,14 +318,15 @@ impl ChatState {
         if !new_usd.is_finite() || new_usd > config.daily_dollar_cap_usd {
             return CapVerdict::UsdCap;
         }
-        let new_input = self.tokens_today.composer_input.saturating_add(input_tokens);
+        let new_input = self
+            .tokens_today
+            .composer_input
+            .saturating_add(input_tokens);
         let new_output = self
             .tokens_today
             .composer_output
             .saturating_add(output_tokens);
-        if new_input > config.daily_input_token_cap
-            || new_output > config.daily_output_token_cap
-        {
+        if new_input > config.daily_input_token_cap || new_output > config.daily_output_token_cap {
             return CapVerdict::ComposerCap;
         }
         CapVerdict::Ok
@@ -386,10 +387,14 @@ impl ChatState {
         // both are stale relative to today.
         self.roll_to_today();
         self.roll_to_day(started_day_utc);
-        self.tokens_today.composer_input =
-            self.tokens_today.composer_input.saturating_add(input_tokens);
-        self.tokens_today.composer_output =
-            self.tokens_today.composer_output.saturating_add(output_tokens);
+        self.tokens_today.composer_input = self
+            .tokens_today
+            .composer_input
+            .saturating_add(input_tokens);
+        self.tokens_today.composer_output = self
+            .tokens_today
+            .composer_output
+            .saturating_add(output_tokens);
         if usd.is_finite() && usd >= 0.0 {
             self.tokens_today.estimated_usd += usd;
         }
@@ -746,7 +751,13 @@ mod tests {
         let secs = iso_utc(dt);
         let millis = crate::chat::jsonl::iso_utc_millis_dt(dt);
         assert_ne!(secs, millis);
-        assert!(!secs.contains('.'), "seconds form must not include fractional component: {secs}");
-        assert!(millis.contains(".123"), "millis form must include .123: {millis}");
+        assert!(
+            !secs.contains('.'),
+            "seconds form must not include fractional component: {secs}"
+        );
+        assert!(
+            millis.contains(".123"),
+            "millis form must include .123: {millis}"
+        );
     }
 }

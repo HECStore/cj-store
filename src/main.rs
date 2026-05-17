@@ -133,11 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // task gets the right end. Capacities follow CHAT.md: 2048 for the
             // broadcast (absorb burst loads, A3) and 4096 for the history
             // mpsc (history is best-effort, never blocking — A3 + ADV11).
-            let (chat_events_tx, _chat_events_rx_root) =
-                broadcast::channel::<ChatEvent>(2048);
+            let (chat_events_tx, _chat_events_rx_root) = broadcast::channel::<ChatEvent>(2048);
             let chat_events_tx = Arc::new(chat_events_tx);
-            let (history_tx, history_rx) =
-                mpsc::channel::<crate::chat::history::HistoryItem>(4096);
+            let (history_tx, history_rx) = mpsc::channel::<crate::chat::history::HistoryItem>(4096);
             let (chat_cmd_tx, chat_cmd_rx) = mpsc::channel::<ChatCommand>(64);
             let in_critical_section = Arc::new(AtomicBool::new(false));
             let bot_username = Arc::new(RwLock::new(None));
@@ -249,9 +247,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // when enabled) have their own clone — otherwise it would
             // keep the chat command channel open past CLI shutdown.
             drop(chat_cmd_tx);
-            let cli_handle = tokio::task::spawn_blocking(move || {
-                cli_task(store_tx, chat_cmd_for_cli)
-            });
+            let cli_handle =
+                tokio::task::spawn_blocking(move || cli_task(store_tx, chat_cmd_for_cli));
 
             info!("[Main] All tasks spawned");
             // chat_handle and history_handle are not joined into try_join!
@@ -262,13 +259,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let join_result = tokio::try_join!(store_handle, bot_handle, cli_handle);
             // Wait briefly for chat / history to wind down. Both should
             // exit naturally when their inputs close.
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(3),
-                async {
-                    let _ = chat_handle.await;
-                    let _ = history_handle.await;
-                },
-            )
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), async {
+                let _ = chat_handle.await;
+                let _ = history_handle.await;
+            })
             .await;
             Ok::<_, Box<dyn std::error::Error>>(join_result)
         })
@@ -296,7 +290,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Brief yield so the tracing file appender can flush final log lines
-    tokio::time::sleep(tokio::time::Duration::from_millis(crate::constants::DELAY_SHORT_MS)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(
+        crate::constants::DELAY_SHORT_MS,
+    ))
+    .await;
 
     if had_error {
         std::process::exit(1);
@@ -326,12 +323,19 @@ fn run_validate_only() -> Result<(), Box<dyn std::error::Error>> {
     match crate::config::Config::load() {
         Ok(cfg) => {
             println!("✅ Config OK");
-            println!("   position:            ({}, {}, {})", cfg.position.x, cfg.position.y, cfg.position.z);
+            println!(
+                "   position:            ({}, {}, {})",
+                cfg.position.x, cfg.position.y, cfg.position.z
+            );
             println!("   fee:                 {}", cfg.fee);
             println!("   server_address:      {}", cfg.server_address);
             println!(
                 "   account_email:       {}",
-                if cfg.account_email.is_empty() { "<empty>" } else { cfg.account_email.as_str() }
+                if cfg.account_email.is_empty() {
+                    "<empty>"
+                } else {
+                    cfg.account_email.as_str()
+                }
             );
             match cfg.buffer_chest_position {
                 Some(p) => println!("   buffer_chest_position: ({}, {}, {})", p.x, p.y, p.z),
@@ -388,7 +392,10 @@ fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
             match res {
                 Ok(ev) if matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_)) => {
                     // Debounce: drain any further events that arrive within the window.
-                    tokio::time::sleep(Duration::from_millis(crate::constants::DELAY_CONFIG_DEBOUNCE_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        crate::constants::DELAY_CONFIG_DEBOUNCE_MS,
+                    ))
+                    .await;
                     while event_rx.try_recv().is_ok() {}
 
                     // `Config::load` writes a default config if the file is
@@ -402,7 +409,11 @@ fn spawn_config_watcher(store_tx: mpsc::Sender<StoreMessage>) {
 
                     match crate::config::Config::load() {
                         Ok(cfg) => {
-                            if store_tx.send(StoreMessage::ReloadConfig(cfg)).await.is_err() {
+                            if store_tx
+                                .send(StoreMessage::ReloadConfig(cfg))
+                                .await
+                                .is_err()
+                            {
                                 info!("[ConfigWatcher] Store channel closed, watcher exiting");
                                 return;
                             }

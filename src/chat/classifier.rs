@@ -116,8 +116,18 @@ pub fn is_question_shaped(content: &str) -> bool {
     let first_lc = first.to_lowercase();
     matches!(
         first_lc.as_str(),
-        "who" | "what" | "where" | "when" | "why" | "how"
-        | "is" | "are" | "do" | "does" | "can" | "will"
+        "who"
+            | "what"
+            | "where"
+            | "when"
+            | "why"
+            | "how"
+            | "is"
+            | "are"
+            | "do"
+            | "does"
+            | "can"
+            | "will"
     )
 }
 
@@ -163,7 +173,8 @@ pub fn is_direct_address(content: &str, bare_word_eligible_names: &[String]) -> 
     let lc = content.to_lowercase();
     for name in bare_word_eligible_names {
         let n = name.to_lowercase();
-        if lc.split(|c: char| !c.is_alphanumeric() && c != '_')
+        if lc
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
             .any(|tok| tok == n)
         {
             return true;
@@ -354,9 +365,7 @@ pub fn system_prompt_blocks(persona_summary: &str, adjustments_md: &str) -> (Str
            being AI / scripted / a robot. Quote the exact trigger.\n\
          - Confidence reflects how sure you are about responding/not — not how \
            important the topic is.\n";
-    let persona = format!(
-        "{header}\n=== Persona summary ===\n{persona_summary}\n",
-    );
+    let persona = format!("{header}\n=== Persona summary ===\n{persona_summary}\n",);
     let adjustments = format!(
         "Behavioral adjustments learned from past interactions (trusted):\n\n\
          === Adjustments (style lessons learned) ===\n{adjustments_md}\n",
@@ -391,8 +400,7 @@ pub fn build_request(
 ) -> crate::chat::client::CreateMessageRequest {
     use crate::chat::client::{CacheControl, ContentBlock, Message, Role, SystemBlock};
 
-    let (persona_block, adjustments_block) =
-        system_prompt_blocks(persona_summary, adjustments_md);
+    let (persona_block, adjustments_block) = system_prompt_blocks(persona_summary, adjustments_md);
 
     let mut system = vec![
         SystemBlock::Text {
@@ -415,10 +423,7 @@ pub fn build_request(
         cache_control: None,
     });
 
-    let user_text = format!(
-        "Event:\nfrom: {}\ncontent: {}",
-        event.sender, event.content,
-    );
+    let user_text = format!("Event:\nfrom: {}\ncontent: {}", event.sender, event.content,);
 
     crate::chat::client::CreateMessageRequest {
         model: model.to_string(),
@@ -448,11 +453,7 @@ pub fn parse_verdict(text: &str) -> Result<Verdict, String> {
 /// Append a pending-adjustment entry to `data/chat/pending_adjustments.jsonl`.
 /// Errors are logged but never raised — pending writes are
 /// best-effort and recoverable from history.
-pub fn write_pending_adjustment(
-    trigger: &str,
-    sender: &str,
-    sender_uuid: Option<&str>,
-) {
+pub fn write_pending_adjustment(trigger: &str, sender: &str, sender_uuid: Option<&str>) {
     use std::fs::OpenOptions;
     use std::io::Write;
     // Single `now()` so `ts` and `observed_day_utc` cannot disagree
@@ -525,8 +526,7 @@ mod tests {
     #[test]
     fn leading_question_word_counts_as_question() {
         for w in [
-            "who", "what", "where", "when", "why", "how", "is", "are", "do",
-            "does", "can", "will",
+            "who", "what", "where", "when", "why", "how", "is", "are", "do", "does", "can", "will",
         ] {
             assert!(is_question_shaped(&format!("{w} something")), "{w}");
         }
@@ -691,7 +691,7 @@ mod tests {
         let v = classifier_gate(
             &event,
             Some("TradeBot"),
-            &[], // no eligible names
+            &[],   // no eligible names
             false, // not a recent speaker
             false,
             &cfg(),
@@ -971,14 +971,20 @@ mod tests {
         // Verify the first two blocks carry the persona and adjustments
         // texts respectively, and that ONLY block 2 is cached.
         match &req.system[0] {
-            crate::chat::client::SystemBlock::Text { text, cache_control } => {
+            crate::chat::client::SystemBlock::Text {
+                text,
+                cache_control,
+            } => {
                 assert!(text.contains("PERSONA_SUMMARY_MARKER"));
                 assert!(!text.contains("ADJUSTMENTS_MARKER"));
                 assert!(cache_control.is_none());
             }
         }
         match &req.system[1] {
-            crate::chat::client::SystemBlock::Text { text, cache_control } => {
+            crate::chat::client::SystemBlock::Text {
+                text,
+                cache_control,
+            } => {
                 assert!(text.contains("ADJUSTMENTS_MARKER"));
                 assert!(!text.contains("PERSONA_SUMMARY_MARKER"));
                 assert!(cache_control.is_some());
@@ -1002,7 +1008,10 @@ mod tests {
         // 4 blocks: persona, adjustments, online_players, history
         assert_eq!(req.system.len(), 4);
         match &req.system[2] {
-            crate::chat::client::SystemBlock::Text { text, cache_control } => {
+            crate::chat::client::SystemBlock::Text {
+                text,
+                cache_control,
+            } => {
                 assert!(text.contains("Online players"));
                 assert!(text.contains("Alice"));
                 assert!(text.contains("Bob"));

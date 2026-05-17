@@ -16,16 +16,16 @@
 //! ~470-line monoliths we had before.
 
 use tokio::sync::oneshot;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{Instrument, error, info, info_span, warn};
 
+use super::queue::QueuedOrder;
+use super::{Store, pricing, rollback, state, utils};
 use crate::constants::CHEST_OP_TIMEOUT_SECS;
 use crate::error::StoreError;
 use crate::messages::{BotInstruction, ChestAction, QueuedOrderType, TradeItem};
-use crate::types::{ItemId, Order};
 use crate::types::storage::ChestTransfer;
+use crate::types::{ItemId, Order};
 use crate::types::{Trade, TradeType};
-use super::{Store, pricing, rollback, state, utils};
-use super::queue::QueuedOrder;
 
 // ===========================================================================
 // Shared helpers
@@ -82,47 +82,71 @@ pub(crate) async fn execute_chest_transfers(
             })
             .await
         {
-            error!(phase = log_tag, chest_id = t.chest_id, "Failed to send chest instruction: {}", e);
+            error!(
+                phase = log_tag,
+                chest_id = t.chest_id,
+                "Failed to send chest instruction: {}",
+                e
+            );
             rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
             return Err(StoreError::BotDisconnected);
         }
 
-        let bot_result = match tokio::time::timeout(
-            tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                error!(phase = log_tag, chest_id = t.chest_id, "Channel dropped: {}", e);
-                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
-                return Err(StoreError::BotResponseDropped(e.to_string()));
-            }
-            Err(_) => {
-                error!(
-                    phase = log_tag,
-                    chest_id = t.chest_id,
-                    item = %item,
-                    amount = t.amount,
-                    timeout_secs = CHEST_OP_TIMEOUT_SECS,
-                    "Chest operation timed out"
-                );
-                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
-                return Err(StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000) });
-            }
-        };
+        let bot_result =
+            match tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
+                .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    error!(
+                        phase = log_tag,
+                        chest_id = t.chest_id,
+                        "Channel dropped: {}",
+                        e
+                    );
+                    rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag)
+                        .await;
+                    return Err(StoreError::BotResponseDropped(e.to_string()));
+                }
+                Err(_) => {
+                    error!(
+                        phase = log_tag,
+                        chest_id = t.chest_id,
+                        item = %item,
+                        amount = t.amount,
+                        timeout_secs = CHEST_OP_TIMEOUT_SECS,
+                        "Chest operation timed out"
+                    );
+                    rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag)
+                        .await;
+                    return Err(StoreError::ChestTimeout {
+                        after_ms: CHEST_OP_TIMEOUT_SECS.saturating_mul(1000),
+                    });
+                }
+            };
 
         match bot_result {
             Err(err) => {
-                error!(phase = log_tag, chest_id = t.chest_id, "Bot reported error: {}", err);
-                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
+                error!(
+                    phase = log_tag,
+                    chest_id = t.chest_id,
+                    "Bot reported error: {}",
+                    err
+                );
+                rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag)
+                    .await;
                 return Err(StoreError::ChestOp(err));
             }
             Ok(report) => {
                 if let Err(e) = store.apply_chest_sync(report) {
-                    error!(phase = log_tag, chest_id = t.chest_id, "Chest sync failed: {}", e);
-                    rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag).await;
+                    error!(
+                        phase = log_tag,
+                        chest_id = t.chest_id,
+                        "Chest sync failed: {}",
+                        e
+                    );
+                    rollback_applied_prefix(store, direction, &applied, item, stack_size, log_tag)
+                        .await;
                     return Err(StoreError::ChestOp(e.to_string()));
                 }
                 applied.push(t.clone());
@@ -203,7 +227,9 @@ pub(crate) async fn perform_trade(
             timeout_ms = store.config.trade_timeout_ms,
             "Trade GUI handoff timed out"
         );
-        StoreError::TradeTimeout { after_ms: store.config.trade_timeout_ms }
+        StoreError::TradeTimeout {
+            after_ms: store.config.trade_timeout_ms,
+        }
     })?
     .map_err(|e| {
         error!(phase = log_tag, player = %target_username, "Trade channel dropped: {}", e);
@@ -274,14 +300,20 @@ async fn validate_and_plan_buy(
             // drained reserves is the "no stock or reserves" message — see
             // RECOVERY.md §1.
             let msg = if pair.item_stock <= 0 {
-                format!("Item '{}' is not available for trading (no stock or reserves).", item)
+                format!(
+                    "Item '{}' is not available for trading (no stock or reserves).",
+                    item
+                )
             } else if qty_i32 >= pair.item_stock {
                 format!(
                     "Cannot buy {} {} - would exceed available stock ({}). Try a smaller amount.",
                     qty_i32, item, pair.item_stock
                 )
             } else {
-                format!("Item '{}' is not available for trading (no stock or reserves).", item)
+                format!(
+                    "Item '{}' is not available for trading (no stock or reserves).",
+                    item
+                )
             };
             utils::send_message_to_player(store, player_name, &msg).await?;
             return Ok(None);
@@ -289,7 +321,12 @@ async fn validate_and_plan_buy(
     };
 
     if !total_cost.is_finite() || total_cost <= 0.0 {
-        utils::send_message_to_player(store, player_name, "Internal error: computed price is invalid.").await?;
+        utils::send_message_to_player(
+            store,
+            player_name,
+            "Internal error: computed price is invalid.",
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -322,7 +359,11 @@ async fn validate_and_plan_buy(
     }
     let stack_size = pair.stack_size;
 
-    let user_balance = store.users.get(&user_uuid).map(|u| u.balance).unwrap_or(0.0);
+    let user_balance = store
+        .users
+        .get(&user_uuid)
+        .map(|u| u.balance)
+        .unwrap_or(0.0);
     let diamonds_to_offer = match diamonds_to_offer_for_buy(total_cost, user_balance) {
         Some(d) => d,
         None => {
@@ -437,7 +478,10 @@ pub async fn handle_buy_order(
         return utils::send_message_to_player(
             store,
             player_name,
-            &format!("Buy aborted: bot failed chest withdrawal step: {}", e.user_message()),
+            &format!(
+                "Buy aborted: bot failed chest withdrawal step: {}",
+                e.user_message()
+            ),
         )
         .await;
     }
@@ -503,9 +547,13 @@ pub async fn handle_buy_order(
             let rollback_msg = match rb.partial_message() {
                 Some(detail) => format!(
                     "Buy aborted: trade failed: {}. Rollback partial: {}.",
-                    err.user_message(), detail
+                    err.user_message(),
+                    detail
                 ),
-                None => format!("Buy aborted: trade failed: {} (items rolled back to storage)", err.user_message()),
+                None => format!(
+                    "Buy aborted: trade failed: {} (items rolled back to storage)",
+                    err.user_message()
+                ),
             };
             store.advance_trade(|s| s.rollback("buy/trade-failed".to_string()));
             return utils::send_message_to_player(store, player_name, &rollback_msg).await;
@@ -519,7 +567,11 @@ pub async fn handle_buy_order(
         .map(|t| t.amount)
         .sum();
 
-    let current_balance = store.users.get(&plan.user_uuid).map(|u| u.balance).unwrap_or(0.0);
+    let current_balance = store
+        .users
+        .get(&plan.user_uuid)
+        .map(|u| u.balance)
+        .unwrap_or(0.0);
 
     // Recheck payment: with require_exact_amount=false the player could have offered
     // fewer diamonds than requested. If (diamonds + balance) doesn't cover cost, bail.
@@ -579,10 +631,9 @@ pub async fn handle_buy_order(
                     " Your {} diamonds have been credited to your balance ({}).",
                     c, detail
                 ),
-                (c, None) if c > 0 => format!(
-                    " Your {} diamonds have been credited to your balance.",
-                    c
-                ),
+                (c, None) if c > 0 => {
+                    format!(" Your {} diamonds have been credited to your balance.", c)
+                }
                 (_, Some(detail)) => format!(
                     " None of your {} diamonds could be deposited ({}); contact an operator.",
                     diamonds_received, detail
@@ -660,16 +711,22 @@ pub async fn handle_buy_order(
     let balance_needed = plan.total_cost - diamonds_received_f64;
     let (balance_deduction, surplus) = if balance_needed > 0.0 {
         let deduction = balance_needed.min(current_balance);
-        store.expect_user_mut(&plan.user_uuid, "buy/commit-deduct")?.balance -= deduction;
+        store
+            .expect_user_mut(&plan.user_uuid, "buy/commit-deduct")?
+            .balance -= deduction;
         (deduction, 0.0)
     } else {
         let backed_surplus = (physical_diamonds_f64 - plan.total_cost).max(0.0);
         if backed_surplus > 0.0 {
-            store.expect_user_mut(&plan.user_uuid, "buy/commit-surplus")?.balance += backed_surplus;
+            store
+                .expect_user_mut(&plan.user_uuid, "buy/commit-surplus")?
+                .balance += backed_surplus;
         }
         (0.0, backed_surplus)
     };
-    store.expect_user_mut(&plan.user_uuid, "buy/commit-username")?.username = player_name.to_owned();
+    store
+        .expect_user_mut(&plan.user_uuid, "buy/commit-username")?
+        .username = player_name.to_owned();
     store.dirty = true;
     store.dirty_users.insert(plan.user_uuid.clone());
 
@@ -682,8 +739,11 @@ pub async fn handle_buy_order(
     // failed (`physical_diamonds < diamonds_received`).
     pair.currency_stock += physical_diamonds_f64 + balance_deduction;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after buy");
-    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
-        "currency_stock invalid after buy: {}", pair.currency_stock);
+    debug_assert!(
+        pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "currency_stock invalid after buy: {}",
+        pair.currency_stock
+    );
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -795,7 +855,10 @@ async fn validate_and_plan_sell(
             utils::send_message_to_player(
                 store,
                 player_name,
-                &format!("Item '{}' is not available for trading (no stock or reserves).", item),
+                &format!(
+                    "Item '{}' is not available for trading (no stock or reserves).",
+                    item
+                ),
             )
             .await?;
             return Ok(None);
@@ -803,7 +866,12 @@ async fn validate_and_plan_sell(
     };
 
     if !total_payout.is_finite() || total_payout <= 0.0 {
-        utils::send_message_to_player(store, player_name, "Internal error: computed payout is invalid.").await?;
+        utils::send_message_to_player(
+            store,
+            player_name,
+            "Internal error: computed payout is invalid.",
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -822,7 +890,9 @@ async fn validate_and_plan_sell(
     }
 
     let stack_size = pair.stack_size;
-    let (deposit_plan, planned_deposited) = store.storage.simulate_deposit_plan(item, qty_i32, stack_size);
+    let (deposit_plan, planned_deposited) = store
+        .storage
+        .simulate_deposit_plan(item, qty_i32, stack_size);
     if planned_deposited < qty_i32 {
         utils::send_message_to_player(
             store,
@@ -903,8 +973,9 @@ pub async fn handle_sell_order(
     // Withdraw the whole-diamond portion from storage so the bot has the physical
     // coins to hand to the player during the trade GUI handoff.
     if plan.whole_diamonds > 0 {
-        let (diamond_plan, planned_total) =
-            store.storage.simulate_withdraw_plan("diamond", plan.whole_diamonds);
+        let (diamond_plan, planned_total) = store
+            .storage
+            .simulate_withdraw_plan("diamond", plan.whole_diamonds);
         if planned_total < plan.whole_diamonds {
             error!(
                 phase = "sell.withdraw",
@@ -939,7 +1010,10 @@ pub async fn handle_sell_order(
             return utils::send_message_to_player(
                 store,
                 player_name,
-                &format!("Sell aborted: failed to get diamonds from storage: {}", e.user_message()),
+                &format!(
+                    "Sell aborted: failed to get diamonds from storage: {}",
+                    e.user_message()
+                ),
             )
             .await;
         }
@@ -992,7 +1066,8 @@ pub async fn handle_sell_order(
             let msg = match rb.partial_message() {
                 Some(detail) => format!(
                     "Sell aborted: trade failed: {}. Rollback partial: {}.",
-                    err.user_message(), detail
+                    err.user_message(),
+                    detail
                 ),
                 None => format!(
                     "Sell aborted: trade failed: {}. Diamonds returned to storage.",
@@ -1069,10 +1144,14 @@ pub async fn handle_sell_order(
     }
 
     // Advance: Trading -> Depositing
-    store.advance_trade(|s| s.begin_depositing(
-        super::trade_state::TradeResult { items_received: actual_received.clone() },
-        plan.deposit_plan.clone(),
-    ));
+    store.advance_trade(|s| {
+        s.begin_depositing(
+            super::trade_state::TradeResult {
+                items_received: actual_received.clone(),
+            },
+            plan.deposit_plan.clone(),
+        )
+    });
 
     // Deposit items from bot inventory into storage.
     if let Err(err) = execute_chest_transfers(
@@ -1120,7 +1199,8 @@ pub async fn handle_sell_order(
             ),
             Err(rerr) => format!(
                 "Sell aborted: failed to deposit items into storage: {}. Diamonds paid; return-trade also failed ({}). Contact an operator.",
-                err.user_message(), rerr.user_message()
+                err.user_message(),
+                rerr.user_message()
             ),
         };
         return utils::send_message_to_player(store, player_name, &msg).await;
@@ -1139,8 +1219,11 @@ pub async fn handle_sell_order(
     pair.item_stock = new_item_stock;
     pair.currency_stock -= plan.total_payout;
     debug_assert!(pair.item_stock >= 0, "item_stock went negative after sell");
-    debug_assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
-        "currency_stock invalid after sell: {}", pair.currency_stock);
+    debug_assert!(
+        pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+        "currency_stock invalid after sell: {}",
+        pair.currency_stock
+    );
     store.dirty = true;
 
     store.trades.push(Trade::new(
@@ -1226,21 +1309,53 @@ pub async fn execute_queued_order(
     let order_span = info_span!("order", order_id = order.id, player = %order.username);
     let result = async {
         match &order.order_type {
-            QueuedOrderType::Buy => handle_buy_order(store, &order.username, &order.user_uuid, &order.item, order.quantity)
-                .await
-                .map(|()| format!("Buy order completed: {} {} for {}", order.quantity, order.item, order.username)),
-            QueuedOrderType::Sell => handle_sell_order(store, &order.username, &order.user_uuid, &order.item, order.quantity)
-                .await
-                .map(|()| format!("Sell order completed: {} {} for {}", order.quantity, order.item, order.username)),
+            QueuedOrderType::Buy => handle_buy_order(
+                store,
+                &order.username,
+                &order.user_uuid,
+                &order.item,
+                order.quantity,
+            )
+            .await
+            .map(|()| {
+                format!(
+                    "Buy order completed: {} {} for {}",
+                    order.quantity, order.item, order.username
+                )
+            }),
+            QueuedOrderType::Sell => handle_sell_order(
+                store,
+                &order.username,
+                &order.user_uuid,
+                &order.item,
+                order.quantity,
+            )
+            .await
+            .map(|()| {
+                format!(
+                    "Sell order completed: {} {} for {}",
+                    order.quantity, order.item, order.username
+                )
+            }),
             QueuedOrderType::Deposit { amount } => {
-                super::handlers::player::handle_deposit_balance_queued(store, &order.username, &order.user_uuid, *amount)
-                    .await
-                    .map(|()| format!("Deposit completed for {}", order.username))
+                super::handlers::player::handle_deposit_balance_queued(
+                    store,
+                    &order.username,
+                    &order.user_uuid,
+                    *amount,
+                )
+                .await
+                .map(|()| format!("Deposit completed for {}", order.username))
             }
             QueuedOrderType::Withdraw { amount } => {
-                super::handlers::player::handle_withdraw_balance_queued(store, &order.username, &order.user_uuid, *amount)
-                    .await
-                    .map(|()| format!("Withdraw completed for {}", order.username))
+                super::handlers::player::handle_withdraw_balance_queued(
+                    store,
+                    &order.username,
+                    &order.user_uuid,
+                    *amount,
+                )
+                .await
+                .map(|()| format!("Withdraw completed for {}", order.username))
             }
         }
     }
@@ -1374,12 +1489,12 @@ mod tests {
                         // slot 0 so `apply_chest_sync` has something to
                         // merge and the rest stay as-is.
                         let (item, delta) = match action {
-                            crate::messages::ChestAction::Withdraw {
-                                item, amount, ..
-                            } => (item, -amount),
-                            crate::messages::ChestAction::Deposit {
-                                item, amount, ..
-                            } => (item, amount),
+                            crate::messages::ChestAction::Withdraw { item, amount, .. } => {
+                                (item, -amount)
+                            }
+                            crate::messages::ChestAction::Deposit { item, amount, .. } => {
+                                (item, amount)
+                            }
                         };
                         let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
                         // Compute new value for slot 0 based on the prior state
@@ -1433,9 +1548,14 @@ mod tests {
 
         // Request more than physical storage holds — handler rejects during
         // validation, before any bot instruction is sent.
-        let result = handle_buy_order(&mut store, "Alice", &test_uuid("Alice"), "cobblestone", 500).await;
+        let result =
+            handle_buy_order(&mut store, "Alice", &test_uuid("Alice"), "cobblestone", 500).await;
 
-        assert!(result.is_ok(), "handler should not propagate error: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "handler should not propagate error: {:?}",
+            result
+        );
         assert_eq!(store.users.get(&uuid).unwrap().balance, 1000.0);
         assert_eq!(store.pairs.get("cobblestone").unwrap().item_stock, 50);
     }
@@ -1450,13 +1570,7 @@ mod tests {
         users.insert(uuid, user);
 
         let storage = make_storage("cobblestone", 0);
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let result = handle_buy_order(&mut store, "Bob", &test_uuid("Bob"), "gunpowder", 10).await;
         assert!(result.is_ok());
@@ -1476,15 +1590,10 @@ mod tests {
         users.insert(payee_uuid.clone(), payee);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
-        let result = player::pay_async(&mut store, "Payer", &test_uuid("Payer"), "Payee", 20.0).await;
+        let result =
+            player::pay_async(&mut store, "Payer", &test_uuid("Payer"), "Payee", 20.0).await;
         assert!(result.is_ok(), "pay failed: {:?}", result);
         assert_eq!(store.users.get(&payer_uuid).unwrap().balance, 30.0);
         assert_eq!(store.users.get(&payee_uuid).unwrap().balance, 30.0);
@@ -1502,13 +1611,7 @@ mod tests {
         users.insert(payee_uuid.clone(), payee);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let result = player::pay_async(&mut store, "Poor", &test_uuid("Poor"), "Rich", 50.0).await;
         assert!(result.is_err());
@@ -1527,15 +1630,10 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = make_storage("cobblestone", 0);
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
-        let result = handle_sell_order(&mut store, "Seller", &test_uuid("Seller"), "gunpowder", 10).await;
+        let result =
+            handle_sell_order(&mut store, "Seller", &test_uuid("Seller"), "gunpowder", 10).await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
         assert!(!store.pairs.contains_key("gunpowder"));
@@ -1557,11 +1655,15 @@ mod tests {
         let storage = make_storage("cobblestone", 100);
         let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
 
-        let result = handle_sell_order(&mut store, "Zed", &test_uuid("Zed"), "cobblestone", 0).await;
+        let result =
+            handle_sell_order(&mut store, "Zed", &test_uuid("Zed"), "cobblestone", 0).await;
         assert!(result.is_ok());
         // Reserves unchanged.
         assert_eq!(store.pairs.get("cobblestone").unwrap().item_stock, 100);
-        assert_eq!(store.pairs.get("cobblestone").unwrap().currency_stock, 500.0);
+        assert_eq!(
+            store.pairs.get("cobblestone").unwrap().currency_stock,
+            500.0
+        );
     }
 
     #[tokio::test]
@@ -1574,22 +1676,36 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         // Zero amount
-        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", &test_uuid("Depositor"), Some(0.0)).await;
-        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        let result = player::handle_deposit_balance_queued(
+            &mut store,
+            "Depositor",
+            &test_uuid("Depositor"),
+            Some(0.0),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler should reject gracefully: {:?}",
+            result
+        );
         assert_eq!(store.users.get(&uuid).unwrap().balance, 10.0);
 
         // Negative amount
-        let result = player::handle_deposit_balance_queued(&mut store, "Depositor", &test_uuid("Depositor"), Some(-5.0)).await;
-        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        let result = player::handle_deposit_balance_queued(
+            &mut store,
+            "Depositor",
+            &test_uuid("Depositor"),
+            Some(-5.0),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler should reject gracefully: {:?}",
+            result
+        );
         assert_eq!(store.users.get(&uuid).unwrap().balance, 10.0);
     }
 
@@ -1603,16 +1719,16 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         // 12 stacks * 64 = 768 is the cap; 1000 exceeds it.
-        let result = player::handle_deposit_balance_queued(&mut store, "BigSpender", &test_uuid("BigSpender"), Some(1000.0)).await;
+        let result = player::handle_deposit_balance_queued(
+            &mut store,
+            "BigSpender",
+            &test_uuid("BigSpender"),
+            Some(1000.0),
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.0);
     }
@@ -1627,16 +1743,20 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "Broke", &test_uuid("Broke"), Some(50.0)).await;
-        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        let result = player::handle_withdraw_balance_queued(
+            &mut store,
+            "Broke",
+            &test_uuid("Broke"),
+            Some(50.0),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler should reject gracefully: {:?}",
+            result
+        );
         assert_eq!(store.users.get(&uuid).unwrap().balance, 3.0);
     }
 
@@ -1650,19 +1770,21 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", &test_uuid("Neg"), Some(-1.0)).await;
+        let result = player::handle_withdraw_balance_queued(
+            &mut store,
+            "Neg",
+            &test_uuid("Neg"),
+            Some(-1.0),
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "Neg", &test_uuid("Neg"), Some(0.0)).await;
+        let result =
+            player::handle_withdraw_balance_queued(&mut store, "Neg", &test_uuid("Neg"), Some(0.0))
+                .await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
     }
@@ -1736,7 +1858,14 @@ mod tests {
         let balance_before = store.users.get(&uuid).unwrap().balance;
         let pair_currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
 
-        let result = handle_buy_order(&mut store, "HappyBuyer", &test_uuid("HappyBuyer"), "cobblestone", 10).await;
+        let result = handle_buy_order(
+            &mut store,
+            "HappyBuyer",
+            &test_uuid("HappyBuyer"),
+            "cobblestone",
+            10,
+        )
+        .await;
         assert!(result.is_ok(), "buy failed: {:?}", result);
 
         // Trade journal + order history received one new entry each.
@@ -1770,12 +1899,12 @@ mod tests {
                         ..
                     } => {
                         let (item, delta) = match action {
-                            crate::messages::ChestAction::Withdraw {
-                                item, amount, ..
-                            } => (item, -amount),
-                            crate::messages::ChestAction::Deposit {
-                                item, amount, ..
-                            } => (item, amount),
+                            crate::messages::ChestAction::Withdraw { item, amount, .. } => {
+                                (item, -amount)
+                            }
+                            crate::messages::ChestAction::Deposit { item, amount, .. } => {
+                                (item, amount)
+                            }
                         };
                         let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
                         let prior = target_chest.amounts.first().copied().unwrap_or(0);
@@ -1838,8 +1967,19 @@ mod tests {
         let diamond_stock_before = store.storage.total_item_amount("diamond");
         assert_eq!(diamond_stock_before, 0);
 
-        let result = handle_buy_order(&mut store, "ShortPayer", &test_uuid("ShortPayer"), "cobblestone", 1).await;
-        assert!(result.is_ok(), "handler should recover gracefully: {:?}", result);
+        let result = handle_buy_order(
+            &mut store,
+            "ShortPayer",
+            &test_uuid("ShortPayer"),
+            "cobblestone",
+            1,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler should recover gracefully: {:?}",
+            result
+        );
 
         // Diamond chest should now contain the partial payment.
         let diamond_stock_after = store.storage.total_item_amount("diamond");
@@ -1881,7 +2021,14 @@ mod tests {
         let orders_before = store.orders.len();
         let pair_currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
 
-        let result = handle_sell_order(&mut store, "HappySeller", &test_uuid("HappySeller"), "cobblestone", 10).await;
+        let result = handle_sell_order(
+            &mut store,
+            "HappySeller",
+            &test_uuid("HappySeller"),
+            "cobblestone",
+            10,
+        )
+        .await;
         assert!(result.is_ok(), "sell failed: {:?}", result);
 
         assert_eq!(store.trades.len(), trades_before + 1);
@@ -1901,16 +2048,12 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         // Full-balance withdraw (amount=None) on <1 diamond balance: rejected.
-        let result = player::handle_withdraw_balance_queued(&mut store, "Empty", &test_uuid("Empty"), None).await;
+        let result =
+            player::handle_withdraw_balance_queued(&mut store, "Empty", &test_uuid("Empty"), None)
+                .await;
         assert!(result.is_ok());
         assert_eq!(store.users.get(&uuid).unwrap().balance, 0.5);
     }
@@ -1928,12 +2071,25 @@ mod tests {
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
         let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
-        let result = player::handle_withdraw_balance_queued(&mut store, "RichPlayer", &test_uuid("RichPlayer"), Some(10.0)).await;
-        assert!(result.is_ok(), "handler should reject gracefully: {:?}", result);
+        let result = player::handle_withdraw_balance_queued(
+            &mut store,
+            "RichPlayer",
+            &test_uuid("RichPlayer"),
+            Some(10.0),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler should reject gracefully: {:?}",
+            result
+        );
         // Balance must be unchanged — no diamonds were paid out.
         assert_eq!(store.users.get(&uuid).unwrap().balance, 100.0);
         // Trade state machine must have reached a terminal state, not left stuck.
-        assert!(store.current_trade.is_none(), "current_trade must be None after rejection");
+        assert!(
+            store.current_trade.is_none(),
+            "current_trade must be None after rejection"
+        );
     }
 
     /// Mock bot that succeeds on `TradeWithPlayer` and `Withdraw` but fails
@@ -1954,7 +2110,8 @@ mod tests {
                         match &action {
                             crate::messages::ChestAction::Deposit { .. } => {
                                 // Simulate a bot-reported failure on every deposit.
-                                let _ = respond_to.send(Err("simulated deposit failure".to_string()));
+                                let _ =
+                                    respond_to.send(Err("simulated deposit failure".to_string()));
                             }
                             crate::messages::ChestAction::Withdraw { item, amount, .. } => {
                                 // Succeed on withdrawals: compute new slot-0 value.
@@ -2012,8 +2169,19 @@ mod tests {
         let currency_before = store.pairs.get("cobblestone").unwrap().currency_stock;
 
         // Sell 10 units; payout will be some positive amount of diamonds.
-        let result = handle_sell_order(&mut store, "DepFail", &test_uuid("DepFail"), "cobblestone", 10).await;
-        assert!(result.is_ok(), "handler must not propagate error: {:?}", result);
+        let result = handle_sell_order(
+            &mut store,
+            "DepFail",
+            &test_uuid("DepFail"),
+            "cobblestone",
+            10,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler must not propagate error: {:?}",
+            result
+        );
 
         // currency_stock must be debited — diamonds physically left storage.
         let currency_after = store.pairs.get("cobblestone").unwrap().currency_stock;
@@ -2059,8 +2227,19 @@ mod tests {
 
         let balance_before = store.users.get(&uuid).unwrap().balance;
 
-        let result = handle_sell_order(&mut store, "NoDiamonds", &test_uuid("NoDiamonds"), "cobblestone", 10).await;
-        assert!(result.is_ok(), "handler must not propagate error: {:?}", result);
+        let result = handle_sell_order(
+            &mut store,
+            "NoDiamonds",
+            &test_uuid("NoDiamonds"),
+            "cobblestone",
+            10,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handler must not propagate error: {:?}",
+            result
+        );
 
         // Player balance must be unchanged — no payout occurred.
         assert_eq!(
@@ -2101,13 +2280,7 @@ mod tests {
         // diamonds, so `rollback_amount_to_storage("diamond", …)` will land
         // its deposit in the existing chest rather than triggering grow.
         let storage = make_storage("cobblestone", 0);
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();
@@ -2132,7 +2305,10 @@ mod tests {
         // Trade journal got exactly one DepositBalance entry of size 5.
         assert_eq!(store.trades.len(), trades_before + 1);
         let last_trade = store.trades.last().unwrap();
-        assert_eq!(last_trade.trade_type, crate::types::TradeType::DepositBalance);
+        assert_eq!(
+            last_trade.trade_type,
+            crate::types::TradeType::DepositBalance
+        );
         assert_eq!(last_trade.amount, 5);
         // Order history grew by one (the queued-order ledger).
         assert_eq!(store.orders.len(), orders_before + 1);
@@ -2177,10 +2353,8 @@ mod tests {
                             }
                             crate::messages::ChestAction::Deposit { item, amount, .. } => {
                                 if deposit_calls < success_calls {
-                                    let mut amounts =
-                                        [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
-                                    let prior =
-                                        target_chest.amounts.first().copied().unwrap_or(0);
+                                    let mut amounts = [-1i32; crate::constants::DOUBLE_CHEST_SLOTS];
+                                    let prior = target_chest.amounts.first().copied().unwrap_or(0);
                                     amounts[0] = (prior + amount).max(0);
                                     let _ = respond_to.send(Ok(ChestSyncReport {
                                         chest_id: target_chest.id,
@@ -2193,9 +2367,8 @@ mod tests {
                                     // server). `items_stuck_on_bot += amount`
                                     // and `items_returned` is NOT credited
                                     // for this step.
-                                    let _ = respond_to.send(Err(
-                                        "simulated deposit failure".to_string(),
-                                    ));
+                                    let _ = respond_to
+                                        .send(Err("simulated deposit failure".to_string()));
                                 }
                                 deposit_calls += 1;
                             }
@@ -2238,13 +2411,7 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = make_storage("cobblestone", 0);
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let trades_before = store.trades.len();
 
@@ -2255,7 +2422,11 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.is_ok(), "handler must not propagate error: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "handler must not propagate error: {:?}",
+            result
+        );
 
         // Balance must be UNCHANGED — zero diamonds reached storage, so the
         // ledger must not mint the `claimed` figure (it would be unbacked).
@@ -2324,25 +2495,19 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = make_storage("cobblestone", 0);
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let trades_before = store.trades.len();
 
         // Flexible deposit so the trade GUI accepts the empty offering.
-        let result = player::handle_deposit_balance_queued(
-            &mut store,
-            "Empty",
-            &test_uuid("Empty"),
-            None,
-        )
-        .await;
-        assert!(result.is_ok(), "handler should not propagate error: {:?}", result);
+        let result =
+            player::handle_deposit_balance_queued(&mut store, "Empty", &test_uuid("Empty"), None)
+                .await;
+        assert!(
+            result.is_ok(),
+            "handler should not propagate error: {:?}",
+            result
+        );
 
         // Balance is unchanged.
         assert_eq!(store.users.get(&uuid).unwrap().balance, 42.0);
@@ -2371,13 +2536,7 @@ mod tests {
         diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
         diamond_chest.amounts[0] = 64;
 
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();
@@ -2396,7 +2555,10 @@ mod tests {
         // Trade journal got one WithdrawBalance entry.
         assert_eq!(store.trades.len(), trades_before + 1);
         let last_trade = store.trades.last().unwrap();
-        assert_eq!(last_trade.trade_type, crate::types::TradeType::WithdrawBalance);
+        assert_eq!(
+            last_trade.trade_type,
+            crate::types::TradeType::WithdrawBalance
+        );
         assert_eq!(last_trade.amount, 7);
         // Order history grew by one.
         assert_eq!(store.orders.len(), orders_before + 1);
@@ -2420,13 +2582,7 @@ mod tests {
         diamond_chest.amounts = vec![0; crate::constants::DOUBLE_CHEST_SLOTS];
         diamond_chest.amounts[0] = 64;
 
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let result = player::handle_withdraw_balance_queued(
             &mut store,
@@ -2480,13 +2636,7 @@ mod tests {
         diamond_chest.amounts[10] = 64;
         diamond_chest.amounts[11] = 64;
 
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         // Full-balance withdraw (`amount = None`).
         let result = player::handle_withdraw_balance_queued(
@@ -2531,13 +2681,7 @@ mod tests {
         users.insert(uuid.clone(), user);
 
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            HashMap::new(),
-            users,
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), HashMap::new(), users, storage);
 
         let result = player::pay_async(
             &mut store,

@@ -11,13 +11,13 @@
 //! `validation` is shared by the command parser (`store::command`) and
 //! handlers; it is `pub(crate)` so both can reach it.
 
-pub mod player;
-pub mod operator;
 pub mod cli;
+pub mod operator;
+pub mod player;
 
 mod buy;
-mod sell;
 mod deposit;
-mod withdraw;
 mod info;
+mod sell;
 pub(crate) mod validation;
+mod withdraw;

@@ -196,12 +196,7 @@ impl PricingTable {
     /// `cache_read_input_tokens` — that path bills cache writes at the
     /// premium rate and cache reads at the discount rate so the daily
     /// USD cap reflects what Anthropic will actually invoice.
-    pub fn usd_for_tokens(
-        &self,
-        model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) -> f64 {
+    pub fn usd_for_tokens(&self, model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
         self.usd_for_call(model, input_tokens, output_tokens, 0, 0)
     }
 
@@ -245,20 +240,18 @@ impl PricingTable {
             }
             return f64::INFINITY;
         };
-        let cache_write_rate = r
-            .cache_write_per_million
-            .unwrap_or(r.input_per_million);
-        let cache_read_rate = r
-            .cache_read_per_million
-            .unwrap_or(r.input_per_million);
+        let cache_write_rate = r.cache_write_per_million.unwrap_or(r.input_per_million);
+        let cache_read_rate = r.cache_read_per_million.unwrap_or(r.input_per_million);
         let input_usd = (input_tokens as f64) * r.input_per_million / 1_000_000.0;
         let output_usd = (output_tokens as f64) * r.output_per_million / 1_000_000.0;
-        let cache_write_usd =
-            (cache_creation_input_tokens as f64) * cache_write_rate / 1_000_000.0;
-        let cache_read_usd =
-            (cache_read_input_tokens as f64) * cache_read_rate / 1_000_000.0;
+        let cache_write_usd = (cache_creation_input_tokens as f64) * cache_write_rate / 1_000_000.0;
+        let cache_read_usd = (cache_read_input_tokens as f64) * cache_read_rate / 1_000_000.0;
         let total = input_usd + output_usd + cache_write_usd + cache_read_usd;
-        if total.is_finite() && total >= 0.0 { total } else { 0.0 }
+        if total.is_finite() && total >= 0.0 {
+            total
+        } else {
+            0.0
+        }
     }
 }
 
@@ -373,7 +366,10 @@ mod tests {
         let t = PricingTable::default_table();
         let h = t.usd_for_tokens("claude-haiku-4-5-20251001", 1_000_000, 0);
         let o = t.usd_for_tokens("claude-opus-4-7", 1_000_000, 0);
-        assert!(h < o, "Haiku must be cheaper than Opus per million input tokens");
+        assert!(
+            h < o,
+            "Haiku must be cheaper than Opus per million input tokens"
+        );
     }
 
     #[test]
@@ -384,7 +380,10 @@ mod tests {
         let t = PricingTable::default_table();
         let h = t.usd_for_tokens("claude-haiku-4-5-20251001", 1_000_000, 0);
         let s = t.usd_for_tokens("claude-sonnet-4-6", 1_000_000, 0);
-        assert!(h < s, "Haiku must be cheaper than Sonnet per million input tokens");
+        assert!(
+            h < s,
+            "Haiku must be cheaper than Sonnet per million input tokens"
+        );
     }
 
     #[test]
@@ -395,7 +394,10 @@ mod tests {
         let t = PricingTable::default_table();
         let s = t.usd_for_call("claude-sonnet-4-6", 1_000_000, 200_000, 0, 0);
         let o = t.usd_for_call("claude-opus-4-7", 1_000_000, 200_000, 0, 0);
-        assert!(s < o, "Sonnet must be cheaper than Opus on a typical I/O mix");
+        assert!(
+            s < o,
+            "Sonnet must be cheaper than Opus on a typical I/O mix"
+        );
     }
 
     // ---- load_from_path: validation + fallback branches --------------------
@@ -429,7 +431,10 @@ mod tests {
         let t = PricingTable::load_from_path(&path).unwrap();
         let after = fs::read(&path).unwrap();
         assert_eq!(t, PricingTable::default_table());
-        assert_eq!(before, after, "file must NOT be rewritten on validation failure");
+        assert_eq!(
+            before, after,
+            "file must NOT be rewritten on validation failure"
+        );
     }
 
     #[test]
@@ -487,6 +492,9 @@ mod tests {
         let t = PricingTable::load_from_path(&path).unwrap();
         let after = fs::read(&path).unwrap();
         assert_eq!(t, PricingTable::default_table());
-        assert_eq!(before, after, "negative cache_write file must NOT be rewritten");
+        assert_eq!(
+            before, after,
+            "negative cache_write file must NOT be rewritten"
+        );
     }
 }

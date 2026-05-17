@@ -80,7 +80,9 @@ impl ApiKey {
                 }
             }
         }
-        Err(format!("env var {env_var} not set in process env or .env file"))
+        Err(format!(
+            "env var {env_var} not set in process env or .env file"
+        ))
     }
 
     /// Test-only constructor. Production code must use `from_env`.
@@ -150,7 +152,13 @@ pub fn effective_temperature(model: &str, configured: Option<f32>) -> Option<f32
     if model.contains("opus") {
         return None;
     }
-    configured.and_then(|t| if t.is_finite() { Some(t.clamp(0.0, 1.0)) } else { None })
+    configured.and_then(|t| {
+        if t.is_finite() {
+            Some(t.clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,7 +341,10 @@ pub enum ClientError {
     /// `anthropic-ratelimit-*-reset` headers) clamped to a sane ceiling
     /// so the retry loop honors Anthropic's bucket-reset rather than
     /// re-entering before the window opens.
-    Throttled { status: u16, retry_after_ms: Option<u64> },
+    Throttled {
+        status: u16,
+        retry_after_ms: Option<u64>,
+    },
     /// 4xx other than 401/404 — the request is malformed in a way that
     /// won't be fixed by retrying.
     BadRequest { status: u16, message: String },
@@ -350,7 +361,10 @@ impl fmt::Display for ClientError {
             ClientError::Transport(s) => write!(f, "transport: {s}"),
             ClientError::Auth => write!(f, "anthropic auth failed (401)"),
             ClientError::ModelNotFound { model } => write!(f, "model not found: {model}"),
-            ClientError::Throttled { status, retry_after_ms } => match retry_after_ms {
+            ClientError::Throttled {
+                status,
+                retry_after_ms,
+            } => match retry_after_ms {
                 // The "upstream-throttled" prefix is a stable marker the
                 // chat orchestrator uses to discriminate genuine 429/5xx
                 // upstream throttle from a `Transport(_)` error that the
@@ -730,7 +744,10 @@ fn demote_request_to_5min(req: &CreateMessageRequest) -> CreateMessageRequest {
         .system
         .iter()
         .map(|b| match b {
-            SystemBlock::Text { text, cache_control } => SystemBlock::Text {
+            SystemBlock::Text {
+                text,
+                cache_control,
+            } => SystemBlock::Text {
                 text: text.clone(),
                 cache_control: demote_cc(cache_control),
             },
@@ -746,7 +763,10 @@ fn demote_request_to_5min(req: &CreateMessageRequest) -> CreateMessageRequest {
                 .content
                 .iter()
                 .map(|cb| match cb {
-                    ContentBlock::Text { text, cache_control } => ContentBlock::Text {
+                    ContentBlock::Text {
+                        text,
+                        cache_control,
+                    } => ContentBlock::Text {
                         text: text.clone(),
                         cache_control: demote_cc(cache_control),
                     },
@@ -755,13 +775,15 @@ fn demote_request_to_5min(req: &CreateMessageRequest) -> CreateMessageRequest {
                         name: name.clone(),
                         input: input.clone(),
                     },
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                        ContentBlock::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
-                            is_error: *is_error,
-                        }
-                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => ContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                    },
                     ContentBlock::ServerToolUse { id, name, input } => {
                         ContentBlock::ServerToolUse {
                             id: id.clone(),
@@ -769,12 +791,13 @@ fn demote_request_to_5min(req: &CreateMessageRequest) -> CreateMessageRequest {
                             input: input.clone(),
                         }
                     }
-                    ContentBlock::WebSearchToolResult { tool_use_id, content } => {
-                        ContentBlock::WebSearchToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
-                        }
-                    }
+                    ContentBlock::WebSearchToolResult {
+                        tool_use_id,
+                        content,
+                    } => ContentBlock::WebSearchToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                    },
                 })
                 .collect(),
         })
@@ -860,9 +883,10 @@ pub async fn call_with_retry(
                     continue;
                 }
                 let (status, server_hint_ms) = match &e {
-                    ClientError::Throttled { status, retry_after_ms } => {
-                        (*status, *retry_after_ms)
-                    }
+                    ClientError::Throttled {
+                        status,
+                        retry_after_ms,
+                    } => (*status, *retry_after_ms),
                     ClientError::Auth => (401, None),
                     ClientError::ModelNotFound { .. } => (404, None),
                     ClientError::BadRequest { status, .. } => (*status, None),
@@ -1159,8 +1183,7 @@ impl RateLimiter {
                 // progress even if the front entry already expired
                 // (shouldn't happen post-prune, but defensive).
                 let target = wakeup.max(now + std::time::Duration::from_millis(1));
-                next_event = tokio::time::Instant::now()
-                    + target.saturating_duration_since(now);
+                next_event = tokio::time::Instant::now() + target.saturating_duration_since(now);
             }
             tokio::time::sleep_until(next_event).await;
         }
@@ -1208,12 +1231,9 @@ pub fn format_daily_ceiling_log_line(
 ) -> String {
     let composer = &config.composer_model;
     let classifier = &config.classifier_model;
-    let input_usd =
-        pricing.usd_for_tokens(composer, config.daily_input_token_cap, 0);
-    let output_usd =
-        pricing.usd_for_tokens(composer, 0, config.daily_output_token_cap);
-    let classifier_usd =
-        pricing.usd_for_tokens(classifier, config.daily_classifier_token_cap, 0);
+    let input_usd = pricing.usd_for_tokens(composer, config.daily_input_token_cap, 0);
+    let output_usd = pricing.usd_for_tokens(composer, 0, config.daily_output_token_cap);
+    let classifier_usd = pricing.usd_for_tokens(classifier, config.daily_classifier_token_cap, 0);
     let token_sum = input_usd + output_usd + classifier_usd;
     let effective = token_sum.min(config.daily_dollar_cap_usd);
     format!(
@@ -1467,12 +1487,18 @@ mod tests {
         assert_eq!(effective_temperature("claude-opus-4-7", Some(1.0)), None);
         assert_eq!(effective_temperature("claude-opus-4-7", None), None);
         // Older opus IDs (e.g. "claude-3-opus-20240229") match too.
-        assert_eq!(effective_temperature("claude-3-opus-20240229", Some(0.7)), None);
+        assert_eq!(
+            effective_temperature("claude-3-opus-20240229", Some(0.7)),
+            None
+        );
     }
 
     #[test]
     fn effective_temperature_passes_through_for_non_opus() {
-        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(0.8)), Some(0.8));
+        assert_eq!(
+            effective_temperature("claude-sonnet-4-6", Some(0.8)),
+            Some(0.8)
+        );
         assert_eq!(
             effective_temperature("claude-haiku-4-5-20251001", Some(0.0)),
             Some(0.0)
@@ -1484,15 +1510,24 @@ mod tests {
     fn effective_temperature_clamps_out_of_range() {
         // Anthropic accepts 0.0..=1.0; defensively clamp so a misconfig
         // doesn't surface as a 400 from the API.
-        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(-0.5)), Some(0.0));
-        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(1.7)), Some(1.0));
+        assert_eq!(
+            effective_temperature("claude-sonnet-4-6", Some(-0.5)),
+            Some(0.0)
+        );
+        assert_eq!(
+            effective_temperature("claude-sonnet-4-6", Some(1.7)),
+            Some(1.0)
+        );
     }
 
     #[test]
     fn effective_temperature_drops_nonfinite_values() {
         // NaN / ±∞ would propagate through `clamp` (NaN as the value)
         // or panic, and either way the API would 400. Collapse to None.
-        assert_eq!(effective_temperature("claude-sonnet-4-6", Some(f32::NAN)), None);
+        assert_eq!(
+            effective_temperature("claude-sonnet-4-6", Some(f32::NAN)),
+            None
+        );
         assert_eq!(
             effective_temperature("claude-sonnet-4-6", Some(f32::INFINITY)),
             None
@@ -1772,11 +1807,7 @@ mod tests {
     /// `call_with_retry` exactly so we can unit-test the policy without
     /// spinning up a real HTTP fixture. Returns the sampled value and
     /// the worst-case upper bound used by the budget guard.
-    fn pick_delay_ms(
-        status: u16,
-        server_hint_ms: Option<u64>,
-        attempt: u32,
-    ) -> Option<(u64, u64)> {
+    fn pick_delay_ms(status: u16, server_hint_ms: Option<u64>, attempt: u32) -> Option<(u64, u64)> {
         let RetryDecision::Retry { min_ms, max_ms } = retry_decision(status, attempt) else {
             return None;
         };
@@ -1794,8 +1825,7 @@ mod tests {
     #[test]
     fn server_hint_wins_over_exponential() {
         // Hint of 3s should be honored even when the schedule says 1s.
-        let (chosen, max_sleep) =
-            pick_delay_ms(429, Some(3_000), 0).expect("retryable");
+        let (chosen, max_sleep) = pick_delay_ms(429, Some(3_000), 0).expect("retryable");
         assert_eq!(chosen, 3_000);
         // Server hint is NOT jittered — caller honors as-is.
         assert_eq!(max_sleep, 3_000);
@@ -1861,10 +1891,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
             let v = jittered_delay_ms(750, 1_250);
-            assert!(
-                (750..=1_250).contains(&v),
-                "sample {v} outside [750, 1250]"
-            );
+            assert!((750..=1_250).contains(&v), "sample {v} outside [750, 1250]");
             seen.insert(v);
         }
         assert!(
@@ -1891,10 +1918,7 @@ mod tests {
         h.insert("retry-after", "5".parse().unwrap());
         let near = (chrono::Utc::now() + chrono::Duration::seconds(2))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        h.insert(
-            "anthropic-ratelimit-requests-reset",
-            near.parse().unwrap(),
-        );
+        h.insert("anthropic-ratelimit-requests-reset", near.parse().unwrap());
         let parsed = parse_retry_after_hint(&h).expect("hint");
         // ~2s from the RFC3339 header should win over the 5s integer.
         assert!(parsed <= 2_500, "expected ~2s, got {parsed}");
@@ -2048,7 +2072,10 @@ mod tests {
         });
         let cb: ContentBlock = serde_json::from_value(raw).unwrap();
         match cb {
-            ContentBlock::WebSearchToolResult { tool_use_id, content } => {
+            ContentBlock::WebSearchToolResult {
+                tool_use_id,
+                content,
+            } => {
                 assert_eq!(tool_use_id, "srvtoolu_abc");
                 // Content is opaque (Value); we just verify it round-trips.
                 assert!(content.is_array());
@@ -2164,7 +2191,10 @@ mod tests {
         };
         let out = demote_request_to_5min(&req);
         match &out.system[0] {
-            SystemBlock::Text { cache_control: Some(cc), .. } => {
+            SystemBlock::Text {
+                cache_control: Some(cc),
+                ..
+            } => {
                 assert!(cc.ttl.is_none(), "ttl field should be absent on 5-min");
             }
             _ => panic!("expected text system block"),
@@ -2186,7 +2216,10 @@ mod tests {
         };
         let out = demote_request_to_5min(&req);
         match &out.system[0] {
-            SystemBlock::Text { cache_control: Some(cc), .. } => assert!(cc.ttl.is_none()),
+            SystemBlock::Text {
+                cache_control: Some(cc),
+                ..
+            } => assert!(cc.ttl.is_none()),
             _ => panic!(),
         }
     }
@@ -2213,8 +2246,11 @@ mod tests {
         let res = rl.acquire(1).await;
         let waited = started.elapsed();
         assert!(matches!(res, Err(ClientError::RateLimited { .. })));
-        assert!(waited >= std::time::Duration::from_millis(900),
-                "expected ~1s wait, got {:?}", waited);
+        assert!(
+            waited >= std::time::Duration::from_millis(900),
+            "expected ~1s wait, got {:?}",
+            waited
+        );
     }
 
     #[tokio::test]
@@ -2272,8 +2308,10 @@ mod tests {
         cfg.daily_dollar_cap_usd = 0.01; // tighter than any token sum
         let pricing = crate::chat::pricing::PricingTable::default_table();
         let line = format_daily_ceiling_log_line(&cfg, &pricing);
-        assert!(line.contains("Effective daily ceiling: $0.01"),
-                "got: {line}");
+        assert!(
+            line.contains("Effective daily ceiling: $0.01"),
+            "got: {line}"
+        );
     }
 
     #[test]

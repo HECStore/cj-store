@@ -220,9 +220,10 @@ impl Order {
         file_path: &Path,
     ) -> io::Result<()> {
         if let Some(parent) = file_path.parent()
-            && !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+        }
 
         // Skipping `len - max_orders` from the front keeps the most recent
         // entries. Note: there is no in-memory pruning of `store.orders` —
@@ -232,7 +233,11 @@ impl Order {
         // Both branches serialize by borrow to avoid cloning every entry on
         // the hot save path.
         let json_str = if orders.len() > max_orders {
-            tracing::info!("[Order] pruning {} -> {} before save", orders.len(), max_orders);
+            tracing::info!(
+                "[Order] pruning {} -> {} before save",
+                orders.len(),
+                max_orders
+            );
             let pruned: Vec<&Self> = orders.iter().skip(orders.len() - max_orders).collect();
             serde_json::to_string_pretty(&pruned).map_err(io::Error::other)?
         } else {
@@ -296,7 +301,9 @@ mod tests {
         let file_path = dir.path().join("orders.json");
 
         let mut q = VecDeque::new();
-        for i in 0..5u32 { q.push_back(make(i)); }
+        for i in 0..5u32 {
+            q.push_back(make(i));
+        }
 
         Order::save_all_with_limit_at(&q, 3, &file_path).unwrap();
 
@@ -313,7 +320,9 @@ mod tests {
         let file_path = dir.path().join("orders.json");
 
         let mut q = VecDeque::new();
-        for i in 0..3u32 { q.push_back(make(i)); }
+        for i in 0..3u32 {
+            q.push_back(make(i));
+        }
 
         Order::save_all_with_limit_at(&q, 10, &file_path).unwrap();
 
@@ -330,7 +339,9 @@ mod tests {
         let file_path = dir.path().join("orders.json");
 
         let mut q = VecDeque::new();
-        for i in 0..3u32 { q.push_back(make(i)); }
+        for i in 0..3u32 {
+            q.push_back(make(i));
+        }
 
         Order::save_all_with_limit_at(&q, 3, &file_path).unwrap();
 

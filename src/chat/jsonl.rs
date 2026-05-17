@@ -136,11 +136,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
         let p1 = day_file(dir, t);
         let p2 = day_file_for_date(dir, date);
-        assert!(
-            p1.ends_with("2024-01-15.jsonl"),
-            "day_file path = {:?}",
-            p1
-        );
+        assert!(p1.ends_with("2024-01-15.jsonl"), "day_file path = {:?}", p1);
         assert!(
             p2.ends_with("2024-01-15.jsonl"),
             "day_file_for_date path = {:?}",

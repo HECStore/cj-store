@@ -17,7 +17,7 @@
 
 use tracing::{debug, warn};
 
-use super::super::command::{parse_command, Command};
+use super::super::command::{Command, parse_command};
 use super::super::{Store, utils};
 use super::validation::validate_username;
 use super::{buy, deposit, info, operator, sell, withdraw};
@@ -244,9 +244,9 @@ async fn whisper_rate_limit_notice(
     let wait_ms = wait_duration.as_millis() as u64;
     let secs_ceil = wait_duration.as_secs_f64().ceil().max(1.0) as u64;
     let msg = match reason {
-        ThrottleReason::GlobalCap => format!(
-            "Server is busy with too many active users; please try again in {secs_ceil}s."
-        ),
+        ThrottleReason::GlobalCap => {
+            format!("Server is busy with too many active users; please try again in {secs_ceil}s.")
+        }
         ThrottleReason::PerUser => {
             if wait_ms < 1_000 {
                 format!(
@@ -313,7 +313,7 @@ mod tests {
     use crate::types::{Position, Storage, User};
     use std::collections::HashMap;
     use tokio::sync::mpsc;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     /// Absorb every `BotInstruction` emitted by the dispatcher and forward
     /// the text of any `Whisper` back to the test. Non-whisper instructions
@@ -325,7 +325,12 @@ mod tests {
         let (tx, out_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let BotInstruction::Whisper { target, message, respond_to } = msg {
+                if let BotInstruction::Whisper {
+                    target,
+                    message,
+                    respond_to,
+                } = msg
+                {
                     let _ = tx.send((target.clone(), message.clone()));
                     let _ = respond_to.send(Ok(()));
                 }
@@ -390,9 +395,7 @@ mod tests {
         (store, out_rx)
     }
 
-    async fn recv_whisper(
-        rx: &mut mpsc::UnboundedReceiver<(String, String)>,
-    ) -> (String, String) {
+    async fn recv_whisper(rx: &mut mpsc::UnboundedReceiver<(String, String)>) -> (String, String) {
         timeout(Duration::from_millis(500), rx.recv())
             .await
             .expect("whisper timeout")
@@ -408,7 +411,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_verb_whispers_parse_error_to_player() {
         let (mut store, mut whispers) = make_store();
-        handle_player_command(&mut store, "Alice", "fizzbuzz 7").await.unwrap();
+        handle_player_command(&mut store, "Alice", "fizzbuzz 7")
+            .await
+            .unwrap();
         let (target, message) = recv_whisper(&mut whispers).await;
         assert_eq!(target, "Alice");
         assert!(
@@ -420,7 +425,9 @@ mod tests {
     #[tokio::test]
     async fn empty_command_whispers_help_hint() {
         let (mut store, mut whispers) = make_store();
-        handle_player_command(&mut store, "Alice", "   ").await.unwrap();
+        handle_player_command(&mut store, "Alice", "   ")
+            .await
+            .unwrap();
         let (_, message) = recv_whisper(&mut whispers).await;
         assert!(
             message.contains("help"),
@@ -434,14 +441,19 @@ mod tests {
         // Pre-seed user as non-operator so the rejection path runs without
         // ensure_user_exists creating them mid-dispatch.
         let uuid = expected_test_uuid("Alice");
-        store.users.insert(uuid.clone(), User {
-            uuid: uuid.clone(),
-            username: "Alice".to_string(),
-            balance: 0.0,
-            operator: false,
-        });
+        store.users.insert(
+            uuid.clone(),
+            User {
+                uuid: uuid.clone(),
+                username: "Alice".to_string(),
+                balance: 0.0,
+                operator: false,
+            },
+        );
 
-        handle_player_command(&mut store, "Alice", "additem cobblestone 64").await.unwrap();
+        handle_player_command(&mut store, "Alice", "additem cobblestone 64")
+            .await
+            .unwrap();
         let (_, message) = recv_whisper(&mut whispers).await;
         assert_eq!(message, "This command is only available to operators.");
     }
@@ -472,14 +484,19 @@ mod tests {
         let (mut store, mut whispers) = make_store();
         // First command passes the limiter; second one within the base
         // cooldown (2 s) trips it.
-        handle_player_command(&mut store, "Alice", "status").await.unwrap();
+        handle_player_command(&mut store, "Alice", "status")
+            .await
+            .unwrap();
         let _ = recv_whisper(&mut whispers).await; // consume status response
 
-        handle_player_command(&mut store, "Alice", "status").await.unwrap();
+        handle_player_command(&mut store, "Alice", "status")
+            .await
+            .unwrap();
         let (target, message) = recv_whisper(&mut whispers).await;
         assert_eq!(target, "Alice");
         assert!(
-            message.starts_with("Please wait") && message.contains("before sending another message"),
+            message.starts_with("Please wait")
+                && message.contains("before sending another message"),
             "expected cooldown notice, got: {message}"
         );
     }
@@ -489,10 +506,14 @@ mod tests {
         // Spamming garbage must also consume the cooldown, otherwise a
         // spammer avoids rate limiting by sending junk.
         let (mut store, mut whispers) = make_store();
-        handle_player_command(&mut store, "Alice", "???").await.unwrap();
+        handle_player_command(&mut store, "Alice", "???")
+            .await
+            .unwrap();
         let _ = recv_whisper(&mut whispers).await; // parse error whisper
 
-        handle_player_command(&mut store, "Alice", "???").await.unwrap();
+        handle_player_command(&mut store, "Alice", "???")
+            .await
+            .unwrap();
         let (_, message) = recv_whisper(&mut whispers).await;
         assert!(
             message.starts_with("Please wait"),
@@ -510,7 +531,9 @@ mod tests {
         // user lands in `store.users`.
         let username = "abcdef";
         let (mut store, mut whispers) = make_store();
-        handle_player_command(&mut store, username, "status").await.unwrap();
+        handle_player_command(&mut store, username, "status")
+            .await
+            .unwrap();
         let _ = recv_whisper(&mut whispers).await;
 
         let uuid = expected_test_uuid(username);

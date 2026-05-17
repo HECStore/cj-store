@@ -259,9 +259,8 @@ const _: () = assert!(CLEANUP_INTERVAL_SECS <= RATE_LIMIT_STALE_AFTER_SECS);
 // reset when their entry is freed before `RATE_LIMIT_RESET_AFTER_MS` has
 // elapsed. The runtime `clamp_stale_threshold` (rate_limit.rs) handles
 // misconfiguration with a one-shot warn; this catches it at build time.
-const _: () = assert!(
-    RATE_LIMIT_STALE_AFTER_SECS.saturating_mul(1_000) >= RATE_LIMIT_RESET_AFTER_MS,
-);
+const _: () =
+    assert!(RATE_LIMIT_STALE_AFTER_SECS.saturating_mul(1_000) >= RATE_LIMIT_RESET_AFTER_MS,);
 
 /// Outer watchdog on `Store::process_next_order` (seconds).
 /// Individual bot operations have their own timeouts (`TRADE_TIMEOUT_MS`,

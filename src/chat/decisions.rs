@@ -179,9 +179,7 @@ fn file_for(t: SystemTime) -> PathBuf {
 /// SAFETY: Single-process append-only — the chat task is the only writer.
 /// The mutex serializes against itself only; no contention is expected.
 fn open_or_reuse(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut guard = DAY_FILE_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = DAY_FILE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     // Fast path: cached writer for the same path — borrow and write through it.
     if let Some((cached_path, writer)) = guard.as_mut()
         && cached_path == path
@@ -210,9 +208,7 @@ fn open_or_reuse(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// because every [`write`] call site is on the chat task — there is no
 /// concurrent writer to fight with.
 pub fn invalidate_cache_for(path: &Path) {
-    let mut guard = DAY_FILE_CACHE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = DAY_FILE_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if guard.as_ref().is_some_and(|(cached, _)| cached == path) {
         *guard = None;
     }
@@ -262,7 +258,9 @@ fn append_line(path: &Path, line: &str, kind: Option<&'static str>) {
                 debug!(target: LOG_TARGET, kind = kind, "decision logged");
             }
         }
-        Err(e) => error!(target: LOG_TARGET, path = %path.display(), error = %e, "decision append failed"),
+        Err(e) => {
+            error!(target: LOG_TARGET, path = %path.display(), error = %e, "decision append failed")
+        }
     }
 }
 
@@ -485,9 +483,12 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).expect("read after second append");
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "second append must add a line, not truncate");
-        let second: serde_json::Value =
-            serde_json::from_str(lines[1]).expect("parse second line");
+        assert_eq!(
+            lines.len(),
+            2,
+            "second append must add a line, not truncate"
+        );
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("parse second line");
         assert_eq!(second["k"], "v");
 
         // Drop the cached handle so `_guard` can clean up cleanly on
@@ -513,8 +514,7 @@ mod tests {
         // Build a record whose serialization exceeds LINE_MAX_BYTES by
         // stuffing a 70 KB string into `extra`.
         let big = "x".repeat(70 * 1024);
-        let record = DecisionRecord::new("composer")
-            .extra("payload", serde_json::Value::from(big));
+        let record = DecisionRecord::new("composer").extra("payload", serde_json::Value::from(big));
 
         // Drive the full `write` path so we exercise the serialize +
         // size-check + sentinel-substitution branch end-to-end.

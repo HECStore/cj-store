@@ -159,7 +159,14 @@ mod tests {
 
     #[test]
     fn item_name_rejects_special_characters() {
-        for bad in ["iron!", "iron@ingot", "iron$", "iron/ingot", "iron.ingot", "iron,ingot"] {
+        for bad in [
+            "iron!",
+            "iron@ingot",
+            "iron$",
+            "iron/ingot",
+            "iron.ingot",
+            "iron,ingot",
+        ] {
             assert!(
                 validate_item_name(bad).is_err(),
                 "expected {bad:?} to be rejected"
@@ -337,20 +344,20 @@ mod tests {
 
         let corpus: &[&str] = &[
             // Boundary lengths.
-            "ab",                  // 2 — reject
-            "abc",                 // 3 — accept
-            "abcdefghijklmnop",    // 16 — accept
-            "abcdefghijklmnopq",   // 17 — reject
-            "",                    // empty — reject
+            "ab",                // 2 — reject
+            "abc",               // 3 — accept
+            "abcdefghijklmnop",  // 16 — accept
+            "abcdefghijklmnopq", // 17 — reject
+            "",                  // empty — reject
             // Underscore positions.
-            "_user_1",             // leading underscore — accept
-            "user_1_",             // trailing underscore — accept
+            "_user_1", // leading underscore — accept
+            "user_1_", // trailing underscore — accept
             // Digit-only.
-            "1234",                // all-digit — accept
+            "1234", // all-digit — accept
             // Hyphen — reject.
             "foo-bar",
             // Single non-ASCII codepoint inside a 3-16-byte string.
-            "abç",                 // multi-byte — reject
+            "abç", // multi-byte — reject
             // 4-byte / 2-char multi-byte — reject (byte-vs-char asymmetry).
             "éé",
             // Whitespace, colon, dot, NUL.

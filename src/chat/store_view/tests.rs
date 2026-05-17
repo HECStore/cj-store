@@ -61,8 +61,7 @@ fn trade_view_handles_every_trade_type_variant() {
         // Round-trip the string back to the type to confirm the chat
         // filter substring is wire-compatible.
         let trade_type_json = serde_json::to_string(&variant).unwrap();
-        let view_string_in_json =
-            format!("\"{}\"", view.trade_type);
+        let view_string_in_json = format!("\"{}\"", view.trade_type);
         assert_eq!(trade_type_json, view_string_in_json);
     }
 }
@@ -96,7 +95,10 @@ fn user_view_drops_operator_field_via_deserialize() {
         operator: true,
     };
     let json = serde_json::to_string(&u).unwrap();
-    assert!(json.contains("\"operator\":true"), "fixture must include operator:true");
+    assert!(
+        json.contains("\"operator\":true"),
+        "fixture must include operator:true"
+    );
     let view: store_view::user::UserView = serde_json::from_str(&json).unwrap();
     assert_eq!(view.uuid, u.uuid);
     assert_eq!(view.username, "alice");

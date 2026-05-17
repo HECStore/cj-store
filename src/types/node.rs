@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use crate::constants::{CHESTS_PER_NODE, NODE_SPACING};
 use crate::error::StoreError;
 use crate::fsutil::write_atomic;
-use crate::types::chest::Chest;
 use crate::types::ItemId;
+use crate::types::chest::Chest;
 use crate::types::position::Position;
 
 /// On-disk directory for per-node files. Single source of truth shared by
@@ -79,11 +79,11 @@ impl Node {
             // These assignments are invariants, not defaults — see Self::load.
             if node_id == 0 {
                 if index == 0 {
-                    chest.item = ItemId::from_normalized(
-                        crate::constants::BASE_CURRENCY_ITEM.to_string(),
-                    );
+                    chest.item =
+                        ItemId::from_normalized(crate::constants::BASE_CURRENCY_ITEM.to_string());
                 } else if index == 1 {
-                    chest.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
+                    chest.item =
+                        ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
                 }
             }
 
@@ -131,8 +131,9 @@ impl Node {
         }
 
         let json_data = fs::read_to_string(&file_path)?;
-        let mut node: Node = serde_json::from_str(&json_data)
-            .map_err(|e| StoreError::InvariantViolation(format!("Failed to parse node {}: {}", id, e)))?;
+        let mut node: Node = serde_json::from_str(&json_data).map_err(|e| {
+            StoreError::InvariantViolation(format!("Failed to parse node {}: {}", id, e))
+        })?;
 
         if node.id != id {
             return Err(StoreError::InvariantViolation(format!(
@@ -210,38 +211,38 @@ impl Node {
             let mut needs_save = false;
 
             if let Some(chest_0) = node.chests.get_mut(0)
-                && chest_0.item != crate::constants::BASE_CURRENCY_ITEM {
-                    let stockpile: i32 =
-                        chest_0.amounts.iter().filter(|&&a| a > 0).sum();
-                    if stockpile > 0 {
-                        return Err(StoreError::InvariantViolation(format!(
-                            "Node 0 chest 0 reserved for `{}` but on-disk item is `{}` with stockpile of {} units; refusing to relabel (would mint currency). Reconcile manually.",
-                            crate::constants::BASE_CURRENCY_ITEM,
-                            chest_0.item,
-                            stockpile
-                        )));
-                    }
-                    chest_0.item = ItemId::from_normalized(
-                        crate::constants::BASE_CURRENCY_ITEM.to_string(),
-                    );
-                    needs_save = true;
+                && chest_0.item != crate::constants::BASE_CURRENCY_ITEM
+            {
+                let stockpile: i32 = chest_0.amounts.iter().filter(|&&a| a > 0).sum();
+                if stockpile > 0 {
+                    return Err(StoreError::InvariantViolation(format!(
+                        "Node 0 chest 0 reserved for `{}` but on-disk item is `{}` with stockpile of {} units; refusing to relabel (would mint currency). Reconcile manually.",
+                        crate::constants::BASE_CURRENCY_ITEM,
+                        chest_0.item,
+                        stockpile
+                    )));
                 }
+                chest_0.item =
+                    ItemId::from_normalized(crate::constants::BASE_CURRENCY_ITEM.to_string());
+                needs_save = true;
+            }
 
             if let Some(chest_1) = node.chests.get_mut(1)
-                && chest_1.item != crate::constants::OVERFLOW_CHEST_ITEM {
-                    let stockpile: i32 =
-                        chest_1.amounts.iter().filter(|&&a| a > 0).sum();
-                    if stockpile > 0 {
-                        return Err(StoreError::InvariantViolation(format!(
-                            "Node 0 chest 1 reserved for `{}` but on-disk item is `{}` with stockpile of {} units; refusing to relabel. Reconcile manually.",
-                            crate::constants::OVERFLOW_CHEST_ITEM,
-                            chest_1.item,
-                            stockpile
-                        )));
-                    }
-                    chest_1.item = ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
-                    needs_save = true;
+                && chest_1.item != crate::constants::OVERFLOW_CHEST_ITEM
+            {
+                let stockpile: i32 = chest_1.amounts.iter().filter(|&&a| a > 0).sum();
+                if stockpile > 0 {
+                    return Err(StoreError::InvariantViolation(format!(
+                        "Node 0 chest 1 reserved for `{}` but on-disk item is `{}` with stockpile of {} units; refusing to relabel. Reconcile manually.",
+                        crate::constants::OVERFLOW_CHEST_ITEM,
+                        chest_1.item,
+                        stockpile
+                    )));
                 }
+                chest_1.item =
+                    ItemId::from_normalized(crate::constants::OVERFLOW_CHEST_ITEM.to_string());
+                needs_save = true;
+            }
 
             if needs_save {
                 tracing::warn!(
@@ -296,24 +297,22 @@ impl Node {
         let file_path = base.join(format!("{}.json", self.id));
 
         if let Some(parent_dir) = file_path.parent()
-            && !parent_dir.is_dir() {
-                // Use is_dir, not exists: if `data/storage` already exists as a
-                // regular file (operator mistake), `create_dir_all` returns a
-                // clear "Not a directory" error; `exists()` would short-circuit
-                // and let the downstream tempfile rename fail with a confusing
-                // path-error far from the cause.
-                fs::create_dir_all(parent_dir)?;
-            }
+            && !parent_dir.is_dir()
+        {
+            // Use is_dir, not exists: if `data/storage` already exists as a
+            // regular file (operator mistake), `create_dir_all` returns a
+            // clear "Not a directory" error; `exists()` would short-circuit
+            // and let the downstream tempfile rename fail with a confusing
+            // path-error far from the cause.
+            fs::create_dir_all(parent_dir)?;
+        }
 
-        let json_data = serde_json::to_string_pretty(self)
-            .map_err(|e| StoreError::InvariantViolation(format!("Failed to serialize node {}: {}", self.id, e)))?;
+        let json_data = serde_json::to_string_pretty(self).map_err(|e| {
+            StoreError::InvariantViolation(format!("Failed to serialize node {}: {}", self.id, e))
+        })?;
         write_atomic(&file_path, &json_data)?;
 
-        tracing::debug!(
-            node_id = self.id,
-            bytes = json_data.len(),
-            "saved node"
-        );
+        tracing::debug!(node_id = self.id, bytes = json_data.len(), "saved node");
         Ok(())
     }
 
@@ -339,10 +338,7 @@ impl Node {
         // Filenames are validated at the `Storage::load` boundary, so this
         // should be unreachable; promote to a release-effective `assert!`
         // because silent garbage in release is worse than no assert at all.
-        assert!(
-            id >= 0,
-            "Node::calc_position requires id >= 0, got {id}",
-        );
+        assert!(id >= 0, "Node::calc_position requires id >= 0, got {id}",);
 
         if id == 0 {
             return Position {
@@ -376,13 +372,11 @@ impl Node {
         // coincidence — a future refactor of the top edge must preserve
         // the corner case explicitly.
         let (dx, dz) = match pos_in_ring / side {
-            0 => (ring, -ring + pos_in_ring),                  // Right edge, walking +z
-            1 => (ring - (pos_in_ring - side), ring),          // Bottom edge, walking -x
-            2 => (-ring, ring - (pos_in_ring - 2 * side)),     // Left edge, walking -z
+            0 => (ring, -ring + pos_in_ring),         // Right edge, walking +z
+            1 => (ring - (pos_in_ring - side), ring), // Bottom edge, walking -x
+            2 => (-ring, ring - (pos_in_ring - 2 * side)), // Left edge, walking -z
             3 | 4 => (-ring + (pos_in_ring - 3 * side), -ring), // Top edge + ring corner
-            other => unreachable!(
-                "pos_in_ring/side must be 0..=4 by construction, got {other}"
-            ),
+            other => unreachable!("pos_in_ring/side must be 0..=4 by construction, got {other}"),
         };
 
         // NODE_SPACING leaves room for the 2-wide chest footprint plus a
@@ -393,7 +387,6 @@ impl Node {
             z: storage_position.z + dz * NODE_SPACING,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -412,7 +405,11 @@ mod tests {
 
     #[test]
     fn calc_position_places_node_0_at_offset_origin() {
-        let off = Position { x: 1000, y: 100, z: -500 };
+        let off = Position {
+            x: 1000,
+            y: 100,
+            z: -500,
+        };
         let pos = Node::calc_position(0, &off);
         assert_eq!((pos.x, pos.y, pos.z), (1000, 100, -500));
     }
@@ -452,8 +449,14 @@ mod tests {
             let pos = Node::calc_position(id, &origin());
             let dx = (pos.x - origin().x).abs();
             let dz = (pos.z - origin().z).abs();
-            assert!(dx <= 2 * NODE_SPACING, "node {id} dx={dx} exceeds 2*spacing");
-            assert!(dz <= 2 * NODE_SPACING, "node {id} dz={dz} exceeds 2*spacing");
+            assert!(
+                dx <= 2 * NODE_SPACING,
+                "node {id} dx={dx} exceeds 2*spacing"
+            );
+            assert!(
+                dz <= 2 * NODE_SPACING,
+                "node {id} dz={dz} exceeds 2*spacing"
+            );
         }
     }
 
@@ -472,7 +475,8 @@ mod tests {
             assert!(
                 seen.insert((pos.x, pos.z)),
                 "node {id} collides with a previously placed node at ({}, {})",
-                pos.x, pos.z
+                pos.x,
+                pos.z
             );
         }
     }
@@ -481,7 +485,11 @@ mod tests {
     fn calc_position_translates_with_storage_origin() {
         // Moving the origin must translate every node by the same vector.
         let a = origin();
-        let b = Position { x: 1000, y: 64, z: -500 };
+        let b = Position {
+            x: 1000,
+            y: 64,
+            z: -500,
+        };
         for id in 0..25 {
             let pa = Node::calc_position(id, &a);
             let pb = Node::calc_position(id, &b);
@@ -492,7 +500,14 @@ mod tests {
 
     #[test]
     fn new_node_0_has_reserved_diamond_and_overflow_chests() {
-        let node = Node::new(0, &Position { x: 50, y: 70, z: 100 });
+        let node = Node::new(
+            0,
+            &Position {
+                x: 50,
+                y: 70,
+                z: 100,
+            },
+        );
         assert_eq!(node.id, 0);
         assert_eq!(node.chests.len(), CHESTS_PER_NODE);
         assert_eq!(node.chests[0].item, "diamond");
@@ -509,7 +524,10 @@ mod tests {
         assert_eq!(node.id, 5);
         assert_eq!(node.chests.len(), CHESTS_PER_NODE);
         for (i, c) in node.chests.iter().enumerate() {
-            assert_eq!(c.item, "", "chest {i} on non-zero node should be unassigned");
+            assert_eq!(
+                c.item, "",
+                "chest {i} on non-zero node should be unassigned"
+            );
         }
     }
 
@@ -519,13 +537,18 @@ mod tests {
         // must sit at the documented offset from that position.
         let node = Node::new(7, &origin());
         let expected = Node::calc_position(7, &origin());
-        assert_eq!((node.position.x, node.position.y, node.position.z),
-                   (expected.x, expected.y, expected.z));
+        assert_eq!(
+            (node.position.x, node.position.y, node.position.z),
+            (expected.x, expected.y, expected.z)
+        );
         for c in &node.chests {
             let expected_chest = Chest::calc_position(&node.position, c.index);
-            assert_eq!((c.position.x, c.position.y, c.position.z),
-                       (expected_chest.x, expected_chest.y, expected_chest.z),
-                       "chest {} misplaced", c.index);
+            assert_eq!(
+                (c.position.x, c.position.y, c.position.z),
+                (expected_chest.x, expected_chest.y, expected_chest.z),
+                "chest {} misplaced",
+                c.index
+            );
         }
     }
 
@@ -614,8 +637,10 @@ mod tests {
         );
         write_node_json(dir.path(), 1, &json);
         let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
-        assert!(matches!(err, StoreError::InvariantViolation(_)),
-                "expected InvariantViolation, got {err:?}");
+        assert!(
+            matches!(err, StoreError::InvariantViolation(_)),
+            "expected InvariantViolation, got {err:?}"
+        );
     }
 
     #[test]
@@ -638,8 +663,10 @@ mod tests {
         );
         write_node_json(dir.path(), 1, &json);
         let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
-        assert!(matches!(err, StoreError::InvariantViolation(_)),
-                "expected InvariantViolation, got {err:?}");
+        assert!(
+            matches!(err, StoreError::InvariantViolation(_)),
+            "expected InvariantViolation, got {err:?}"
+        );
     }
 
     #[test]
@@ -663,8 +690,10 @@ mod tests {
         );
         write_node_json(dir.path(), 1, &json);
         let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
-        assert!(matches!(err, StoreError::InvariantViolation(_)),
-                "expected InvariantViolation, got {err:?}");
+        assert!(
+            matches!(err, StoreError::InvariantViolation(_)),
+            "expected InvariantViolation, got {err:?}"
+        );
     }
 
     #[test]
@@ -689,8 +718,10 @@ mod tests {
         );
         write_node_json(dir.path(), 1, &json);
         let err = Node::load_from_dir(1, &origin(), dir.path()).unwrap_err();
-        assert!(matches!(err, StoreError::InvariantViolation(_)),
-                "expected InvariantViolation, got {err:?}");
+        assert!(
+            matches!(err, StoreError::InvariantViolation(_)),
+            "expected InvariantViolation, got {err:?}"
+        );
     }
 
     #[test]

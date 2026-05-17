@@ -47,9 +47,7 @@ pub enum ChatEventKind {
 #[derive(Debug)]
 pub enum ChatCommand {
     /// Graceful shutdown: chat task drains in-flight work and returns.
-    Shutdown {
-        ack: oneshot::Sender<()>,
-    },
+    Shutdown { ack: oneshot::Sender<()> },
     /// Snapshot of runtime state for the operator (CHAT.md
     /// `Chat: status`).
     Status {
@@ -68,9 +66,7 @@ pub enum ChatCommand {
     },
     /// Clear moderation backoff (CHAT.md
     /// `Chat: clear moderation backoff`).
-    ClearModerationBackoff {
-        respond_to: oneshot::Sender<()>,
-    },
+    ClearModerationBackoff { respond_to: oneshot::Sender<()> },
     /// Run the retention sweep on demand. Normally triggered at
     /// startup and at the first event each new UTC day.
     RunRetentionSweep {

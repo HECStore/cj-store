@@ -141,8 +141,8 @@ pub async fn handle_deposit_balance_queued(
             item: "diamond".to_string(),
             amount: if is_flexible { 1 } else { diamonds_to_trade },
         }],
-        false,        // require_exact_amount
-        is_flexible,  // flexible_validation
+        false,       // require_exact_amount
+        is_flexible, // flexible_validation
         "[Deposit]",
     )
     .await
@@ -261,9 +261,7 @@ pub async fn handle_deposit_balance_queued(
         user_uuid.clone(),
     ));
 
-    store.advance_trade(|s| {
-        s.commit("diamond".to_string(), credited_diamonds, actual_amount)
-    });
+    store.advance_trade(|s| s.commit("diamond".to_string(), credited_diamonds, actual_amount));
 
     info!(
         player = player_name,

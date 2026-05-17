@@ -149,7 +149,10 @@ impl Chest {
         if self.amounts.len() != DOUBLE_CHEST_SLOTS {
             return Err(StoreError::InvariantViolation(format!(
                 "Node {} chest {} has amounts.len()={}, expected {}",
-                expected_node_id, self.index, self.amounts.len(), DOUBLE_CHEST_SLOTS
+                expected_node_id,
+                self.index,
+                self.amounts.len(),
+                DOUBLE_CHEST_SLOTS
             )));
         }
         Ok(())
@@ -188,7 +191,13 @@ impl Chest {
 mod tests {
     use super::*;
 
-    fn node_origin() -> Position { Position { x: 100, y: 70, z: -50 } }
+    fn node_origin() -> Position {
+        Position {
+            x: 100,
+            y: 70,
+            z: -50,
+        }
+    }
 
     #[test]
     fn new_computes_id_from_node_and_index() {
@@ -207,10 +216,38 @@ mod tests {
     fn calc_position_matches_layout_for_all_indices() {
         let n = node_origin();
         // All chests use z-1 (front of double chest); columns x-2 / x-1; rows y+1 / y.
-        assert_eq!(Chest::calc_position(&n, 0), Position { x: n.x - 2, y: n.y + 1, z: n.z - 1 });
-        assert_eq!(Chest::calc_position(&n, 1), Position { x: n.x - 1, y: n.y + 1, z: n.z - 1 });
-        assert_eq!(Chest::calc_position(&n, 2), Position { x: n.x - 2, y: n.y,     z: n.z - 1 });
-        assert_eq!(Chest::calc_position(&n, 3), Position { x: n.x - 1, y: n.y,     z: n.z - 1 });
+        assert_eq!(
+            Chest::calc_position(&n, 0),
+            Position {
+                x: n.x - 2,
+                y: n.y + 1,
+                z: n.z - 1
+            }
+        );
+        assert_eq!(
+            Chest::calc_position(&n, 1),
+            Position {
+                x: n.x - 1,
+                y: n.y + 1,
+                z: n.z - 1
+            }
+        );
+        assert_eq!(
+            Chest::calc_position(&n, 2),
+            Position {
+                x: n.x - 2,
+                y: n.y,
+                z: n.z - 1
+            }
+        );
+        assert_eq!(
+            Chest::calc_position(&n, 3),
+            Position {
+                x: n.x - 1,
+                y: n.y,
+                z: n.z - 1
+            }
+        );
     }
 
     #[test]

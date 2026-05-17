@@ -2,11 +2,11 @@
 
 use tracing::{error, info, warn};
 
+use super::super::{Store, state, utils};
 use crate::constants::{CHEST_OP_TIMEOUT_SECS, CHESTS_PER_NODE};
 use crate::error::StoreError;
 use crate::messages::TradeItem;
 use crate::types::{ItemId, Order, Trade, TradeType};
-use super::super::{Store, state, utils};
 
 /// Resolve `player_name` to a Mojang UUID for an operator command and, on
 /// failure, whisper a sanitized notice to the operator IN-PLACE before
@@ -75,7 +75,11 @@ pub async fn handle_additem_order(
             .await;
     }
 
-    let stock_before = store.pairs.get(item.as_str()).map(|p| p.item_stock).unwrap_or(0);
+    let stock_before = store
+        .pairs
+        .get(item.as_str())
+        .map(|p| p.item_stock)
+        .unwrap_or(0);
     info!(
         "[Additem] start: operator={} uuid={} item={} qty={} stock_before={}",
         player_name, user_uuid, item, quantity, stock_before
@@ -84,8 +88,9 @@ pub async fn handle_additem_order(
     // Plan deposit against a read-only view of storage so we don't pay the
     // cost of cloning the entire structure just to preview placement.
     let stack_size = store.expect_pair(item, "additem/preview")?.stack_size;
-    let (preview_deposit_plan, preview_planned) =
-        store.storage.simulate_deposit_plan(item, qty_i32, stack_size);
+    let (preview_deposit_plan, preview_planned) = store
+        .storage
+        .simulate_deposit_plan(item, qty_i32, stack_size);
     // The deposit planner is bounded by current storage capacity; if it can't
     // place every requested item, accepting the trade anyway would orphan the
     // overflow in the bot's inventory and falsify the audit row that records
@@ -107,8 +112,12 @@ pub async fn handle_additem_order(
     utils::send_message_to_player(
         store,
         player_name,
-        &format!("Additem {} {}: Please offer the items in the trade.", quantity, item),
-    ).await?;
+        &format!(
+            "Additem {} {}: Please offer the items in the trade.",
+            quantity, item
+        ),
+    )
+    .await?;
 
     // Exact-amount enforcement is critical here: the deposit plan was sized for
     // `qty_i32` and our stock accounting assumes that's what entered bot inventory.
@@ -140,7 +149,7 @@ pub async fn handle_additem_order(
     let mut items_deposited = 0i32;
     let mut deposit_failed = false;
     let mut failed_reason = String::new();
-    
+
     for (step, t) in preview_deposit_plan.iter().enumerate() {
         let node_position = store.get_node_position(t.chest_id);
         let chest = crate::types::Chest {
@@ -153,7 +162,8 @@ pub async fn handle_additem_order(
         };
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let send_result = store.bot_tx
+        let send_result = store
+            .bot_tx
             .send(crate::messages::BotInstruction::InteractWithChestAndSync {
                 target_chest: chest,
                 node_position,
@@ -166,50 +176,77 @@ pub async fn handle_additem_order(
                 respond_to: tx,
             })
             .await;
-        
+
         if let Err(e) = send_result {
-            error!("[Additem] deposit step {} failed to send: operator={} item={} chunk_amount={} err={}",
-                step + 1, player_name, item, t.amount, e);
+            error!(
+                "[Additem] deposit step {} failed to send: operator={} item={} chunk_amount={} err={}",
+                step + 1,
+                player_name,
+                item,
+                t.amount,
+                e
+            );
             deposit_failed = true;
             // Sanitize for operator whisper: the raw mpsc SendError leaks
             // transport detail. The operator-facing whisper splices
             // `failed_reason` verbatim, so wrap through `user_message()`.
-            failed_reason = StoreError::BotSendFailed(e.to_string()).user_message().into_owned();
+            failed_reason = StoreError::BotSendFailed(e.to_string())
+                .user_message()
+                .into_owned();
             break;
         }
 
-        let bot_result = tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
-            .await
-            .map_err(|_| StoreError::ChestTimeout { after_ms: CHEST_OP_TIMEOUT_SECS * 1000 })
-            .and_then(|r| r.map_err(|e| StoreError::BotResponseDropped(e.to_string())));
+        let bot_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(CHEST_OP_TIMEOUT_SECS), rx)
+                .await
+                .map_err(|_| StoreError::ChestTimeout {
+                    after_ms: CHEST_OP_TIMEOUT_SECS * 1000,
+                })
+                .and_then(|r| r.map_err(|e| StoreError::BotResponseDropped(e.to_string())));
 
         match bot_result {
             Ok(Ok(report)) => {
                 if let Err(e) = store.apply_chest_sync(report) {
-                    warn!("[Additem] chest sync failed after deposit: item={} chest_id={} err={}",
-                        item, t.chest_id, e);
+                    warn!(
+                        "[Additem] chest sync failed after deposit: item={} chest_id={} err={}",
+                        item, t.chest_id, e
+                    );
                 }
                 items_deposited += t.amount;
             }
             Ok(Err(err)) => {
-                error!("[Additem] deposit step {} bot error: item={} chest_id={} chunk_amount={} err={}",
-                    step + 1, item, t.chest_id, t.amount, err);
+                error!(
+                    "[Additem] deposit step {} bot error: item={} chest_id={} chunk_amount={} err={}",
+                    step + 1,
+                    item,
+                    t.chest_id,
+                    t.amount,
+                    err
+                );
                 deposit_failed = true;
                 // Sanitize for operator whisper: bot-reported error text may
                 // include transport-layer detail. Wrap through `user_message()`.
-                failed_reason = StoreError::BotReportedError(err).user_message().into_owned();
+                failed_reason = StoreError::BotReportedError(err)
+                    .user_message()
+                    .into_owned();
                 break;
             }
             Err(err) => {
-                error!("[Additem] deposit step {} error: item={} chest_id={} chunk_amount={} err={}",
-                    step + 1, item, t.chest_id, t.amount, err);
+                error!(
+                    "[Additem] deposit step {} error: item={} chest_id={} chunk_amount={} err={}",
+                    step + 1,
+                    item,
+                    t.chest_id,
+                    t.amount,
+                    err
+                );
                 deposit_failed = true;
                 failed_reason = err.user_message().into_owned();
                 break;
             }
         }
     }
-    
+
     // The operator already parted with their items in the trade above, so any
     // undeposited remainder is sitting in the bot's inventory. Return it via a reverse
     // trade so the operator is made whole. If that reverse trade also fails, the items
@@ -235,7 +272,8 @@ pub async fn handle_additem_order(
             );
 
             let (rb_tx, rb_rx) = tokio::sync::oneshot::channel();
-            let rb_send_result = store.bot_tx
+            let rb_send_result = store
+                .bot_tx
                 .send(crate::messages::BotInstruction::TradeWithPlayer {
                     target_username: player_name.to_string(),
                     bot_offers: vec![TradeItem {
@@ -262,7 +300,12 @@ pub async fn handle_additem_order(
                     items_in_bot_inventory, item, e
                 )));
             } else {
-                match tokio::time::timeout(tokio::time::Duration::from_millis(store.config.trade_timeout_ms), rb_rx).await {
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_millis(store.config.trade_timeout_ms),
+                    rb_rx,
+                )
+                .await
+                {
                     Ok(Ok(Ok(_))) => {
                         info!(
                             "[Additem] returned items to operator: operator={} item={} returned={} deposited={}",
@@ -299,7 +342,11 @@ pub async fn handle_additem_order(
                         error!(
                             "[Additem] CRITICAL: return-to-operator trade timed out after {}ms — \
                             {} item(s) of '{}' stuck in bot inventory; operator={} deposited={}",
-                            store.config.trade_timeout_ms, items_in_bot_inventory, item, player_name, items_deposited
+                            store.config.trade_timeout_ms,
+                            items_in_bot_inventory,
+                            item,
+                            player_name,
+                            items_deposited
                         );
                         final_status = Some(format!(
                             "Additem CRITICAL ERROR: {}. {} items stuck in bot inventory (return trade timed out). Contact administrator. {} items were stored.",
@@ -323,10 +370,13 @@ pub async fn handle_additem_order(
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "additem/commit")?;
     pair.item_stock = new_stock;
-    assert!(pair.item_stock >= 0,
+    assert!(
+        pair.item_stock >= 0,
         "[Additem] INVARIANT VIOLATED: item_stock went negative after add_stock \
         (item={}, stock={}). This indicates a storage accounting bug.",
-        item, pair.item_stock);
+        item,
+        pair.item_stock
+    );
     store.dirty = true;
 
     if record_audit {
@@ -353,13 +403,19 @@ pub async fn handle_additem_order(
     // Repair-mode invariant check fires regardless of success/failure so any drift
     // detected post-deposit gets logged + saved rather than poisoning later handlers.
     if let Err(e) = state::assert_invariants(store, "post-additem", true) {
-        error!("[Additem] invariant violation after commit: operator={} item={} err={}",
-            player_name, item, e);
+        error!(
+            "[Additem] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e
+        );
         let _ = state::save(store);
     }
 
-    let whisper_text = final_status
-        .unwrap_or_else(|| format!("Added {} {} to storage. New stock: {}", quantity, item, new_stock));
+    let whisper_text = final_status.unwrap_or_else(|| {
+        format!(
+            "Added {} {} to storage. New stock: {}",
+            quantity, item, new_stock
+        )
+    });
     let whisper_result = utils::send_message_to_player(store, player_name, &whisper_text).await;
 
     // Failure-path Err propagation (e.g. BotSendFailed) takes precedence over a successful
@@ -403,7 +459,11 @@ pub async fn handle_removeitem_order(
             .await;
     }
 
-    let stock_before = store.pairs.get(item.as_str()).map(|p| p.item_stock).unwrap_or(0);
+    let stock_before = store
+        .pairs
+        .get(item.as_str())
+        .map(|p| p.item_stock)
+        .unwrap_or(0);
     info!(
         "[Removeitem] start: operator={} uuid={} item={} qty={} stock_before={}",
         player_name, user_uuid, item, quantity, stock_before
@@ -440,10 +500,18 @@ pub async fn handle_removeitem_order(
     utils::send_message_to_player(
         store,
         player_name,
-        &format!("Removeitem {} {}: Withdrawing from storage, then trading to you.", quantity, item),
-    ).await?;
+        &format!(
+            "Removeitem {} {}: Withdrawing from storage, then trading to you.",
+            quantity, item
+        ),
+    )
+    .await?;
 
-    let stack_size = store.pairs.get(item.as_str()).map(|p| p.stack_size).unwrap_or(64);
+    let stack_size = store
+        .pairs
+        .get(item.as_str())
+        .map(|p| p.stack_size)
+        .unwrap_or(64);
     if let Err(e) = super::super::orders::execute_chest_transfers(
         store,
         &preview_withdraw_plan,
@@ -454,8 +522,10 @@ pub async fn handle_removeitem_order(
     )
     .await
     {
-        error!("[Removeitem] chest withdraw failed: operator={} item={} err={}",
-            player_name, item, e);
+        error!(
+            "[Removeitem] chest withdraw failed: operator={} item={} err={}",
+            player_name, item, e
+        );
         utils::send_message_to_player(
             store,
             player_name,
@@ -500,7 +570,11 @@ pub async fn handle_removeitem_order(
             record_audit = false;
             // Rollback: withdrawal already moved items from chests into the bot.
             // Re-deposit each planned chunk back into its source chest via the shared helper.
-            let stack_size = store.pairs.get(item.as_str()).map(|p| p.stack_size).unwrap_or(64);
+            let stack_size = store
+                .pairs
+                .get(item.as_str())
+                .map(|p| p.stack_size)
+                .unwrap_or(64);
             let rb = super::super::rollback::deposit_transfers(
                 store,
                 &preview_withdraw_plan,
@@ -526,10 +600,16 @@ pub async fn handle_removeitem_order(
         }
         Err(StoreError::TradeRejected(err)) => {
             record_audit = false;
-            warn!("[Removeitem] trade failed, rolling back to storage: operator={} item={} qty={} err={}",
-                player_name, item, quantity, err);
+            warn!(
+                "[Removeitem] trade failed, rolling back to storage: operator={} item={} qty={} err={}",
+                player_name, item, quantity, err
+            );
             // Items are still in the bot's inventory; re-deposit them via the same plan.
-            let stack_size = store.pairs.get(item.as_str()).map(|p| p.stack_size).unwrap_or(64);
+            let stack_size = store
+                .pairs
+                .get(item.as_str())
+                .map(|p| p.stack_size)
+                .unwrap_or(64);
             let rb = super::super::rollback::deposit_transfers(
                 store,
                 &preview_withdraw_plan,
@@ -555,7 +635,8 @@ pub async fn handle_removeitem_order(
                 final_status = Some(format!(
                     "Removeitem CRITICAL ERROR: trade failed and rollback also partially failed. \
                     {} item(s) may be stuck in bot inventory. Contact administrator. trade_error='{}'",
-                    qty_i32 - rb.items_returned, err
+                    qty_i32 - rb.items_returned,
+                    err
                 ));
             } else {
                 final_status = Some(utils::format_action_aborted(
@@ -580,10 +661,13 @@ pub async fn handle_removeitem_order(
     let new_stock = store.storage.total_item_amount(item);
     let pair = store.expect_pair_mut(item, "removeitem/commit")?;
     pair.item_stock = new_stock;
-    assert!(pair.item_stock >= 0,
+    assert!(
+        pair.item_stock >= 0,
         "[Removeitem] INVARIANT VIOLATED: item_stock went negative after remove_stock \
         (item={}, stock={}). This indicates a storage accounting bug.",
-        item, pair.item_stock);
+        item,
+        pair.item_stock
+    );
     store.dirty = true;
 
     if record_audit {
@@ -610,13 +694,19 @@ pub async fn handle_removeitem_order(
     // Repair-mode invariant check fires regardless of success/failure so any drift
     // detected post-rollback gets logged + saved rather than poisoning later handlers.
     if let Err(e) = state::assert_invariants(store, "post-removeitem", true) {
-        error!("[Removeitem] invariant violation after commit: operator={} item={} err={}",
-            player_name, item, e);
+        error!(
+            "[Removeitem] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e
+        );
         let _ = state::save(store);
     }
 
-    let whisper_text = final_status
-        .unwrap_or_else(|| format!("Removed {} {} from storage. Remaining stock: {}", quantity, item, new_stock));
+    let whisper_text = final_status.unwrap_or_else(|| {
+        format!(
+            "Removed {} {} from storage. Remaining stock: {}",
+            quantity, item, new_stock
+        )
+    });
     let whisper_result = utils::send_message_to_player(store, player_name, &whisper_text).await;
 
     // Failure-path Err propagation (e.g. BotDisconnected) takes precedence over a successful
@@ -655,13 +745,16 @@ pub async fn handle_add_currency(
     }
 
     if !amount.is_finite() || amount <= 0.0 {
-        return utils::send_message_to_player(store, player_name, "Amount must be positive")
-            .await;
+        return utils::send_message_to_player(store, player_name, "Amount must be positive").await;
     }
 
     utils::ensure_user_exists(store, player_name, &user_uuid);
 
-    let reserve_before = store.pairs.get(item.as_str()).map(|p| p.currency_stock).unwrap_or(0.0);
+    let reserve_before = store
+        .pairs
+        .get(item.as_str())
+        .map(|p| p.currency_stock)
+        .unwrap_or(0.0);
     info!(
         "[AddCurrency] start: operator={} uuid={} item={} amount={:.2} reserve_before={:.2}",
         player_name, user_uuid, item, amount, reserve_before
@@ -669,10 +762,13 @@ pub async fn handle_add_currency(
 
     let pair = store.expect_pair_mut(item, "add-currency/commit")?;
     pair.currency_stock += amount;
-    assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+    assert!(
+        pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
         "[AddCurrency] INVARIANT VIOLATED: currency_stock invalid after add_currency \
         (item={}, stock={}). This indicates a currency accounting bug.",
-        item, pair.currency_stock);
+        item,
+        pair.currency_stock
+    );
     let new_reserve = pair.currency_stock;
     store.dirty = true;
 
@@ -696,15 +792,20 @@ pub async fn handle_add_currency(
     );
 
     if let Err(e) = state::assert_invariants(store, "post-add-currency", true) {
-        error!("[AddCurrency] invariant violation after commit: operator={} item={} err={}",
-            player_name, item, e);
+        error!(
+            "[AddCurrency] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e
+        );
         let _ = state::save(store);
     }
 
     utils::send_message_to_player(
         store,
         player_name,
-        &format!("Added {:.2} diamonds to {} reserve. New reserve: {:.2}", amount, item, new_reserve),
+        &format!(
+            "Added {:.2} diamonds to {} reserve. New reserve: {:.2}",
+            amount, item, new_reserve
+        ),
     )
     .await
 }
@@ -737,8 +838,7 @@ pub async fn handle_remove_currency(
     }
 
     if !amount.is_finite() || amount <= 0.0 {
-        return utils::send_message_to_player(store, player_name, "Amount must be positive")
-            .await;
+        return utils::send_message_to_player(store, player_name, "Amount must be positive").await;
     }
 
     let pair = store.expect_pair(item, "remove-currency/check")?;
@@ -764,10 +864,13 @@ pub async fn handle_remove_currency(
 
     let pair = store.expect_pair_mut(item, "remove-currency/commit")?;
     pair.currency_stock -= amount;
-    assert!(pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
+    assert!(
+        pair.currency_stock.is_finite() && pair.currency_stock >= 0.0,
         "[RemoveCurrency] INVARIANT VIOLATED: currency_stock invalid after remove_currency \
         (item={}, stock={}). This indicates a currency accounting bug.",
-        item, pair.currency_stock);
+        item,
+        pair.currency_stock
+    );
     let new_reserve = pair.currency_stock;
     store.dirty = true;
 
@@ -791,15 +894,20 @@ pub async fn handle_remove_currency(
     );
 
     if let Err(e) = state::assert_invariants(store, "post-remove-currency", true) {
-        error!("[RemoveCurrency] invariant violation after commit: operator={} item={} err={}",
-            player_name, item, e);
+        error!(
+            "[RemoveCurrency] invariant violation after commit: operator={} item={} err={}",
+            player_name, item, e
+        );
         let _ = state::save(store);
     }
 
     utils::send_message_to_player(
         store,
         player_name,
-        &format!("Removed {:.2} diamonds from {} reserve. Remaining reserve: {:.2}", amount, item, new_reserve),
+        &format!(
+            "Removed {:.2} diamonds from {} reserve. Remaining reserve: {:.2}",
+            amount, item, new_reserve
+        ),
     )
     .await
 }
@@ -811,19 +919,19 @@ mod tests {
     //! Helpers here are duplicated (intentionally) from `src/store/orders.rs`'s
     //! private `mod tests` — that module is not importable, so we inline the
     //! minimum set needed to spin up a `Store::new_for_test` and a mock bot.
+    use super::super::super::Store;
     use super::*;
     use crate::config::Config;
     use crate::messages::{BotInstruction, ChestSyncReport};
+    use crate::types::ItemId;
+    use crate::types::order::OrderType;
+    use crate::types::trade::TradeType;
     use crate::types::{Chest, Node, Pair, Position, Storage, User};
+    use crate::types::{Order, Trade};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::mpsc;
-    use crate::types::order::OrderType;
-    use crate::types::trade::TradeType;
-    use crate::types::ItemId;
-    use crate::types::{Order, Trade};
-    use super::super::super::Store;
 
     fn test_config() -> Config {
         Config {
@@ -1014,15 +1122,11 @@ mod tests {
                         if let Some(flag) = fail_next_chest_op.as_ref()
                             && flag.swap(false, Ordering::SeqCst)
                         {
-                            let _ = respond_to
-                                .send(Err("simulated bot chest failure".to_string()));
+                            let _ = respond_to.send(Err("simulated bot chest failure".to_string()));
                             continue;
                         }
-                        let report = mock_apply_chest_action(
-                            &target_chest,
-                            action,
-                            chest_state.as_ref(),
-                        );
+                        let report =
+                            mock_apply_chest_action(&target_chest, action, chest_state.as_ref());
                         let _ = respond_to.send(Ok(report));
                     }
                     BotInstruction::TradeWithPlayer {
@@ -1034,8 +1138,7 @@ mod tests {
                         if let Some(flag) = fail_next_trade.as_ref()
                             && flag.swap(false, Ordering::SeqCst)
                         {
-                            let _ = respond_to
-                                .send(Err("simulated trade rejection".to_string()));
+                            let _ = respond_to.send(Err("simulated trade rejection".to_string()));
                         } else {
                             let _ = respond_to.send(Ok(player_offers));
                         }
@@ -1059,19 +1162,18 @@ mod tests {
         pairs.insert(k, p);
 
         let storage = make_storage(item, 100);
-        let mut store = Store::new_for_test(
-            tx,
-            test_config(),
-            pairs,
-            HashMap::new(),
-            storage,
-        );
+        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
 
-        let result = handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 250.0).await;
+        let result =
+            handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 250.0).await;
         assert!(result.is_ok(), "handle_add_currency failed: {:?}", result);
 
         // Currency reserve incremented exactly.
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 750.0).abs() < 1e-9,
             "currency_stock expected 750.0 (500 + 250), got {}",
@@ -1129,8 +1231,18 @@ mod tests {
         // Snapshot the pair map BEFORE the call so we can prove it's unchanged.
         let pairs_before = store.pairs.clone();
 
-        let result = handle_add_currency(&mut store, "Alice", &ItemId::new("diamond_block").unwrap(), 50.0).await;
-        assert!(result.is_ok(), "handle_add_currency should whisper, not error: {:?}", result);
+        let result = handle_add_currency(
+            &mut store,
+            "Alice",
+            &ItemId::new("diamond_block").unwrap(),
+            50.0,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_add_currency should whisper, not error: {:?}",
+            result
+        );
 
         // Pair map untouched (no new entry inserted, no existing one mutated).
         assert_eq!(
@@ -1149,8 +1261,14 @@ mod tests {
             seeded.currency_stock
         );
 
-        assert!(store.trades.is_empty(), "no trade audit on unknown-item rejection");
-        assert!(store.orders.is_empty(), "no order audit on unknown-item rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on unknown-item rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on unknown-item rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1159,17 +1277,32 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 0.0).await;
-        assert!(result.is_ok(), "handle_add_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 0.0).await;
+        assert!(
+            result.is_ok(),
+            "handle_add_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on zero-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on zero-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on zero-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on zero-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on zero-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1178,17 +1311,32 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), -1.0).await;
-        assert!(result.is_ok(), "handle_add_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), -1.0).await;
+        assert!(
+            result.is_ok(),
+            "handle_add_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on negative-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on negative-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on negative-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on negative-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on negative-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1197,17 +1345,32 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), f64::NAN).await;
-        assert!(result.is_ok(), "handle_add_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), f64::NAN).await;
+        assert!(
+            result.is_ok(),
+            "handle_add_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on NaN-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on NaN-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on NaN-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on NaN-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on NaN-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1216,17 +1379,37 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_add_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), f64::INFINITY).await;
-        assert!(result.is_ok(), "handle_add_currency should whisper, not error: {:?}", result);
+        let result = handle_add_currency(
+            &mut store,
+            "Alice",
+            &ItemId::new(item).unwrap(),
+            f64::INFINITY,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_add_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on infinite-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on infinite-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on infinite-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on infinite-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on infinite-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1261,11 +1444,20 @@ mod tests {
         let item = "cobblestone";
         let mut store = remove_currency_test_store(item, 1000.0);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 250.0).await;
-        assert!(result.is_ok(), "handle_remove_currency failed: {:?}", result);
+        let result =
+            handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 250.0).await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency failed: {:?}",
+            result
+        );
 
         // Currency reserve decremented exactly: 1000 - 250 = 750.
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 750.0).abs() < 1e-9,
             "currency_stock expected 750.0 (1000 - 250), got {}",
@@ -1274,7 +1466,11 @@ mod tests {
 
         // Exactly one Trade audit row, of type RemoveCurrency, with the
         // currency_amount in `amount_currency` and zero in `amount`.
-        assert_eq!(store.trades.len(), 1, "expected exactly one trade audit row");
+        assert_eq!(
+            store.trades.len(),
+            1,
+            "expected exactly one trade audit row"
+        );
         let trade: &Trade = store.trades.last().expect("trade must be appended");
         assert!(matches!(trade.trade_type, TradeType::RemoveCurrency));
         assert!(
@@ -1287,7 +1483,11 @@ mod tests {
         assert_eq!(trade.user_uuid, test_uuid("Alice"));
 
         // Exactly one Order audit row of type RemoveCurrency.
-        assert_eq!(store.orders.len(), 1, "expected exactly one order audit row");
+        assert_eq!(
+            store.orders.len(),
+            1,
+            "expected exactly one order audit row"
+        );
         let order: &Order = store.orders.back().expect("order must be appended");
         assert!(matches!(order.order_type, OrderType::RemoveCurrency));
         assert_eq!(order.amount, 0);
@@ -1313,15 +1513,31 @@ mod tests {
         let item = "cobblestone";
         let mut store = remove_currency_test_store(item, 500.0);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 500.0).await;
-        assert!(result.is_ok(), "handle_remove_currency failed: {:?}", result);
+        let result =
+            handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 500.0).await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency failed: {:?}",
+            result
+        );
 
         // Exact zero — no epsilon. The assert in the handler would have
         // panicked if the value were negative or non-finite.
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
-        assert_eq!(after, 0.0, "currency_stock must be EXACTLY 0.0 after exact-reserve drain");
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
+        assert_eq!(
+            after, 0.0,
+            "currency_stock must be EXACTLY 0.0 after exact-reserve drain"
+        );
 
-        assert_eq!(store.trades.len(), 1, "expected exactly one trade audit row");
+        assert_eq!(
+            store.trades.len(),
+            1,
+            "expected exactly one trade audit row"
+        );
         let trade: &Trade = store.trades.last().expect("trade must be appended");
         assert!(matches!(trade.trade_type, TradeType::RemoveCurrency));
         assert!(
@@ -1330,7 +1546,11 @@ mod tests {
             trade.amount_currency
         );
 
-        assert_eq!(store.orders.len(), 1, "expected exactly one order audit row");
+        assert_eq!(
+            store.orders.len(),
+            1,
+            "expected exactly one order audit row"
+        );
         let order: &Order = store.orders.back().expect("order must be appended");
         assert!(matches!(order.order_type, OrderType::RemoveCurrency));
 
@@ -1345,17 +1565,32 @@ mod tests {
         let item = "cobblestone";
         let mut store = remove_currency_test_store(item, 100.0);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 100.01).await;
-        assert!(result.is_ok(), "handle_remove_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 100.01).await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 100.0).abs() < 1e-9,
             "currency_stock must remain 100.0 on over-reserve reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on over-reserve rejection");
-        assert!(store.orders.is_empty(), "no order audit on over-reserve rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on over-reserve rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on over-reserve rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1367,8 +1602,18 @@ mod tests {
         // Snapshot the pair map BEFORE the call so we can prove it's unchanged.
         let pairs_before = store.pairs.clone();
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new("diamond_block").unwrap(), 50.0).await;
-        assert!(result.is_ok(), "handle_remove_currency should whisper, not error: {:?}", result);
+        let result = handle_remove_currency(
+            &mut store,
+            "Alice",
+            &ItemId::new("diamond_block").unwrap(),
+            50.0,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency should whisper, not error: {:?}",
+            result
+        );
 
         // Pair map untouched (no new entry inserted, no existing one mutated).
         assert_eq!(
@@ -1387,8 +1632,14 @@ mod tests {
             seeded.currency_stock
         );
 
-        assert!(store.trades.is_empty(), "no trade audit on unknown-item rejection");
-        assert!(store.orders.is_empty(), "no order audit on unknown-item rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on unknown-item rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on unknown-item rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1397,17 +1648,32 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 0.0).await;
-        assert!(result.is_ok(), "handle_remove_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), 0.0).await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on zero-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on zero-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on zero-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on zero-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on zero-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1416,17 +1682,32 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), -1.0).await;
-        assert!(result.is_ok(), "handle_remove_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), -1.0).await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on negative-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on negative-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on negative-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on negative-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on negative-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1435,17 +1716,33 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), f64::NAN).await;
-        assert!(result.is_ok(), "handle_remove_currency should whisper, not error: {:?}", result);
+        let result =
+            handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), f64::NAN)
+                .await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on NaN-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on NaN-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on NaN-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on NaN-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on NaN-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1454,17 +1751,37 @@ mod tests {
         let item = "cobblestone";
         let mut store = rejection_test_store(item);
 
-        let result = handle_remove_currency(&mut store, "Alice", &ItemId::new(item).unwrap(), f64::INFINITY).await;
-        assert!(result.is_ok(), "handle_remove_currency should whisper, not error: {:?}", result);
+        let result = handle_remove_currency(
+            &mut store,
+            "Alice",
+            &ItemId::new(item).unwrap(),
+            f64::INFINITY,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "handle_remove_currency should whisper, not error: {:?}",
+            result
+        );
 
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert!(
             (after - 500.0).abs() < 1e-9,
             "currency_stock must remain 500.0 on infinite-amount reject, got {}",
             after
         );
-        assert!(store.trades.is_empty(), "no trade audit on infinite-amount rejection");
-        assert!(store.orders.is_empty(), "no order audit on infinite-amount rejection");
+        assert!(
+            store.trades.is_empty(),
+            "no trade audit on infinite-amount rejection"
+        );
+        assert!(
+            store.orders.is_empty(),
+            "no order audit on infinite-amount rejection"
+        );
         assert!(!store.dirty, "store.dirty must remain false on rejection");
     }
 
@@ -1491,14 +1808,28 @@ mod tests {
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();
 
-        let add_result = handle_add_currency(&mut store, "Ops", &ItemId::new(item).unwrap(), 250.0).await;
-        assert!(add_result.is_ok(), "handle_add_currency failed: {:?}", add_result);
+        let add_result =
+            handle_add_currency(&mut store, "Ops", &ItemId::new(item).unwrap(), 250.0).await;
+        assert!(
+            add_result.is_ok(),
+            "handle_add_currency failed: {:?}",
+            add_result
+        );
 
-        let remove_result = handle_remove_currency(&mut store, "Ops", &ItemId::new(item).unwrap(), 250.0).await;
-        assert!(remove_result.is_ok(), "handle_remove_currency failed: {:?}", remove_result);
+        let remove_result =
+            handle_remove_currency(&mut store, "Ops", &ItemId::new(item).unwrap(), 250.0).await;
+        assert!(
+            remove_result.is_ok(),
+            "handle_remove_currency failed: {:?}",
+            remove_result
+        );
 
         // Bit-exact: integer-typed f64 round trip must restore the reserve.
-        let after = store.pairs.get(item).expect("pair must exist").currency_stock;
+        let after = store
+            .pairs
+            .get(item)
+            .expect("pair must exist")
+            .currency_stock;
         assert_eq!(
             after, 1000.0,
             "currency_stock must be EXACTLY 1000.0 after add+remove round trip"
@@ -1588,7 +1919,8 @@ mod tests {
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();
 
-        let result = handle_additem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 100).await;
+        let result =
+            handle_additem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 100).await;
         assert!(result.is_ok(), "handle_additem_order failed: {:?}", result);
 
         // Pair stock matches physical storage post-deposit.
@@ -1670,7 +2002,8 @@ mod tests {
         let dirty_before = store.dirty;
         let stock_before = store.pairs.get(item).expect("pair must exist").item_stock;
 
-        let result = handle_additem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 10).await;
+        let result =
+            handle_additem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 10).await;
         assert!(
             result.is_ok(),
             "handler should whisper, not propagate error: {:?}",
@@ -1731,7 +2064,8 @@ mod tests {
         let orders_before = store.orders.len();
         let physical_before = store.storage.total_item_amount(item);
 
-        let result = handle_additem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 100).await;
+        let result =
+            handle_additem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 100).await;
         // Handler returns Ok because the failure is reported via whisper, not Err.
         // (The only Err propagation paths are validation/StoreError::BotSendFailed;
         // a bot-reported chest error funnels into `final_status` whisper text.)
@@ -1827,8 +2161,13 @@ mod tests {
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();
 
-        let result = handle_removeitem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 20).await;
-        assert!(result.is_ok(), "handle_removeitem_order failed: {:?}", result);
+        let result =
+            handle_removeitem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 20).await;
+        assert!(
+            result.is_ok(),
+            "handle_removeitem_order failed: {:?}",
+            result
+        );
 
         // Pair stock matches physical storage post-withdraw.
         let physical_after = store.storage.total_item_amount(item);
@@ -1914,7 +2253,8 @@ mod tests {
         let orders_before = store.orders.len();
         let stock_before = store.pairs.get(item).expect("pair must exist").item_stock;
 
-        let result = handle_removeitem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 20).await;
+        let result =
+            handle_removeitem_order(&mut store, "Alice", &ItemId::new(item).unwrap(), 20).await;
         // Handler returns Ok because the failure is reported via whisper, not Err.
         // (TradeRejected funnels into `final_status`; only BotDisconnected propagates.)
         assert!(

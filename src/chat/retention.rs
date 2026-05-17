@@ -235,10 +235,8 @@ fn sweep_history_paired(
             History,
             Overlay,
         }
-        let parsed: Option<(String, Kind)> = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|name| {
+        let parsed: Option<(String, Kind)> =
+            path.file_name().and_then(|n| n.to_str()).and_then(|name| {
                 if let Some(date_part) = name.strip_suffix(".uuids.json") {
                     if parse_date_str(date_part).is_some() {
                         return Some((date_part.to_string(), Kind::Overlay));
@@ -508,7 +506,6 @@ pub fn sweep_due_today(last_sweep_day: Option<&str>) -> Option<String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,10 +665,18 @@ mod tests {
         // 12 archives spanning 12 different stamps; sweep with max=10
         // should delete the 2 oldest.
         let stamps = [
-            "20260101T000000Z", "20260102T000000Z", "20260103T000000Z",
-            "20260104T000000Z", "20260105T000000Z", "20260106T000000Z",
-            "20260107T000000Z", "20260108T000000Z", "20260109T000000Z",
-            "20260110T000000Z", "20260111T000000Z", "20260112T000000Z",
+            "20260101T000000Z",
+            "20260102T000000Z",
+            "20260103T000000Z",
+            "20260104T000000Z",
+            "20260105T000000Z",
+            "20260106T000000Z",
+            "20260107T000000Z",
+            "20260108T000000Z",
+            "20260109T000000Z",
+            "20260110T000000Z",
+            "20260111T000000Z",
+            "20260112T000000Z",
         ];
         for stamp in stamps {
             touch(&s.0.join(format!("persona.md.{stamp}")), "p");
@@ -697,10 +702,7 @@ mod tests {
     fn persona_archives_under_cap_are_kept() {
         let s = ChatScratch::new("persona-under");
         for i in 0..5 {
-            touch(
-                &s.0.join(format!("persona.md.2026010{i}T000000Z")),
-                "p",
-            );
+            touch(&s.0.join(format!("persona.md.2026010{i}T000000Z")), "p");
         }
         let cfg = SweepConfig {
             chat_dir: s.0.clone(),
@@ -735,8 +737,14 @@ mod tests {
         };
         let r = run_sweep(&cfg);
         assert_eq!(r.pending_adjustments_deleted, 1);
-        assert!(!s.0.join("pending_adjustments.20260101T000000Z.jsonl").exists());
-        assert!(s.0.join("pending_adjustments.20260420T000000Z.jsonl").exists());
+        assert!(
+            !s.0.join("pending_adjustments.20260101T000000Z.jsonl")
+                .exists()
+        );
+        assert!(
+            s.0.join("pending_adjustments.20260420T000000Z.jsonl")
+                .exists()
+        );
     }
 
     // ---- sweep_due_today ------------------------------------------------

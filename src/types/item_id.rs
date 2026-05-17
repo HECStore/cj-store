@@ -50,7 +50,10 @@ impl ItemId {
         if normalized.is_empty() {
             return Err("empty item ID");
         }
-        if !normalized.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if !normalized
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
             return Err("item id contains forbidden character");
         }
         Ok(Self(normalized.to_ascii_lowercase()))
@@ -67,7 +70,10 @@ impl ItemId {
     /// — folding empty into [`EMPTY`](Self::EMPTY) silently would mask real
     /// bugs in callers that produce values they think are non-empty.
     pub fn from_normalized(s: String) -> Self {
-        assert!(!s.is_empty(), "ItemId::from_normalized called with empty string");
+        assert!(
+            !s.is_empty(),
+            "ItemId::from_normalized called with empty string"
+        );
         Self(s)
     }
 
@@ -185,7 +191,10 @@ mod tests {
     fn canonicalizes_case_to_lowercase() {
         assert_eq!(ItemId::new("Diamond").unwrap().as_str(), "diamond");
         assert_eq!(ItemId::new("DIAMOND").unwrap().as_str(), "diamond");
-        assert_eq!(ItemId::new("minecraft:Diamond").unwrap().as_str(), "diamond");
+        assert_eq!(
+            ItemId::new("minecraft:Diamond").unwrap().as_str(),
+            "diamond"
+        );
         assert_eq!(ItemId::new("a").unwrap(), ItemId::new("A").unwrap());
     }
 
@@ -245,8 +254,7 @@ mod tests {
         // String-keyed map. Regression guard: if Borrow<str> is removed or
         // the hash/eq contract diverges, this fails.
         use std::borrow::Borrow;
-        let mut map: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         map.insert("iron_ingot".to_string(), 7);
         let id = ItemId::new("iron_ingot").unwrap();
         let key: &str = (&id).borrow();
@@ -350,7 +358,10 @@ mod tests {
             "music_disc_11",
             "overflow",
         ] {
-            assert!(ItemId::new(raw).is_ok(), "should accept real item id: {raw}");
+            assert!(
+                ItemId::new(raw).is_ok(),
+                "should accept real item id: {raw}"
+            );
         }
     }
 }

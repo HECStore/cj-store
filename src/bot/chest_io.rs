@@ -11,12 +11,12 @@ use super::Bot;
 use crate::constants::{
     CHEST_OP_MAX_ATTEMPTS, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
     CHUNK_RELOAD_MAX_DELAY_MS, DELAY_BLOCK_OP_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS,
-    DELAY_MEDIUM_MS, DELAY_SETTLE_MS, DELAY_SHORT_MS, DELAY_SHULKER_PLACE_MS,
-    DOUBLE_CHEST_SLOTS, HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS,
-    SHULKER_BOX_SLOTS, VERIFY_POLL_DEFAULT_MS, exponential_backoff_delay_jittered,
+    DELAY_MEDIUM_MS, DELAY_SETTLE_MS, DELAY_SHORT_MS, DELAY_SHULKER_PLACE_MS, DOUBLE_CHEST_SLOTS,
+    HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, SHULKER_BOX_SLOTS,
+    VERIFY_POLL_DEFAULT_MS, exponential_backoff_delay_jittered,
 };
-use azalea::inventory::ItemStack;
 use crate::types::Position;
+use azalea::inventory::ItemStack;
 
 /// Error prefix used to tag chunk-not-loaded / transient world-state failures.
 /// `open_chest_container` checks for this prefix to apply longer backoff and
@@ -109,9 +109,7 @@ pub fn find_shulker_in_inventory_view(
         .ok_or_else(|| "Chest closed".to_string())?
         .len();
     for (i, slot_item) in all_slots.iter().enumerate().skip(chest_size) {
-        if slot_item.count() > 0
-            && super::shulker::is_shulker_box(&slot_item.kind().to_string())
-        {
+        if slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
             return Ok(Some(i));
         }
     }
@@ -141,7 +139,7 @@ pub async fn place_shulker_in_chest_slot_verified(
     // VERIFY_POLL_DEFAULT_MS (250) — see constants.rs for the empirical basis.
 
     info!(
-        "place_shulker_in_chest_slot_verified: Moving shulker from container slot {} to chest slot {}", 
+        "place_shulker_in_chest_slot_verified: Moving shulker from container slot {} to chest slot {}",
         container_slot, chest_slot
     );
 
@@ -151,14 +149,18 @@ pub async fn place_shulker_in_chest_slot_verified(
         .ok_or_else(|| "Container closed before pickup".to_string())?;
     if let Some(slot_item) = slots_before.get(container_slot) {
         debug!(
-            "place_shulker_in_chest_slot_verified: Source slot {} BEFORE: {} x{}", 
-            container_slot, slot_item.kind(), slot_item.count()
+            "place_shulker_in_chest_slot_verified: Source slot {} BEFORE: {} x{}",
+            container_slot,
+            slot_item.kind(),
+            slot_item.count()
         );
     }
     if let Some(slot_item) = slots_before.get(chest_slot) {
         debug!(
-            "place_shulker_in_chest_slot_verified: Target slot {} BEFORE: {} x{}", 
-            chest_slot, slot_item.kind(), slot_item.count()
+            "place_shulker_in_chest_slot_verified: Target slot {} BEFORE: {} x{}",
+            chest_slot,
+            slot_item.kind(),
+            slot_item.count()
         );
     }
 
@@ -178,8 +180,10 @@ pub async fn place_shulker_in_chest_slot_verified(
         .ok_or_else(|| "Container closed while picking up shulker".to_string())?;
     if let Some(slot_item) = slots_after_pickup.get(container_slot) {
         debug!(
-            "place_shulker_in_chest_slot_verified: Source slot {} AFTER pickup: {} x{}", 
-            container_slot, slot_item.kind(), slot_item.count()
+            "place_shulker_in_chest_slot_verified: Source slot {} AFTER pickup: {} x{}",
+            container_slot,
+            slot_item.kind(),
+            slot_item.count()
         );
         if slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
             warn!(
@@ -191,15 +195,21 @@ pub async fn place_shulker_in_chest_slot_verified(
                 slot: Some(container_slot as u16),
             });
             tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_INTERACT_MS)).await;
-            
+
             // Check again
-            let slots_retry = container.slots().ok_or_else(|| "Container closed".to_string())?;
+            let slots_retry = container
+                .slots()
+                .ok_or_else(|| "Container closed".to_string())?;
             if let Some(slot_item) = slots_retry.get(container_slot) {
                 debug!(
                     "place_shulker_in_chest_slot_verified: Source slot {} AFTER retry pickup: {} x{}",
-                    container_slot, slot_item.kind(), slot_item.count()
+                    container_slot,
+                    slot_item.kind(),
+                    slot_item.count()
                 );
-                if slot_item.count() > 0 && super::shulker::is_shulker_box(&slot_item.kind().to_string()) {
+                if slot_item.count() > 0
+                    && super::shulker::is_shulker_box(&slot_item.kind().to_string())
+                {
                     return Err(format!(
                         "Shulker still in container slot {} after retry pickup — cannot safely place into chest slot {}",
                         container_slot, chest_slot
@@ -238,7 +248,11 @@ pub async fn place_shulker_in_chest_slot_verified(
     debug!("place_shulker_in_chest_slot_verified: Current shulker locations:");
     for (idx, slot) in updated_slots.iter().enumerate() {
         if slot.count() > 0 && super::shulker::is_shulker_box(&slot.kind().to_string()) {
-            let slot_type = if idx < DOUBLE_CHEST_SLOTS { "chest" } else { "inventory/hotbar" };
+            let slot_type = if idx < DOUBLE_CHEST_SLOTS {
+                "chest"
+            } else {
+                "inventory/hotbar"
+            };
             debug!("  {} slot {}: {}", slot_type, idx, slot.kind());
         }
     }
@@ -252,8 +266,7 @@ pub async fn place_shulker_in_chest_slot_verified(
             slots
                 .get(chest_slot)
                 .map(|item| {
-                    item.count() > 0
-                        && super::shulker::is_shulker_box(&item.kind().to_string())
+                    item.count() > 0 && super::shulker::is_shulker_box(&item.kind().to_string())
                 })
                 .unwrap_or(false)
         },
@@ -279,12 +292,14 @@ pub async fn place_shulker_in_chest_slot_verified(
         let final_slots = container
             .slots()
             .ok_or_else(|| "Container closed during recovery".to_string())?;
-        
+
         debug!("place_shulker_in_chest_slot_verified: Recovery - checking final state:");
         if let Some(chest_item) = final_slots.get(chest_slot) {
             debug!(
-                "  Chest slot {}: {} x{}", 
-                chest_slot, chest_item.kind(), chest_item.count()
+                "  Chest slot {}: {} x{}",
+                chest_slot,
+                chest_item.kind(),
+                chest_item.count()
             );
             if chest_item.count() > 0
                 && super::shulker::is_shulker_box(&chest_item.kind().to_string())
@@ -297,7 +312,11 @@ pub async fn place_shulker_in_chest_slot_verified(
         error!("place_shulker_in_chest_slot_verified: Recovery FAILED - shulker locations:");
         for (idx, slot) in final_slots.iter().enumerate() {
             if slot.count() > 0 && super::shulker::is_shulker_box(&slot.kind().to_string()) {
-                let slot_type = if idx < DOUBLE_CHEST_SLOTS { "chest" } else { "inventory/hotbar" };
+                let slot_type = if idx < DOUBLE_CHEST_SLOTS {
+                    "chest"
+                } else {
+                    "inventory/hotbar"
+                };
                 error!("  {} slot {}: {}", slot_type, idx, slot.kind());
             }
         }
@@ -333,8 +352,7 @@ async fn open_chest_container_once(
         );
         format!(
             "{}Bot not connected - cannot open chest at ({}, {}, {})",
-            BOT_DISCONNECTED_PREFIX,
-            chest_pos.x, chest_pos.y, chest_pos.z
+            BOT_DISCONNECTED_PREFIX, chest_pos.x, chest_pos.y, chest_pos.z
         )
     })?;
 
@@ -350,7 +368,10 @@ async fn open_chest_container_once(
         let block_state = world.read().get_block_state(chest_pos);
         if let Some(state) = block_state {
             let block_name = format!("{:?}", state);
-            debug!("open_chest_container_once: Block at position: {}", block_name);
+            debug!(
+                "open_chest_container_once: Block at position: {}",
+                block_name
+            );
             if !block_name.to_lowercase().contains("chest") {
                 warn!(
                     "open_chest_container_once: Expected chest but found: {} - open may fail!",
@@ -361,8 +382,7 @@ async fn open_chest_container_once(
                 // `open_chest_container` short-circuits.
                 return Err(format!(
                     "{}Expected chest at ({}, {}, {}) but found: {}",
-                    WRONG_BLOCK_PREFIX,
-                    chest_pos.x, chest_pos.y, chest_pos.z, block_name
+                    WRONG_BLOCK_PREFIX, chest_pos.x, chest_pos.y, chest_pos.z, block_name
                 ));
             }
         } else {
@@ -376,8 +396,7 @@ async fn open_chest_container_once(
             );
             return Err(format!(
                 "{}Block state at ({}, {}, {}) is None - chunk not loaded",
-                CHUNK_NOT_LOADED_PREFIX,
-                chest_pos.x, chest_pos.y, chest_pos.z
+                CHUNK_NOT_LOADED_PREFIX, chest_pos.x, chest_pos.y, chest_pos.z
             ));
         }
     }
@@ -534,8 +553,8 @@ pub async fn open_chest_container(
     // a long chunk-rebuild after teleport can't burn the budget on
     // transient world-state issues. The cap prevents an infinite loop in
     // the pathological case where every attempt sees a chunk-not-loaded.
-    let hard_cap = CHEST_OP_MAX_ATTEMPTS
-        .saturating_add(CHUNK_RELOAD_EXTRA_RETRIES.saturating_mul(2));
+    let hard_cap =
+        CHEST_OP_MAX_ATTEMPTS.saturating_add(CHUNK_RELOAD_EXTRA_RETRIES.saturating_mul(2));
     let mut max_attempts = CHEST_OP_MAX_ATTEMPTS;
 
     let mut attempt = 0u32;
@@ -550,9 +569,17 @@ pub async fn open_chest_container(
             let delay_ms = exponential_backoff_delay_jittered(attempt - 1, base, max_delay);
             info!(
                 "Retrying chest open at ({}, {}, {}) attempt {}/{} after {}ms{}",
-                chest_pos.x, chest_pos.y, chest_pos.z,
-                attempt + 1, max_attempts, delay_ms,
-                if chunk_not_loaded_seen { " (waiting for chunk reload)" } else { "" }
+                chest_pos.x,
+                chest_pos.y,
+                chest_pos.z,
+                attempt + 1,
+                max_attempts,
+                delay_ms,
+                if chunk_not_loaded_seen {
+                    " (waiting for chunk reload)"
+                } else {
+                    ""
+                }
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
         }
@@ -569,9 +596,7 @@ pub async fn open_chest_container(
                 // not on every error, so other persistent failures still hit
                 // the normal budget.
                 if e.starts_with(CHUNK_NOT_LOADED_PREFIX) && max_attempts < hard_cap {
-                    let new_max = max_attempts
-                        .saturating_add(1)
-                        .min(hard_cap);
+                    let new_max = max_attempts.saturating_add(1).min(hard_cap);
                     if !chunk_not_loaded_seen {
                         chunk_not_loaded_seen = true;
                     }
@@ -652,7 +677,9 @@ pub async fn open_chest_container(
     }
 
     // Strip the internal prefix from the final user-facing message
-    let clean_error = last_error.strip_prefix(CHUNK_NOT_LOADED_PREFIX).unwrap_or(&last_error);
+    let clean_error = last_error
+        .strip_prefix(CHUNK_NOT_LOADED_PREFIX)
+        .unwrap_or(&last_error);
     error!(
         "open_chest_container: FAILED after {} attempts at ({}, {}, {}): {}",
         max_attempts, chest_pos.x, chest_pos.y, chest_pos.z, clean_error
@@ -680,14 +707,15 @@ pub async fn transfer_items_with_shulker(
     );
 
     let total_moved = match direction {
-        "withdraw" => {
-            transfer_withdraw_from_shulker(shulker_container, &target_id, amount).await?
-        }
+        "withdraw" => transfer_withdraw_from_shulker(shulker_container, &target_id, amount).await?,
         "deposit" => {
             transfer_deposit_into_shulker(shulker_container, &target_id, amount, stack_size).await?
         }
         _ => {
-            error!("transfer_items_with_shulker: Invalid direction: {}", direction);
+            error!(
+                "transfer_items_with_shulker: Invalid direction: {}",
+                direction
+            );
             return Err(format!("Invalid direction: {}", direction));
         }
     };
@@ -734,9 +762,7 @@ async fn transfer_withdraw_from_shulker(
         })?;
         let mut found: Option<(usize, i32)> = None;
         for (i, stack) in contents.iter().enumerate() {
-            if stack.count() > 0
-                && Bot::normalize_item_id(&stack.kind().to_string()) == target_id
-            {
+            if stack.count() > 0 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id {
                 found = Some((i, stack.count()));
                 debug!(
                     "transfer_items_with_shulker: Found {} x{} in shulker slot {}",
@@ -953,18 +979,29 @@ async fn transfer_deposit_into_shulker(
         let mut found: Option<(usize, i32)> = None;
         // Search in BOTH inventory (27-53) AND hotbar (54-62) slots
         // Limit to actual container size
-        for (i, stack) in all_slots.iter().enumerate().take(inventory_end.min(inv_end)).skip(inv_start) {
-            if stack.count() > 0
-                && Bot::normalize_item_id(&stack.kind().to_string()) == target_id
-            {
+        for (i, stack) in all_slots
+            .iter()
+            .enumerate()
+            .take(inventory_end.min(inv_end))
+            .skip(inv_start)
+        {
+            if stack.count() > 0 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id {
                 found = Some((i, stack.count()));
-                let slot_type = if i < DOUBLE_CHEST_SLOTS { "inventory" } else { "hotbar" };
+                let slot_type = if i < DOUBLE_CHEST_SLOTS {
+                    "inventory"
+                } else {
+                    "hotbar"
+                };
                 debug!(
                     "transfer_items_with_shulker: Found {} x{} in {} slot {} (container idx {})",
                     stack.kind(),
                     stack.count(),
                     slot_type,
-                    if i >= DOUBLE_CHEST_SLOTS { i - DOUBLE_CHEST_SLOTS } else { i - SHULKER_BOX_SLOTS },
+                    if i >= DOUBLE_CHEST_SLOTS {
+                        i - DOUBLE_CHEST_SLOTS
+                    } else {
+                        i - SHULKER_BOX_SLOTS
+                    },
                     i
                 );
                 break;
@@ -1052,7 +1089,9 @@ async fn transfer_deposit_into_shulker(
 
             if target_slots.is_empty() {
                 // No space at all - put items back and let caller handle
-                warn!("transfer_items_with_shulker: Shulker is completely full - no space for partial transfer");
+                warn!(
+                    "transfer_items_with_shulker: Shulker is completely full - no space for partial transfer"
+                );
                 shulker_container.click(PickupClick::Left {
                     slot: Some(slot as u16),
                 });
@@ -1099,7 +1138,10 @@ async fn transfer_deposit_into_shulker(
                 .ok_or_else(|| "Shulker closed".to_string())?;
             let mut sum_delta: i32 = 0;
             for (target_slot, pre) in &pre_counts {
-                let post = slots_after.get(*target_slot).map(|s| s.count()).unwrap_or(0);
+                let post = slots_after
+                    .get(*target_slot)
+                    .map(|s| s.count())
+                    .unwrap_or(0);
                 let delta = post - pre;
                 if delta > 0 {
                     sum_delta += delta;
@@ -1217,14 +1259,24 @@ async fn prepare_for_chest_io(bot: &Bot, node_position: &Position) -> Result<(),
     if dx != 0 || dy != 0 || dz != 0 {
         error!(
             "Position verification FAILED: Bot at ({}, {}, {}) but must be at EXACT node position ({}, {}, {}) - offset ({}, {}, {})",
-            current_block.x, current_block.y, current_block.z,
-            node_position.x, node_position.y, node_position.z,
-            dx, dy, dz
+            current_block.x,
+            current_block.y,
+            current_block.z,
+            node_position.x,
+            node_position.y,
+            node_position.z,
+            dx,
+            dy,
+            dz
         );
         return Err(format!(
             "Bot not at exact node position: current ({}, {}, {}), required ({}, {}, {}). Navigation may have failed.",
-            current_block.x, current_block.y, current_block.z,
-            node_position.x, node_position.y, node_position.z
+            current_block.x,
+            current_block.y,
+            current_block.z,
+            node_position.x,
+            node_position.y,
+            node_position.z
         ));
     }
 
@@ -1601,7 +1653,10 @@ async fn finish_shulker_round_trip(
             j.complete_with_state(JournalState::ShulkerReplaced)
         });
         if let Err(e) = res {
-            warn!("[Journal] complete_with_state(ShulkerReplaced) failed: {}", e);
+            warn!(
+                "[Journal] complete_with_state(ShulkerReplaced) failed: {}",
+                e
+            );
         }
     }
 
@@ -1684,9 +1739,7 @@ async fn withdraw_shulkers(
             }
 
             let stack = &contents[slot_idx];
-            if stack.count() <= 0
-                || !super::shulker::is_shulker_box(&stack.kind().to_string())
-            {
+            if stack.count() <= 0 || !super::shulker::is_shulker_box(&stack.kind().to_string()) {
                 continue;
             }
 
@@ -1866,14 +1919,15 @@ async fn deposit_shulkers(
         // discovering it's full, and putting it back.
         if let Some(known) = known_counts
             && let Some(&count) = known.get(slot_idx)
-                && count >= shulker_capacity {
-                    debug!(
-                        "Skipping slot {}: known full with {} items (max {})",
-                        slot_idx, count, shulker_capacity
-                    );
-                    confirmed_full.insert(slot_idx);
-                    continue;
-                }
+            && count >= shulker_capacity
+        {
+            debug!(
+                "Skipping slot {}: known full with {} items (max {})",
+                slot_idx, count, shulker_capacity
+            );
+            confirmed_full.insert(slot_idx);
+            continue;
+        }
 
         // Ensure chest is open (it might have been closed by a server restart,
         // chunk unload, or previous shulker iteration). Reopen uses the
@@ -1896,8 +1950,7 @@ async fn deposit_shulkers(
         }
 
         let stack = &contents[slot_idx];
-        if stack.count() <= 0 || !super::shulker::is_shulker_box(&stack.kind().to_string())
-        {
+        if stack.count() <= 0 || !super::shulker::is_shulker_box(&stack.kind().to_string()) {
             debug!("Skipping slot {}: empty or not a shulker", slot_idx);
             continue;
         }
@@ -1946,10 +1999,13 @@ async fn deposit_shulkers(
         // Search BOTH inventory (27-53) AND hotbar (54-62) - items can be anywhere after a trade
         let inventory_and_hotbar_end = inv_start + SHULKER_BOX_SLOTS + 9; // 27 inventory + 9 hotbar = 36 slots
         let mut bot_item_count = 0i32;
-        for (_i, stack) in all_slots.iter().enumerate().take(inventory_and_hotbar_end).skip(inv_start) {
-            if stack.count() > 0
-                && Bot::normalize_item_id(&stack.kind().to_string()) == target_id
-            {
+        for (_i, stack) in all_slots
+            .iter()
+            .enumerate()
+            .take(inventory_and_hotbar_end)
+            .skip(inv_start)
+        {
+            if stack.count() > 0 && Bot::normalize_item_id(&stack.kind().to_string()) == target_id {
                 bot_item_count += stack.count();
             }
         }
@@ -1969,7 +2025,16 @@ async fn deposit_shulkers(
                 target_id, chest_id, slot_idx
             );
             // Put the shulker back before returning so it isn't stranded on the station.
-            finish_shulker_round_trip(bot, chest_pos, slot_idx, station_pos, node_position, shulker_container, false).await?;
+            finish_shulker_round_trip(
+                bot,
+                chest_pos,
+                slot_idx,
+                station_pos,
+                node_position,
+                shulker_container,
+                false,
+            )
+            .await?;
             return Err(err_msg);
         } else if total_space == 0 {
             // Shulker is full or contains a different item type — skip it.
@@ -2005,7 +2070,16 @@ async fn deposit_shulkers(
                         target_id, chest_id, slot_idx, total_space, bot_item_count
                     );
                     // Put the shulker back before returning so it isn't stranded on the station.
-                    finish_shulker_round_trip(bot, chest_pos, slot_idx, station_pos, node_position, shulker_container, false).await?;
+                    finish_shulker_round_trip(
+                        bot,
+                        chest_pos,
+                        slot_idx,
+                        station_pos,
+                        node_position,
+                        shulker_container,
+                        false,
+                    )
+                    .await?;
                     return Err(err_msg);
                 }
             }

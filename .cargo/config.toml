@@ -1,6 +1,20 @@
 # Adapted from bevy/.cargo/config_fast_builds — fast-build linker + share-generics
 # knobs. Active config for this project; nightly-only `-Zshare-generics=y` is
 # guarded by the rust-toolchain.toml pin.
+#
+# CAVEAT: Cargo's precedence rule means a user-set `RUSTFLAGS` env var
+# REPLACES (not appends to) the `rustflags` entries below. Contributors who
+# want extra flags (e.g. `RUSTFLAGS="-C target-cpu=native"`) must re-include
+# `-Clink-arg=-fuse-ld=lld -Zshare-generics=y` on Linux to keep the fast-
+# build path. The macOS/aarch64 stanzas behave the same way.
+
+# Robust git-source fetching for vendored git deps (azalea-rs, simdnbt).
+# Cargo's built-in libgit2 client periodically hits transient GitHub rate
+# limits on CI runners; `git-fetch-with-cli = true` shells out to the
+# system `git` binary, which uses the user's credentials and is more
+# resilient to slow networks and rate-limit hiccups.
+[net]
+git-fetch-with-cli = true
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"

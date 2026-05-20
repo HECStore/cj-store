@@ -12,6 +12,12 @@ updates:
       interval: weekly
     target-branch: master
     open-pull-requests-limit: 5
+    # 5-day cooldown blunts npm-style maintainer-takeover / typosquat
+    # attacks: a brand-new release pushed by a compromised maintainer no
+    # longer auto-PRs within hours of upload. Security advisories bypass
+    # the cooldown automatically.
+    cooldown:
+      default-days: 5
     # Bunch sub-dep churn into single PRs so the review queue stays
     # tractable; security patches still come in dedicated PRs.
     groups:
@@ -28,3 +34,5 @@ updates:
       interval: weekly
     target-branch: master
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 5

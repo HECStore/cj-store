@@ -38,17 +38,41 @@ pub struct ItemId(String);
 impl ItemId {
     pub const EMPTY: ItemId = ItemId(String::new());
 
+    /// Maximum byte length of an `ItemId` payload (post `minecraft:` strip).
+    ///
+    /// Real Minecraft item IDs top out well under 40 characters. The cap
+    /// fail-closes the JSON deserialize path against a tampered/corrupt
+    /// `data/*/*.json` containing arbitrarily long item strings — without
+    /// it a single malicious field would force allocation of the lowercased
+    /// `String` plus every downstream `format!("minecraft:{}", ...)`.
+    pub const MAX_LEN: usize = 64;
+
+    /// Returns true if `s` already satisfies the `ItemId` invariants:
+    /// non-empty, length within `MAX_LEN`, all bytes are ASCII lowercase
+    /// alphanumerics or `_`, and the string does not begin with the
+    /// `minecraft:` prefix. Used by [`from_normalized`]'s debug check.
+    fn is_canonical(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= Self::MAX_LEN
+            && !s.starts_with("minecraft:")
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
     /// Create a new `ItemId`, normalizing the `minecraft:` prefix.
     ///
     /// Returns `Err` if the resulting identifier is empty (e.g. bare
-    /// `"minecraft:"` or `""`), or if it contains any character that is not
-    /// ASCII alphanumeric or `_`. This rejects path traversal (`..`, `/`,
-    /// `\`), control characters, and Unicode lookalikes such as Cyrillic `с`
-    /// that visually resemble Latin letters.
+    /// `"minecraft:"` or `""`), exceeds `MAX_LEN` bytes, or if it contains
+    /// any character that is not ASCII alphanumeric or `_`. This rejects
+    /// path traversal (`..`, `/`, `\`), control characters, and Unicode
+    /// lookalikes such as Cyrillic `с` that visually resemble Latin letters.
     pub fn new(raw: &str) -> Result<Self, &'static str> {
         let normalized = raw.strip_prefix("minecraft:").unwrap_or(raw);
         if normalized.is_empty() {
             return Err("empty item ID");
+        }
+        if normalized.len() > Self::MAX_LEN {
+            return Err("item id too long");
         }
         if !normalized
             .bytes()
@@ -69,10 +93,19 @@ impl ItemId {
     /// user/external input. The check fires in release builds as well as debug
     /// — folding empty into [`EMPTY`](Self::EMPTY) silently would mask real
     /// bugs in callers that produce values they think are non-empty.
+    ///
+    /// In debug builds, also asserts that `s` is canonical
+    /// (lowercase + byte-class + no `minecraft:` prefix + within `MAX_LEN`),
+    /// catching callers that smuggle non-canonical input into a constructor
+    /// that promises trusted invariants.
     pub fn from_normalized(s: String) -> Self {
         assert!(
             !s.is_empty(),
             "ItemId::from_normalized called with empty string"
+        );
+        debug_assert!(
+            Self::is_canonical(&s),
+            "ItemId::from_normalized called with non-canonical string: {s:?}"
         );
         Self(s)
     }
@@ -282,6 +315,41 @@ mod tests {
     fn rejects_path_traversal_dotdot() {
         assert!(ItemId::new("..").is_err());
         assert!(ItemId::new("../etc").is_err());
+    }
+
+    #[test]
+    fn rejects_over_max_len() {
+        let big = "a".repeat(ItemId::MAX_LEN + 1);
+        assert!(ItemId::new(&big).is_err());
+        // A `minecraft:`-prefixed string is measured AFTER the strip, so a
+        // prefixed but otherwise short input must still pass.
+        let prefixed_short = format!("minecraft:{}", "a".repeat(ItemId::MAX_LEN));
+        assert!(ItemId::new(&prefixed_short).is_ok());
+        // And a 10_000-byte fuzz input must fail fast.
+        let huge = "z".repeat(10_000);
+        assert!(ItemId::new(&huge).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-canonical")]
+    fn from_normalized_debug_asserts_on_uppercase() {
+        // In debug builds, `from_normalized` rejects non-canonical input so
+        // a future refactor that wraps a constant in `format!("minecraft:{}")`
+        // (or otherwise smuggles in unnormalized bytes) panics in CI rather
+        // than silently bypassing every ItemId security check.
+        let _ = ItemId::from_normalized("DIAMOND".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-canonical")]
+    fn from_normalized_debug_asserts_on_prefix() {
+        let _ = ItemId::from_normalized("minecraft:diamond".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-canonical")]
+    fn from_normalized_debug_asserts_on_dotdot() {
+        let _ = ItemId::from_normalized("../etc".to_string());
     }
 
     #[test]

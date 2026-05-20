@@ -138,6 +138,26 @@ impl Pair {
                 "Cannot save pair with empty/sentinel item name",
             ));
         }
+        // Defense-in-depth perimeter: `ItemId::from_normalized` does not
+        // validate, so a caller that constructs an ItemId from a tampered
+        // string could smuggle a path-separator or other unsafe byte through
+        // the typed wrapper. Match the byte-class invariant that `ItemId::new`
+        // enforces; on violation, refuse to write rather than let the bytes
+        // reach `dir_path.join` and potentially escape the pairs directory.
+        if !self
+            .item
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Cannot save pair with non-canonical item bytes: {:?}",
+                    self.item.as_str()
+                ),
+            ));
+        }
         // Minecraft only has three legal stack sizes (1, 16, 64). A pair
         // persisted with any other value (e.g. the `Default` of 0, or a
         // hand-edited 32) silently breaks `shulker_capacity_for_stack_size`
@@ -209,6 +229,29 @@ impl Pair {
                 match fs::read_to_string(&path) {
                     Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                         Ok(pair) => {
+                            // EMPTY-item pair files are unsalvageable: the
+                            // ItemId deserializer maps `""` → ItemId::EMPTY,
+                            // but `Pair::save_in_dir` errors on empty item,
+                            // so inserting one would silently poison every
+                            // future autosave (state::save reports failure;
+                            // `self.dirty` never clears; shutdown drops every
+                            // staged mutation). Quarantine here at the load
+                            // boundary so the bad file is preserved as
+                            // forensic evidence and the in-memory map stays
+                            // clean.
+                            if pair.item.is_empty() {
+                                if let Err(e) = quarantine_pair_file(
+                                    &path,
+                                    "empty item: Pair requires a non-EMPTY ItemId",
+                                ) {
+                                    warn!(
+                                        "[Pair] quarantine rename failed for {} (empty item): {e}; skipping insert",
+                                        path.display()
+                                    );
+                                }
+                                quarantined += 1;
+                                continue;
+                            }
                             // Defense-in-depth at the load boundary: require
                             // the embedded `item` to map back to the file
                             // stem. Without this, `diamond.json` could carry
@@ -216,12 +259,19 @@ impl Pair {
                             // race against the legitimate `cobblestone.json`,
                             // causing the legitimate file to be quarantined
                             // while the misnamed/tampered file wins.
+                            //
+                            // Case-insensitive on the stem: on case-insensitive
+                            // filesystems (Windows, default macOS APFS), the
+                            // file `Diamond.json` is the same path as
+                            // `diamond.json` but the stem reads back as
+                            // `"Diamond"`. An operator hand-editing a pair file
+                            // shouldn't lose stock to byte-equal stem-mismatch.
                             let expected_stem = Self::sanitize_item_name_for_filename(&pair.item);
                             let stem = path
                                 .file_stem()
                                 .map(|s| s.to_string_lossy().into_owned())
                                 .unwrap_or_default();
-                            if stem != expected_stem {
+                            if !stem.eq_ignore_ascii_case(&expected_stem) {
                                 if let Err(e) = quarantine_pair_file(
                                     &path,
                                     &format!(

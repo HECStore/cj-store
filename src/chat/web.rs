@@ -753,23 +753,23 @@ pub async fn fetch(url: &str, max_bytes: usize) -> Result<String, String> {
         // IP pinned and lets the connect path fall back to system DNS for
         // anything else.
         //
-        // For `Host::Ip` literals we ALSO call `resolve_to_addrs` keyed
-        // on the literal IP string, defense-in-depth against any future
-        // reqwest regression where a literal-IP connect honors a system
-        // resolver or hosts-file override (some platforms — Windows
-        // especially — can map literal IPs via custom name resolution
-        // providers). The override key matches what reqwest extracts
-        // from the URL's host component.
+        // For `Host::Ip` literals the resolver override is effectively dead
+        // code: hyper-util's HttpConnector strips the brackets and parses
+        // the host string as an IP via `dns::SocketAddrs::try_parse(host,
+        // port)`, which SKIPS the DNS resolver entirely when it succeeds.
+        // So `resolve_to_addrs` is never consulted for literal-IP targets.
+        // The actual SSRF gate for literal IPs is `is_denied_ip` at the
+        // validation step ABOVE (before this client is built).
+        //
+        // We still register the override below for defense-in-depth (in
+        // case a future hyper-util change routes literal IPs through the
+        // resolver), but readers should not rely on it as the load-bearing
+        // gate. The IPv6 bracketed form (`[2001:db8::1]`) is a best-effort
+        // guess at what such a future resolver call would receive; the v4
+        // form (`1.2.3.4`) is the un-bracketed canonical Display form.
         let host_key = match &safe.host {
             Host::Name(n) => n.clone(),
             Host::Ip(IpAddr::V4(v4)) => v4.to_string(),
-            // IPv6 literals MUST be bracketed for the resolver override
-            // key: reqwest's URL parser registers the host component as
-            // `[2001:db8::1]` (the bracketed registry-name form per
-            // RFC 3986 §3.2.2), so a bare `2001:db8::1` key would NOT
-            // match the URL host and the `resolve_to_addrs` pin would
-            // silently fall through to the system DNS path — a quiet
-            // SSRF-gate bypass for IPv6 literal targets.
             Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
         };
         builder = builder.resolve_to_addrs(&host_key, &resolved_addrs);

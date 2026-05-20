@@ -403,9 +403,7 @@ mod tests {
     }
 
     fn expected_test_uuid(name: &str) -> String {
-        let trimmed: String = name.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
-        format!("00000000-0000-0000-0000-{}", padded)
+        crate::mojang::fixture_uuid(name)
     }
 
     #[tokio::test]
@@ -523,13 +521,12 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_creates_user_record_on_first_command() {
-        // The mojang `cfg(test)` fixture embeds the username's literal
-        // characters in the trailing UUID segment, and `ensure_user_exists`
-        // now rejects non-canonical UUIDs (lowercase hex / hyphens only).
-        // Pick a username whose first 12 chars are all valid hex digits so
-        // the synthetic UUID passes the shape gate and the auto-created
-        // user lands in `store.users`.
-        let username = "abcdef";
+        // First-command auto-create: any valid-shape username works because
+        // `mojang::fixture_uuid` digests it into a hex-clean payload that
+        // satisfies `ensure_user_exists`'s `is_valid_uuid_shape` gate. We
+        // assert `store.users` is keyed on the same UUID the resolver would
+        // produce so a future drift between resolver and fixture trips here.
+        let username = "Alice";
         let (mut store, mut whispers) = make_store();
         handle_player_command(&mut store, username, "status")
             .await

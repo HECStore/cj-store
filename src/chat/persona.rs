@@ -108,8 +108,18 @@ pub fn load() -> io::Result<Option<String>> {
 /// happens to include literal `</something>` cannot synthetically close
 /// the trusted persona block in a downstream composer call (CHAT.md
 /// ADV8 final paragraph).
+///
+/// `&` is escaped FIRST so the escape is idempotent under
+/// [`crate::chat::reasoning_filter::unescape_trusted_block`]: an input
+/// containing literal `&lt;` round-trips back as `&lt;` instead of being
+/// silently decoded to `<` by the unescape pass. The round-trip invariant
+/// is pinned by `unescape_round_trips_escape_for_trusted_block`. Order
+/// matters — escaping `&` after `<`/`>` would double-encode the freshly
+/// inserted `&lt;`/`&gt;` to `&amp;lt;`/`&amp;gt;` and break the inverse.
 pub fn escape_for_trusted_block(s: &str) -> String {
-    s.replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Compute a SHA-256 hex digest of the seed string.

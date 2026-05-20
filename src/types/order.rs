@@ -81,7 +81,11 @@ impl Order {
     pub fn buy(item: ItemId, qty: i32, price: f64, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
         debug_assert!(qty > 0, "qty must be positive (got {qty})");
-        debug_assert!(
+        // Release-mode `assert!`: orders are written to the audit log and
+        // re-loaded on next startup without serde validation. A NaN/negative
+        // currency value here becomes a permanent corrupt record on disk that
+        // poisons every downstream aggregation.
+        assert!(
             price.is_finite() && price >= 0.0,
             "price must be finite and non-negative (got {price})"
         );
@@ -98,7 +102,8 @@ impl Order {
     pub fn sell(item: ItemId, qty: i32, payout: f64, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
         debug_assert!(qty > 0, "qty must be positive (got {qty})");
-        debug_assert!(
+        // Release `assert!` — see `buy` above.
+        assert!(
             payout.is_finite() && payout >= 0.0,
             "payout must be finite and non-negative (got {payout})"
         );
@@ -149,7 +154,8 @@ impl Order {
     /// Operator credited `amount` of currency to the reserve for `item`.
     pub fn add_currency(item: ItemId, amount: f64, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(
+        // Release `assert!` — see `buy` above.
+        assert!(
             amount.is_finite() && amount >= 0.0,
             "amount must be finite and non-negative (got {amount})"
         );
@@ -165,7 +171,8 @@ impl Order {
     /// Operator debited `amount` of currency from the reserve for `item`.
     pub fn remove_currency(item: ItemId, amount: f64, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(
+        // Release `assert!` — see `buy` above.
+        assert!(
             amount.is_finite() && amount >= 0.0,
             "amount must be finite and non-negative (got {amount})"
         );

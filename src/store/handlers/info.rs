@@ -698,11 +698,11 @@ mod tests {
     }
 
     /// Mirrors the `test_uuid` convention used in `store::orders::tests` and
-    /// `handlers::player::tests` — keeps cross-module test fixtures aligned.
+    /// `handlers::player::tests` — keeps cross-module test fixtures aligned
+    /// by routing through the shared `mojang::fixture_uuid` synthesizer that
+    /// `resolve_user_uuid`'s `cfg(test)` branch also uses.
     fn test_uuid(username: &str) -> String {
-        let trimmed: String = username.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
-        format!("00000000-0000-0000-0000-{}", padded)
+        crate::mojang::fixture_uuid(username)
     }
 
     #[tokio::test]

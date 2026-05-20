@@ -10,11 +10,12 @@ on:
   schedule:
     - cron: '0 8 * * 1'
 
-# Least-privilege: this pipeline only checks/builds/tests, so the implicit
-# GITHUB_TOKEN is restricted to read-only on repository contents. Shrinks
-# blast radius if a third-party action is ever compromised.
-permissions:
-  contents: read
+# Workflow-level deny-by-default: any future step (Codecov upload, artifact
+# upload, PR comment, etc.) must explicitly request the scope it needs.
+# `contents: read` is re-granted at the job level only on jobs that actually
+# checkout. Matches the OpenSSF Scorecard recommendation and makes the
+# implicit-default-scope class of regressions impossible to introduce silently.
+permissions: {}
 
 # Cancel superseded runs on the same ref so a fast push train doesn't keep
 # running stale Windows builds. Safe for a build/test pipeline (no deploy).
@@ -26,9 +27,50 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Standalone parity guard: lightweight bash + grep with no toolchain
+  # install. Extracted from the matrix `build` job so the parity invariant
+  # is structurally required (every other job declares `needs:
+  # azalea-parity`) and cannot be silently skipped by a matrix change or
+  # manual rerun of the Windows-only lane.
+  azalea-parity:
+    name: azalea rev parity (parent vs vendor)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Compare azalea rev pins
+        shell: bash
+        run: |
+          # Anchor the match to the `azalea = ...` dependency line so a
+          # future second git-pinned dep (e.g. a forked simdnbt) can't
+          # silently invalidate the parity guard by appearing earlier in
+          # the file than azalea.
+          parent_rev=$(grep -nE '^[[:space:]]*azalea[[:space:]]*=.*rev[[:space:]]*=' Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | head -n1)
+          vendor_rev=$(grep -nE '^[[:space:]]*azalea[[:space:]]*=.*rev[[:space:]]*=' vendor/azalea-viaversion/Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | head -n1)
+          echo "parent: $parent_rev"
+          echo "vendor: $vendor_rev"
+          if [ -z "$parent_rev" ] || [ -z "$vendor_rev" ]; then
+            echo "::error::Could not extract azalea rev from one of the manifests"
+            exit 1
+          fi
+          if [ "$parent_rev" != "$vendor_rev" ]; then
+            echo "::error::azalea rev mismatch between parent Cargo.toml and vendor/azalea-viaversion/Cargo.toml"
+            exit 1
+          fi
+
   build:
     name: build / clippy / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: azalea-parity
+    permissions:
+      contents: read
+    # Cron is for the security-audit job only — the build matrix produces no
+    # signal against an unchanged master and would waste ~15 min of Actions
+    # minutes plus produce noisy green checks every Monday morning.
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -63,34 +105,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
 
-      # Parity check: the parent Cargo.toml and vendor/azalea-viaversion/
-      # Cargo.toml MUST pin azalea to the same git rev, otherwise cargo
-      # resolves two separate git sources and silently compiles two azalea
-      # instances side by side — events fire on the wrong type. See the
-      # rationale block in the parent Cargo.toml. Cheap shell guard.
-      - name: Verify azalea rev parity (parent vs vendor)
-        if: matrix.os == 'ubuntu-24.04'
-        shell: bash
-        run: |
-          # Anchor the match to the `azalea = ...` dependency line so a
-          # future second git-pinned dep (e.g. a forked simdnbt per the
-          # TODO in the parent Cargo.toml) can't silently invalidate the
-          # parity guard by appearing earlier in the file than azalea.
-          parent_rev=$(grep -nE '^[[:space:]]*azalea[[:space:]]*=.*rev[[:space:]]*=' Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | head -n1)
-          vendor_rev=$(grep -nE '^[[:space:]]*azalea[[:space:]]*=.*rev[[:space:]]*=' vendor/azalea-viaversion/Cargo.toml | grep -oE 'rev = "[0-9a-f]{40}"' | head -n1)
-          echo "parent: $parent_rev"
-          echo "vendor: $vendor_rev"
-          if [ -z "$parent_rev" ] || [ -z "$vendor_rev" ]; then
-            echo "::error::Could not extract azalea rev from one of the manifests"
-            exit 1
-          fi
-          if [ "$parent_rev" != "$vendor_rev" ]; then
-            echo "::error::azalea rev mismatch between parent Cargo.toml and vendor/azalea-viaversion/Cargo.toml"
-            exit 1
-          fi
-
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+      # Vendor crate carries a "LOCAL VENDOR EDIT (do not upstream)" diff
+      # (the azalea rev pin) — future edits to its source should pass the
+      # same fmt/clippy gates as the parent workspace, not just `cargo check`.
+      - name: cargo fmt --check (vendor/azalea-viaversion)
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo fmt --manifest-path vendor/azalea-viaversion/Cargo.toml --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -112,6 +135,12 @@ jobs:
       - name: cargo check (vendor/azalea-viaversion)
         run: cargo check --locked --manifest-path vendor/azalea-viaversion/Cargo.toml
 
+      # Vendor clippy: same -D warnings policy as the parent workspace so
+      # a future regression in the vendored crate can't ship past CI.
+      - name: cargo clippy (vendor/azalea-viaversion)
+        if: matrix.os == 'ubuntu-24.04'
+        run: cargo clippy --locked --manifest-path vendor/azalea-viaversion/Cargo.toml --all-targets -- -D warnings
+
       # Release-profile gate: Cargo.toml enables `lto = "thin"` for release;
       # LTO/codegen failures only surface under a real codegen step.
       # `cargo check` skips codegen entirely and therefore would NOT catch
@@ -122,6 +151,15 @@ jobs:
       - name: cargo build --release (Linux only)
         if: matrix.os == 'ubuntu-24.04'
         run: cargo build --locked --release --all-targets
+
+      # Startup smoke against the just-built binary: `--validate-only`
+      # exercises dotenv loading, config parsing, and validation paths
+      # before exiting non-zero on any startup failure. Catches "links
+      # cleanly but instantly panics on startup" regressions that a pure
+      # codegen step cannot detect.
+      - name: cj-store --validate-only smoke
+        if: matrix.os == 'ubuntu-24.04'
+        run: ./target/release/cj-store --validate-only
 
       # Rustdoc hygiene: src/main.rs sets
       # `#![deny(rustdoc::broken_intra_doc_links)]` + invalid_html_tags.
@@ -141,6 +179,8 @@ jobs:
   security-audit:
     name: cargo deny
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

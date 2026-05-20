@@ -388,7 +388,16 @@ impl Store {
             // to here so a lingering dirty flag is flushed on the configured
             // cadence even with zero inbound traffic.
             if self.dirty && last_save.elapsed() >= min_save_interval {
-                if let Err(e) = state::save(&mut self) {
+                // Advance `last_save` unconditionally (Ok or Err) so a sustained
+                // save failure honors `min_save_interval` cadence instead of
+                // busy-looping the save chain on every poll tick. The
+                // `last_save_error_logged` throttle hides the log spam, but
+                // without this advance the underlying I/O pressure stays
+                // unbounded. `dirty` remains sticky on Err so retry still
+                // happens — just at the configured cadence.
+                let save_result = state::save(&mut self);
+                last_save = tokio::time::Instant::now();
+                if let Err(e) = save_result {
                     let should_log = last_save_error_logged
                         .map_or(true, |t| t.elapsed() >= save_error_log_interval);
                     if should_log {
@@ -400,7 +409,6 @@ impl Store {
                         last_save_error_logged = Some(tokio::time::Instant::now());
                     }
                 } else {
-                    last_save = tokio::time::Instant::now();
                     last_save_error_logged = None;
                     self.dirty = false;
                     self.dirty_users.clear();
@@ -444,7 +452,11 @@ impl Store {
                 // Save eagerly after every order so trades and stock updates
                 // cannot be lost to a crash before the next debounced autosave.
                 if self.dirty {
-                    if let Err(e) = state::save(&mut self) {
+                    // Advance `last_save` unconditionally — see the idle-autosave
+                    // branch above for rationale.
+                    let save_result = state::save(&mut self);
+                    last_save = tokio::time::Instant::now();
+                    if let Err(e) = save_result {
                         let should_log = last_save_error_logged
                             .map_or(true, |t| t.elapsed() >= save_error_log_interval);
                         if should_log {
@@ -455,7 +467,6 @@ impl Store {
                             last_save_error_logged = Some(tokio::time::Instant::now());
                         }
                     } else {
-                        last_save = tokio::time::Instant::now();
                         last_save_error_logged = None;
                         self.dirty = false;
                         self.dirty_users.clear();
@@ -705,12 +716,20 @@ impl Store {
                 warn!("[Store] Failed to re-persist non-terminal trade state: {}", e);
             }
         } else {
-            self.current_trade = None;
             // Trade reached a terminal state (either committed or failed with
-            // rollback already run) - clear the on-disk mirror so a restart
-            // doesn't re-detect this completed trade as interrupted.
-            if let Err(e) = trade_state::clear_persisted() {
-                warn!("[Store] Failed to clear persisted trade state: {}", e);
+            // rollback already run). Clear the on-disk mirror FIRST and only
+            // zero the in-memory `current_trade` on Ok: a crash between the
+            // two would otherwise leave a stale `current_trade.json` showing
+            // a terminal phase, triggering the loud "TERMINAL-BUT-UNFLUSHED"
+            // operator alert in `Store::new`'s recovery branch even though
+            // the ledger is consistent. On clear failure, leave both in
+            // place so the next attempt retries cleanly.
+            match trade_state::clear_persisted() {
+                Ok(()) => self.current_trade = None,
+                Err(e) => warn!(
+                    "[Store] Failed to clear persisted trade state, leaving in-memory current_trade in place to retry: {}",
+                    e
+                ),
             }
         }
         self.dirty = true;

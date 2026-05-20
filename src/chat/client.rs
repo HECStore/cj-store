@@ -1953,9 +1953,15 @@ mod tests {
 
     #[test]
     fn sanitize_redacts_long_alnum_runs() {
+        // The `sk-ant-*` token is consumed by `redact_anthropic_keys` (the
+        // first pre-pass) which substitutes `[redacted-key]`, not the
+        // generic `[redacted]` marker the alnum heuristic emits. Assert the
+        // key-specific marker so the test pins the right code path —
+        // checking for `[redacted]` here would fail (and previously did)
+        // because `[redacted-key]` is the literal substring produced.
         let s = sanitize_for_log("error: api_key=sk-ant-1234567890abcdefghijklmnopqrstuvwxyz");
         assert!(!s.contains("sk-ant-1234567890abcdefghijklmnopqrstuvwxyz"));
-        assert!(s.contains("[redacted]"));
+        assert!(s.contains("[redacted-key]"));
     }
 
     #[test]

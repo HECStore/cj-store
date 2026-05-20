@@ -301,21 +301,8 @@ impl Journal {
             "leftover",
             &ARCHIVE_SEQ,
         )?;
-        match fs::rename(&self.path, &archived) {
-            Ok(()) => Ok(archived),
-            Err(_) => {
-                fs::copy(&self.path, &archived)?;
-                crate::fsutil::durably_sync_archive(&archived);
-                if let Err(remove_err) = fs::remove_file(&self.path) {
-                    tracing::warn!(
-                        "[Journal] archived leftover to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                        archived,
-                        self.path
-                    );
-                }
-                Ok(archived)
-            }
-        }
+        crate::fsutil::archive_aside(&self.path, &archived)?;
+        Ok(archived)
     }
 
     /// Move an unreadable journal file aside to a timestamped sibling so the
@@ -329,21 +316,8 @@ impl Journal {
     fn quarantine_unreadable(path: &Path) -> io::Result<PathBuf> {
         let archived =
             crate::fsutil::pick_archive_path(path.parent(), "journal", "unreadable", &ARCHIVE_SEQ)?;
-        match fs::rename(path, &archived) {
-            Ok(()) => Ok(archived),
-            Err(_) => {
-                fs::copy(path, &archived)?;
-                crate::fsutil::durably_sync_archive(&archived);
-                if let Err(remove_err) = fs::remove_file(path) {
-                    tracing::warn!(
-                        "[Journal] quarantined unreadable journal to {:?} but failed to remove original {:?}: {remove_err} - archive succeeded; original may need manual cleanup (likely a held handle on Windows)",
-                        archived,
-                        path
-                    );
-                }
-                Ok(archived)
-            }
-        }
+        crate::fsutil::archive_aside(path, &archived)?;
+        Ok(archived)
     }
 
     /// Start tracking a new shulker operation.
@@ -374,43 +348,23 @@ impl Journal {
         // next begin() destroys the forensic record restore_leftover was
         // created to preserve.
         if self.restored_leftover {
-            match crate::fsutil::pick_archive_path(
+            // Fail closed on archive failure: any path that does NOT actually
+            // move the on-disk file aside must return Err BEFORE the new
+            // begin() proceeds, otherwise the persist below would overwrite
+            // exactly the forensic record `restored_leftover` was created to
+            // preserve. `archive_aside` returns Err only when both rename and
+            // copy fail; on success the original is gone from the active path.
+            let archived = crate::fsutil::pick_archive_path(
                 self.path.parent(),
                 "journal",
                 "begin-replaces-restored",
                 &ARCHIVE_SEQ,
-            ) {
-                Ok(archived) => match fs::rename(&self.path, &archived) {
-                    Ok(()) => tracing::error!(
-                        "[Journal] archived restored-leftover at {:?} before replacing with new begin - preserve for operator review",
-                        archived
-                    ),
-                    Err(rename_err) => match fs::copy(&self.path, &archived) {
-                        Ok(_) => {
-                            crate::fsutil::durably_sync_archive(&archived);
-                            if let Err(remove_err) = fs::remove_file(&self.path) {
-                                tracing::warn!(
-                                    "[Journal] archived restored-leftover to {:?} via copy fallback but failed to remove original {:?}: {remove_err}",
-                                    archived,
-                                    self.path
-                                );
-                            } else {
-                                tracing::error!(
-                                    "[Journal] archived restored-leftover at {:?} (via copy fallback after rename err: {rename_err}) before replacing with new begin",
-                                    archived
-                                );
-                            }
-                        }
-                        Err(copy_err) => tracing::warn!(
-                            "[Journal] could not archive restored-leftover at {:?}: rename={rename_err} copy={copy_err} - on-disk evidence may be overwritten on next persist",
-                            self.path
-                        ),
-                    },
-                },
-                Err(pick_err) => tracing::warn!(
-                    "[Journal] could not pick archive path for restored-leftover: {pick_err} - on-disk evidence may be overwritten on next persist"
-                ),
-            }
+            )?;
+            crate::fsutil::archive_aside(&self.path, &archived)?;
+            tracing::error!(
+                "[Journal] archived restored-leftover at {:?} before replacing with new begin - preserve for operator review",
+                archived
+            );
             self.restored_leftover = false;
         }
         let operation_id = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);

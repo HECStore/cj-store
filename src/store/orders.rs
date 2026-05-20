@@ -1181,12 +1181,30 @@ pub async fn handle_sell_order(
         .await;
         // Diamonds physically left storage and were handed to the player in the
         // trade; update ledgers regardless of what the item return-trade does.
-        if let Some(pair) = store.pairs.get_mut(item) {
-            pair.currency_stock -= plan.total_payout;
+        //
+        // Loud-alert the missing-pair / missing-user cases: validation upstream
+        // guarantees both exist, so missing here is an invariant violation that
+        // silently inflates reserves (the next sell would pay out from currency
+        // that doesn't exist). Diamonds have already moved physically — we
+        // can't return Err — but the error must be operator-visible.
+        match store.pairs.get_mut(item) {
+            Some(pair) => pair.currency_stock -= plan.total_payout,
+            None => tracing::error!(
+                item = %item,
+                payout = plan.total_payout,
+                "[Sell/deposit-failed] INVARIANT: pair missing while debiting reserves — currency_stock NOT decremented; reserves are now inflated by {} until operator reconciles",
+                plan.total_payout
+            ),
         }
         if plan.fractional_diamonds > 0.0 {
-            if let Some(u) = store.users.get_mut(&plan.user_uuid) {
-                u.balance += plan.fractional_diamonds;
+            match store.users.get_mut(&plan.user_uuid) {
+                Some(u) => u.balance += plan.fractional_diamonds,
+                None => tracing::error!(
+                    user_uuid = %plan.user_uuid,
+                    fractional = plan.fractional_diamonds,
+                    "[Sell/deposit-failed] INVARIANT: user missing while crediting fractional diamonds — balance NOT credited; player is owed {} diamonds",
+                    plan.fractional_diamonds
+                ),
             }
             store.dirty_users.insert(plan.user_uuid.clone());
         }
@@ -1418,9 +1436,7 @@ mod tests {
     }
 
     fn test_uuid(username: &str) -> String {
-        let trimmed: String = username.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
-        format!("00000000-0000-0000-0000-{}", padded)
+        crate::mojang::fixture_uuid(username)
     }
 
     fn make_user(username: &str, balance: f64) -> (String, User) {

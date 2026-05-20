@@ -593,7 +593,17 @@ pub fn looks_like_reasoning_leak(s: &str) -> bool {
 /// change to the escape helper without a paired addition here trips
 /// that test, instead of one direction silently shipping literal
 /// `&lt;`/`&gt;` to chat.
-const TRUSTED_BLOCK_ENTITY_PAIRS: &[(&str, &str)] = &[("&lt;", "<"), ("&gt;", ">")];
+///
+/// **Order matters**: `&amp;` must come LAST. The escape applies `&` →
+/// `&amp;` FIRST and `<`/`>` → `&lt;`/`&gt;` AFTER, so an input
+/// containing literal `&lt;` becomes `&amp;lt;`. Unescaping must reverse
+/// in the opposite order — handle `&lt;`/`&gt;` first (which finds zero
+/// matches in `&amp;lt;` because there's no `&l` adjacency until after
+/// the `;`), then `&amp;` → `&` (yielding back `&lt;`). Reversing this
+/// order would decode `&amp;lt;` to `&lt;` and then to `<`, silently
+/// breaking the idempotency contract.
+const TRUSTED_BLOCK_ENTITY_PAIRS: &[(&str, &str)] =
+    &[("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&")];
 
 /// Reverse the `escape_for_trusted_block` entity encoding (`&lt;` → `<`,
 /// `&gt;` → `>`) on text that has already passed the reasoning filter.

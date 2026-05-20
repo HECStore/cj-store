@@ -286,20 +286,15 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveEr
     {
         // Offline deterministic UUID for integration tests: avoids hitting the
         // Mojang API (which requires network and introduces flakiness).
+        //
+        // Returns `InvalidShape` (not `NotFound`) for shape-failing usernames
+        // so the typed-error contract matches production's
+        // `resolve_user_uuid_inner` path. A previous divergence (returning
+        // `NotFound`) silently broke `matches!(err, InvalidShape)` assertions.
         if !crate::types::user::is_valid_username_shape(username) {
-            return Err(MojangResolveError::NotFound {
-                username: username.to_string(),
-            });
+            return Err(MojangResolveError::InvalidShape);
         }
-        let trimmed: String = username.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
-        let out = format!("00000000-0000-0000-0000-{}", padded);
-        debug_assert_eq!(
-            out.len(),
-            36,
-            "test fixture produced non-canonical UUID for {username:?}: {out:?}"
-        );
-        Ok(out)
+        Ok(fixture_uuid(username))
     }
     #[cfg(not(test))]
     {
@@ -497,7 +492,13 @@ fn check_cache(
     if !entry.is_fresh(now, ttl, neg_ttl) {
         return None;
     }
-    entry.touch(now);
+    // Only refresh the LRU rank for positive hits. Touching negative entries
+    // lets an adversary spamming distinct nonexistent usernames keep the
+    // negative entries at the freshest LRU rank, flushing warm positive
+    // identities under cap pressure.
+    if matches!(entry, CachedEntry::Found { .. }) {
+        entry.touch(now);
+    }
     match entry {
         CachedEntry::Found { uuid, .. } => {
             let uuid = uuid.clone();
@@ -589,10 +590,16 @@ fn evict_cache_if_needed(cache: &mut UuidCache) {
     if cache.len() < MAX_UUID_CACHE_ENTRIES {
         return;
     }
-    // LRU-by-access: evict the entry with the oldest `last_access`.
+    // LRU-by-access with a negative-bias tiebreak: when at cap, prefer
+    // evicting negative entries (NotFound/RateLimited) over positive ones
+    // at equal age. This blunts negative-cache flush attacks against the
+    // positive (Found) entries that the bot actually depends on.
     if let Some(oldest_key) = cache
         .iter()
-        .min_by_key(|(_, entry)| entry.last_access())
+        .min_by_key(|(_, entry)| {
+            let is_positive = matches!(entry, CachedEntry::Found { .. });
+            (is_positive, entry.last_access())
+        })
         .map(|(k, _)| k.clone())
     {
         cache.remove(&oldest_key);
@@ -744,6 +751,40 @@ pub fn cleanup_in_flight() {
 pub fn clear_uuid_cache() {
     uuid_cache().lock().clear();
     in_flight().lock().clear();
+}
+
+/// Canonical synthesis of the deterministic `cfg(test)` UUID fixture.
+///
+/// `resolve_user_uuid`'s test branch and every per-module `test_uuid` helper
+/// route through this single function so a test that pre-seeds
+/// `store.users` keyed on `fixture_uuid("Alice")` is guaranteed to be found
+/// by a handler that resolves "Alice" via `resolve_user_uuid`. Without this
+/// shared helper the two formulas drifted: the resolver produced an FNV-1a
+/// digest while test helpers pad-with-literal-username — silently breaking
+/// auto-create / self-pay / balance-transfer round-trips.
+///
+/// The padding uses an FNV-1a hex digest of the lowercased username so the
+/// resulting UUID satisfies `is_valid_uuid_shape` for any input (including
+/// usernames containing non-hex letters like `s`, `t`, `v` or `_`).
+#[cfg(test)]
+pub fn fixture_uuid(username: &str) -> String {
+    let mut acc: u64 = 0xcbf29ce484222325; // FNV-1a 64 offset basis
+    for b in username.to_ascii_lowercase().bytes() {
+        acc ^= b as u64;
+        acc = acc.wrapping_mul(0x100000001b3); // FNV-1a prime
+    }
+    let padded = format!("{:012x}", acc & 0xFFFF_FFFF_FFFF);
+    let out = format!("00000000-0000-0000-0000-{}", padded);
+    debug_assert_eq!(
+        out.len(),
+        36,
+        "test fixture produced non-canonical UUID for {username:?}: {out:?}"
+    );
+    debug_assert!(
+        crate::types::user::is_valid_uuid_shape(&out),
+        "test fixture produced shape-invalid UUID for {username:?}: {out:?}"
+    );
+    out
 }
 
 #[cfg(test)]
@@ -911,20 +952,21 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_user_uuid_cfg_test_branch_pads_deterministically() {
-        fn expected_test_uuid(username: &str) -> String {
-            let trimmed: String = username.chars().take(12).collect();
-            format!("00000000-0000-0000-0000-{:0>12}", trimmed)
-        }
+        // The fixture pads with a hex digest of the lowercased username so
+        // the resulting UUID always passes `is_valid_uuid_shape`. We assert
+        // the shape and the determinism (same input -> same output, casing
+        // canonicalized), not the specific hash bytes.
         let abc = "abc";
-        assert_eq!(
-            resolve_user_uuid(abc).await.unwrap(),
-            expected_test_uuid(abc)
+        let first = resolve_user_uuid(abc).await.unwrap();
+        let second = resolve_user_uuid(abc).await.unwrap();
+        assert_eq!(first, second, "fixture must be deterministic");
+        assert!(
+            crate::types::user::is_valid_uuid_shape(&first),
+            "fixture UUID must satisfy is_valid_uuid_shape: {first}"
         );
-        let sixteen = "abcdefghijklmnop";
-        assert_eq!(
-            resolve_user_uuid(sixteen).await.unwrap(),
-            "00000000-0000-0000-0000-abcdefghijkl",
-        );
+        // Case-insensitive: usernames are lowercased before digesting.
+        let mixed = resolve_user_uuid("AbC").await.unwrap();
+        assert_eq!(first, mixed);
     }
 
     #[tokio::test]

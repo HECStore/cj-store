@@ -88,29 +88,6 @@ impl Chest {
         }
     }
 
-    /// Calculate the world position of a chest from its parent node's position and its index.
-    ///
-    /// Returned position is the block the bot interacts with (the south-facing
-    /// front block of the double chest), not the chest block itself — that is
-    /// why every branch uses `z - 1`.
-    ///
-    /// Layout (top down, P is southeast corner at x, z):
-    /// ```text
-    /// NCCN  <- z-2 (back of double chests, not accessed)
-    /// NCCN  <- z-1 (front of double chests, where we click)
-    /// NSNP  <- z (working row; N = empty, S = shulker station, P = bot position)
-    /// ```
-    /// When standing at P looking north, chest indices are:
-    /// ```text
-    /// 01  <- y+1 (top row)
-    /// 23  <- y (bottom row)
-    /// ```
-    /// Left column: x-2. Right column: x-1.
-    ///
-    /// # Panics
-    /// Panics if `index` is not in range 0-3. This is a programming error;
-    /// all callers (Node::new, Node::load, bot validation) control the index
-    /// parameter directly.
     /// Verifies the on-struct invariants documented above (`amounts.len()`,
     /// `id == node_id * CHESTS_PER_NODE + index`, redundant id-field
     /// agreement, and that `index` is in range). Save/load boundary helper —
@@ -155,9 +132,47 @@ impl Chest {
                 DOUBLE_CHEST_SLOTS
             )));
         }
+        // Documented invariant: an unassigned chest (`item.is_empty()`) must
+        // have all slots at 0. Orphan amounts in an EMPTY-item chest are
+        // invisible to `total_item_amount` (the iteration filters by item
+        // equality) — a state-machine bug that leaks units into the wrong
+        // chest would otherwise silently shrink the catalog total.
+        if self.item.is_empty() {
+            for (i, &a) in self.amounts.iter().enumerate() {
+                if a > 0 {
+                    return Err(StoreError::InvariantViolation(format!(
+                        "Node {} chest {} has empty item but amounts[{i}]={a} > 0",
+                        expected_node_id, self.index
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
+    /// Calculate the world position of a chest from its parent node's position and its index.
+    ///
+    /// Returned position is the block the bot interacts with (the south-facing
+    /// front block of the double chest), not the chest block itself — that is
+    /// why every branch uses `z - 1`.
+    ///
+    /// Layout (top down, P is southeast corner at x, z):
+    /// ```text
+    /// NCCN  <- z-2 (back of double chests, not accessed)
+    /// NCCN  <- z-1 (front of double chests, where we click)
+    /// NSNP  <- z (working row; N = empty, S = shulker station, P = bot position)
+    /// ```
+    /// When standing at P looking north, chest indices are:
+    /// ```text
+    /// 01  <- y+1 (top row)
+    /// 23  <- y (bottom row)
+    /// ```
+    /// Left column: x-2. Right column: x-1.
+    ///
+    /// # Panics
+    /// Panics if `index` is not in range 0-3. This is a programming error;
+    /// all callers (Node::new, Node::load, bot validation) control the index
+    /// parameter directly.
     pub fn calc_position(node_position: &Position, index: i32) -> Position {
         match index {
             0 => Position {

@@ -148,7 +148,20 @@ impl Storage {
         let mut skipped = 0usize;
 
         for entry in fs::read_dir(storage_path)? {
-            let entry = entry?;
+            // Per-entry IO errors (transient lock, deleted-during-iter,
+            // EACCES on a single file) skip the entry rather than aborting
+            // the whole `Storage::load` — which would propagate up to
+            // `Store::new` and prevent startup. Sibling loaders
+            // (Pair::load_all, User::load_all_in_dir, Trade::load_all_with_limit)
+            // already standardized on warn-and-continue here.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!("[Storage] skipping unreadable directory entry: {e}");
+                    continue;
+                }
+            };
             let path = entry.path();
 
             // Cap node_id so `node_id * CHESTS_PER_NODE + 3` (computed in
@@ -156,34 +169,60 @@ impl Storage {
             // filenames like `2147483647.json` would otherwise wrap to a
             // negative chest id and silently collide with a real chest.
             let max_node_id = i32::MAX / crate::constants::CHESTS_PER_NODE as i32 - 1;
-            if path.is_file()
-                && let Some(extension) = path.extension()
-                && extension == "json"
-                && let Some(file_name) = path.file_stem()
-                && let Some(file_str) = file_name.to_str()
-                && let Ok(node_id) = file_str.parse::<i32>()
-                && node_id >= 0
-                && node_id <= max_node_id
-            {
-                match Node::load(node_id, storage_position) {
-                    Ok(node) => nodes.push(node),
-                    Err(e) => {
-                        skipped += 1;
+            // Skip silently for non-`.json` files (sibling docs, backups) but
+            // log + count any `.json` whose stem fails the node_id shape
+            // check. The malformed-content path quarantines and counts; this
+            // closes the parallel observability gap for malformed *filenames*.
+            if !path.is_file() {
+                continue;
+            }
+            let is_json = path.extension().is_some_and(|ext| ext == "json");
+            if !is_json {
+                continue;
+            }
+            let parsed = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<i32>().ok());
+            let node_id = match parsed {
+                Some(id) if (0..=max_node_id).contains(&id) => id,
+                Some(id) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        node_id_raw = id,
+                        max_node_id,
+                        "[Storage] skipping node file with out-of-range id stem at {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                None => {
+                    skipped += 1;
+                    tracing::warn!(
+                        "[Storage] skipping node file with non-integer stem at {}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            match Node::load(node_id, storage_position) {
+                Ok(node) => nodes.push(node),
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        node_id,
+                        error = %e,
+                        "[Storage] failed to load node; quarantining",
+                    );
+                    if let Err(qe) =
+                        quarantine_node_file(&path, &format!("Node::load failed: {e}"))
+                    {
                         tracing::warn!(
                             node_id,
-                            error = %e,
-                            "[Storage] failed to load node; quarantining",
+                            error = %qe,
+                            "[Storage] quarantine failed for node file {}: {qe}",
+                            path.display(),
                         );
-                        if let Err(qe) =
-                            quarantine_node_file(&path, &format!("Node::load failed: {e}"))
-                        {
-                            tracing::warn!(
-                                node_id,
-                                error = %qe,
-                                "[Storage] quarantine failed for node file {}: {qe}",
-                                path.display(),
-                            );
-                        }
                     }
                 }
             }
@@ -202,11 +241,20 @@ impl Storage {
         if let Some(first) = nodes.first()
             && first.id != 0
         {
-            tracing::error!(
-                first_node_id = first.id,
-                "[Storage] node 0 is missing from disk — `nodes[0]` invariant violated; reserved-chest lookups will route to node {} instead",
-                first.id,
-            );
+            // Refuse startup: every reserved-chest lookup
+            // (`simulate_deposit_plan`, `find_empty_chest_index`,
+            // `get_overflow_chest`, `is_reserved_chest_blocked_for`, the
+            // auto-create guard in `store/mod.rs`) assumes `nodes[0]` is
+            // node id 0. Continuing past this point would route diamond /
+            // overflow reserved-chest logic to an arbitrary other node,
+            // which can mint currency on the next `add_node`-driven node 0
+            // re-creation. Operator must restore `data/storage/0.json` (or
+            // remove the inhabited nodes so the auto-create path can run
+            // cleanly) before restart.
+            return Err(Box::new(io::Error::other(format!(
+                "node 0 missing from disk after load — first loaded node has id {}; refusing startup to prevent reserved-chest mis-routing (restore data/storage/0.json or quarantine the surviving nodes manually)",
+                first.id
+            ))));
         }
 
         tracing::info!(
@@ -279,7 +327,11 @@ impl Storage {
     /// Returns the plan plus the total amount that could actually be planned
     /// (may be less than `qty` if storage is short).
     pub fn simulate_withdraw_plan(&self, item: &str, qty: i32) -> (Vec<ChestTransfer>, i32) {
-        if qty <= 0 {
+        if qty <= 0 || item.is_empty() {
+            // Empty `item` would match every unassigned (EMPTY-sentinel)
+            // chest via `chest.item != item` returning false — silently
+            // routing the plan through sentinel chests rather than no chests.
+            // No validated caller passes empty; refuse closed.
             return (Vec::new(), 0);
         }
         let mut plan: Vec<ChestTransfer> = Vec::new();
@@ -347,7 +399,10 @@ impl Storage {
         qty: i32,
         stack_size: i32,
     ) -> (Vec<ChestTransfer>, i32) {
-        if qty <= 0 {
+        if qty <= 0 || item.is_empty() {
+            // Empty `item` would corrupt storage by assigning it to chests
+            // (see `deposit_plan` below); refuse closed even in the simulation
+            // path so callers get consistent semantics.
             return (Vec::new(), 0);
         }
 
@@ -499,7 +554,7 @@ impl Storage {
     /// **Note**: This is a planning function. The actual withdrawal happens
     /// when the bot executes the plan and syncs chest contents back to storage.
     pub fn withdraw_plan(&mut self, item: &str, mut qty: i32) -> Vec<ChestTransfer> {
-        if qty <= 0 {
+        if qty <= 0 || item.is_empty() {
             return Vec::new();
         }
         let requested = qty;
@@ -590,7 +645,13 @@ impl Storage {
         mut qty: i32,
         stack_size: i32,
     ) -> Vec<ChestTransfer> {
-        if qty <= 0 {
+        if qty <= 0 || item.is_empty() {
+            // Empty `item` is unreachable from validated callers, but defend
+            // closed: it would mutate empty-sentinel chests (the `!= item`
+            // filter matches both empty-item chests AND the empty input),
+            // then panic when `ItemId::from_normalized("".to_string())` is
+            // called for the ChestTransfer — leaving the chest mutated and
+            // on-disk state corrupted on the next save.
             return Vec::new();
         }
         let requested = qty;

@@ -192,7 +192,20 @@ pub(crate) fn durably_sync_archive(archived: &Path) {
 /// (typically a held handle on Windows).
 pub(crate) fn archive_aside(src: &Path, dst: &Path) -> io::Result<()> {
     match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // fsync the destination's parent directory so the rename's
+            // directory entry is durable. Without this, a crash between
+            // rename-return and the next OS commit can lose both the archive
+            // AND the original (rename has already moved the source). The
+            // copy fallback below already calls `durably_sync_archive` which
+            // covers parent fsync via its own tail; the rename path needs
+            // this explicit call. No-op on Windows (no equivalent op).
+            #[cfg(unix)]
+            if let Some(parent) = dst.parent() {
+                sync_parent_dir(parent);
+            }
+            Ok(())
+        }
         Err(_) => {
             fs::copy(src, dst)?;
             durably_sync_archive(dst);

@@ -347,7 +347,22 @@ pub async fn rollback_amount_to_storage(
             );
             break;
         }
-        store.storage.add_node();
+        // Persist the new node BEFORE dispatching any bot deposit into it.
+        // Otherwise a crash between this growth and the next state::save loses
+        // the node's metadata while the bot has physically placed items into
+        // chests of a node that does not exist on disk — `Storage::load` would
+        // silently omit it on restart and the audit pass would zero the items
+        // that were in those chests. On persist failure, refuse to grow:
+        // the rollback then surfaces an "items stuck on bot" outcome (loud)
+        // rather than a silent inventory loss.
+        let new_node = store.storage.add_node();
+        if let Err(e) = new_node.save() {
+            warn!(
+                "{} Rollback grow-fallback failed to persist new node {}: {} — refusing further growth so items stay surfaced as stuck rather than placed into an unloaded node",
+                context, new_node.id, e
+            );
+            break;
+        }
         let (re_plan, re_planned) = store
             .storage
             .simulate_deposit_plan(item, amount, stack_size);

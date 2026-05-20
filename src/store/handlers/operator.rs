@@ -950,14 +950,9 @@ mod tests {
     }
 
     fn test_uuid(username: &str) -> String {
-        let trimmed: String = username.chars().take(12).collect();
-        let padded = format!("{:0>12}", trimmed);
-        format!("00000000-0000-0000-0000-{}", padded)
+        crate::mojang::fixture_uuid(username)
     }
 
-    /// Kept (allowed-dead) so future fixers adding rejection / round-trip
-    /// tests can reuse it without re-deriving `test_uuid` glue.
-    #[allow(dead_code)]
     fn make_user(username: &str, balance: f64) -> (String, User) {
         let uuid = test_uuid(username);
         (
@@ -1995,7 +1990,18 @@ mod tests {
         // anything. This is the simplest way to trip the capacity guard without
         // needing to fully fill 16+ chests of node-0 with shulker-stacks.
         let storage = Storage::new(&Position { x: 0, y: 64, z: 0 });
-        let mut store = Store::new_for_test(tx, test_config(), pairs, HashMap::new(), storage);
+
+        // Pre-seed Alice so `ensure_user_exists` is a no-op. The dirty-flag
+        // assertion below pins the rejection-path invariant (no item/stock
+        // mutation when capacity is insufficient); a brand-new operator
+        // auto-created mid-dispatch would also set dirty=true via
+        // `ensure_user_exists`, conflating the user-registration side effect
+        // with the capacity-rejection contract this test was written to
+        // pin.
+        let mut users = HashMap::new();
+        let (alice_uuid, alice) = make_user("Alice", 0.0);
+        users.insert(alice_uuid, alice);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
 
         let trades_before = store.trades.len();
         let orders_before = store.orders.len();

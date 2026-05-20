@@ -172,11 +172,27 @@ impl Trade {
         // lexicographic order equals chronological order. Sorting before
         // slicing lets us take only the last `max_trades` filenames and
         // deserialize only those files, avoiding a full history read.
-        let mut json_paths: Vec<PathBuf> = fs::read_dir(dir_path)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "json"))
-            .collect();
+        // Explicit per-entry error handling (matches the Pair/User sibling
+        // loaders): a transient IO error during read_dir iteration is a
+        // signal an operator wants to see, not a silent skip. The
+        // `filter_map(.ok())` pattern hides sharing-violations on Windows,
+        // AV-locked files, and races with the quarantine path.
+        let mut json_paths: Vec<PathBuf> = Vec::new();
+        let mut entry_skipped = 0usize;
+        for entry in fs::read_dir(dir_path)? {
+            match entry {
+                Ok(e) => {
+                    let p = e.path();
+                    if p.is_file() && p.extension().is_some_and(|ext| ext == "json") {
+                        json_paths.push(p);
+                    }
+                }
+                Err(e) => {
+                    entry_skipped += 1;
+                    tracing::warn!("[Trade] skipping unreadable directory entry: {e}");
+                }
+            }
+        }
         let file_count = json_paths.len();
 
         json_paths.sort();
@@ -194,6 +210,33 @@ impl Trade {
             match fs::read_to_string(path) {
                 Ok(json_str) => match serde_json::from_str::<Self>(&json_str) {
                     Ok(trade) => {
+                        // Defend against filename-vs-embedded-timestamp drift.
+                        // Sibling Pair/User loaders already do this. Without
+                        // it, the next save_all_in_dir computes expected_files
+                        // from trade.timestamp's canonical filename and the
+                        // orphan sweep deletes the original stem-mismatched
+                        // file — destroying audit-log history that cannot be
+                        // reconstructed.
+                        let expected_stem = trade.timestamp.to_rfc3339().replace(':', "-");
+                        let actual_stem =
+                            path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                        if actual_stem != expected_stem {
+                            if let Err(qe) = quarantine_trade_file(
+                                path,
+                                &format!(
+                                    "stem mismatch: file={actual_stem} embedded_ts={expected_stem}"
+                                ),
+                            ) {
+                                tracing::warn!(
+                                    "[Trade] quarantine failed for {}: {qe}",
+                                    path.display(),
+                                );
+                                quarantine_failed += 1;
+                            } else {
+                                quarantined += 1;
+                            }
+                            continue;
+                        }
                         trades.push(trade);
                     }
                     Err(e) => {
@@ -226,6 +269,49 @@ impl Trade {
         // Trades are already in chronological order due to sorted filenames,
         // but sort by timestamp field to be safe against any filename anomalies.
         trades.sort_by_key(|a| a.timestamp);
+
+        // Detect duplicate timestamps in the loaded set. The audit log keys
+        // every on-disk file by `timestamp.to_rfc3339()`, so two trades that
+        // happen to share a timestamp collide on the same filename — the next
+        // `save_all_in_dir` then writes one over the other and the orphan
+        // sweep destroys the loser without comment. Quarantine the later
+        // duplicate here so the operator can reconcile manually.
+        let mut dedup_idx = 1;
+        let mut dropped_dups = 0usize;
+        while dedup_idx < trades.len() {
+            if trades[dedup_idx].timestamp == trades[dedup_idx - 1].timestamp {
+                let dup = trades.remove(dedup_idx);
+                let stem = dup.timestamp.to_rfc3339().replace(':', "-");
+                let dup_path = dir_path.join(format!("{stem}.json"));
+                if dup_path.exists()
+                    && let Err(qe) = quarantine_trade_file(
+                        &dup_path,
+                        &format!(
+                            "duplicate timestamp '{stem}' already loaded from a sibling file"
+                        ),
+                    )
+                {
+                    tracing::warn!(
+                        "[Trade] quarantine failed for duplicate {}: {qe}",
+                        dup_path.display(),
+                    );
+                }
+                dropped_dups += 1;
+            } else {
+                dedup_idx += 1;
+            }
+        }
+        if dropped_dups > 0 {
+            tracing::warn!(
+                "[Trade] dropped {dropped_dups} trades with duplicate timestamps from memory; \
+                 colliding files quarantined if reachable"
+            );
+        }
+        if entry_skipped > 0 {
+            tracing::warn!(
+                "[Trade] {entry_skipped} directory entries were unreadable and skipped"
+            );
+        }
 
         tracing::info!(
             "[Trade] loaded {} of {} trades (limit {}, quarantined {}, quarantine_failed {})",

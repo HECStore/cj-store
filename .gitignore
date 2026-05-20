@@ -1,10 +1,16 @@
 /target
 /data
 
-# Secrets
+# Secrets — keep this list exhaustive. `.env*` covers `.env.local`,
+# `.env.backup`, etc. The additional entries below catch direnv files
+# (`.envrc`) and dotenv variants that don't start with `.env`.
 .env
 .env.*
 !.env.example
+.envrc
+*.envrc
+dotenv
+.dotenv
 # Cargo registry tokens — only credential files are excluded; the rest of
 # .cargo/ (notably config.toml) is tracked normally.
 .cargo/credentials

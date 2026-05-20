@@ -131,9 +131,11 @@ recovered). The usual async discipline — never hold the guard across
   quantity always returns `None`, `x*y=k` exact at `fee=0.0`, fee knob is
   monotonic.
 - **`assert!`** guards in [src/store/handlers/operator.rs](src/store/handlers/operator.rs)
-  verify non-negativity and finiteness of stock values and fire in both debug
-  and release builds. **`debug_assert!`** guards in
-  [src/store/orders.rs](src/store/orders.rs) are compiled out of release.
+  verify non-negativity and finiteness of stock values, and in
+  [src/types/order.rs](src/types/order.rs) verify `qty > 0` on every order
+  constructor; both fire in debug and release builds. **`debug_assert!`**
+  guards in [src/store/orders.rs](src/store/orders.rs) are compiled out of
+  release.
 - **Integration tests** build a `Store` in-memory via `Store::new_for_test`
   and spawn a mock bot task; `crate::mojang::resolve_user_uuid` is cfg-gated
   to deterministic offline UUIDs under `#[cfg(test)]`.

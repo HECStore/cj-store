@@ -392,16 +392,12 @@ pub async fn handle_withdraw_balance_queued(
         let safe_err = StoreError::BotReportedError(err.clone())
             .user_message()
             .into_owned();
-        let msg = match rb.partial_message() {
-            Some(detail) => format!(
-                "Withdraw aborted: trade failed: {}. Rollback partial: {}.",
-                safe_err, detail
-            ),
-            None => format!(
-                "Withdraw aborted: trade failed: {}. Diamonds returned to storage.",
-                safe_err
-            ),
+        let partial_detail = rb.partial_message().map(|d| format!(" Rollback partial: {d}."));
+        let suffix = match partial_detail.as_deref() {
+            Some(s) => s,
+            None => " Diamonds returned to storage.",
         };
+        let msg = utils::format_action_aborted("Withdraw", &safe_err, Some(suffix));
         store.advance_trade(|s| s.rollback("withdraw/trade-rejected".to_string()));
         return utils::send_message_to_player(store, player_name, &msg).await;
     }

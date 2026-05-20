@@ -365,22 +365,9 @@ mod tests {
     // ------------------------------------------------------------------------
     fn test_store() -> Store {
         let (tx, _rx) = mpsc::channel::<BotInstruction>(1);
-        let config = crate::config::Config {
-            position: crate::types::Position { x: 0, y: 64, z: 0 },
-            fee: 0.125,
-            account_email: String::new(),
-            server_address: "test".to_string(),
-            buffer_chest_position: None,
-            trade_timeout_ms: 5_000,
-            pathfinding_timeout_ms: 5_000,
-            max_orders: 1000,
-            max_trades_in_memory: 1000,
-            autosave_interval_secs: 10,
-            chat: crate::config::ChatConfig::default(),
-        };
         Store::new_for_test(
             tx,
-            config,
+            crate::config::Config::test_default(),
             HashMap::new(),
             HashMap::new(),
             crate::types::Storage::default(),
@@ -401,6 +388,14 @@ mod tests {
         assert_eq!(u.balance, 0.0);
         assert!(!u.operator);
         assert!(store.dirty);
+        // Durability invariant: a brand-new user must also be flagged in
+        // `dirty_users` so the per-user persistence layer actually writes it
+        // to disk on the next save. Without this insert the user would be
+        // silently skipped until shutdown.
+        assert!(
+            store.dirty_users.contains(ALICE_UUID),
+            "newly created user must be in dirty_users"
+        );
     }
 
     #[test]
@@ -408,6 +403,7 @@ mod tests {
         let mut store = test_store();
         ensure_user_exists(&mut store, "Alice", ALICE_UUID);
         store.dirty = false;
+        store.dirty_users.clear();
 
         ensure_user_exists(&mut store, "AliceRenamed", ALICE_UUID);
         assert_eq!(
@@ -415,6 +411,12 @@ mod tests {
             "AliceRenamed"
         );
         assert!(store.dirty);
+        // Drift-update path must also re-flag the user as dirty for the
+        // per-user save path.
+        assert!(
+            store.dirty_users.contains(ALICE_UUID),
+            "username-drifted user must be re-added to dirty_users"
+        );
     }
 
     #[test]
@@ -440,9 +442,16 @@ mod tests {
         let mut store = test_store();
         ensure_user_exists(&mut store, "Alice", ALICE_UUID);
         store.dirty = false;
+        store.dirty_users.clear();
 
         ensure_user_exists(&mut store, "Alice", ALICE_UUID);
         assert!(!store.dirty, "no change should not mark dirty");
+        // No-op path must not pollute `dirty_users` either — a write of an
+        // unchanged user is wasted I/O.
+        assert!(
+            store.dirty_users.is_empty(),
+            "no-op call must not flag user as dirty"
+        );
     }
 
     #[test]

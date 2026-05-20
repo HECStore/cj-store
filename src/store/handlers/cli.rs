@@ -695,19 +695,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     fn test_config() -> crate::config::Config {
-        crate::config::Config {
-            position: crate::types::Position { x: 0, y: 64, z: 0 },
-            fee: 0.125,
-            account_email: String::new(),
-            server_address: "test".to_string(),
-            buffer_chest_position: None,
-            trade_timeout_ms: 5_000,
-            pathfinding_timeout_ms: 5_000,
-            max_orders: 1000,
-            max_trades_in_memory: 1000,
-            autosave_interval_secs: 10,
-            chat: crate::config::ChatConfig::default(),
-        }
+        crate::config::Config::test_default()
     }
 
     /// Canonical 36-char hyphenated UUID for "Alice". Must satisfy

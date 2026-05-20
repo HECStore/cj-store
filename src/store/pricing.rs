@@ -245,6 +245,85 @@ mod tests {
     }
 
     #[test]
+    fn buy_cost_pure_returns_none_on_non_finite_currency_stock() {
+        // NaN currency_stock is filtered early by `reserves_sufficient`
+        // (NaN > MIN_RESERVE_FOR_PRICE is false via IEEE-754).
+        assert_eq!(buy_cost_pure(100, f64::NAN, 1, 0.125), None);
+        // INFINITY slips past `reserves_sufficient` (inf > threshold) and is
+        // caught by the trailing `cost.is_finite()` check. Two distinct
+        // fail-closed paths — both must reject.
+        assert_eq!(buy_cost_pure(100, f64::INFINITY, 1, 0.125), None);
+        assert_eq!(buy_cost_pure(100, f64::NEG_INFINITY, 1, 0.125), None);
+    }
+
+    #[test]
+    fn sell_payout_pure_returns_none_on_non_finite_currency_stock() {
+        assert_eq!(sell_payout_pure(100, f64::NAN, 1, 0.125), None);
+        assert_eq!(sell_payout_pure(100, f64::INFINITY, 1, 0.125), None);
+        assert_eq!(sell_payout_pure(100, f64::NEG_INFINITY, 1, 0.125), None);
+    }
+
+    // -- indicative_spot_* direct tests --------------------------------------
+
+    #[test]
+    fn indicative_spot_buy_price_returns_none_at_unit_item_stock() {
+        // `buy_cost_pure` rejects `amount >= item_stock`, so a 1-item pool is
+        // un-quotable on the buy side. Chat treats this as `price_available =
+        // false`; a future "fix" of the `>=` bound would silently change the
+        // chat contract — pin it.
+        assert_eq!(
+            indicative_spot_buy_price(1, 1_000_000.0, 0.125),
+            None,
+            "1-stock pool must be un-quotable on buy side"
+        );
+    }
+
+    #[test]
+    fn indicative_spot_buy_price_matches_buy_cost_pure_at_amount_one() {
+        let stock = 100;
+        let currency = 1000.0;
+        let fee = 0.125;
+        assert_eq!(
+            indicative_spot_buy_price(stock, currency, fee),
+            buy_cost_pure(stock, currency, 1, fee),
+        );
+    }
+
+    #[test]
+    fn indicative_spot_sell_price_matches_sell_payout_pure_at_amount_one() {
+        let stock = 100;
+        let currency = 1000.0;
+        let fee = 0.125;
+        assert_eq!(
+            indicative_spot_sell_price(stock, currency, fee),
+            sell_payout_pure(stock, currency, 1, fee),
+        );
+    }
+
+    #[test]
+    fn indicative_spot_prices_return_none_at_or_below_reserve_threshold() {
+        // Both helpers must refuse to quote when reserves are insufficient,
+        // so chat surfaces `price_available = false` rather than a number
+        // produced from a pool too small to quote reliably.
+        assert_eq!(
+            indicative_spot_buy_price(100, MIN_RESERVE_FOR_PRICE, 0.125),
+            None,
+        );
+        assert_eq!(
+            indicative_spot_buy_price(100, MIN_RESERVE_FOR_PRICE / 2.0, 0.125),
+            None,
+        );
+        assert_eq!(
+            indicative_spot_sell_price(100, MIN_RESERVE_FOR_PRICE, 0.125),
+            None,
+        );
+        assert_eq!(
+            indicative_spot_sell_price(100, MIN_RESERVE_FOR_PRICE / 2.0, 0.125),
+            None,
+        );
+    }
+
+    #[test]
     fn buy_cost_pure_returns_none_just_under_reserve_threshold() {
         // Currency stock just below MIN_RESERVE_FOR_PRICE → no quote.
         assert_eq!(
@@ -429,19 +508,7 @@ mod tests {
         let storage = Storage::new(&origin);
         let (tx, _rx) = mpsc::channel(1);
 
-        let config = Config {
-            position: origin,
-            fee: 0.125,
-            account_email: String::new(),
-            server_address: "test".to_string(),
-            buffer_chest_position: None,
-            trade_timeout_ms: 5_000,
-            pathfinding_timeout_ms: 5_000,
-            max_orders: 1000,
-            max_trades_in_memory: 1000,
-            autosave_interval_secs: 10,
-            chat: crate::config::ChatConfig::default(),
-        };
+        let config = Config::test_default();
 
         let mut pairs = HashMap::new();
         for (name, item_stock, currency_stock) in pairs_spec {

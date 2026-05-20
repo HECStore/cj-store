@@ -123,14 +123,13 @@ pub(crate) async fn get_in_dir(item: &str, dir: &std::path::Path) -> Option<Pair
 /// rejected; they are already excluded by the byte-class check, but
 /// listing them keeps the intent obvious to future readers.
 fn is_safe_pair_stem(stem: &str) -> bool {
-    if stem.is_empty() {
-        return false;
-    }
     if stem.contains('/') || stem.contains('\\') || stem.contains("..") || stem.contains('\0') {
         return false;
     }
-    stem.bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    // Delegate to the canonical byte-class + non-empty + length-cap invariant
+    // owned by `ItemId`. The explicit traversal-byte checks above are kept
+    // for intent-documentation; they are already subsumed by the byte-class.
+    crate::types::ItemId::is_canonical(stem)
 }
 
 /// Single-file read for the fast path. Uses the same retry-on-rename

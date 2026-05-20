@@ -141,15 +141,11 @@ impl Pair {
         // Defense-in-depth perimeter: `ItemId::from_normalized` does not
         // validate, so a caller that constructs an ItemId from a tampered
         // string could smuggle a path-separator or other unsafe byte through
-        // the typed wrapper. Match the byte-class invariant that `ItemId::new`
-        // enforces; on violation, refuse to write rather than let the bytes
-        // reach `dir_path.join` and potentially escape the pairs directory.
-        if !self
-            .item
-            .as_str()
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        {
+        // the typed wrapper. Match the canonical invariant that `ItemId::new`
+        // enforces via the shared `ItemId::is_canonical` helper; on violation,
+        // refuse to write rather than let the bytes reach `dir_path.join` and
+        // potentially escape the pairs directory.
+        if !ItemId::is_canonical(self.item.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(

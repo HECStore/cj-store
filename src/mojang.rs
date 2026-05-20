@@ -132,7 +132,6 @@ enum CachedEntry {
     /// already been clamped by `parse_retry_after` (1h max).
     RateLimited {
         until: Instant,
-        retry_after: Option<Duration>,
         last_access: Instant,
     },
 }
@@ -298,9 +297,11 @@ pub async fn resolve_user_uuid(username: &str) -> Result<String, MojangResolveEr
     }
     #[cfg(not(test))]
     {
-        resolve_user_uuid_inner(username, |u: String| async move {
-            User::get_uuid_async(&u).await
-        })
+        resolve_user_uuid_inner(
+            username,
+            |u: String| async move { User::get_uuid_async(&u).await },
+            false,
+        )
         .await
     }
 }
@@ -315,20 +316,30 @@ pub async fn resolve_user_uuid_with_resolver(
     resolver: Resolver,
 ) -> Result<String, MojangResolveError> {
     let r = resolver.clone();
-    resolve_user_uuid_inner(username, move |u| r(u)).await
+    resolve_user_uuid_inner(username, move |u| r(u), false).await
 }
 
 /// Core single-flight + cache loop. Generic over the resolver function so
 /// tests can inject controllable backends and production can wire in
 /// `User::get_uuid_async`. See the module-level doc for the protocol.
-async fn resolve_user_uuid_inner<F, Fut>(
-    username: &str,
+///
+/// `reentered` is a bounded-recursion flag: a follower that wakes after a
+/// leader's transport failure re-enters this function once (with
+/// `reentered = true`) so the second wave coalesces under a new leader
+/// rather than each parked follower issuing its own retry. A re-entered
+/// call that itself ends up as a follower-after-transport-failure falls
+/// through to a direct resolver call instead of recursing again, capping
+/// total recursion depth at 1 even against a persistently-failing endpoint.
+fn resolve_user_uuid_inner<'a, F, Fut>(
+    username: &'a str,
     resolver: F,
-) -> Result<String, MojangResolveError>
+    reentered: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, MojangResolveError>> + Send + 'a>>
 where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = Result<String, MojangResolveError>>,
+    F: Fn(String) -> Fut + Clone + Send + 'a,
+    Fut: std::future::Future<Output = Result<String, MojangResolveError>> + Send + 'a,
 {
+    Box::pin(async move {
     // Defense-in-depth shape check before the cache lookup so a junk
     // username can't pollute the cache or burn a Mojang round-trip.
     if !crate::types::user::is_valid_username_shape(username) {
@@ -413,12 +424,19 @@ where
             if let Some(result) = check_cache(&key, username, ttl, neg_ttl) {
                 return result;
             }
-            // Fall through: a transient leader-failure happened. Promote
-            // ourselves to leader for this username. Best-effort: a
-            // follower-as-leader path doesn't re-claim IN_FLIGHT (the
-            // leader's Drop just removed it; another concurrent caller
-            // may already be promoting in parallel — that's an acceptable
-            // small-cardinality stampede after a hard transport failure).
+            // Fall through: a transient leader-failure happened. Re-enter
+            // the single-flight protocol ONCE so the second wave of
+            // followers coalesces under a new leader rather than each
+            // parked follower firing its own retry (turning one upstream
+            // failure into N concurrent retries against a likely-still-
+            // failing endpoint — the worst moment to ignore rate-limit
+            // etiquette). Bounded by `reentered`: a re-entered call that
+            // again ends up as a follower-after-transport-failure falls
+            // through to a direct resolver invocation here, capping total
+            // recursion depth at 1.
+            if !reentered {
+                return resolve_user_uuid_inner(username, resolver, true).await;
+            }
             resolver(username.to_string()).await
         }
         SingleFlight::Leader => {
@@ -472,6 +490,7 @@ where
             to_return
         }
     }
+    })
 }
 
 /// Read the cache for `key`, treating `username` as the original
@@ -511,21 +530,22 @@ fn check_cache(
                 username: username.to_string(),
             }))
         }
-        CachedEntry::RateLimited {
-            until, retry_after, ..
-        } => {
+        CachedEntry::RateLimited { until, .. } => {
             let remaining = until.saturating_duration_since(now);
             debug!(
                 username = username,
                 remaining_secs = remaining.as_secs(),
                 "UUID rate-limited cache hit"
             );
-            // Always present a non-None retry_after to the caller (the
-            // remaining time), even if the original 429 didn't include a
-            // Retry-After header — the cooldown duration is information
-            // the caller needs.
-            let ra = retry_after.or(Some(remaining));
-            Some(Err(MojangResolveError::RateLimited { retry_after: ra }))
+            // Surface the actually-remaining cooldown, not the original
+            // Retry-After hint captured at insert time. Returning the stale
+            // hint verbatim on a hit 50s later would mislead exponential
+            // backoff into waiting the full original window again instead of
+            // the small remaining slice. The clamp/ceiling already happened
+            // when `until` was computed at insert time.
+            Some(Err(MojangResolveError::RateLimited {
+                retry_after: Some(remaining),
+            }))
         }
     }
 }
@@ -570,7 +590,6 @@ fn insert_rate_limited(key: &str, retry_after: Option<Duration>) {
         key.to_string(),
         CachedEntry::RateLimited {
             until: now + cooldown,
-            retry_after,
             last_access: now,
         },
     );
@@ -935,7 +954,6 @@ mod tests {
             "expired_429".to_string(),
             CachedEntry::RateLimited {
                 until: now - Duration::from_secs(1),
-                retry_after: None,
                 last_access: now - Duration::from_secs(5),
             },
         );

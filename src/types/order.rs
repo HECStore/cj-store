@@ -80,11 +80,13 @@ impl Order {
     /// User purchased `qty` of `item` for `price` total diamonds.
     pub fn buy(item: ItemId, qty: i32, price: f64, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(qty > 0, "qty must be positive (got {qty})");
-        // Release-mode `assert!`: orders are written to the audit log and
-        // re-loaded on next startup without serde validation. A NaN/negative
-        // currency value here becomes a permanent corrupt record on disk that
-        // poisons every downstream aggregation.
+        // Release-mode `assert!`: a non-positive `qty` or a NaN/negative
+        // currency value would poison every in-process aggregation that walks
+        // the orders queue, and `serde_json::to_string_pretty` rejects
+        // non-finite f64 by default — so a NaN that smuggled in here would
+        // also cause every subsequent on-disk save to fail, silently dropping
+        // the entire queue until restart.
+        assert!(qty > 0, "qty must be positive (got {qty})");
         assert!(
             price.is_finite() && price >= 0.0,
             "price must be finite and non-negative (got {price})"
@@ -101,8 +103,8 @@ impl Order {
     /// User sold `qty` of `item` for `payout` total diamonds.
     pub fn sell(item: ItemId, qty: i32, payout: f64, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(qty > 0, "qty must be positive (got {qty})");
         // Release `assert!` — see `buy` above.
+        assert!(qty > 0, "qty must be positive (got {qty})");
         assert!(
             payout.is_finite() && payout >= 0.0,
             "payout must be finite and non-negative (got {payout})"
@@ -122,7 +124,8 @@ impl Order {
     /// `currency_amount` is f64 for the variants that genuinely need it.
     pub fn deposit_balance(whole_diamonds: i32, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(
+        // Release `assert!` — see `buy` above.
+        assert!(
             whole_diamonds > 0,
             "whole_diamonds must be positive (got {whole_diamonds})"
         );
@@ -138,7 +141,8 @@ impl Order {
     /// User withdrew `whole_diamonds` diamonds from their store balance.
     pub fn withdraw_balance(whole_diamonds: i32, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(
+        // Release `assert!` — see `buy` above.
+        assert!(
             whole_diamonds > 0,
             "whole_diamonds must be positive (got {whole_diamonds})"
         );
@@ -188,7 +192,8 @@ impl Order {
     /// Operator added `qty` of `item` to storage (no currency leg).
     pub fn add_item(item: ItemId, qty: i32, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(qty > 0, "qty must be positive (got {qty})");
+        // Release `assert!` — see `buy` above.
+        assert!(qty > 0, "qty must be positive (got {qty})");
         Self {
             order_type: OrderType::AddItem,
             item,
@@ -201,7 +206,8 @@ impl Order {
     /// Operator removed `qty` of `item` from storage (no currency leg).
     pub fn remove_item(item: ItemId, qty: i32, uuid: String) -> Self {
         debug_assert!(!uuid.is_empty(), "uuid must be non-empty");
-        debug_assert!(qty > 0, "qty must be positive (got {qty})");
+        // Release `assert!` — see `buy` above.
+        assert!(qty > 0, "qty must be positive (got {qty})");
         Self {
             order_type: OrderType::RemoveItem,
             item,

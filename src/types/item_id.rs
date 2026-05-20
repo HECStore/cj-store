@@ -50,8 +50,10 @@ impl ItemId {
     /// Returns true if `s` already satisfies the `ItemId` invariants:
     /// non-empty, length within `MAX_LEN`, all bytes are ASCII lowercase
     /// alphanumerics or `_`, and the string does not begin with the
-    /// `minecraft:` prefix. Used by [`from_normalized`]'s debug check.
-    fn is_canonical(s: &str) -> bool {
+    /// `minecraft:` prefix. Used by [`from_normalized`]'s debug check and
+    /// by the perimeter byte-class checks in `Pair::save_in_dir` and the
+    /// chat `store_view` so a single source of truth defines canonicality.
+    pub(crate) fn is_canonical(s: &str) -> bool {
         !s.is_empty()
             && s.len() <= Self::MAX_LEN
             && !s.starts_with("minecraft:")
@@ -330,26 +332,55 @@ mod tests {
         assert!(ItemId::new(&huge).is_err());
     }
 
+    // The three `#[should_panic(expected = "non-canonical")]` tests below
+    // rely on `from_normalized`'s `debug_assert!` firing — which is compiled
+    // out under `cargo test --release`. Gate them on `debug_assertions` so
+    // a release-mode test run does not flip them to red. The empty-string
+    // invariant uses an unconditional `assert!`, so its regression guard
+    // (`from_normalized_panics_on_empty_in_release`) runs in both profiles.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "non-canonical")]
     fn from_normalized_debug_asserts_on_uppercase() {
-        // In debug builds, `from_normalized` rejects non-canonical input so
-        // a future refactor that wraps a constant in `format!("minecraft:{}")`
-        // (or otherwise smuggles in unnormalized bytes) panics in CI rather
-        // than silently bypassing every ItemId security check.
         let _ = ItemId::from_normalized("DIAMOND".to_string());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "non-canonical")]
     fn from_normalized_debug_asserts_on_prefix() {
         let _ = ItemId::from_normalized("minecraft:diamond".to_string());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "non-canonical")]
     fn from_normalized_debug_asserts_on_dotdot() {
         let _ = ItemId::from_normalized("../etc".to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "called with empty string")]
+    fn from_normalized_panics_on_empty_in_release() {
+        // Unconditional `assert!` — must fire in both debug and release.
+        let _ = ItemId::from_normalized(String::new());
+    }
+
+    #[test]
+    fn base_currency_and_overflow_constants_are_canonical() {
+        // These two constants flow unchecked through `ItemId::from_normalized`
+        // at src/types/node.rs (release builds skip the debug_assert!), so a
+        // future edit changing them to e.g. "Diamond" or "overflow_chest_v2"
+        // would silently smuggle non-canonical bytes through the typed wrapper.
+        assert!(
+            ItemId::is_canonical(crate::constants::BASE_CURRENCY_ITEM),
+            "BASE_CURRENCY_ITEM must be canonical (lowercase ASCII alphanumeric/underscore, \
+             no `minecraft:` prefix, non-empty, within MAX_LEN)"
+        );
+        assert!(
+            ItemId::is_canonical(crate::constants::OVERFLOW_CHEST_ITEM),
+            "OVERFLOW_CHEST_ITEM must be canonical"
+        );
     }
 
     #[test]

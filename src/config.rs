@@ -1064,6 +1064,28 @@ impl Config {
         }
     }
 
+    /// Canonical in-memory fixture used by tests across the codebase.
+    /// Centralises the `Config { ... }` literal that was previously
+    /// duplicated verbatim in many test modules so adding a new field
+    /// requires editing exactly one place. Test-only; gated behind
+    /// `#[cfg(test)]` so it does not bloat the production binary.
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        Config {
+            position: Position { x: 0, y: 64, z: 0 },
+            fee: 0.125,
+            account_email: String::new(),
+            server_address: "test".to_string(),
+            buffer_chest_position: None,
+            trade_timeout_ms: 5_000,
+            pathfinding_timeout_ms: 5_000,
+            max_orders: 1000,
+            max_trades_in_memory: 1000,
+            autosave_interval_secs: 10,
+            chat: ChatConfig::default(),
+        }
+    }
+
     /// Loads configuration from `data/config.json`, creating it with
     /// defaults if missing, and validates the result.
     ///

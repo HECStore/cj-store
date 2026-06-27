@@ -330,10 +330,37 @@ pub async fn place_shulker_in_chest_slot_verified(
     Ok(())
 }
 
+/// The point the bot should `look_at` before opening a chest: the centre of the
+/// chest's **south face** (`+Z`), i.e. `(x+0.5, y+0.5, z+1.0)` — NOT the block
+/// centre.
+///
+/// Why the face and not the centre: azalea's `block_interact` /
+/// `open_container_at` forces the interaction at `chest_pos`, but only sends the
+/// *real* hit (correct face + on-surface cursor location) when the bot's
+/// crosshair raycast actually lands on that exact block. Otherwise it falls back
+/// to a synthetic hit at the block **centre with face = Up** (see azalea's
+/// `handle_start_use_item_queued`), which the server rejects — the chest never
+/// opens and we burn the full 15 s open timeout. Our storage nodes park the bot
+/// to the south of each chest with open air on that side, so aiming at the south
+/// face makes the raycast approach from the clear side and land on the chest
+/// directly, instead of grazing the adjacent chest in the row when aiming
+/// through the block centre.
+///
+/// This deliberately does NOT apply to shulker-on-station opens: a freshly
+/// placed shulker sits in the open with clear line-of-sight, so centre-aim works
+/// there (see `bot::shulker::open_shulker_at_station_once`).
+fn chest_open_aim_point(chest_pos: BlockPos) -> Vec3 {
+    Vec3::new(
+        chest_pos.x as f64 + 0.5,
+        chest_pos.y as f64 + 0.5,
+        chest_pos.z as f64 + 1.0,
+    )
+}
+
 /// Open a chest container at the given position (single attempt, no retry).
 ///
-/// Looks at the center of the chest block before attempting to open it,
-/// which helps ensure the interaction is successful.
+/// Looks at the chest's south face before attempting to open it (see
+/// [`chest_open_aim_point`]), which keeps the server-side interaction valid.
 ///
 /// # Arguments
 /// * `bot` - Bot instance
@@ -401,17 +428,15 @@ async fn open_chest_container_once(
         }
     }
 
-    // Look at the center of the chest block before opening
-    let chest_center = Vec3::new(
-        chest_pos.x as f64 + 0.5,
-        chest_pos.y as f64 + 0.5,
-        chest_pos.z as f64 + 0.5,
-    );
+    // Look at the chest's south face (not its centre) before opening — see
+    // `chest_open_aim_point` for why aiming at the block centre makes the server
+    // reject the interaction.
+    let aim = chest_open_aim_point(chest_pos);
     debug!(
-        "open_chest_container_once: Looking at chest center ({:.1}, {:.1}, {:.1})",
-        chest_center.x, chest_center.y, chest_center.z
+        "open_chest_container_once: Looking at chest south face ({:.1}, {:.1}, {:.1})",
+        aim.x, aim.y, aim.z
     );
-    client.look_at(chest_center);
+    client.look_at(aim);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
 
     // 300 ticks = 15 seconds at 20 TPS
@@ -499,13 +524,10 @@ pub async fn open_chest_container_for_validation(
         chest_pos.x, chest_pos.y, chest_pos.z
     );
 
-    // Look at the center of the chest block before opening
-    let chest_center = Vec3::new(
-        chest_pos.x as f64 + 0.5,
-        chest_pos.y as f64 + 0.5,
-        chest_pos.z as f64 + 0.5,
-    );
-    client.look_at(chest_center);
+    // Look at the chest's south face (not its centre) before opening — see
+    // `chest_open_aim_point`.
+    let aim = chest_open_aim_point(chest_pos);
+    client.look_at(aim);
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
 
     // Use short timeout for validation: 100 ticks = 5 seconds at 20 TPS
@@ -1425,12 +1447,16 @@ async fn place_shulker_on_station(
     // are post-physical and stay log-and-continue, since aborting after the
     // shulker has moved makes the world state strictly worse.)
     {
-        // `block_in_place` lets the multi-thread runtime migrate other tasks
-        // off this worker while the synchronous file write inside `begin`
-        // (serde + fsync via `write_atomic`) holds the parking_lot::Mutex.
-        let res = tokio::task::block_in_place(|| {
-            bot.journal.lock().begin(journal_op, chest_id, slot_idx)
-        });
+        // Journal writes run synchronously on this thread. We deliberately do
+        // NOT wrap them in `tokio::task::block_in_place`: the bot task runs on a
+        // `LocalSet` (azalea's client future is `!Send`), and `block_in_place`
+        // panics inside a LocalSet ("can call blocking only when running on the
+        // multi-threaded runtime") — that panic would abort the chest-IO task,
+        // drop its response channel, and crash the main loop. The write is small
+        // (serde + one atomic fsync) and the guard is never held across an
+        // `.await`, so briefly blocking this thread is fine — the Store and chat
+        // tasks run on separate multi-thread workers and keep making progress.
+        let res = bot.journal.lock().begin(journal_op, chest_id, slot_idx);
         if let Err(e) = res {
             error!(
                 "[Journal] begin failed before shulker pickup at chest {} slot {}: {}",
@@ -1540,10 +1566,10 @@ async fn place_shulker_on_station(
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_SHULKER_PLACE_MS)).await;
 
     // Journal: shulker is now on the station.
+    // Direct synchronous write — no `block_in_place` (panics inside the
+    // LocalSet; see the note in `place_shulker_on_station`'s journal `begin`).
     {
-        let res = tokio::task::block_in_place(|| {
-            bot.journal.lock().advance(JournalState::ShulkerOnStation)
-        });
+        let res = bot.journal.lock().advance(JournalState::ShulkerOnStation);
         if let Err(e) = res {
             warn!("[Journal] advance(ShulkerOnStation) failed: {}", e);
         }
@@ -1585,10 +1611,9 @@ async fn finish_shulker_round_trip(
     tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_SETTLE_MS)).await;
 
     // Journal: items have been transferred (or 0 moved, still advancing state).
+    // Direct synchronous write — no `block_in_place` (panics inside the LocalSet).
     {
-        let res = tokio::task::block_in_place(|| {
-            bot.journal.lock().advance(JournalState::ItemsTransferred)
-        });
+        let res = bot.journal.lock().advance(JournalState::ItemsTransferred);
         if let Err(e) = res {
             warn!("[Journal] advance(ItemsTransferred) failed: {}", e);
         }
@@ -1608,10 +1633,9 @@ async fn finish_shulker_round_trip(
     super::shulker::pickup_shulker_from_station(bot, station_pos, node_position).await?;
 
     // Journal: shulker is back in bot inventory; station is clear.
+    // Direct synchronous write — no `block_in_place` (panics inside the LocalSet).
     {
-        let res = tokio::task::block_in_place(|| {
-            bot.journal.lock().advance(JournalState::ShulkerPickedUp)
-        });
+        let res = bot.journal.lock().advance(JournalState::ShulkerPickedUp);
         if let Err(e) = res {
             warn!("[Journal] advance(ShulkerPickedUp) failed: {}", e);
         }
@@ -1647,11 +1671,12 @@ async fn finish_shulker_round_trip(
     // intermediate `ShulkerReplaced` state — a crash between an `advance`
     // and a `complete` would otherwise violate the journal's invariant
     // that "only truly in-flight entries remain" on disk.
+    // Direct synchronous write — no `block_in_place` (panics inside the LocalSet).
     {
-        let res = tokio::task::block_in_place(|| {
+        let res = {
             let mut j = bot.journal.lock();
             j.complete_with_state(JournalState::ShulkerReplaced)
-        });
+        };
         if let Err(e) = res {
             warn!(
                 "[Journal] complete_with_state(ShulkerReplaced) failed: {}",

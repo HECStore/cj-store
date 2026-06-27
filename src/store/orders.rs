@@ -1300,6 +1300,37 @@ pub async fn handle_sell_order(
 // Queue dispatcher
 // ===========================================================================
 
+/// Build the dispatch-summary line for a buy/sell handler that returned
+/// `Ok(())`.
+///
+/// A buy/sell handler returning `Ok(())` means "handled to a clean conclusion"
+/// — which is EITHER a committed trade OR a graceful abort (rollback after a
+/// failed chest open, an underpaid/under-delivered trade, etc.) OR a pre-trade
+/// validation rejection. Only a *committed* trade is a genuine success. The
+/// dispatcher used to label every `Ok(())` as "<verb> order completed", so an
+/// aborted order (e.g. the bot failing to open a chest) showed up in the logs
+/// as "Buy order completed" even though nothing was delivered. Inspect the
+/// terminal trade state so the summary reflects what actually happened.
+fn buy_sell_outcome_summary(store: &Store, verb: &str, order: &QueuedOrder) -> String {
+    use super::trade_state::TradeState;
+    match store.current_trade.as_ref() {
+        Some(TradeState::Committed(_)) => format!(
+            "{} order completed: {} {} for {}",
+            verb, order.quantity, order.item, order.username
+        ),
+        Some(TradeState::RolledBack { reason, .. }) => format!(
+            "{} order aborted ({}): {} {} for {}",
+            verb, reason, order.quantity, order.item, order.username
+        ),
+        // Queued (validation rejected before the trade machine started),
+        // None, or any other non-terminal state: the order did not complete.
+        _ => format!(
+            "{} order not completed: {} {} for {}",
+            verb, order.quantity, order.item, order.username
+        ),
+    }
+}
+
 /// Execute a queued order.
 ///
 /// Dispatches to the appropriate handler based on order type. Returns a
@@ -1327,34 +1358,30 @@ pub async fn execute_queued_order(
     let order_span = info_span!("order", order_id = order.id, player = %order.username);
     let result = async {
         match &order.order_type {
-            QueuedOrderType::Buy => handle_buy_order(
-                store,
-                &order.username,
-                &order.user_uuid,
-                &order.item,
-                order.quantity,
-            )
-            .await
-            .map(|()| {
-                format!(
-                    "Buy order completed: {} {} for {}",
-                    order.quantity, order.item, order.username
+            QueuedOrderType::Buy => {
+                handle_buy_order(
+                    store,
+                    &order.username,
+                    &order.user_uuid,
+                    &order.item,
+                    order.quantity,
                 )
-            }),
-            QueuedOrderType::Sell => handle_sell_order(
-                store,
-                &order.username,
-                &order.user_uuid,
-                &order.item,
-                order.quantity,
-            )
-            .await
-            .map(|()| {
-                format!(
-                    "Sell order completed: {} {} for {}",
-                    order.quantity, order.item, order.username
+                .await?;
+                // `Ok(())` covers commit, graceful abort, and validation
+                // rejection alike — derive the real outcome from the trade state.
+                Ok(buy_sell_outcome_summary(store, "Buy", order))
+            }
+            QueuedOrderType::Sell => {
+                handle_sell_order(
+                    store,
+                    &order.username,
+                    &order.user_uuid,
+                    &order.item,
+                    order.quantity,
                 )
-            }),
+                .await?;
+                Ok(buy_sell_outcome_summary(store, "Sell", order))
+            }
             QueuedOrderType::Deposit { amount } => {
                 super::handlers::player::handle_deposit_balance_queued(
                     store,
@@ -2142,6 +2169,84 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Buy where every chest interaction fails — simulates the bot being unable
+    /// to open the storage chest (the field-log scenario where a failed chest
+    /// open was mislabeled as "Buy order completed").
+    fn spawn_mock_bot_withdraw_fail(mut rx: mpsc::Receiver<BotInstruction>) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    BotInstruction::Whisper { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    }
+                    BotInstruction::InteractWithChestAndSync { respond_to, .. } => {
+                        let _ = respond_to.send(Err("simulated chest open failure".to_string()));
+                    }
+                    BotInstruction::TradeWithPlayer {
+                        player_offers: items_player_must_give,
+                        respond_to,
+                        ..
+                    } => {
+                        let _ = respond_to.send(Ok(items_player_must_give));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Regression: a buy whose chest withdrawal fails must be reported as
+    /// *aborted*, not "completed". The handler still returns `Ok` (graceful
+    /// recovery), but the dispatch summary is derived from the terminal trade
+    /// state, so a rolled-back order no longer masquerades as a success.
+    #[tokio::test]
+    async fn test_buy_chest_withdraw_failure_reports_aborted_not_completed() {
+        let (tx, rx) = mpsc::channel(64);
+        spawn_mock_bot_withdraw_fail(rx);
+
+        let mut users = HashMap::new();
+        let (uuid, user) = make_user("Buyer", 1000.0);
+        users.insert(uuid.clone(), user);
+
+        let mut pairs = HashMap::new();
+        let (k, p) = make_pair("cobblestone", 64, 500.0);
+        pairs.insert(k, p);
+
+        let storage = make_storage("cobblestone", 64);
+        let mut store = Store::new_for_test(tx, test_config(), pairs, users, storage);
+
+        let order = QueuedOrder::new(
+            1,
+            test_uuid("Buyer"),
+            "Buyer".to_string(),
+            QueuedOrderType::Buy,
+            "cobblestone".to_string(),
+            1,
+        );
+        // Mirror process_next_order: seed the trade state machine before
+        // dispatch so the handler's rollback transition is recorded.
+        store.current_trade = Some(crate::store::trade_state::TradeState::new(order.clone()));
+
+        let result = execute_queued_order(&mut store, &order).await;
+
+        let summary = result.expect("buy must recover gracefully (Ok) on chest failure");
+        assert!(
+            summary.contains("aborted"),
+            "aborted buy must say so, got: {summary}"
+        );
+        assert!(
+            !summary.contains("completed"),
+            "aborted buy must NOT be summarized as completed, got: {summary}"
+        );
+        assert_eq!(
+            store.current_trade.as_ref().map(|t| t.phase()),
+            Some("rolled_back"),
+            "trade must end in the terminal rollback state"
+        );
+        // Buyer is never charged for an order that delivered nothing.
+        assert_eq!(store.users.get(&uuid).unwrap().balance, 1000.0);
     }
 
     /// Sell where the trade succeeds but every deposit chest operation fails.

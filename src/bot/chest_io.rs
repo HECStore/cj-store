@@ -12,8 +12,9 @@ use crate::constants::{
     CHEST_OP_MAX_ATTEMPTS, CHUNK_RELOAD_BASE_DELAY_MS, CHUNK_RELOAD_EXTRA_RETRIES,
     CHUNK_RELOAD_MAX_DELAY_MS, DELAY_BLOCK_OP_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS,
     DELAY_MEDIUM_MS, DELAY_SETTLE_MS, DELAY_SHORT_MS, DELAY_SHULKER_PLACE_MS, DOUBLE_CHEST_SLOTS,
-    HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, SHULKER_BOX_SLOTS,
-    SHULKER_PLACE_MAX_ATTEMPTS, VERIFY_POLL_DEFAULT_MS, exponential_backoff_delay_jittered,
+    HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, SHULKER_AIM_POLL_ATTEMPTS,
+    SHULKER_BOX_SLOTS, SHULKER_PLACE_MAX_ATTEMPTS, VERIFY_POLL_DEFAULT_MS,
+    exponential_backoff_delay_jittered,
 };
 use crate::types::Position;
 use azalea::inventory::ItemStack;
@@ -1436,6 +1437,26 @@ fn block_is_shulker(client: &azalea::Client, pos: BlockPos) -> bool {
         .unwrap_or(false)
 }
 
+/// Poll the client's crosshair hit-result until it lands on `target`, so a
+/// following `block_interact(target)` sends a *real* face hit. azalea otherwise
+/// fabricates a synthetic hit at the block centre with face = Up (see its
+/// `handle_start_use_item_queued`), which stricter server anticheat silently
+/// rejects — leaving the placement/interaction a no-op. Returns true once the
+/// crosshair is on `target`, false if it never lands within the poll budget.
+async fn wait_until_aimed_at(client: &azalea::Client, target: BlockPos, max_polls: u32) -> bool {
+    use azalea::core::hit_result::HitResult;
+    for _ in 0..max_polls {
+        if let HitResult::Block(hit) = client.hit_result()
+            && !hit.miss
+            && hit.block_pos == target
+        {
+            return true;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_SHORT_MS)).await;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn place_shulker_on_station(
     bot: &Bot,
@@ -1581,8 +1602,27 @@ async fn place_shulker_on_station(
     // rollback) if it never lands.
     let mut placed = false;
     for attempt in 1..=SHULKER_PLACE_MAX_ATTEMPTS {
+        // The shulker is in hotbar slot 0, but `block_interact` places whatever
+        // is actually held — and the selected slot can drift across the
+        // inventory shuffling above. Explicitly hold slot 0 so we place the
+        // shulker and not air / some other item.
+        client.set_selected_hotbar_slot(0);
         client.look_at(place_vec3);
         tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
+
+        // Wait until the crosshair is actually on the floor block so azalea
+        // sends a real top-face hit; without this the server rejects the
+        // synthetic centre+Up hit and the shulker never lands.
+        if !wait_until_aimed_at(&client, floor_block, SHULKER_AIM_POLL_ATTEMPTS).await {
+            warn!(
+                "place_shulker_on_station: crosshair never landed on floor block {:?} (hit={:?}) on attempt {}/{}",
+                floor_block,
+                client.hit_result(),
+                attempt,
+                SHULKER_PLACE_MAX_ATTEMPTS
+            );
+        }
+
         client.block_interact(floor_block);
         // The block entity needs time to register before we can read it back or
         // open it as a container (750 ms ~= 15 ticks).

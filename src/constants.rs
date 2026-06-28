@@ -108,6 +108,12 @@ pub const SHULKER_OP_MAX_ATTEMPTS: u32 = 2;
 /// the place up to this many times before aborting (the loop runs `1..=N`).
 pub const SHULKER_PLACE_MAX_ATTEMPTS: u32 = 3;
 
+/// How many times to poll the crosshair hit-result (spaced `DELAY_SHORT_MS`
+/// apart) waiting for it to land on the placement target before interacting.
+/// Landing a real hit makes azalea send the true block face instead of the
+/// synthetic centre+Up hit that stricter anticheat rejects. ~1.5 s at 100 ms.
+pub const SHULKER_AIM_POLL_ATTEMPTS: u32 = 15;
+
 /// Total attempt count for pathfinding navigation (the retry loop runs
 /// `0..N`, so `N` is the total number of attempts).
 pub const NAVIGATION_MAX_ATTEMPTS: u32 = 2;

@@ -13,7 +13,7 @@ use crate::constants::{
     CHUNK_RELOAD_MAX_DELAY_MS, DELAY_BLOCK_OP_MS, DELAY_INTERACT_MS, DELAY_LOOK_AT_MS,
     DELAY_MEDIUM_MS, DELAY_SETTLE_MS, DELAY_SHORT_MS, DELAY_SHULKER_PLACE_MS, DOUBLE_CHEST_SLOTS,
     HOTBAR_SLOT_0, RETRY_BASE_DELAY_MS, RETRY_MAX_DELAY_MS, SHULKER_BOX_SLOTS,
-    VERIFY_POLL_DEFAULT_MS, exponential_backoff_delay_jittered,
+    SHULKER_PLACE_MAX_ATTEMPTS, VERIFY_POLL_DEFAULT_MS, exponential_backoff_delay_jittered,
 };
 use crate::types::Position;
 use azalea::inventory::ItemStack;
@@ -1423,6 +1423,19 @@ struct ShulkerOnStation {
 ///
 /// **`container` is consumed** — the chest must be reopened by the caller
 /// (via `finish_shulker_round_trip`) once the shulker has been processed.
+///
+/// True if the block the client currently sees at `pos` is a shulker box.
+/// Uses the same debug-string match as the chest/shulker open paths — good
+/// enough to confirm a placement landed before we try to open it.
+fn block_is_shulker(client: &azalea::Client, pos: BlockPos) -> bool {
+    client
+        .world()
+        .read()
+        .get_block_state(pos)
+        .map(|s| format!("{s:?}").to_lowercase().contains("shulker"))
+        .unwrap_or(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn place_shulker_on_station(
     bot: &Bot,
@@ -1550,22 +1563,49 @@ async fn place_shulker_on_station(
     // Right-click the floor block below the station position to place the shulker
     // on top of it (standard Minecraft block-placement mechanic).
     let floor_block = BlockPos::new(station_pos.x, station_pos.y - 1, station_pos.z);
+    let station_block = BlockPos::new(station_pos.x, station_pos.y, station_pos.z);
     let place_vec3 = Vec3::new(
         station_pos.x as f64 + 0.5,
         // Look slightly below station Y to target the floor block's top face.
         station_pos.y as f64 - 0.4,
         station_pos.z as f64 + 0.5,
     );
-    client.look_at(place_vec3);
-    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
-    client.block_interact(floor_block);
-    // Use the longer shulker-placement delay here (750 ms) because the block
-    // entity needs extra time to register before we can open it as a container.
-    // The withdraw path previously used DELAY_SETTLE_MS (500 ms) and the deposit
-    // path used DELAY_SHULKER_PLACE_MS (750 ms); we take the conservative value.
-    tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_SHULKER_PLACE_MS)).await;
 
-    // Journal: shulker is now on the station.
+    // `block_interact` is fire-and-forget: the server (with anticheat) can
+    // silently drop a placement it doesn't like, leaving the station empty.
+    // Previously we advanced the journal and tried to open the shulker
+    // regardless — which then burned two 15 s open timeouts on an empty station
+    // and left a phantom `ShulkerOnStation` journal entry on the next restart.
+    // Re-issue the look + place and verify the shulker actually materialised
+    // before proceeding; abort cleanly (shulker stays in hand for the caller's
+    // rollback) if it never lands.
+    let mut placed = false;
+    for attempt in 1..=SHULKER_PLACE_MAX_ATTEMPTS {
+        client.look_at(place_vec3);
+        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_LOOK_AT_MS)).await;
+        client.block_interact(floor_block);
+        // The block entity needs time to register before we can read it back or
+        // open it as a container (750 ms ~= 15 ticks).
+        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_SHULKER_PLACE_MS)).await;
+
+        if block_is_shulker(&client, station_block) {
+            placed = true;
+            break;
+        }
+        warn!(
+            "place_shulker_on_station: shulker not present at station ({}, {}, {}) after place attempt {}/{} — server may have rejected the interaction; retrying",
+            station_pos.x, station_pos.y, station_pos.z, attempt, SHULKER_PLACE_MAX_ATTEMPTS
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(DELAY_BLOCK_OP_MS)).await;
+    }
+    if !placed {
+        return Err(format!(
+            "Failed to place shulker on station ({}, {}, {}) after {} attempts — station still empty (server likely rejected the placement interaction)",
+            station_pos.x, station_pos.y, station_pos.z, SHULKER_PLACE_MAX_ATTEMPTS
+        ));
+    }
+
+    // Journal: shulker is now on the station (verified present above).
     // Direct synchronous write — no `block_in_place` (panics inside the
     // LocalSet; see the note in `place_shulker_on_station`'s journal `begin`).
     {

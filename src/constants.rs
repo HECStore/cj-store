@@ -102,6 +102,12 @@ pub const CHUNK_RELOAD_MAX_DELAY_MS: u64 = 10_000;
 /// `0..N`, so `N` is the total number of attempts).
 pub const SHULKER_OP_MAX_ATTEMPTS: u32 = 2;
 
+/// Total attempt count for placing a shulker on the station. `block_interact`
+/// is fire-and-forget and the server can silently drop a rejected placement, so
+/// `place_shulker_on_station` verifies the block actually landed and re-issues
+/// the place up to this many times before aborting (the loop runs `1..=N`).
+pub const SHULKER_PLACE_MAX_ATTEMPTS: u32 = 3;
+
 /// Total attempt count for pathfinding navigation (the retry loop runs
 /// `0..N`, so `N` is the total number of attempts).
 pub const NAVIGATION_MAX_ATTEMPTS: u32 = 2;

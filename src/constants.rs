@@ -185,6 +185,18 @@ pub const FEE_MAX: f64 = 1.0;
 
 pub const MAX_TRANSACTION_QUANTITY: i32 = 1_000_000;
 
+/// Number of item-offer slots available to each side of the `/trade` GUI.
+///
+/// The trade window is a 9x6 double chest; each party gets a 3x4 block of 12
+/// slots to place their offered item stacks (see the slot maps in
+/// `bot::trade`). A single trade can therefore move at most
+/// `TRADE_OFFER_SLOTS_PER_SIDE * stack_size` of one item — orders above that
+/// can be withdrawn into the bot's inventory but then cannot all be placed
+/// into the offer grid, so they must be rejected up front (see
+/// `validate_and_plan_buy` / `validate_and_plan_sell`) rather than failing
+/// mid-trade with "Bot trade offer slots are full" and forcing a rollback.
+pub const TRADE_OFFER_SLOTS_PER_SIDE: i32 = 12;
+
 /// Maximum diamonds movable in a single trade.
 ///
 /// Minecraft's vanilla trade UI exposes 12 offer slots (4x3 grid); each
@@ -192,7 +204,7 @@ pub const MAX_TRANSACTION_QUANTITY: i32 = 1_000_000;
 /// at most 768 diamonds. We reject larger requests at the handler rather
 /// than silently truncating so the player isn't surprised by a partial
 /// transaction.
-pub const MAX_TRADE_DIAMONDS: i32 = 12 * 64;
+pub const MAX_TRADE_DIAMONDS: i32 = TRADE_OFFER_SLOTS_PER_SIDE * 64;
 
 /// Minimum reserve before price calculation becomes unreliable.
 /// Pricing formulas typically divide by reserve; values this small cause

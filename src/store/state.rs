@@ -415,6 +415,149 @@ pub fn assert_invariants(store: &mut Store, context: &str, repair: bool) -> Resu
     )))
 }
 
+/// Pre-trade safety gate scoped to a single traded `item` and `user_uuid`.
+///
+/// `assert_invariants(.., repair=false)` audits the ENTIRE store and refuses
+/// the order if *any* pair, chest, or balance is inconsistent. That blast
+/// radius is what turned a single item's stock drift into a store-wide outage:
+/// in the incident a `gunpowder item_stock != physical` drift (caused by a
+/// failed rollback) blocked every unrelated `totem_of_undying` / `scute` /
+/// `emerald_block` order for hours, for every player, until an operator ran a
+/// repair. This gate instead blocks only on inconsistencies that actually make
+/// *this* trade unsafe. The full-store audit still runs here (so the complete
+/// picture is logged), we just don't *fail* the order on out-of-scope issues.
+///
+/// Blocking (in scope):
+///   * the trading user's balance is non-finite or negative — NaN/negatives
+///     poison the money comparisons in the buy/sell planner (`balance < cost`
+///     is `false` for a NaN balance, which would let a buy through for free);
+///   * the traded pair's own ledger — negative `item_stock` / `currency_stock`,
+///     or `item_stock` drifting from the physical chest total (we'd otherwise
+///     hand over the wrong quantity or miscount the reserve);
+///   * structural corruption (wrong length or out-of-range slot amount) in a
+///     chest that physically stores `item`.
+///
+/// Out of scope (surfaced by the full audit's own log, not blocking here): the
+/// same problems on *other* pairs, *other* chests, and *other* users — none of
+/// which this trade reads or mutates.
+///
+/// NOTE: these in-scope checks deliberately mirror a subset of `audit_state`.
+/// If you add a new pair/chest invariant there that bears on trade safety, add
+/// its scoped form here too — `assert_tradeable_*` tests pin the isolation.
+pub fn assert_tradeable(
+    store: &mut Store,
+    item: &str,
+    user_uuid: &str,
+    context: &str,
+) -> Result<(), StoreError> {
+    use crate::store::utils;
+
+    // Full-store audit for observability only (it logs its own warning when the
+    // store has issues). repair=false: never silently rewrite a ledger at
+    // pre-trade — that would mask items lost by a failed rollback.
+    let full = audit_state(store, false);
+
+    let mut blocking: Vec<String> = Vec::new();
+
+    // (1) The trading user's balance — the shared money math for THIS trade.
+    if let Some(user) = store.users.get(user_uuid) {
+        if !user.balance.is_finite() {
+            blocking.push(format!("User {} has non-finite balance", user.username));
+        } else if user.balance < 0.0 {
+            blocking.push(format!(
+                "User {} has negative balance: {}",
+                user.username, user.balance
+            ));
+        }
+    }
+
+    // (2) The traded pair's own ledger.
+    if let Some(pair) = store.pairs.get(item) {
+        if pair.item_stock < 0 {
+            blocking.push(format!(
+                "Pair {} has negative item_stock {}",
+                pair.item, pair.item_stock
+            ));
+        }
+        if pair.currency_stock < 0.0 {
+            blocking.push(format!(
+                "Pair {} has negative currency_stock {}",
+                pair.item, pair.currency_stock
+            ));
+        }
+        let physical = store.storage.total_item_amount(&pair.item);
+        if pair.item_stock != physical {
+            blocking.push(format!(
+                "Pair {} item_stock {} != physical {}",
+                pair.item, pair.item_stock, physical
+            ));
+        }
+    }
+
+    // (3) Chests that physically store this item.
+    let shulker_capacity = store
+        .pairs
+        .get(item)
+        .map(|p| crate::types::Pair::shulker_capacity_for_stack_size(p.stack_size))
+        .unwrap_or(crate::types::Storage::DEFAULT_SHULKER_CAPACITY);
+    for node in &store.storage.nodes {
+        for chest in &node.chests {
+            if chest.item.as_str() != item {
+                continue;
+            }
+            if chest.amounts.len() != crate::types::Storage::SLOTS_PER_CHEST {
+                blocking.push(format!(
+                    "Chest {} amounts len is {} (expected {})",
+                    chest.id,
+                    chest.amounts.len(),
+                    crate::types::Storage::SLOTS_PER_CHEST
+                ));
+            }
+            for (i, a) in chest.amounts.iter().enumerate() {
+                if *a < -1 {
+                    blocking.push(format!(
+                        "Chest {} slot {} has invalid amount {}",
+                        chest.id, i, a
+                    ));
+                }
+                if *a > shulker_capacity {
+                    blocking.push(format!(
+                        "Chest {} (item: {}) slot {} exceeds max capacity ({}): {}",
+                        chest.id, item, i, shulker_capacity, a
+                    ));
+                }
+            }
+        }
+    }
+
+    if blocking.is_empty() {
+        // Out-of-scope issues exist but don't endanger this trade: let it
+        // proceed and say so, so an operator understands why the store didn't
+        // hard-stop and knows to reconcile via AuditState.
+        if !full.issues.is_empty() {
+            tracing::warn!(
+                context,
+                item,
+                out_of_scope_issues = full.issues.len(),
+                "pre-trade audit found store-wide issues unrelated to this item; allowing trade (scoped gate) — run AuditState to reconcile"
+            );
+        }
+        return Ok(());
+    }
+
+    tracing::error!(
+        context,
+        item,
+        count = blocking.len(),
+        "invariant violation detected (item-scoped pre-trade gate)"
+    );
+    Err(StoreError::InvariantViolation(utils::fmt_issues(
+        &format!("({})", context),
+        &blocking,
+        8,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1036,136 @@ mod tests {
         // so assert_invariants should return Ok.
         assert!(assert_invariants(&mut store, "post-op", true).is_ok());
         assert_eq!(store.pairs["iron_ingot"].item_stock, 50);
+    }
+
+    // ---------- assert_tradeable (scoped pre-trade gate) ----------
+
+    /// Build a pair whose cached `item_stock` matches physical storage of
+    /// `count` (so it is internally consistent / tradeable by default).
+    fn consistent_pair(item: &str, count: i32) -> Pair {
+        Pair {
+            item: ItemId::new(item).unwrap(),
+            stack_size: 64,
+            item_stock: count,
+            currency_stock: 0.0,
+        }
+    }
+
+    #[test]
+    fn assert_tradeable_allows_trade_when_only_an_unrelated_pair_drifts() {
+        // gunpowder is drifted (item_stock != physical); iron_ingot is clean.
+        // A buy/sell of iron_ingot must NOT be blocked by gunpowder's drift —
+        // this is the exact regression the incident exposed.
+        let mut storage = test_storage();
+        seed_iron(&mut storage, 100);
+
+        let mut pairs = HashMap::new();
+        pairs.insert("iron_ingot".to_string(), consistent_pair("iron_ingot", 100));
+        // gunpowder claims stock it has no physical backing for -> drift.
+        pairs.insert("gunpowder".to_string(), consistent_pair("gunpowder", 45183));
+
+        let mut users = HashMap::new();
+        users.insert(
+            "u".to_string(),
+            User {
+                uuid: "u".to_string(),
+                username: "trader".to_string(),
+                balance: 10.0,
+                operator: false,
+            },
+        );
+        let mut store = build_store(pairs, users, storage);
+
+        // Sanity: the full audit DOES see the unrelated gunpowder drift...
+        assert!(
+            audit_state(&mut store, false)
+                .issues
+                .iter()
+                .any(|i| i.contains("gunpowder") && i.contains("!=")),
+            "test setup must produce an unrelated drift"
+        );
+        // ...but the scoped gate for iron_ingot lets the trade through.
+        assert!(
+            assert_tradeable(&mut store, "iron_ingot", "u", "pre-buy").is_ok(),
+            "an unrelated pair's drift must not block trading iron_ingot"
+        );
+    }
+
+    #[test]
+    fn assert_tradeable_blocks_when_the_traded_pair_itself_drifts() {
+        let mut storage = test_storage();
+        seed_iron(&mut storage, 100); // physical iron = 100
+
+        let mut pairs = HashMap::new();
+        // Traded pair claims 42 but physical is 100 -> in-scope drift.
+        pairs.insert("iron_ingot".to_string(), consistent_pair("iron_ingot", 42));
+        let mut store = build_store(pairs, HashMap::new(), storage);
+
+        let err = assert_tradeable(&mut store, "iron_ingot", "u", "pre-buy")
+            .expect_err("the traded pair's own drift must block the trade");
+        let msg = format!("{err}");
+        assert!(msg.contains("pre-buy"), "context expected: {msg}");
+        assert!(
+            msg.contains("iron_ingot") && msg.contains("42") && msg.contains("100"),
+            "drift detail expected: {msg}"
+        );
+    }
+
+    #[test]
+    fn assert_tradeable_blocks_on_trading_users_corrupt_balance_only() {
+        // A NaN balance for the TRADING user blocks (poisons money math); the
+        // same corruption on a DIFFERENT user does not block this trade.
+        let mut pairs = HashMap::new();
+        pairs.insert("iron_ingot".to_string(), consistent_pair("iron_ingot", 0));
+
+        let mut users = HashMap::new();
+        users.insert(
+            "me".to_string(),
+            User {
+                uuid: "me".to_string(),
+                username: "me".to_string(),
+                balance: f64::NAN,
+                operator: false,
+            },
+        );
+        users.insert(
+            "other".to_string(),
+            User {
+                uuid: "other".to_string(),
+                username: "other".to_string(),
+                balance: f64::NAN,
+                operator: false,
+            },
+        );
+        let mut store = build_store(pairs, users, test_storage());
+
+        assert!(
+            assert_tradeable(&mut store, "iron_ingot", "me", "pre-buy").is_err(),
+            "trading user's non-finite balance must block"
+        );
+        // The drifted-balance user "other" exists, but a clean trader "me2"
+        // must still be able to trade (other users' corruption is out of scope).
+        store.users.insert(
+            "me2".to_string(),
+            User {
+                uuid: "me2".to_string(),
+                username: "me2".to_string(),
+                balance: 5.0,
+                operator: false,
+            },
+        );
+        assert!(
+            assert_tradeable(&mut store, "iron_ingot", "me2", "pre-buy").is_ok(),
+            "another user's corrupt balance must not block this trader"
+        );
+    }
+
+    #[test]
+    fn assert_tradeable_clean_store_is_ok() {
+        let mut pairs = HashMap::new();
+        pairs.insert("iron_ingot".to_string(), consistent_pair("iron_ingot", 0));
+        let mut store = build_store(pairs, HashMap::new(), test_storage());
+        assert!(assert_tradeable(&mut store, "iron_ingot", "u", "pre-buy").is_ok());
     }
 
     // ---------- AuditReport::to_lines ----------

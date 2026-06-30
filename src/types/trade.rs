@@ -473,11 +473,21 @@ impl Trade {
             }
         }
 
+        // Accurate accounting: `written` only counts trades in the dirty tail
+        // that were actually (re)written. The `dirty_start` historical trades
+        // are intentionally skipped because their on-disk bytes are already
+        // byte-identical (Trade is append-only) — they are NOT failures.
+        // Reporting `trades.len() - written` as "failed" was a false alarm that
+        // logged e.g. "wrote 0 of 160 trades (failed 160)" on every autosave
+        // even though nothing failed; only `attempted - written` is real.
+        let (attempted, skipped, failed) = save_all_counts(total, dirty_tail_count, written);
         tracing::info!(
-            "[Trade] save_all: wrote {} of {} trades (failed {}), cleaned {} orphan files",
+            "[Trade] save_all: wrote {} of {} dirty trades (failed {}, skipped {} already-persisted of {} total), cleaned {} orphan files",
             written,
+            attempted,
+            failed,
+            skipped,
             trades.len(),
-            trades.len() - written,
             removed,
         );
         match first_save_err.or(first_sweep_err) {
@@ -485,6 +495,28 @@ impl Trade {
             None => Ok(()),
         }
     }
+}
+
+/// Compute the `(attempted, skipped, failed)` counts for the `save_all` log
+/// line from the total trade count, the dirty-tail size, and how many of the
+/// dirty tail were actually written.
+///
+/// Split out as a pure function so the accounting can be unit-tested without a
+/// filesystem. The leading `total - dirty_tail_count` trades are skipped (their
+/// on-disk bytes are already byte-identical — `Trade` is append-only), so only
+/// `attempted - written` is a genuine failure. Conflating the skipped trades
+/// with failures is what produced the spurious "wrote 0 of 160 trades
+/// (failed 160)" log on every autosave.
+fn save_all_counts(
+    total: usize,
+    dirty_tail_count: usize,
+    written: usize,
+) -> (usize, usize, usize) {
+    let dirty_start = total.saturating_sub(dirty_tail_count);
+    let attempted = total - dirty_start;
+    let skipped = dirty_start;
+    let failed = attempted.saturating_sub(written);
+    (attempted, skipped, failed)
 }
 
 /// Rename a malformed/unreadable trade file aside so the next `save_all`
@@ -555,6 +587,34 @@ mod tests {
             let back: TradeType = serde_json::from_str(&json).unwrap();
             assert_eq!(back, variant);
         }
+    }
+
+    #[test]
+    fn save_all_counts_does_not_report_skipped_clean_trades_as_failed() {
+        // The original autosave log computed `failed = total - written`, which
+        // counted every already-persisted (skipped) historical trade as a
+        // failure — e.g. a clean autosave of 160 trades with nothing dirty
+        // logged "wrote 0 of 160 trades (failed 160)". The accounting must
+        // treat skipped trades as skipped, never failed.
+
+        // Steady-state autosave: 160 on disk, none dirty, nothing written.
+        // Nothing was attempted, so nothing failed; all 160 are skipped.
+        assert_eq!(save_all_counts(160, 0, 0), (0, 160, 0));
+
+        // One new trade appended and successfully written: 1 attempted, 159
+        // skipped, 0 failed (was previously mis-logged as "failed 160").
+        assert_eq!(save_all_counts(161, 1, 1), (1, 160, 0));
+
+        // A genuine write failure in the dirty tail IS counted: 3 attempted,
+        // 1 written -> 2 failed.
+        assert_eq!(save_all_counts(10, 3, 1), (3, 7, 2));
+
+        // "Save all" (dirty_tail == total) with every write succeeding:
+        // nothing skipped, nothing failed.
+        assert_eq!(save_all_counts(5, 5, 5), (5, 0, 0));
+
+        // dirty_tail larger than total is clamped (saturating): attempted == total.
+        assert_eq!(save_all_counts(4, 99, 4), (4, 0, 0));
     }
 
     #[test]

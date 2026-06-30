@@ -20,7 +20,7 @@ use tracing::{Instrument, error, info, info_span, warn};
 
 use super::queue::QueuedOrder;
 use super::{Store, pricing, rollback, state, utils};
-use crate::constants::CHEST_OP_TIMEOUT_SECS;
+use crate::constants::{CHEST_OP_TIMEOUT_SECS, TRADE_OFFER_SLOTS_PER_SIDE};
 use crate::error::StoreError;
 use crate::messages::{BotInstruction, ChestAction, QueuedOrderType, TradeItem};
 use crate::types::storage::ChestTransfer;
@@ -359,6 +359,26 @@ async fn validate_and_plan_buy(
     }
     let stack_size = pair.stack_size;
 
+    // The trade GUI exposes only 12 bot-offer slots, so the bot can hand over at
+    // most 12 full stacks of an item in one trade. A larger order withdraws into
+    // the bot's inventory fine, but then cannot all be placed into the offer grid
+    // — it fails with "Bot trade offer slots are full" mid-trade and forces a
+    // rollback (see the 800x gunpowder incident). Reject up front with a clear
+    // cap, mirroring how the diamond side is capped at MAX_TRADE_DIAMONDS.
+    let max_per_trade = TRADE_OFFER_SLOTS_PER_SIDE * stack_size;
+    if qty_i32 > max_per_trade {
+        utils::send_message_to_player(
+            store,
+            player_name,
+            &format!(
+                "Cannot buy {} {} in one trade - the trade window holds at most {} ({} stacks of {}). Please order {} or fewer at a time.",
+                qty_i32, item, max_per_trade, TRADE_OFFER_SLOTS_PER_SIDE, stack_size, max_per_trade
+            ),
+        )
+        .await?;
+        return Ok(None);
+    }
+
     let user_balance = store
         .users
         .get(&user_uuid)
@@ -453,7 +473,9 @@ pub async fn handle_buy_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     info!(phase = "buy.start", player = %player_name, item = %item, qty = quantity, "Buy order starting");
-    state::assert_invariants(store, "pre-buy", false)?;
+    // Scoped pre-trade gate: a stock drift on some *other* item must not block
+    // this buy (that blast radius bricked the whole store in the incident).
+    state::assert_tradeable(store, item, user_uuid, "pre-buy")?;
 
     let plan = match validate_and_plan_buy(store, player_name, user_uuid, item, quantity).await? {
         Some(p) => p,
@@ -890,6 +912,25 @@ async fn validate_and_plan_sell(
     }
 
     let stack_size = pair.stack_size;
+
+    // The trade GUI exposes only 12 player-offer slots, so the player can hand
+    // over at most 12 full stacks of an item in one trade. A larger sell can
+    // never be completed (the player physically cannot place the items), so
+    // reject up front with a clear cap rather than failing validation mid-trade.
+    let max_per_trade = TRADE_OFFER_SLOTS_PER_SIDE * stack_size;
+    if qty_i32 > max_per_trade {
+        utils::send_message_to_player(
+            store,
+            player_name,
+            &format!(
+                "Cannot sell {} {} in one trade - the trade window holds at most {} ({} stacks of {}). Please sell {} or fewer at a time.",
+                qty_i32, item, max_per_trade, TRADE_OFFER_SLOTS_PER_SIDE, stack_size, max_per_trade
+            ),
+        )
+        .await?;
+        return Ok(None);
+    }
+
     let (deposit_plan, planned_deposited) = store
         .storage
         .simulate_deposit_plan(item, qty_i32, stack_size);
@@ -939,7 +980,9 @@ pub async fn handle_sell_order(
     quantity: u32,
 ) -> Result<(), StoreError> {
     info!(phase = "sell.start", player = %player_name, item = %item, qty = quantity, "Sell order starting");
-    state::assert_invariants(store, "pre-sell", false)?;
+    // Scoped pre-trade gate: a stock drift on some *other* item must not block
+    // this sell (that blast radius bricked the whole store in the incident).
+    state::assert_tradeable(store, item, user_uuid, "pre-sell")?;
 
     let plan = match validate_and_plan_sell(store, player_name, user_uuid, item, quantity).await? {
         Some(p) => p,

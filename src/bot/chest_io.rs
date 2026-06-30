@@ -1457,11 +1457,103 @@ async fn wait_until_aimed_at(client: &azalea::Client, target: BlockPos, max_poll
     false
 }
 
+/// Best-effort recovery for a shulker that was successfully placed on the
+/// station but could not be *opened* (e.g. `open_shulker_at_station` timed out
+/// under server lag). Without this, the `?` on the open call abandoned the
+/// shulker: it sat on the station forever (an "empty shulker on station") and
+/// left a phantom `ShulkerOnStation` journal entry that survived restarts and
+/// required manual reconciliation — exactly the incident this comment is named
+/// after.
+///
+/// Steps (each best-effort — any can itself fail under the same lag that broke
+/// the open): break + collect the shulker back into inventory, advance the
+/// journal to `ShulkerPickedUp`, reopen the chest, and place the shulker back
+/// into its original slot, completing the journal. If collection fails the
+/// journal is intentionally left at `ShulkerOnStation` so crash recovery still
+/// flags the stranded shulker. This NEVER changes the outcome the caller sees —
+/// `place_shulker_on_station` still returns the original open error so the
+/// order is rolled back — it only keeps the physical world from drifting.
+async fn recover_stranded_station_shulker(
+    bot: &Bot,
+    chest_pos: BlockPos,
+    chest_id: i32,
+    slot_idx: usize,
+    node_position: &Position,
+    station_pos: &Position,
+) {
+    use crate::store::journal::JournalState;
+
+    if let Err(e) =
+        super::shulker::pickup_shulker_from_station(bot, station_pos, node_position).await
+    {
+        error!(
+            "recover_stranded_station_shulker: could not collect shulker from station ({}, {}, {}) for chest {} slot {}: {} — leaving journal at ShulkerOnStation for crash/operator recovery",
+            station_pos.x, station_pos.y, station_pos.z, chest_id, slot_idx, e
+        );
+        return;
+    }
+
+    {
+        let res = bot.journal.lock().advance(JournalState::ShulkerPickedUp);
+        if let Err(e) = res {
+            warn!("[Journal] advance(ShulkerPickedUp) during station recovery failed: {}", e);
+        }
+    }
+
+    let container = match open_chest_container(bot, chest_pos).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                "recover_stranded_station_shulker: shulker collected to inventory but chest {} reopen failed: {} — shulker left loose in inventory",
+                chest_id, e
+            );
+            return;
+        }
+    };
+
+    match find_shulker_in_inventory_view(&container) {
+        Ok(Some(container_slot)) => {
+            if let Err(e) =
+                place_shulker_in_chest_slot_verified(&container, container_slot, slot_idx).await
+            {
+                error!(
+                    "recover_stranded_station_shulker: failed to replace recovered shulker into chest {} slot {}: {} — shulker left loose in inventory",
+                    chest_id, slot_idx, e
+                );
+                return;
+            }
+            {
+                let res = {
+                    let mut j = bot.journal.lock();
+                    j.complete_with_state(JournalState::ShulkerReplaced)
+                };
+                if let Err(e) = res {
+                    warn!("[Journal] complete_with_state(ShulkerReplaced) during station recovery failed: {}", e);
+                }
+            }
+            info!(
+                "recover_stranded_station_shulker: recovered shulker back into chest {} slot {} after open failure",
+                chest_id, slot_idx
+            );
+        }
+        Ok(None) => error!(
+            "recover_stranded_station_shulker: recovered shulker not found in chest {} inventory view — left loose in inventory",
+            chest_id
+        ),
+        Err(e) => error!(
+            "recover_stranded_station_shulker: error locating recovered shulker for chest {}: {} — left loose in inventory",
+            chest_id, e
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn place_shulker_on_station(
     bot: &Bot,
+    chest_pos: BlockPos,
     chest_id: i32,
     slot_idx: usize,
+    node_position: &Position,
     station_pos: &Position,
     journal_op: crate::store::journal::JournalOp,
     container: azalea::container::ContainerHandle,
@@ -1655,9 +1747,31 @@ async fn place_shulker_on_station(
         }
     }
 
-    // Open the placed shulker as a container.
-    let shulker_container = super::shulker::open_shulker_at_station(bot, station_pos).await?;
-    Ok(ShulkerOnStation { shulker_container })
+    // Open the placed shulker as a container. The shulker is now physically on
+    // the station (verified above) and journaled as ShulkerOnStation, so an
+    // open failure here must NOT just `?`-abandon it — that strands the shulker
+    // on the station (see recover_stranded_station_shulker). Recover it back
+    // into its chest slot (best-effort), then surface the original open error
+    // so the caller still rolls the order back.
+    match super::shulker::open_shulker_at_station(bot, station_pos).await {
+        Ok(shulker_container) => Ok(ShulkerOnStation { shulker_container }),
+        Err(open_err) => {
+            warn!(
+                "place_shulker_on_station: opened-failed at station ({}, {}, {}) for chest {} slot {} ({}): {} — recovering shulker so it isn't stranded",
+                station_pos.x, station_pos.y, station_pos.z, chest_id, slot_idx, context_label, open_err
+            );
+            recover_stranded_station_shulker(
+                bot,
+                chest_pos,
+                chest_id,
+                slot_idx,
+                node_position,
+                station_pos,
+            )
+            .await;
+            Err(open_err)
+        }
+    }
 }
 
 /// Common epilogue shared by every shulker round-trip:
@@ -1856,8 +1970,10 @@ async fn withdraw_shulkers(
             // Phase 1: Take shulker from chest slot, place on station, open it.
             let ShulkerOnStation { shulker_container } = place_shulker_on_station(
                 bot,
+                chest_pos,
                 chest_id,
                 slot_idx,
+                node_position,
                 station_pos,
                 JournalOp::WithdrawFromChest,
                 container,
@@ -2067,8 +2183,10 @@ async fn deposit_shulkers(
         // Phase 1: Take shulker from chest slot, place on station, open it.
         let ShulkerOnStation { shulker_container } = place_shulker_on_station(
             bot,
+            chest_pos,
             chest_id,
             slot_idx,
+            node_position,
             station_pos,
             JournalOp::DepositToChest,
             container,
